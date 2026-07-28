@@ -1,4 +1,5 @@
 import csv
+import os
 from configparser import ConfigParser
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -6,11 +7,24 @@ from typing import cast, override
 
 import pytest
 
+os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QSlider
+
 from artisanlib.main import ApplicationWindow
 
 
 def parse_ini_array(value: str) -> list[str]:
     return next(csv.reader([value], skipinitialspace=True))
+
+
+@pytest.fixture(scope='module')
+def qapplication() -> QApplication:
+    app = QApplication.instance()
+    if app is None:
+        return QApplication([])
+    return cast(QApplication, app)
 
 
 @dataclass
@@ -282,6 +296,104 @@ def test_warmup_preset_load_initializes_after_temperature_metadata(
     assert displayed_values[2] == expected_target
     assert window.santokerWarmupController.desired_temp_c == 190.0
     assert sliders[2].blockSignals.call_args_list == [call(True), call(False)]
+
+
+@pytest.mark.parametrize(
+    (
+        'initial_unit',
+        'new_unit',
+        'initial_target',
+        'initial_min',
+        'initial_max',
+        'expected_target',
+        'expected_min',
+        'expected_max',
+    ),
+    [
+        ('C', 'F', 190, 100, 300, 374, 212, 572),
+        ('F', 'C', 374, 212, 572, 190, 100, 300),
+    ],
+    ids=['celsius-to-fahrenheit', 'fahrenheit-to-celsius'],
+)
+def test_runtime_temperature_mode_switch_restores_warmup_target(
+    qapplication: QApplication,
+    initial_unit: str,
+    new_unit: str,
+    initial_target: int,
+    initial_min: int,
+    initial_max: int,
+    expected_target: int,
+    expected_min: int,
+    expected_max: int,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from artisanlib.canvas import tgraphcanvas
+    from artisanlib.santoker_warmup import SantokerWarmupController
+
+    del qapplication
+    slider_values = [10, 20, initial_target, 40]
+    sliders = [QSlider(Qt.Orientation.Vertical) for _ in range(4)]
+    min_values = [0, 0, initial_min, 0]
+    max_values = [100, 100, initial_max, 100]
+    for index, slider in enumerate(sliders):
+        slider.setRange(min_values[index], max_values[index])
+        slider.setValue(slider_values[index])
+
+    slider_actions = [Mock() for _ in sliders]
+    for slider, action in zip(sliders, slider_actions, strict=True):
+        slider.valueChanged.connect(action)
+
+    controller = SantokerWarmupController()
+    pidcontrol = SimpleNamespace(conv2celsius=Mock(), conv2fahrenheit=Mock())
+    window = SimpleNamespace(
+        slider1=sliders[0],
+        slider2=sliders[1],
+        slider3=sliders[2],
+        slider4=sliders[3],
+        eventslidercommands=['', '', 'santokerWarmupTemp({})', ''],
+        eventslidermin=min_values,
+        eventslidermax=max_values,
+        eventslidervalues=slider_values,
+        eventslidertemp=[0, 0, 1, 0],
+        santokerWarmupController=controller,
+        pidcontrol=pidcontrol,
+        updateSliderLCD=Mock(),
+    )
+    canvas = SimpleNamespace(
+        aw=window,
+        mode=new_unit,
+        mode_tempsliders=initial_unit,
+    )
+    window.qmc = canvas
+    window.moveslider = lambda index, value, forceLCDupdate=False: (
+        ApplicationWindow.moveslider(
+            cast(ApplicationWindow, window), index, value, forceLCDupdate
+        )
+    )
+    window.updateSliderMinMax = lambda: ApplicationWindow.updateSliderMinMax(
+        cast(ApplicationWindow, window)
+    )
+    window.initializeSantokerWarmupSlider = (
+        lambda: ApplicationWindow.initializeSantokerWarmupSlider(
+            cast(ApplicationWindow, window)
+        )
+    )
+
+    tgraphcanvas.adjustTempSliders(cast(tgraphcanvas, canvas))
+
+    assert canvas.mode_tempsliders == new_unit
+    assert sliders[2].minimum() == expected_min
+    assert sliders[2].maximum() == expected_max
+    assert sliders[2].value() == expected_target
+    assert slider_values == [10, 20, expected_target, 40]
+    assert controller.desired_temp_c == 190.0
+    assert [slider.value() for slider in sliders if slider is not sliders[2]] == [
+        10, 20, 40
+    ]
+    for action in slider_actions:
+        action.assert_not_called()
 
 
 def test_warmup_button_uses_real_no_event_processing_path() -> None:
