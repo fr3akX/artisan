@@ -283,9 +283,9 @@ The app also applies sequencing and guard conditions around commands. Examples i
 
 ## Evidence
 
-- Official Google Play app:  
+- Official Google Play app:
   <https://play.google.com/store/apps/details?id=com.santoker.roastassistant>
-- Official iOS app:  
+- Official iOS app:
   <https://apps.apple.com/us/app/santoker/id6504513978>
 - The iOS release history explicitly mentions X3 and “热机” behavior.
 - Static Android app analysis identified:
