@@ -9617,8 +9617,8 @@ class ApplicationWindow(QMainWindow):
                                 elif c.startswith('santokerWarmupTemp'):
                                     args = c[len('santokerWarmupTemp'):]
                                     if args.startswith('(') and args.endswith(')'):
-                                        value = float(eval(args[1:-1][:eval_limit]))  # pylint: disable=eval-used
-                                        self.setSantokerWarmupTarget(value)
+                                        warmup_target_value = float(eval(args[1:-1][:eval_limit]))  # pylint: disable=eval-used
+                                        self.setSantokerWarmupTarget(warmup_target_value)
 
                                 ##  santokerWarmup(<enabled>) : switch Santoker warm-up before CHARGE; does not send Machine ON
                                 elif c.startswith('santokerWarmup'):

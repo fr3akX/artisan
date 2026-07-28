@@ -1,8 +1,11 @@
 from configparser import ConfigParser
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import pytest
+
+from artisanlib.main import ApplicationWindow
 
 
 @dataclass
@@ -137,8 +140,6 @@ def test_window_updates_only_semantic_warmup_buttons() -> None:
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from artisanlib.main import ApplicationWindow
-
     style_signal = Mock()
     window = SimpleNamespace(
         extraeventsactionstrings=['santoker(fa,10)', 'santokerWarmup(1 - $)'],
@@ -146,7 +147,7 @@ def test_window_updates_only_semantic_warmup_buttons() -> None:
         setExtraEventButtonStyleSignal=style_signal,
     )
 
-    ApplicationWindow.setSantokerWarmupButtonState(window, True)
+    ApplicationWindow.setSantokerWarmupButtonState(cast(ApplicationWindow, window), True)
 
     assert window.buttonStates == [0, 1]
     style_signal.emit.assert_called_once_with(1, 'pressed')
@@ -156,7 +157,6 @@ def test_window_moves_warmup_slider_without_firing_action() -> None:
     from types import SimpleNamespace
     from unittest.mock import Mock, call
 
-    from artisanlib.main import ApplicationWindow
     from artisanlib.santoker_warmup import SantokerWarmupController
 
     slider = Mock()
@@ -171,7 +171,7 @@ def test_window_moves_warmup_slider_without_firing_action() -> None:
         moveslider=Mock(),
     )
 
-    ApplicationWindow.santokerWarmupTargetChanged(window, 190.0)
+    ApplicationWindow.santokerWarmupTargetChanged(cast(ApplicationWindow, window), 190.0)
 
     assert window.santokerWarmupController.desired_temp_c == 190.0
     assert slider.blockSignals.call_args_list == [call(True), call(False)]
@@ -183,7 +183,6 @@ def test_window_rejected_warmup_restoration_uses_signal_from_worker_thread() -> 
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from artisanlib.main import ApplicationWindow
     from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 
     button_state_signal = Mock()
@@ -199,7 +198,7 @@ def test_window_rejected_warmup_restoration_uses_signal_from_worker_thread() -> 
 
     def run_action() -> None:
         try:
-            results.append(ApplicationWindow.setSantokerWarmup(window, True))
+            results.append(ApplicationWindow.setSantokerWarmup(cast(ApplicationWindow, window), True))
         except BaseException as exc:  # pragma: no cover - re-raised in the test thread
             errors.append(exc)
 
