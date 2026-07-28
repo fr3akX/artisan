@@ -120,6 +120,11 @@ class Santoker(AsyncComm):
     POWER:Final[bytes] = b'\xFA'
     AIR:Final[bytes] = b'\xCA'
     DRUM:Final[bytes] = b'\xC0'
+    WARMUP:Final[bytes] = b'\x7E'
+    WARMUP_TEMP:Final[bytes] = b'\x7F'
+    MIN_WARMUP_TEMP_C:Final[float] = 100.0
+    MAX_WARMUP_TEMP_C:Final[float] = 300.0
+    DEFAULT_WARMUP_TEMP_C:Final[float] = 190.0
     #
     CHARGE:Final = b'\x80'
     DRY:Final = b'\x81'
@@ -133,9 +138,11 @@ class Santoker(AsyncComm):
     BT_CALIB = b'\x87'
     ET_CALIB = b'\x88'
 
-    __slots__ = [ 'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler', '_board', '_bt', '_et',
-                    '_bt_ror', '_et_ror', '_ir',
-                    '_power', '_air', '_drum', '_CHARGE', '_DRY', '_FCs', '_SCs', '_DROP', '_connect_using_ble', '_ble_client' ]
+    __slots__ = [ 'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler', '_warmup_handler', '_warmup_temp_handler',
+                    '_board', '_bt', '_et', '_bt_ror', '_et_ror', '_ir',
+                    '_power', '_air', '_drum', '_CHARGE', '_DRY', '_FCs', '_SCs', '_DROP',
+                    '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
+                    '_connect_using_ble', '_ble_client' ]
 
     def __init__(self, host:str = '127.0.0.1', port:int = 8080, serial:'SerialSettings|None' = None,
                 connect_using_ble:bool = False,
@@ -145,7 +152,10 @@ class Santoker(AsyncComm):
                 dry_handler:Callable[[], None]|None = None,
                 fcs_handler:Callable[[], None]|None = None,
                 scs_handler:Callable[[], None]|None = None,
-                drop_handler:Callable[[], None]|None = None) -> None:
+                drop_handler:Callable[[], None]|None = None,
+                warmup_handler:Callable[[bool | None], None]|None = None,
+                warmup_temp_handler:Callable[[float], None]|None = None,
+                warmup_target: float = DEFAULT_WARMUP_TEMP_C) -> None:
 
         super().__init__(host, port, serial, connected_handler, disconnected_handler)
 
@@ -159,6 +169,15 @@ class Santoker(AsyncComm):
         self._fcs_handler:Callable[[], None]|None = fcs_handler
         self._scs_handler:Callable[[], None]|None = scs_handler
         self._drop_handler:Callable[[], None]|None = drop_handler
+        self._warmup_handler:Callable[[bool | None], None]|None = warmup_handler
+        self._warmup_temp_handler:Callable[[float], None]|None = warmup_temp_handler
+
+        self._header_ready:bool = False
+        self._warmup:bool | None = None
+        self._warmup_target:float = self.DEFAULT_WARMUP_TEMP_C
+        self._reported_warmup_target:float | None = None
+        if self.MIN_WARMUP_TEMP_C <= warmup_target <= self.MAX_WARMUP_TEMP_C:
+            self._warmup_target = warmup_target
 
         # current readings
         self._board:float = -1  # board temperature in °C
@@ -202,6 +221,42 @@ class Santoker(AsyncComm):
         return self._air
     def getDrum(self) -> int:
         return self._drum
+    def isHeaderReady(self) -> bool:
+        return self._header_ready
+    def getWarmup(self) -> bool | None:
+        return self._warmup
+    def getWarmupTarget(self) -> float:
+        return self._warmup_target
+
+    def _setWarmupState(self, enabled: bool | None) -> None:
+        if enabled != self._warmup:
+            self._warmup = enabled
+            if self._warmup_handler is not None:
+                try:
+                    self._warmup_handler(enabled)
+                except Exception as e: # pylint: disable=broad-except
+                    _log.exception(e)
+
+    def setWarmupTarget(self, temp_c: float) -> bool:
+        if not self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
+            return False
+        self._warmup_target = temp_c
+        if self._warmup is True:
+            if not self._header_ready:
+                return False
+            self.send_msg(self.WARMUP_TEMP, int(round(temp_c * 10)))
+        return True
+
+    def setWarmup(self, enabled: bool) -> bool:
+        if not self._header_ready:
+            return False
+        if enabled:
+            self.send_msg(self.WARMUP_TEMP, int(round(self._warmup_target * 10)))
+            self.send_msg(self.WARMUP, 1)
+        else:
+            self.send_msg(self.WARMUP, 0)
+        self._setWarmupState(enabled)
+        return True
 
     def resetReadings(self) -> None:
         self._board = -1

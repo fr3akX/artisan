@@ -30,7 +30,7 @@ modules that handle complex async communication and sensor data processing.
 
 import sys
 from collections.abc import Generator
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -831,3 +831,106 @@ class TestSantokerImplementationDetails:
 #
 #        # Test None handler
 #        assert safe_call_handler(None) is True
+
+
+class TestSantokerWarmupProtocol:
+    def test_warmup_packets_use_expected_targets_and_crc(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        assert santoker.create_msg(b'\x7f', 1900) == bytes.fromhex(
+            'eea57f02040300076cf260fffcffff'
+        )
+        assert santoker.create_msg(b'\x7e', 1) == bytes.fromhex(
+            'eea57e02040300000131bdfffcffff'
+        )
+        assert santoker.create_msg(b'\x7e', 0) == bytes.fromhex(
+            'eea57e020403000000f07dfffcffff'
+        )
+
+    def test_start_warmup_sends_target_before_on(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        state_handler = Mock()
+        santoker = Santoker(warmup_handler=state_handler)
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setWarmupTarget(190.0)
+            assert santoker.setWarmup(True)
+
+        assert send_msg.call_args_list == [
+            call(Santoker.WARMUP_TEMP, 1900),
+            call(Santoker.WARMUP, 1),
+        ]
+        assert santoker.getWarmup() is True
+        state_handler.assert_called_once_with(True)
+
+    def test_target_change_is_cached_while_inactive(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setWarmupTarget(205.5)
+
+        send_msg.assert_not_called()
+        assert santoker.getWarmupTarget() == 205.5
+
+    def test_target_change_is_sent_while_active(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+        santoker._warmup = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setWarmupTarget(205.5)
+
+        send_msg.assert_called_once_with(Santoker.WARMUP_TEMP, 2055)
+
+    @pytest.mark.parametrize('temp_c', [99.9, 300.1])
+    def test_warmup_target_rejects_out_of_range_values(self, temp_c: float) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setWarmupTarget(temp_c)
+
+        send_msg.assert_not_called()
+        assert santoker.getWarmupTarget() == Santoker.DEFAULT_WARMUP_TEMP_C
+
+    def test_start_warmup_rejects_unready_header(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setWarmup(True)
+
+        send_msg.assert_not_called()
+        assert santoker.getWarmup() is None
+
+    def test_stop_warmup_sends_only_off(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+        santoker._warmup = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setWarmup(False)
+
+        send_msg.assert_called_once_with(Santoker.WARMUP, 0)
+        assert santoker.getWarmup() is False
