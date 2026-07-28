@@ -58,8 +58,8 @@ The remaining gaps are higher-level ones: named constants and state, model-aware
 | `0x7B` | Heating on/off | No | No | No | Yes | No named state, UI action, or safety/state checks |
 | `0x7C` | Cooling on/off | No | No | No | Yes | No named state or UI action |
 | `0x7D` | Blend/agitation on/off | No | No | No | Yes | No named state or UI action |
-| `0x7E` | Warm-up on/off | No | No | No | Yes | No named state, UI action, or warm-up sequencing checks |
-| `0x7F` | Warm-up target | No | No | No | Yes | No °C scaling/range helper, state, or UI action |
+| `0x7E` | Warm-up on/off | `WARMUP` | Yes, state callback | X3 Master Bluetooth | Yes | Physical X3 verification pending |
+| `0x7F` | Warm-up target | `WARMUP_TEMP` | Yes, °C × 10 | X3 Master Bluetooth | Yes | Physical X3 verification pending |
 | `0x80` | Charge/start | `CHARGE` | Yes, rising-edge callback | Yes | Yes | Implemented; Artisan also transmits event markers rather than only recording them locally |
 | `0x81`–`0x83` | Dry, FC, and SC event states | `DRY`, `FCs`, `SCs` | Yes, rising-edge callbacks | Yes | Yes | Artisan presets transmit these targets, although no equivalent outbound builder path was found in the analyzed Android app |
 | `0x84` | Drop/end | `DROP` | Yes, rising-edge callback | Yes | Yes | Implemented |
@@ -75,7 +75,7 @@ The remaining gaps are higher-level ones: named constants and state, model-aware
 | `0xCA` | Airflow | `AIR` | Yes | Yes | Yes | Implemented, but no app-equivalent state-dependent limits |
 | `0xFA` | Fire/power | `POWER` | Yes | Yes | Yes | Implemented, but no app-equivalent state-dependent limits |
 
-The tracked X3-relevant presets are `src/includes/Machines/Santoker/Q_+_X_Series_Bluetooth.aset` and `Q_+_X_Series_WiFi.aset`. They expose fire and airflow sliders and roast-event commands. Drum is configured as a command and extra device but its slider and increment/decrement buttons are hidden. They contain no machine on/off, heating, cooling, blend, warm-up, or warm-up-temperature controls.
+The tracked Santoker presets include `src/includes/Machines/Santoker/Q_+_X_Series_Bluetooth.aset`, `src/includes/Machines/Santoker/Q_+_X_Series_WiFi.aset`, and `src/includes/Machines/Santoker/X3_Master_Bluetooth.aset`. The dedicated X3 preset exposes warm-up through the semantic commands `santokerWarmupTemp({})`, `santokerWarmup(1 - $)`, and `santokerWarmup(0)`, alongside Santoker fire, airflow, drum, and roast-event controls. The older Q/X presets still expose fire and airflow sliders and roast-event commands. Drum is configured as a command and extra device there, but its slider and increment/decrement buttons are hidden. Those presets still contain no machine on/off, heating, cooling, or blend controls.
 
 ### Telemetry coverage matrix
 
@@ -84,7 +84,8 @@ The tracked X3-relevant presets are `src/includes/Machines/Santoker/Q_+_X_Series
 | `0xF0`–`0xF6`, `0xF8` | Named and decoded | Board, BT, ET, legacy BT/ET, RoR, and IR are implemented |
 | `0xC0`, `0xCA`, `0xFA` | Named, decoded, and available as extra-device channels | Implemented |
 | `0x80`–`0x84` | Named and decoded into event callbacks | Implemented |
-| `0x7A`–`0x7F` | Frame is accepted, but `register_reading()` ignores the target | Operating and warm-up states are not retained or exposed |
+| `0x7A`–`0x7D` | Frame is accepted, but `register_reading()` ignores the target | Machine, heating, cooling, and blend states are not retained or exposed |
+| `0x7E`, `0x7F` | Named, decoded, and reconciled into warm-up state/target | Physical X3 verification pending |
 | `0x85`–`0x88`, `0x8B`, `0x8C`, `0x91`, `0x92` | Frame is accepted, but value is ignored | Machine settings cannot be displayed or synchronized |
 
 ### Protocol behavior already aligned
@@ -94,18 +95,18 @@ The tracked X3-relevant presets are `src/includes/Machines/Santoker/Q_+_X_Series
 - It initially selects `A5` for WiFi and `B5` for BLE, but accepts either header on incoming frames and adopts the observed header for later writes. This accommodates an X3 using `A5` over BLE.
 - Existing temperature and RoR scaling agrees with the app analysis.
 - Existing fire, airflow, drum, and event target numbers agree with the app analysis.
+- Warm-up support now names `0x7E` and `0x7F`, validates the target range, gates semantic warm-up writes on observed header readiness, limits warm-up enablement to pre-`CHARGE`, and reconciles echoed warm-up state/target reports.
 
 ### Functional and safety gaps
 
-1. **No X3-specific control workflow.** The generic command can send the packets, but Artisan does not model machine-on, heating, cooling, blend, warm-up, or warm-up-target state.
-2. **No official-app guard conditions.** Artisan does not enforce the app's 100–300°C warm-up range, state sequencing, minimum airflow behavior, or X3 drum-speed firmware/range checks.
-3. **Commands can precede header detection.** A BLE instance starts with `B5`. If an X3 requires `A5`, a command sent before the first valid incoming `A5` frame may use the wrong header.
-4. **No acknowledgements or state reconciliation.** Sending is fire-and-forget. Echoed `0x7A`–`0x7F` state is ignored, and there is no command success/failure indication.
-5. **No model/firmware detection.** Artisan adapts the header but does not identify X3, inspect its capability version, or send/interpret the app's setup sequence.
-6. **Advanced settings are mostly unnamed and all unexposed.** Four targets are declared as unsupported constants; the rest are only reachable by raw target number.
+1. **Physical BLE/header verification is still pending.** Static analysis and tests now cover the warm-up path, but a live X3 capture is still needed to confirm that outbound BLE warm-up writes use the expected `A5` header and match real hardware behavior.
+2. **No model/firmware detection.** Artisan adapts the header but does not identify X3, inspect its capability version, or gate features such as drum-speed control on confirmed firmware support.
+3. **Setup-target semantics remain unresolved.** The app's `0x8A`, `0x8E`, and `0x8F` synchronization/setup sequence is still not understood well enough to automate safely.
+4. **No acknowledgements or report-cadence guarantees.** Warm-up state/target reports are now reconciled when seen, but sending is still fire-and-forget and protocol-level success/failure semantics remain unknown.
+5. **Controls outside warm-up scope are still mostly generic.** Machine on/off, heating, cooling, blend, advanced settings, and model-specific limits remain largely reachable only through raw targets or older preset actions.
+6. **Raw `santoker()` intentionally bypasses semantic safety.** The new warm-up helpers enforce pre-`CHARGE`, header-readiness, and display-unit conversion rules, but direct `santoker(<target>,<value>)` calls can still skip those safeguards.
 7. **Unsigned-only encoder API.** Negative calibration values must be converted by the caller to their 16-bit two's-complement number, such as `-1` to `65535`, to produce low bytes `FF FF`. Passing `-1` directly fails unsigned `to_bytes()` conversion.
-8. **Minimal active protocol tests.** Current active tests mostly inspect source text. The more detailed frame, CRC, parser, and event tests in `test_santoker.py` are commented out, and none cover the newly identified targets or X3 `A5`-over-BLE behavior.
-9. **Preset/app event difference.** Artisan sends `0x81`–`0x83` for DRY/FC/SC from its presets, while the analyzed app path records those events locally. This should be verified on hardware before assuming both behaviors are interchangeable.
+8. **Preset/app event difference.** Artisan sends `0x81`–`0x83` for DRY/FC/SC from its presets, while the analyzed app path records those events locally. This should be verified on hardware before assuming both behaviors are interchangeable.
 
 ## User-facing outbound commands
 
@@ -161,9 +162,19 @@ Set warm-up temperature to 200°C:
 EE A5 7F 02 04 03 00 07 D0 F3 D1 FF FC FF FF
 ```
 
-## Artisan generic-command examples
+## Artisan semantic and generic-command examples
 
-Artisan's existing encoder produces the standard three-byte value format. After Artisan has received a valid X3 frame and selected the machine's `A5` header, the command mappings are conceptually:
+The dedicated X3 preset uses semantic warm-up helpers:
+
+```text
+santokerWarmupTemp(190)
+santokerWarmup(1)
+santokerWarmup(0)
+```
+
+`santokerWarmupTemp(<value>)` interprets `<value>` in Artisan's current temperature-slider unit (`°C` or `°F`) and converts it to the protocol's required `°C × 10` payload. The semantic warm-up commands also enforce the implemented pre-`CHARGE` and header-readiness checks.
+
+Artisan's existing generic encoder still produces the standard three-byte value format. After Artisan has received a valid X3 frame and selected the machine's `A5` header, the raw command mappings are conceptually:
 
 ```text
 santoker(7a,1)      # machine on
@@ -187,7 +198,7 @@ santoker(80,1)      # charge/start roast
 santoker(84,1)      # drop/end roast
 ```
 
-These examples document encoding, not a recommended automatic operating sequence. The official app applies state, model, temperature, and firmware checks before sending many of them.
+These examples document encoding, not a recommended automatic operating sequence. The official app applies state, model, temperature, and firmware checks before sending many of them, and raw `santoker()` calls bypass the semantic warm-up safeguards above.
 
 ## Advanced configuration commands
 

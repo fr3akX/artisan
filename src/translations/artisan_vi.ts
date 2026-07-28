@@ -17104,6 +17104,31 @@ Bạn nên lưu trước cài đặt hiện tại của mình qua menu Trợ gi�
         <translation>Nhập khẩu thất bại</translation>
     </message>
     <message>
+        <location filename="../artisanlib/main.py" line="18075"/>
+        <source>Santoker warm-up reported ON after CHARGE; sending OFF</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18082"/>
+        <source>Santoker roaster is not connected</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18085"/>
+        <source>Waiting for Santoker roaster data</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18088"/>
+        <source>Santoker warm-up is only available before CHARGE</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18091"/>
+        <source>Santoker warm-up target must be between 100 and 300°C</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
         <location filename="../artisanlib/main.py" line="18140"/>
         <source>Your batch counter is currently turned off. Turn it on and set it to {} from the settings file to be imported?</source>
         <translation>Bộ đếm hàng loạt của bạn hiện đang tắt. Hãy bật nó lên và đặt thành {} từ tệp cài đặt để nhập?</translation>

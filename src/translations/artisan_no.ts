@@ -17080,6 +17080,31 @@ Det anbefales å lagre gjeldende innstillinger på forhånd via menyen Hjelp &gt
         <translation>Importen mislyktes</translation>
     </message>
     <message>
+        <location filename="../artisanlib/main.py" line="18075"/>
+        <source>Santoker warm-up reported ON after CHARGE; sending OFF</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18082"/>
+        <source>Santoker roaster is not connected</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18085"/>
+        <source>Waiting for Santoker roaster data</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18088"/>
+        <source>Santoker warm-up is only available before CHARGE</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18091"/>
+        <source>Santoker warm-up target must be between 100 and 300°C</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
         <location filename="../artisanlib/main.py" line="18140"/>
         <source>Your batch counter is currently turned off. Turn it on and set it to {} from the settings file to be imported?</source>
         <translation>Batch-telleren din er for øyeblikket slått av. Slå den på og sett den til {} fra innstillingsfilen som skal importeres?</translation>
