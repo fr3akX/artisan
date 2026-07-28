@@ -157,7 +157,12 @@ class Santoker(AsyncComm):
                 warmup_temp_handler:Callable[[float], None]|None = None,
                 warmup_target: float = DEFAULT_WARMUP_TEMP_C) -> None:
 
-        super().__init__(host, port, serial, connected_handler, disconnected_handler)
+        def on_disconnected() -> None:
+            self.resetProtocolState()
+            if disconnected_handler is not None:
+                disconnected_handler()
+
+        super().__init__(host, port, serial, connected_handler, on_disconnected)
 
         self.HEADER:bytes = (self.HEADER_BT if connect_using_ble else self.HEADER_WIFI)
 
@@ -198,7 +203,7 @@ class Santoker(AsyncComm):
         self._DROP:bool = False
 
         self._ble_client:SantokerCube_BLE|None = \
-                (SantokerCube_BLE(self.read_msg, connected_handler, disconnected_handler) if self._connect_using_ble else None)
+                (SantokerCube_BLE(self.read_msg, connected_handler, on_disconnected) if self._connect_using_ble else None)
 
 
     # external API to access machine state
@@ -268,6 +273,11 @@ class Santoker(AsyncComm):
         self._power = -1
         self._air = -1
         self._drum = -1
+
+    def resetProtocolState(self) -> None:
+        self._header_ready = False
+        self._reported_warmup_target = None
+        self._setWarmupState(None)
 
     # message decoder
 
@@ -353,6 +363,24 @@ class Santoker(AsyncComm):
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
             self._DROP = b
+        elif target == self.WARMUP:
+            if value in {0, 1}:
+                self._setWarmupState(bool(value))
+            elif self._logging:
+                _log.debug('invalid warm-up state: %s', value)
+        elif target == self.WARMUP_TEMP:
+            temp_c = value / 10.0
+            if self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
+                changed = temp_c != self._reported_warmup_target
+                self._reported_warmup_target = temp_c
+                self._warmup_target = temp_c
+                if changed and self._warmup_temp_handler is not None:
+                    try:
+                        self._warmup_temp_handler(temp_c)
+                    except Exception as e: # pylint: disable=broad-except
+                        _log.exception(e)
+            elif self._logging:
+                _log.debug('invalid warm-up target: %s', temp_c)
 #        elif self._logging and target in {self.MIN_POWER, self.MAX_POWER, self.BT_CALIB, self.ET_CALIB}:
 #            _log.debug('unsupported data target %s', target)
 #        elif self._logging:
@@ -376,9 +404,9 @@ class Santoker(AsyncComm):
         # so we adjust to the header we receive and use that on sending our messages as well
         snd_header_byte = await stream.readexactly(1)
         if snd_header_byte == self.HEADER_BT[1:2]:
-            self.HEADER = self.HEADER_BT
+            candidate_header = self.HEADER_BT
         elif snd_header_byte == self.HEADER_WIFI[1:2]:
-            self.HEADER = self.HEADER_WIFI
+            candidate_header = self.HEADER_WIFI
         else:
             return
         # read the data target (BT, ET,..)
@@ -406,6 +434,8 @@ class Santoker(AsyncComm):
         if tail != self.TAIL:
             return
         # full message decoded
+        self.HEADER = candidate_header
+        self._header_ready = True
         self.register_reading(target, data)
 
     # send message interface
@@ -438,6 +468,7 @@ class Santoker(AsyncComm):
 
     @override
     def stop(self) -> None:
+        self.resetProtocolState()
         if self._connect_using_ble and hasattr(self, '_ble_client') and self._ble_client is not None:
             self._ble_client.stop()
             #del self._ble_client # on this level the released object should be automatically collected by the GC
