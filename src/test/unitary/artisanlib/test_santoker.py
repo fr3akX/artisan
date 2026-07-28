@@ -904,6 +904,19 @@ class TestSantokerWarmupProtocol:
 
         send_msg.assert_called_once_with(Santoker.WARMUP_TEMP, 2055)
 
+    @pytest.mark.parametrize('temp_c', [100.0, 300.0])
+    def test_warmup_target_accepts_inclusive_boundaries(self, temp_c: float) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setWarmupTarget(temp_c)
+
+        send_msg.assert_not_called()
+        assert santoker.getWarmupTarget() == temp_c
+
     @pytest.mark.parametrize('temp_c', [99.9, 300.1])
     def test_warmup_target_rejects_out_of_range_values(self, temp_c: float) -> None:
         sys.modules.pop('artisanlib.santoker', None)

@@ -25,8 +25,10 @@
 # AUTHOR
 # Marko Luther, 2026
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from _thread import RLock
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Final, Literal, Protocol
 
@@ -65,6 +67,14 @@ class SantokerWarmupDevice(Protocol):
 @dataclass
 class SantokerWarmupController:
     desired_temp_c: float = DEFAULT_WARMUP_TEMP_C
+    _serialization_lock: RLock = field(
+        default_factory=RLock, init=False, repr=False, compare=False
+    )
+
+    @contextmanager
+    def serialized(self) -> Iterator[None]:
+        with self._serialization_lock:
+            yield
 
     def set_target(
         self,
@@ -72,13 +82,14 @@ class SantokerWarmupController:
         unit: Literal['C', 'F'],
         device: SantokerWarmupDevice | None,
     ) -> WarmupResult:
-        temp_c = _from_f_to_cstrict(display_temp) if unit == 'F' else display_temp
-        if not MIN_WARMUP_TEMP_C <= temp_c <= MAX_WARMUP_TEMP_C:
-            return WarmupResult.OUT_OF_RANGE
-        self.desired_temp_c = temp_c
-        if device is not None and not device.setWarmupTarget(temp_c):
-            return WarmupResult.OUT_OF_RANGE
-        return WarmupResult.OK
+        with self.serialized():
+            temp_c = _from_f_to_cstrict(display_temp) if unit == 'F' else display_temp
+            if not MIN_WARMUP_TEMP_C <= temp_c <= MAX_WARMUP_TEMP_C:
+                return WarmupResult.OUT_OF_RANGE
+            self.desired_temp_c = temp_c
+            if device is not None and not device.setWarmupTarget(temp_c):
+                return WarmupResult.OUT_OF_RANGE
+            return WarmupResult.OK
 
     def set_enabled(
         self,
@@ -86,19 +97,20 @@ class SantokerWarmupController:
         charge_index: int,
         device: SantokerWarmupDevice | None,
     ) -> WarmupResult:
-        if device is None:
-            return WarmupResult.NO_CONNECTION
-        if not device.isHeaderReady():
-            return WarmupResult.NOT_READY
-        if enabled and charge_index > -1:
-            return WarmupResult.AFTER_CHARGE
-        if not enabled and device.getWarmup() is not True:
+        with self.serialized():
+            if device is None:
+                return WarmupResult.NO_CONNECTION
+            if not device.isHeaderReady():
+                return WarmupResult.NOT_READY
+            if enabled and charge_index > -1:
+                return WarmupResult.AFTER_CHARGE
+            if not enabled and device.getWarmup() is not True:
+                return WarmupResult.OK
+            if enabled and not device.setWarmupTarget(self.desired_temp_c):
+                return WarmupResult.OUT_OF_RANGE
+            if not device.setWarmup(enabled):
+                return WarmupResult.NOT_READY
             return WarmupResult.OK
-        if enabled and not device.setWarmupTarget(self.desired_temp_c):
-            return WarmupResult.OUT_OF_RANGE
-        if not device.setWarmup(enabled):
-            return WarmupResult.NOT_READY
-        return WarmupResult.OK
 
     def reconcile_reported_state(
         self,
@@ -106,17 +118,24 @@ class SantokerWarmupController:
         charge_index: int,
         device: SantokerWarmupDevice | None,
     ) -> bool:
-        unsafe = enabled and charge_index > -1
-        if unsafe and device is not None and device.isHeaderReady():
-            device.setWarmup(False)
-        return unsafe
+        with self.serialized():
+            unsafe = enabled and charge_index > -1
+            if unsafe and device is not None and device.isHeaderReady():
+                device.setWarmup(False)
+            return unsafe
 
     def accept_reported_target(self, temp_c: float) -> None:
-        if MIN_WARMUP_TEMP_C <= temp_c <= MAX_WARMUP_TEMP_C:
-            self.desired_temp_c = temp_c
+        with self.serialized():
+            if MIN_WARMUP_TEMP_C <= temp_c <= MAX_WARMUP_TEMP_C:
+                self.desired_temp_c = temp_c
 
     def target_for_display(self, unit: Literal['C', 'F']) -> float:
-        return _from_c_to_fstrict(self.desired_temp_c) if unit == 'F' else self.desired_temp_c
+        with self.serialized():
+            return (
+                _from_c_to_fstrict(self.desired_temp_c)
+                if unit == 'F'
+                else self.desired_temp_c
+            )
 
 
 def find_warmup_slider(commands: Sequence[str]) -> int | None:
@@ -136,3 +155,11 @@ def find_warmup_buttons(commands: Sequence[str]) -> list[int]:
         for i, command in enumerate(commands)
         if command.strip().startswith('santokerWarmup(')
     ]
+
+
+def has_warmup_controls(
+    slider_commands: Sequence[str], button_commands: Sequence[str]
+) -> bool:
+    return find_warmup_slider(slider_commands) is not None and bool(
+        find_warmup_buttons(button_commands)
+    )

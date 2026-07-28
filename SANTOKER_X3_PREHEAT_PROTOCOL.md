@@ -48,7 +48,7 @@ santoker(<target>,<value>)
 
 The command parser in `src/artisanlib/main.py` interprets `target` as hex, rounds `value` to an integer, and forwards both to `Santoker.send_msg()`. `src/artisanlib/santoker.py` then creates the same fixed three-byte payload and CRC frame used by the Android app. Consequently, every standard unsigned Android command in this document is already **sendable at the wire level** without adding a new encoder or a method per target.
 
-The remaining gaps are higher-level ones: named constants and state, model-aware validation, UI/preset actions, incoming-state handling, and tests. “Not exposed” below therefore does not mean “impossible to send with `santoker()`.”
+The dedicated X3 warm-up support now adds named state, validated semantic commands, UI/preset actions, incoming-state handling, and tests for targets `0x7E` and `0x7F`. Other targets still have the higher-level gaps identified below. “Not exposed” therefore does not mean “impossible to send with `santoker()`.”
 
 ### Command coverage matrix
 

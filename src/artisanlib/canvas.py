@@ -14346,6 +14346,9 @@ class tgraphcanvas(QObject):
     # if noaction is True, the button event action is not triggered
     @pyqtSlot(bool)
     def markCharge(self, noaction:bool = False) -> None:
+        self.aw.runSantokerWarmupCharge(lambda: self._markCharge(noaction))
+
+    def _markCharge(self, noaction:bool = False) -> None:
         zoomed_in: bool = False # True if zoomed in; in that case we prevent xaxistoxm to reset the x-axis limits (set_xlim)
         try:
             if self.aw.ntb._nav_stack(): # pylint: disable=protected-access
