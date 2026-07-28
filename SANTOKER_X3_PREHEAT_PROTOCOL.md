@@ -36,6 +36,77 @@ The app selects the second header byte from the machine type:
 
 The X3 is identified by the app as `X_3_ELECTRIC / "X3 master"`, so the official app appears to use `A5` for it even over Bluetooth.
 
+## Cross-check against Artisan
+
+### Important distinction: transport support versus product support
+
+Artisan already implements the general IO command:
+
+```text
+santoker(<target>,<value>)
+```
+
+The command parser in `src/artisanlib/main.py` interprets `target` as hex, rounds `value` to an integer, and forwards both to `Santoker.send_msg()`. `src/artisanlib/santoker.py` then creates the same fixed three-byte payload and CRC frame used by the Android app. Consequently, every standard unsigned Android command in this document is already **sendable at the wire level** without adding a new encoder or a method per target.
+
+The remaining gaps are higher-level ones: named constants and state, model-aware validation, UI/preset actions, incoming-state handling, and tests. “Not exposed” below therefore does not mean “impossible to send with `santoker()`.”
+
+### Command coverage matrix
+
+| Android app target | Android meaning | Named in `santoker.py` | Decoded/stored by Artisan | Used by tracked Santoker presets | Generic send works | Gap |
+|---:|---|---|---|---|---|---|
+| `0x7A` | Machine on/off | No | No | No | Yes | No named state, UI action, or safety/state checks |
+| `0x7B` | Heating on/off | No | No | No | Yes | No named state, UI action, or safety/state checks |
+| `0x7C` | Cooling on/off | No | No | No | Yes | No named state or UI action |
+| `0x7D` | Blend/agitation on/off | No | No | No | Yes | No named state or UI action |
+| `0x7E` | Warm-up on/off | No | No | No | Yes | No named state, UI action, or warm-up sequencing checks |
+| `0x7F` | Warm-up target | No | No | No | Yes | No °C scaling/range helper, state, or UI action |
+| `0x80` | Charge/start | `CHARGE` | Yes, rising-edge callback | Yes | Yes | Implemented; Artisan also transmits event markers rather than only recording them locally |
+| `0x81`–`0x83` | Dry, FC, and SC event states | `DRY`, `FCs`, `SCs` | Yes, rising-edge callbacks | Yes | Yes | Artisan presets transmit these targets, although no equivalent outbound builder path was found in the analyzed Android app |
+| `0x84` | Drop/end | `DROP` | Yes, rising-edge callback | Yes | Yes | Implemented |
+| `0x85`, `0x86` | Minimum/maximum fire | `MIN_POWER`, `MAX_POWER`, marked unsupported | No | `0x85` only in Cube pre-charge actions | Yes | No settings UI, validation, or state reporting |
+| `0x87`, `0x88` | BT/ET calibration | `BT_CALIB`, `ET_CALIB`, marked unsupported | No | No | Yes, after signed conversion | No settings UI, signed-value helper, validation, or state reporting |
+| `0x8B`, `0x8C` | Minimum/maximum airflow | No | No | No | Yes | No named support, settings UI, validation, or state reporting |
+| `0x91`, `0x92` | Out-/in-bean time | No | No | No | Yes | No named support, settings UI, unit handling, or state reporting |
+| `0x95` | Q50 mute temperature | No | No | No | Yes | Correctly not exposed as an X3 feature; no Q50-specific workflow either |
+| `0x32` | App's “Serial” setting | No | No | No | Yes | Meaning is still unresolved, so implementation would be premature |
+| `0x8A`, `0x8F` | Setup/synchronization | No | No | No | Yes | Semantics and required sequence are unresolved |
+| `0x8E` | Model/capacity synchronization | No | No | No | Technically, as one 24-bit integer | No model representation or synchronization workflow |
+| `0xC0` | Drum speed | `DRUM` | Yes | Configured; hidden in Q/X preset UI | Yes | No X3 firmware capability check; Q/X preset range remains `0–100`, not app's `30–100` |
+| `0xCA` | Airflow | `AIR` | Yes | Yes | Yes | Implemented, but no app-equivalent state-dependent limits |
+| `0xFA` | Fire/power | `POWER` | Yes | Yes | Yes | Implemented, but no app-equivalent state-dependent limits |
+
+The tracked X3-relevant presets are `src/includes/Machines/Santoker/Q_+_X_Series_Bluetooth.aset` and `Q_+_X_Series_WiFi.aset`. They expose fire and airflow sliders and roast-event commands. Drum is configured as a command and extra device but its slider and increment/decrement buttons are hidden. They contain no machine on/off, heating, cooling, blend, warm-up, or warm-up-temperature controls.
+
+### Telemetry coverage matrix
+
+| Targets | Artisan status | Gap |
+|---|---|---|
+| `0xF0`–`0xF6`, `0xF8` | Named and decoded | Board, BT, ET, legacy BT/ET, RoR, and IR are implemented |
+| `0xC0`, `0xCA`, `0xFA` | Named, decoded, and available as extra-device channels | Implemented |
+| `0x80`–`0x84` | Named and decoded into event callbacks | Implemented |
+| `0x7A`–`0x7F` | Frame is accepted, but `register_reading()` ignores the target | Operating and warm-up states are not retained or exposed |
+| `0x85`–`0x88`, `0x8B`, `0x8C`, `0x91`, `0x92` | Frame is accepted, but value is ignored | Machine settings cannot be displayed or synchronized |
+
+### Protocol behavior already aligned
+
+- Artisan's frame header, code bytes, fixed three-byte payload, CRC input, and tail match the app findings.
+- Artisan supports WiFi, serial, and BLE through the same packet implementation.
+- It initially selects `A5` for WiFi and `B5` for BLE, but accepts either header on incoming frames and adopts the observed header for later writes. This accommodates an X3 using `A5` over BLE.
+- Existing temperature and RoR scaling agrees with the app analysis.
+- Existing fire, airflow, drum, and event target numbers agree with the app analysis.
+
+### Functional and safety gaps
+
+1. **No X3-specific control workflow.** The generic command can send the packets, but Artisan does not model machine-on, heating, cooling, blend, warm-up, or warm-up-target state.
+2. **No official-app guard conditions.** Artisan does not enforce the app's 100–300°C warm-up range, state sequencing, minimum airflow behavior, or X3 drum-speed firmware/range checks.
+3. **Commands can precede header detection.** A BLE instance starts with `B5`. If an X3 requires `A5`, a command sent before the first valid incoming `A5` frame may use the wrong header.
+4. **No acknowledgements or state reconciliation.** Sending is fire-and-forget. Echoed `0x7A`–`0x7F` state is ignored, and there is no command success/failure indication.
+5. **No model/firmware detection.** Artisan adapts the header but does not identify X3, inspect its capability version, or send/interpret the app's setup sequence.
+6. **Advanced settings are mostly unnamed and all unexposed.** Four targets are declared as unsupported constants; the rest are only reachable by raw target number.
+7. **Unsigned-only encoder API.** Negative calibration values must be converted by the caller to their 16-bit two's-complement number, such as `-1` to `65535`, to produce low bytes `FF FF`. Passing `-1` directly fails unsigned `to_bytes()` conversion.
+8. **Minimal active protocol tests.** Current active tests mostly inspect source text. The more detailed frame, CRC, parser, and event tests in `test_santoker.py` are commented out, and none cover the newly identified targets or X3 `A5`-over-BLE behavior.
+9. **Preset/app event difference.** Artisan sends `0x81`–`0x83` for DRY/FC/SC from its presets, while the analyzed app path records those events locally. This should be verified on hardware before assuming both behaviors are interchangeable.
+
 ## User-facing outbound commands
 
 ### Operating mode commands
@@ -140,7 +211,7 @@ Notes:
 - The app increments calibration and in/out-bean time settings by one raw unit. The physical unit of the calibration values has not been conclusively established from static analysis.
 - `0x95` is explicitly restricted by the app to the Q50 model and a range of `30–50°C`; it is not an X3 command.
 - The precise meaning of the app resource named `advanced_setting_serial` and its enum values `1–3` remains unknown.
-- Artisan's current generic encoder accepts only unsigned integers. It cannot directly encode a negative signed calibration offset without converting it to the corresponding 16-bit two's-complement representation.
+- Artisan's current generic encoder accepts only unsigned integers. A negative signed calibration offset can still be represented by passing its unsigned 16-bit two's-complement value; for example, pass `65535` for `-1` so the low payload bytes are `FF FF`.
 
 ## Internal synchronization and setup packets
 
