@@ -1447,6 +1447,7 @@ class ApplicationWindow(QMainWindow):
     santokerSendMessageSignal = pyqtSignal(bytes,int)
     santokerWarmupStateSignal = pyqtSignal(object)
     santokerWarmupTargetSignal = pyqtSignal(float)
+    santokerWarmupButtonStateSignal = pyqtSignal(bool)
     kaleidoSendMessageSignal = pyqtSignal(str,str)
     kaleidoSendMessageAwaitSignal = pyqtSignal(str,str,int,int)
     orbiterSendMessageSignal = pyqtSignal(bytes,bytes,bytes,int)
@@ -4305,6 +4306,7 @@ class ApplicationWindow(QMainWindow):
         self.santokerSendMessageSignal.connect(self.santokerSendMessage)
         self.santokerWarmupStateSignal.connect(self.santokerWarmupStateChanged)
         self.santokerWarmupTargetSignal.connect(self.santokerWarmupTargetChanged)
+        self.santokerWarmupButtonStateSignal.connect(self.setSantokerWarmupButtonState, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
         self.kaleidoSendMessageSignal.connect(self.kaleidoSendMessage)
         self.kaleidoSendMessageAwaitSignal.connect(self.kaleidoSendMessageAwait)
         self.orbiterSendMessageSignal.connect(self.orbiterSendMessage)
@@ -18023,6 +18025,7 @@ class ApplicationWindow(QMainWindow):
                 self.notificationManager.disableNotifications()
                 self.notificationManager.hideNotifications()
 
+    @pyqtSlot(bool)
     def setSantokerWarmupButtonState(self, enabled:bool) -> None:
         for button in find_warmup_buttons(self.extraeventsactionstrings):
             if button < len(self.buttonStates):
@@ -18110,10 +18113,7 @@ class ApplicationWindow(QMainWindow):
         )
         self.reportSantokerWarmupResult(result)
         accepted = result is WarmupResult.OK
-        QTimer.singleShot(
-            0,
-            lambda: self.setSantokerWarmupButtonState(enabled if accepted else False),
-        )
+        self.santokerWarmupButtonStateSignal.emit(enabled if accepted else False)
         return accepted
 
     @pyqtSlot(bytes,int)

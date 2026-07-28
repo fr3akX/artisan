@@ -174,3 +174,40 @@ def test_window_moves_warmup_slider_without_firing_action() -> None:
     assert window.santokerWarmupController.desired_temp_c == 190.0
     assert slider.blockSignals.call_args_list == [call(True), call(False)]
     window.moveslider.assert_called_once_with(2, 190.0, forceLCDupdate=True)
+
+
+def test_window_rejected_warmup_restoration_uses_signal_from_worker_thread() -> None:
+    from threading import Thread
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from artisanlib.main import ApplicationWindow
+    from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
+
+    button_state_signal = Mock()
+    window = SimpleNamespace(
+        qmc=SimpleNamespace(timeindex=[10]),
+        santoker=FakeWarmupDevice(),
+        santokerWarmupController=SantokerWarmupController(),
+        santokerWarmupButtonStateSignal=button_state_signal,
+        reportSantokerWarmupResult=Mock(),
+    )
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def run_action() -> None:
+        try:
+            results.append(ApplicationWindow.setSantokerWarmup(window, True))
+        except BaseException as exc:  # pragma: no cover - re-raised in the test thread
+            errors.append(exc)
+
+    thread = Thread(target=run_action)
+    thread.start()
+    thread.join()
+
+    if errors:
+        raise errors[0]
+    assert results == [False]
+    window.reportSantokerWarmupResult.assert_called_once_with(WarmupResult.AFTER_CHARGE)
+    button_state_signal.emit.assert_called_once_with(False)
+    assert window.santoker.calls == []
