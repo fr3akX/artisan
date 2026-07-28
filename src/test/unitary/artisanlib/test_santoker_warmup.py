@@ -1,4 +1,6 @@
+from configparser import ConfigParser
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
@@ -211,3 +213,34 @@ def test_window_rejected_warmup_restoration_uses_signal_from_worker_thread() -> 
     window.reportSantokerWarmupResult.assert_called_once_with(WarmupResult.AFTER_CHARGE)
     button_state_signal.emit.assert_called_once_with(False)
     assert window.santoker.calls == []
+
+
+def test_x3_master_bluetooth_preset_contract() -> None:
+    from artisanlib.santoker import Santoker
+
+    src_dir = Path(__file__).parents[3]
+    preset = src_dir / 'includes' / 'Machines' / 'Santoker' / 'X3_Master_Bluetooth.aset'
+    config = ConfigParser(interpolation=None, strict=False)
+    assert config.read(preset, encoding='utf-8') == [str(preset)]
+
+    assert config.get('General', 'roastertype_setup') == 'Santoker X3 Master BT'
+    assert config.getint('Device', 'id') == 134
+    assert config.getboolean('Device', 'santokerBLE')
+
+    slider_commands = config.get('Sliders', 'slidercommands')
+    assert 'santoker(ca,{})' in slider_commands
+    assert 'santokerWarmupTemp({})' in slider_commands
+    assert 'santoker(fa,{})' in slider_commands
+    assert config.get('Sliders', 'eventslidertemp') == '0, 0, 1, 0'
+    assert config.get('Sliders', 'slidermin') == '0, 0, 100, 0'
+    assert config.get('Sliders', 'slidermax') == '100, 100, 300, 100'
+    assert config.get('Sliders', 'slidervisibilities') == '1, 0, 1, 1'
+
+    warmup_actions = config.get('ExtraEventButtons', 'extraeventsactionstrings')
+    assert 'santokerWarmup(1 - $)' in warmup_actions
+    assert 'WARM-UP' in config.get('ExtraEventButtons', 'extraeventslabels')
+
+    charge_actions = config.get('DefaultButtons', 'buttonactionstrings')
+    assert charge_actions.index('santokerWarmup(0)') < charge_actions.index('santoker(80,1)')
+
+    assert Santoker.DEFAULT_WARMUP_TEMP_C == 190.0
