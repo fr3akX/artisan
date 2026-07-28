@@ -129,3 +129,48 @@ def test_semantic_control_lookup() -> None:
         'santokerWarmup(1 - $)',
         'santokerWarmup(0)',
     ]) == [1, 2]
+
+
+def test_window_updates_only_semantic_warmup_buttons() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from artisanlib.main import ApplicationWindow
+
+    style_signal = Mock()
+    window = SimpleNamespace(
+        extraeventsactionstrings=['santoker(fa,10)', 'santokerWarmup(1 - $)'],
+        buttonStates=[0, 0],
+        setExtraEventButtonStyleSignal=style_signal,
+    )
+
+    ApplicationWindow.setSantokerWarmupButtonState(window, True)
+
+    assert window.buttonStates == [0, 1]
+    style_signal.emit.assert_called_once_with(1, 'pressed')
+
+
+def test_window_moves_warmup_slider_without_firing_action() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock, call
+
+    from artisanlib.main import ApplicationWindow
+    from artisanlib.santoker_warmup import SantokerWarmupController
+
+    slider = Mock()
+    slider.blockSignals = Mock()
+    window = SimpleNamespace(
+        eventslidercommands=['', '', 'santokerWarmupTemp({})', ''],
+        eventslidermin=[0, 0, 100, 0],
+        eventslidermax=[100, 100, 300, 100],
+        qmc=SimpleNamespace(mode_tempsliders='C'),
+        santokerWarmupController=SantokerWarmupController(),
+        slider3=slider,
+        moveslider=Mock(),
+    )
+
+    ApplicationWindow.santokerWarmupTargetChanged(window, 190.0)
+
+    assert window.santokerWarmupController.desired_temp_c == 190.0
+    assert slider.blockSignals.call_args_list == [call(True), call(False)]
+    window.moveslider.assert_called_once_with(2, 190.0, forceLCDupdate=True)
