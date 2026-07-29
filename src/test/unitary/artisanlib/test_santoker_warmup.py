@@ -1271,20 +1271,20 @@ def test_x3_master_bluetooth_preset_contract() -> None:
     assert slider_commands == [
         'santoker(ca,{})',
         'santoker(c0,{})',
-        'santokerWarmupTemp({})',
+        '',
         'santoker(fa,{})',
     ]
     assert parse_ini_array(config.get('Sliders', 'eventslidertemp')) == [
-        '0', '0', '1', '0'
+        '0', '0', '0', '0'
     ]
     assert parse_ini_array(config.get('Sliders', 'slidermin')) == [
-        '0', '0', '100', '0'
+        '0', '0', '0', '0'
     ]
     assert parse_ini_array(config.get('Sliders', 'slidermax')) == [
-        '100', '100', '300', '100'
+        '100', '100', '100', '100'
     ]
     assert parse_ini_array(config.get('Sliders', 'slidervisibilities')) == [
-        '1', '0', '1', '1'
+        '1', '0', '0', '1'
     ]
 
     event_array_keys = [
@@ -1303,10 +1303,10 @@ def test_x3_master_bluetooth_preset_contract() -> None:
         for key in event_array_keys
     }
     assert {key: len(value) for key, value in event_arrays.items()} == dict.fromkeys(
-        event_array_keys, 9
+        event_array_keys, 8
     )
     assert event_arrays['extraeventsactions'] == [
-        '6', '6', '0', '6', '6', '0', '6', '6', '6'
+        '6', '6', '0', '6', '6', '0', '6', '6'
     ]
     assert event_arrays['extraeventsactionstrings'] == [
         'santoker(fa,{})',
@@ -1317,18 +1317,18 @@ def test_x3_master_bluetooth_preset_contract() -> None:
         '',
         'santoker(c0,{})',
         'santoker(c0,{})',
-        'santokerWarmup(1 - $)',
     ]
     assert event_arrays['extraeventstypes'] == [
-        '8', '8', '4', '5', '5', '4', '6', '6', '4'
+        '8', '8', '4', '5', '5', '4', '6', '6'
     ]
     assert event_arrays['extraeventsvalues'] == [
-        '-2', '2', '0', '-2', '2', '0', '-2', '2', '0'
+        '-2', '2', '0', '-2', '2', '0', '-2', '2'
     ]
     assert event_arrays['extraeventsvisibility'] == [
-        '1', '1', '0', '1', '1', '0', '0', '0', '1'
+        '1', '1', '0', '1', '1', '0', '0', '0'
     ]
-    assert event_arrays['extraeventslabels'][-1] == 'WARM-UP'
+    assert 'santokerWarmup(' not in ','.join(event_arrays['extraeventsactionstrings'])
+    assert 'WARM-UP' not in event_arrays['extraeventslabels']
 
     default_actions = parse_ini_array(
         config.get('DefaultButtons', 'buttonactionstrings')

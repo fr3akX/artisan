@@ -26,7 +26,7 @@
 # Marko Luther, 2026
 
 from _thread import RLock
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -151,30 +151,3 @@ class SantokerWarmupController:
                 if unit == 'F'
                 else self.desired_temp_c
             )
-
-
-def find_warmup_slider(commands: Sequence[str]) -> int | None:
-    return next(
-        (
-            i
-            for i, command in enumerate(commands)
-            if command.strip().startswith('santokerWarmupTemp(')
-        ),
-        None,
-    )
-
-
-def find_warmup_buttons(commands: Sequence[str]) -> list[int]:
-    return [
-        i
-        for i, command in enumerate(commands)
-        if command.strip().startswith('santokerWarmup(')
-    ]
-
-
-def has_warmup_controls(
-    slider_commands: Sequence[str], button_commands: Sequence[str]
-) -> bool:
-    return find_warmup_slider(slider_commands) is not None and bool(
-        find_warmup_buttons(button_commands)
-    )

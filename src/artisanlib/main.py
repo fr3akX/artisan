@@ -223,7 +223,6 @@ from artisanlib.qtsingleapplication import QtSingleApplication
 from artisanlib.santoker_warmup import (
     SantokerWarmupController,
     WarmupResult,
-    find_warmup_buttons,
 )
 from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
@@ -18075,13 +18074,6 @@ class ApplicationWindow(QMainWindow):
             style = self.pushbuttonstyles['ON' if enabled else 'OFF']
             controls.setStyleSheet(style)
             controls.button.setStyleSheet(style)
-        for button in find_warmup_buttons(self.extraeventsactionstrings):
-            if button < len(self.buttonStates):
-                self.buttonStates[button] = int(enabled)
-                self.setExtraEventButtonStyleSignal.emit(
-                    button,
-                    'pressed' if enabled else 'normal',
-                )
 
     def runSantokerWarmupCharge(self, action:Callable[[], None]) -> None:
         try:
