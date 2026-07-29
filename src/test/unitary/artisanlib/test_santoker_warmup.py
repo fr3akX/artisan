@@ -4,7 +4,7 @@ from configparser import ConfigParser
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, cast, override
+from typing import Any, Literal, cast, override
 from unittest.mock import Mock
 
 import pytest
@@ -12,7 +12,7 @@ import pytest
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QSlider
+from PyQt6.QtWidgets import QApplication, QMainWindow, QSlider
 
 from artisanlib.main import ApplicationWindow
 from artisanlib.santoker_warmup import SantokerWarmupController
@@ -181,6 +181,16 @@ class ImmediateBoolSignal:
         self.slot(enabled)  # type: ignore[operator]
 
 
+class ImmediateSignal:
+    def __init__(self, slot: object) -> None:
+        self.slot = slot
+        self.emissions = 0
+
+    def emit(self) -> None:
+        self.emissions += 1
+        self.slot()  # type: ignore[operator]
+
+
 def compact_window(
     controls: SantokerWarmupControls,
     controller: SantokerWarmupController,
@@ -207,6 +217,11 @@ def compact_window(
     window.santokerWarmupButtonStateSignal = ImmediateBoolSignal(
         lambda enabled: ApplicationWindow.setSantokerWarmupButtonState(
             cast(ApplicationWindow, window), enabled
+        )
+    )
+    window.santokerWarmupControlsRefreshSignal = ImmediateSignal(
+        lambda: ApplicationWindow.refreshSantokerWarmupControls(
+            cast(ApplicationWindow, window)
         )
     )
     return window
@@ -324,6 +339,73 @@ def test_target_field_edit_caches_while_inactive_and_sends_while_active(
 
     assert controller.desired_temp_c == 210.0
     assert device.calls == [('target', 210.0)]
+
+
+def test_worker_target_edit_queues_compact_refresh_to_gui_signal(
+    qapplication: QApplication,
+) -> None:
+    from threading import Thread, get_ident
+
+    class RecordingWarmupDevice(FakeWarmupDevice):
+        thread_ids: list[int]
+
+        def __init__(self) -> None:
+            super().__init__(ready=True, warmup=True)
+            self.thread_ids = []
+
+        @override
+        def setWarmupTarget(self, temp_c: float) -> bool:
+            self.thread_ids.append(get_ident())
+            return super().setWarmupTarget(temp_c)
+
+    controls = SantokerWarmupControls()
+    controls.configureTarget('C', 190.0)
+    device = RecordingWarmupDevice()
+    controller = SantokerWarmupController()
+    window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
+    QMainWindow.__init__(window)
+    window.app = SimpleNamespace(artisanviewerMode=False)
+    window.qmc = SimpleNamespace(mode_tempsliders='C', timeindex=[-1])
+    window.santokerWarmup = True
+    window.santoker = device
+    window.santokerWarmupController = controller
+    window.santokerWarmupControls = controls
+    window.pushbuttonstyles = {'OFF': 'off-style', 'ON': 'on-style'}
+    window.reportSantokerWarmupResult = Mock()
+    refresh_signal = getattr(window, 'santokerWarmupControlsRefreshSignal', None)
+    if refresh_signal is not None:
+        refresh_signal.connect(window.refreshSantokerWarmupControls)
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def run_action() -> None:
+        try:
+            results.append(window.setSantokerWarmupTarget(205.0))
+        except BaseException as exc:  # pragma: no cover - re-raised in the test thread
+            errors.append(exc)
+
+    thread = Thread(target=run_action)
+    thread.start()
+    thread.join(timeout=3)
+
+    if errors:
+        raise errors[0]
+    assert not thread.is_alive()
+    assert results == [True]
+    assert controller.desired_temp_c == 205.0
+    assert device.calls == [('target', 205.0)]
+    assert device.thread_ids and device.thread_ids[0] != get_ident()
+    assert controls.target.value() == 190
+    assert hasattr(window, 'santokerWarmupControlsRefreshSignal')
+
+    for _ in range(10):
+        qapplication.processEvents()
+        if controls.target.value() == 205:
+            break
+
+    assert controls.target.value() == 205
+    window.deleteLater()
+    qapplication.processEvents()
 
 
 def test_warmup_report_updates_compact_state_without_command(

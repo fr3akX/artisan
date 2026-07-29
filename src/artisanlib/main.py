@@ -1449,6 +1449,7 @@ class ApplicationWindow(QMainWindow):
     santokerWarmupTargetSignal = pyqtSignal(float)
     santokerWarmupReadySignal = pyqtSignal(bool)
     santokerWarmupButtonStateSignal = pyqtSignal(bool)
+    santokerWarmupControlsRefreshSignal = pyqtSignal()
     kaleidoSendMessageSignal = pyqtSignal(str,str)
     kaleidoSendMessageAwaitSignal = pyqtSignal(str,str,int,int)
     orbiterSendMessageSignal = pyqtSignal(bytes,bytes,bytes,int)
@@ -4323,6 +4324,7 @@ class ApplicationWindow(QMainWindow):
         self.santokerWarmupTargetSignal.connect(self.santokerWarmupTargetChanged)
         self.santokerWarmupReadySignal.connect(self.santokerWarmupReadyChanged)
         self.santokerWarmupButtonStateSignal.connect(self.setSantokerWarmupButtonState, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
+        self.santokerWarmupControlsRefreshSignal.connect(self.refreshSantokerWarmupControls)
         self.kaleidoSendMessageSignal.connect(self.kaleidoSendMessage)
         self.kaleidoSendMessageAwaitSignal.connect(self.kaleidoSendMessageAwait)
         self.orbiterSendMessageSignal.connect(self.orbiterSendMessage)
@@ -18159,7 +18161,7 @@ class ApplicationWindow(QMainWindow):
         self.reportSantokerWarmupResult(result)
         controls = getattr(self, 'santokerWarmupControls', None)
         if controls is not None:
-            ApplicationWindow.updateSantokerWarmupControls(self)
+            self.santokerWarmupControlsRefreshSignal.emit()
         return result is WarmupResult.OK
 
     def setSantokerWarmup(self, enabled:bool) -> bool:
