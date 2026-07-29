@@ -640,7 +640,22 @@ def test_x3_master_bluetooth_preset_contract() -> None:
     assert config.getint('Device', 'id') == 134
     assert config.getboolean('Device', 'santokerBLE')
 
-    assert parse_ini_array(config.get('ExtraDev', 'extradevices')) == ['135', '136']
+    extra_devices = parse_ini_array(config.get('ExtraDev', 'extradevices'))
+    assert extra_devices == ['135', '136']
+    expected_extra_serial = {
+        'extrabaudrate': ['19200', '19200'],
+        'extrabytesize': ['8', '8'],
+        'extracomport': ['COM1', 'COM1'],
+        'extraparity': ['E', 'E'],
+        'extrastopbits': ['1', '1'],
+        'extratimeout': ['0.5', '0.5'],
+    }
+    extra_serial = {
+        key: parse_ini_array(config.get('ExtraComm', key))
+        for key in expected_extra_serial
+    }
+    assert extra_serial == expected_extra_serial
+    assert {len(value) for value in extra_serial.values()} == {len(extra_devices)}
 
     slider_commands = parse_ini_array(config.get('Sliders', 'slidercommands'))
     assert slider_commands == [
