@@ -227,6 +227,7 @@ from artisanlib.santoker_warmup import (
     find_warmup_slider,
     has_warmup_controls,
 )
+from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
 
 
@@ -1486,7 +1487,7 @@ class ApplicationWindow(QMainWindow):
         'userprofilepath', 'printer', 'main_widget', 'defaultdpi', 'dpi', 'qmc', 'HottopControlActive', 'AsyncSamplingTimer', 'wheeldialog',
         'simulator', 'simulatorpath', 'comparator', 'eventsbuttonflag', 'minieventsflags', 'seriallogflag',
         'seriallog', 'ser', 'modbus', 'extraMODBUStemps', 'extraMODBUStx', 's7', 'extraS7tx', 'ws', 'extraser', 'extracomport', 'extrabaudrate',
-        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
+        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerWarmup', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
         'mugmaHost','mugmaPort', 'mugma', 'mugma_default_host', 'shelly_3EMPro_host', 'shelly_PlusPlug_host',
         'kaleido_default_host', 'kaleidoHost', 'kaleidoPort', 'kaleidoSerial', 'kaleidoPID', 'kaleido', 'kaleidoEventFlags', 'colorTrack_mean_window_size', 'colorTrack_median_window_size', 'ikawa',
         'lcdpaletteB', 'lcdpaletteF', 'extraeventsbuttonsflags', 'extraeventslabels', 'extraeventbuttoncolor', 'extraeventsactionstrings',
@@ -1512,7 +1513,7 @@ class ApplicationWindow(QMainWindow):
         'saveAsSettingsAction', 'resetAction', 'messagelabel', 'button_font_size_pt', 'button_font_size', 'button_font_size_small', 'button_font_size_small_selected',
         'button_font_size_tiny', 'button_font_size_micro',
         'pushbuttonstyles_simulator', 'pushbuttonstyles', 'standard_button_tiny_height', 'standard_button_small_height', 'standard_button_height',
-        'buttonONOFF', 'buttonSTARTSTOP', 'buttonFCs', 'buttonFCe', 'buttonSCs', 'buttonSCe', 'buttonRESET', 'buttonCHARGE', 'buttonDROP',
+        'buttonONOFF', 'santokerWarmupControls', 'buttonSTARTSTOP', 'buttonFCs', 'buttonFCe', 'buttonSCs', 'buttonSCe', 'buttonRESET', 'buttonCHARGE', 'buttonDROP',
         'buttonCONTROL', 'buttonEVENT', 'buttonSVp5', 'buttonSVp10', 'buttonSVp20', 'buttonSVm20', 'buttonSVm10', 'buttonSVm5', 'buttonDRY',
         'buttonCOOL', 'lcd1', 'lcd2', 'lcd3', 'lcd4', 'lcd5',
         'lcd6', 'lcd7', 'label2', 'label3', 'label4', 'label5', 'label6', 'label7', 'extraLCD1', 'extraLCD2', 'extraLCDlabel1', 'extraLCDlabel2',
@@ -1846,6 +1847,7 @@ class ApplicationWindow(QMainWindow):
         #    santokerSerial and santokerBLE should never be True at the same time (BLE will have preceedence)
         self.santokerSerial:bool = False # if True connection is via the main serial port
         self.santokerBLE:bool = False # if True connection is via the main serial port
+        self.santokerWarmup:bool = False # if True compact Santoker warm-up controls are shown in the top bar
         self.santokerEventFlags:list[bool] = [False, False, False, False, False, False, False ] # CHARGE, DRY, FCs, FCe, SCs, SCe, DROP
         self.santoker:Santoker|None = None # holds the Santoker instance created on connect; reset to None on disconnect
         self.santokerWarmupController:SantokerWarmupController = SantokerWarmupController()
@@ -3228,6 +3230,17 @@ class ApplicationWindow(QMainWindow):
         if self.app.artisanviewerMode:
             self.buttonONOFF.setVisible(False)
 
+        self.santokerWarmupControls: SantokerWarmupControls = SantokerWarmupControls()
+        self.santokerWarmupControls.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.santokerWarmupControls.setStyleSheet(self.pushbuttonstyles['OFF'])
+        self.santokerWarmupControls.button.setStyleSheet(self.pushbuttonstyles['OFF'])
+        self.santokerWarmupControls.setGraphicsEffect(self.makeShadow())
+        self.santokerWarmupControls.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.santokerWarmupControls.setMinimumHeight(self.standard_button_height)
+        self.santokerWarmupControls.enabledChanged.connect(self.setSantokerWarmup)
+        self.santokerWarmupControls.targetChanged.connect(self.setSantokerWarmupTarget)
+        self.santokerWarmupControls.hide()
+
         #create START/STOP buttons
         self.buttonSTARTSTOP: QPushButton = QPushButton(QApplication.translate('Button', 'START'))
         self.buttonSTARTSTOP.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -3945,6 +3958,8 @@ class ApplicationWindow(QMainWindow):
         self.level1layout.addWidget(self.buttonRESET)
         self.level1layout.addSpacing(10)
         self.level1layout.addWidget(self.buttonONOFF)
+        self.level1layout.addSpacing(10)
+        self.level1layout.addWidget(self.santokerWarmupControls)
         self.level1layout.addSpacing(10)
         self.level1layout.addWidget(self.buttonSTARTSTOP)
         self.level1layout.addSpacing(15)
@@ -12008,6 +12023,27 @@ class ApplicationWindow(QMainWindow):
         else:
             self.hideControls(False)
 
+    def updateSantokerWarmupControls(self) -> None:
+        visible = bool(self.santokerWarmup) and not self.app.artisanviewerMode
+        unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
+        target = self.santokerWarmupController.target_for_display(unit)
+        self.santokerWarmupControls.configureTarget(unit, target)
+
+        warmup_enabled = False
+        ready = False
+        if self.santoker is not None:
+            ready = self.santoker.isHeaderReady()
+            warmup_enabled = self.santoker.getWarmup() is True
+        safe_to_start = visible and ready and self.qmc.timeindex[0] == -1
+
+        self.santokerWarmupControls.setVisible(visible)
+        self.santokerWarmupControls.setState(warmup_enabled)
+        self.santokerWarmupControls.button.setEnabled(safe_to_start)
+        self.santokerWarmupControls.target.setEnabled(visible)
+        style = self.pushbuttonstyles['ON' if warmup_enabled else 'OFF']
+        self.santokerWarmupControls.setStyleSheet(style)
+        self.santokerWarmupControls.button.setStyleSheet(style)
+
     @pyqtSlot()
     @pyqtSlot(bool)
     def toggleReadings(self,_:bool = False) -> None:
@@ -18029,6 +18065,12 @@ class ApplicationWindow(QMainWindow):
 
     @pyqtSlot(bool)
     def setSantokerWarmupButtonState(self, enabled:bool) -> None:
+        controls = getattr(self, 'santokerWarmupControls', None)
+        if controls is not None:
+            controls.setState(enabled)
+            style = self.pushbuttonstyles['ON' if enabled else 'OFF']
+            controls.setStyleSheet(style)
+            controls.button.setStyleSheet(style)
         for button in find_warmup_buttons(self.extraeventsactionstrings):
             if button < len(self.buttonStates):
                 self.buttonStates[button] = int(enabled)
@@ -18072,6 +18114,9 @@ class ApplicationWindow(QMainWindow):
         finally:
             if widget is not None:
                 widget.blockSignals(False)
+        controls = getattr(self, 'santokerWarmupControls', None)
+        if controls is not None:
+            self.updateSantokerWarmupControls()
 
     @pyqtSlot(object)
     def santokerWarmupStateChanged(self, state:object) -> None:
@@ -18122,6 +18167,9 @@ class ApplicationWindow(QMainWindow):
             self.santoker,
         )
         self.reportSantokerWarmupResult(result)
+        controls = getattr(self, 'santokerWarmupControls', None)
+        if controls is not None:
+            self.updateSantokerWarmupControls()
         return result is WarmupResult.OK
 
     def setSantokerWarmup(self, enabled:bool) -> bool:
@@ -18519,6 +18567,7 @@ class ApplicationWindow(QMainWindow):
             self.santokerPort = toInt(settings.value('santokerPort',self.santokerPort))
             self.santokerSerial = toBool(settings.value('santokerSerial',self.santokerSerial))
             self.santokerBLE = toBool(settings.value('santokerBLE',self.santokerBLE))
+            self.santokerWarmup = toBool(settings.value('santokerWarmup',self.santokerWarmup))
             if settings.contains('santokerEventFlags'):
                 self.santokerEventFlags = [toBool(x) for x in toList(settings.value('santokerEventFlags',self.santokerEventFlags))]
             self.kaleidoHost = toString(settings.value('kaleidoHost',self.kaleidoHost))
@@ -19971,6 +20020,7 @@ class ApplicationWindow(QMainWindow):
             self.updateSlidersVisibility() # update visibility of sliders based on the users preference
             self.update_minieventline_visibility()
             self.updateControlsVisibility()
+            self.updateSantokerWarmupControls()
             self.updateReadingsLCDsVisibility() # update visibility of reading LCD based on the users preference
 
             if filename is None and self.full_screen_mode_active:
@@ -20601,6 +20651,7 @@ class ApplicationWindow(QMainWindow):
             self.settingsSetValue(settings, default_settings, 'santokerPort',self.santokerPort, read_defaults)
             self.settingsSetValue(settings, default_settings, 'santokerSerial',self.santokerSerial, read_defaults)
             self.settingsSetValue(settings, default_settings, 'santokerBLE',self.santokerBLE, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'santokerWarmup',self.santokerWarmup, read_defaults)
             self.settingsSetValue(settings, default_settings, 'santokerEventFlags',self.santokerEventFlags, read_defaults)
             self.settingsSetValue(settings, default_settings, 'kaleidoHost',self.kaleidoHost, read_defaults)
             self.settingsSetValue(settings, default_settings, 'kaleidoPort',self.kaleidoPort, read_defaults)

@@ -3,6 +3,7 @@ import os
 from configparser import ConfigParser
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast, override
 
 import pytest
@@ -13,6 +14,8 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QSlider
 
 from artisanlib.main import ApplicationWindow
+from artisanlib.santoker_warmup import SantokerWarmupController
+from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
 
 def parse_ini_array(value: str) -> list[str]:
@@ -628,6 +631,32 @@ def test_window_rejected_warmup_restoration_uses_signal_from_worker_thread() -> 
     assert window.santoker.calls == []
 
 
+@pytest.mark.parametrize(
+    ('capability', 'viewer', 'visible'),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_window_updates_compact_control_visibility(
+    qapplication: QApplication, capability: bool, viewer: bool, visible: bool
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    window = SimpleNamespace(
+        app=SimpleNamespace(artisanviewerMode=viewer),
+        qmc=SimpleNamespace(mode_tempsliders='C', timeindex=[-1]),
+        santokerWarmup=capability,
+        santoker=None,
+        santokerWarmupController=SantokerWarmupController(),
+        santokerWarmupControls=controls,
+        pushbuttonstyles={'OFF': '', 'ON': ''},
+    )
+
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+
+    assert controls.isHidden() is (not visible)
+    assert not controls.button.isEnabled()
+    assert controls.target.isEnabled() is visible
+
+
 def test_x3_master_bluetooth_preset_contract() -> None:
     from artisanlib.santoker import Santoker
 
@@ -639,6 +668,7 @@ def test_x3_master_bluetooth_preset_contract() -> None:
     assert config.get('General', 'roastertype_setup') == 'Santoker X3 Master BT'
     assert config.getint('Device', 'id') == 134
     assert config.getboolean('Device', 'santokerBLE')
+    assert config.getboolean('Device', 'santokerWarmup')
 
     extra_devices = parse_ini_array(config.get('ExtraDev', 'extradevices'))
     assert extra_devices == ['135', '136']

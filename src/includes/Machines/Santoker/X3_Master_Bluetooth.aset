@@ -9,6 +9,7 @@ santokerHost=10.10.100.254
 santokerPort=20001
 santokerSerial=false
 santokerBLE=true
+santokerWarmup=true
 Controlbuttonflag=true
 
 [events]
