@@ -1350,6 +1350,49 @@ def test_failed_machine_selection_restores_warmup_capability() -> None:
 
 
 @pytest.mark.parametrize(
+    ('flagon', 'flagstart', 'controls_flag'),
+    [(False, False, False), (True, False, True), (False, True, True)],
+    ids=['off', 'monitoring', 'recording'],
+)
+def test_generic_control_visibility_refreshes_warmup_controls(
+    flagon: bool,
+    flagstart: bool,
+    controls_flag: bool,
+) -> None:
+    refresh_warmup = Mock()
+    window = SimpleNamespace(
+        qmc=SimpleNamespace(flagon=flagon, flagstart=flagstart),
+        controlsflags=[False, True, True],
+        controlsVisible=Mock(return_value=not controls_flag),
+        showControls=Mock(),
+        hideControls=Mock(),
+        updateSantokerWarmupControls=refresh_warmup,
+    )
+
+    ApplicationWindow.updateControlsVisibility(cast(ApplicationWindow, window))
+
+    if controls_flag:
+        window.showControls.assert_called_once_with(False)
+        window.hideControls.assert_not_called()
+    else:
+        window.hideControls.assert_called_once_with(False)
+        window.showControls.assert_not_called()
+    refresh_warmup.assert_called_once_with()
+
+
+def test_recording_stop_refreshes_warmup_after_flag_change() -> None:
+    import inspect
+
+    from artisanlib.canvas import tgraphcanvas
+
+    source = inspect.getsource(tgraphcanvas.OffRecorder)
+
+    flag_change = source.index('self.flagstart = False')
+    refresh = source.index('self.aw.updateSantokerWarmupControls()')
+    assert flag_change < refresh
+
+
+@pytest.mark.parametrize(
     ('capability', 'viewer', 'monitoring', 'recording', 'visible'),
     [
         (True, False, False, False, False),

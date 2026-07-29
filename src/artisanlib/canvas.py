@@ -14244,6 +14244,7 @@ class tgraphcanvas(QObject):
             self.aw.enableSaveActions()
             self.aw.resetCurveVisibilities()
             self.flagstart = False
+            self.aw.updateSantokerWarmupControls()
             if self.aw.simulator:
                 self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles_simulator['STOP'])
             else:

@@ -12022,6 +12022,7 @@ class ApplicationWindow(QMainWindow):
             self.showControls(False)
         else:
             self.hideControls(False)
+        self.updateSantokerWarmupControls()
 
     def updateSantokerWarmupControls(self) -> None:
         visible = (
@@ -20033,7 +20034,6 @@ class ApplicationWindow(QMainWindow):
             self.updateSlidersVisibility() # update visibility of sliders based on the users preference
             self.update_minieventline_visibility()
             self.updateControlsVisibility()
-            self.updateSantokerWarmupControls()
             self.updateReadingsLCDsVisibility() # update visibility of reading LCD based on the users preference
 
             if filename is None and self.full_screen_mode_active:
