@@ -8010,6 +8010,7 @@ class tgraphcanvas(QObject):
                 self.aw.eventactionx(self.xextrabuttonactions[0],self.xextrabuttonactionstrings[0])
             except Exception as e: # pylint: disable=broad-except
                 _log.exception(e)
+        reset_succeeded = False
         try:
             if self.designerflag:
                 # reset the users chosen widget visibility for the state
@@ -8296,6 +8297,7 @@ class tgraphcanvas(QObject):
             if self.crossmarker:
                 self.togglecrosslines()
 
+            reset_succeeded = True
         except Exception as ex: # pylint: disable=broad-except
             _log.exception(ex)
             _, _, exc_tb = sys.exc_info()
@@ -8307,8 +8309,6 @@ class tgraphcanvas(QObject):
         # now clear all measurements and redraw
 
         self.clearMeasurements()
-        self.aw.santokerWarmupController.reset_charge()
-        self.aw.updateSantokerWarmupControls()
         #clear PhasesLCDs
         self.aw.updatePhasesLCDs()
         #clear AUC LCD
@@ -8356,6 +8356,11 @@ class tgraphcanvas(QObject):
 
 
         self.aw.sendmessage(QApplication.translate('Message','Scope has been reset'))
+
+        # reset the warm-up lifecycle only after all unrelated reset work completed
+        if reset_succeeded:
+            self.aw.santokerWarmupController.reset_charge()
+            self.aw.updateSantokerWarmupControls()
 
         #QApplication.processEvents() # this one seems to be needed for a proper redraw in fullscreen mode on OS X if a profile was loaded and NEW is pressed
         #   this processEvents() seems not to be needed any longer!?

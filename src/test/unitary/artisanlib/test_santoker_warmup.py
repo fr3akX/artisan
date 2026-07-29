@@ -253,6 +253,146 @@ def compact_window(
     return window
 
 
+@dataclass
+class TrackingSemaphore:
+    trace: list[str]
+    locked: bool = False
+
+    def acquire(self, _count: int) -> None:
+        assert not self.locked
+        self.locked = True
+        self.trace.append('semaphore-acquired')
+
+    def available(self) -> int:
+        return int(not self.locked)
+
+    def release(self, _count: int) -> None:
+        assert self.locked
+        self.locked = False
+        self.trace.append('semaphore-released')
+
+
+class ResetTrackingController(SantokerWarmupController):
+    def __init__(self, semaphore: TrackingSemaphore, trace: list[str]) -> None:
+        super().__init__()
+        self.semaphore = semaphore
+        self.trace = trace
+
+    @override
+    def reset_charge(self) -> None:
+        assert not self.semaphore.locked
+        self.trace.append('reset-charge')
+        super().reset_charge()
+
+
+def successful_reset_canvas(
+    controls: SantokerWarmupControls,
+    controller: ResetTrackingController,
+    device: FakeWarmupDevice | None,
+    semaphore: TrackingSemaphore,
+    trace: list[str],
+) -> SimpleNamespace:
+    window = compact_window(controls, controller, device)
+    window.pushbuttonstyles['STOP'] = 'stop-style'
+    window.centralWidget = Mock(return_value=None)
+    window.restoreExtraDeviceSettingsBackup = Mock()
+    window.soundpopSignal = Mock()
+    window.simulator = None
+    window.AUClcd = Mock()
+    for name in (
+        'buttonFCs',
+        'buttonFCe',
+        'buttonSCs',
+        'buttonSCe',
+        'buttonRESET',
+        'buttonCHARGE',
+        'buttonDROP',
+        'buttonDRY',
+        'buttonCOOL',
+        'buttonONOFF',
+        'buttonSTARTSTOP',
+    ):
+        setattr(window, name, Mock())
+    window.pidcontrol = SimpleNamespace(pidActive=True)
+    window.fujipid = SimpleNamespace(sv=0)
+    window.resetBBPMetrics = Mock()
+    window.eNumberSpinBox = Mock()
+    window.lineEvent = Mock()
+    window.etypeComboBox = Mock()
+    window.valueEdit = Mock()
+    window.resetKeyboardButtonMarks = Mock()
+    window.setTimerColorSignal = Mock()
+    window.ntb = Mock()
+    window.lastbuttonpressed = -1
+    window.updateWindowTitle = Mock()
+    window.hideDefaultButtons = Mock()
+    window.enableEditMenus = Mock()
+    window.updatePhasesLCDs = Mock()
+    window.updateAUCLCD = Mock()
+    window.updatePlusStatus = Mock()
+    window.announce_current_ui_mode = Mock()
+    window.autoAdjustAxis = Mock()
+
+    canvas = SimpleNamespace(
+        aw=window,
+        checkSaved=Mock(return_value=True),
+        flagOpenCompleted=False,
+        designerflag=False,
+        profileDataSemaphore=semaphore,
+        resetTimer=Mock(),
+        batchprefix='',
+        roastpropertiesflag=False,
+        flagKeepON=False,
+        weight=(0.0, 0.0, 'g'),
+        volume=(0.0, 0.0, 'l'),
+        density_roasted=(0.0, 0.0, 1, 0.0),
+        timex=[],
+        timeindex=[0],
+        mode_tempsliders='C',
+        flagon=False,
+        meterreads_default=[],
+        crossmarker=False,
+        disconnect_designer=Mock(),
+        canvas=Mock(),
+        analyzer_connect_id=None,
+        flavorlabels=[],
+        deleteAnnoPositions=Mock(),
+        alarmflag=[],
+        backgroundprofile=None,
+        backgroundprofile_moved_x=0,
+        backgroundprofile_moved_y=0,
+        autotimex=False,
+        background=False,
+        locktimex=False,
+        locktimex_start=0.0,
+        locktimex_end=1200.0,
+        chargemintime=-120.0,
+        resetmaxtime=1200.0,
+        endofx=1200.0,
+        redraw=Mock(),
+        adderror=Mock(),
+        timealign=Mock(),
+    )
+
+    def clear_measurements() -> None:
+        assert not semaphore.locked
+        trace.append('measurements-cleared')
+        canvas.timeindex[0] = -1
+
+    def update_warmup_controls() -> None:
+        assert not semaphore.locked
+        assert not controller.is_charge_latched()
+        trace.append('controls-refreshed')
+        ApplicationWindow.updateSantokerWarmupControls(
+            cast(ApplicationWindow, window)
+        )
+
+    canvas.clearMeasurements = clear_measurements
+    window.qmc = canvas
+    window.updateSantokerWarmupControls = update_warmup_controls
+    return canvas
+
+
 def test_reported_target_updates_spinbox_without_command(
     qapplication: QApplication,
 ) -> None:
@@ -744,6 +884,108 @@ def test_warmup_on_and_charge_are_serialized(
     assert not controls.button.isChecked()
 
 
+@pytest.mark.parametrize(
+    ('device', 'enabled_after_reset'),
+    [(None, False), (FakeWarmupDevice(ready=True), True)],
+    ids=['disconnected', 'retained-ready'],
+)
+def test_successful_reset_clears_charge_latch_after_profile_unlock(
+    qapplication: QApplication,
+    device: FakeWarmupDevice | None,
+    enabled_after_reset: bool,
+) -> None:
+    from artisanlib.canvas import tgraphcanvas
+
+    del qapplication
+    trace: list[str] = []
+    semaphore = TrackingSemaphore(trace)
+    controller = ResetTrackingController(semaphore, trace)
+    controller.mark_charge()
+    controls = SantokerWarmupControls()
+    controls.setState(True)
+    controls.button.setEnabled(True)
+    canvas = successful_reset_canvas(
+        controls, controller, device, semaphore, trace
+    )
+
+    assert tgraphcanvas.reset(
+        cast(tgraphcanvas, canvas),
+        redraw=False,
+        soundOn=False,
+        fireResetAction=False,
+    )
+
+    assert trace == [
+        'semaphore-acquired',
+        'semaphore-released',
+        'measurements-cleared',
+        'reset-charge',
+        'controls-refreshed',
+    ]
+    assert not controller.is_charge_latched()
+    assert controls.button.isEnabled() is enabled_after_reset
+    assert not controls.button.isChecked()
+    canvas.adderror.assert_not_called()
+
+
+def test_caught_reset_exception_does_not_clear_charge_latch(
+    qapplication: QApplication,
+) -> None:
+    from artisanlib.canvas import tgraphcanvas
+
+    del qapplication
+    trace: list[str] = []
+    semaphore = TrackingSemaphore(trace)
+    controller = ResetTrackingController(semaphore, trace)
+    controller.mark_charge()
+    controls = SantokerWarmupControls()
+    canvas = successful_reset_canvas(
+        controls, controller, FakeWarmupDevice(), semaphore, trace
+    )
+    canvas.resetTimer.side_effect = RuntimeError('timer reset failed')
+
+    assert tgraphcanvas.reset(
+        cast(tgraphcanvas, canvas),
+        redraw=False,
+        soundOn=False,
+        fireResetAction=False,
+    )
+
+    assert controller.is_charge_latched()
+    assert 'reset-charge' not in trace
+    assert 'controls-refreshed' not in trace
+    canvas.adderror.assert_called_once()
+
+
+def test_uncaught_reset_exception_does_not_clear_charge_latch(
+    qapplication: QApplication,
+) -> None:
+    from artisanlib.canvas import tgraphcanvas
+
+    del qapplication
+    trace: list[str] = []
+    semaphore = TrackingSemaphore(trace)
+    controller = ResetTrackingController(semaphore, trace)
+    controller.mark_charge()
+    controls = SantokerWarmupControls()
+    canvas = successful_reset_canvas(
+        controls, controller, FakeWarmupDevice(), semaphore, trace
+    )
+    canvas.aw.updatePhasesLCDs.side_effect = RuntimeError('phase refresh failed')
+
+    with pytest.raises(RuntimeError, match='phase refresh failed'):
+        tgraphcanvas.reset(
+            cast(tgraphcanvas, canvas),
+            redraw=False,
+            soundOn=False,
+            fireResetAction=False,
+        )
+
+    assert controller.is_charge_latched()
+    assert 'reset-charge' not in trace
+    assert 'controls-refreshed' not in trace
+
+
 def test_cancelled_reset_does_not_clear_charge_latch(
     qapplication: QApplication,
 ) -> None:
@@ -769,6 +1011,63 @@ def test_cancelled_reset_does_not_clear_charge_latch(
     )
     assert controller.is_charge_latched()
     canvas.aw.updateSantokerWarmupControls.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('device', 'timex', 'manual_reading', 'expected_auto_charge'),
+    [
+        (134, [], None, 1),
+        (18, [1.0], (0.0, -1.0, -1.0), 0),
+    ],
+    ids=['insufficient-data', 'manual-cancellation'],
+)
+def test_rejected_charge_does_not_set_latch(
+    qapplication: QApplication,
+    device: int,
+    timex: list[float],
+    manual_reading: tuple[float, float, float] | None,
+    expected_auto_charge: int,
+) -> None:
+    from artisanlib.canvas import tgraphcanvas
+
+    del qapplication
+    controller = SantokerWarmupController()
+    trace: list[str] = []
+    semaphore = TrackingSemaphore(trace)
+    charge_button = Mock()
+    charge_button.isFlat.return_value = False
+    window = SimpleNamespace(
+        ntb=SimpleNamespace(_nav_stack=list),
+        soundpopSignal=Mock(),
+        buttonCHARGE=charge_button,
+        simulator=None,
+        ser=SimpleNamespace(NONE=Mock(return_value=manual_reading)),
+        santokerWarmupController=controller,
+        updateSantokerWarmupControls=Mock(),
+        sendmessage=Mock(),
+    )
+    canvas = SimpleNamespace(
+        aw=window,
+        profileDataSemaphore=semaphore,
+        flagstart=True,
+        fileDirtySignal=Mock(),
+        timeindex=[-1],
+        autoChargeIdx=0,
+        device=device,
+        timex=timex,
+        drawmanual=Mock(),
+        adderror=Mock(),
+    )
+
+    tgraphcanvas._markCharge(cast(tgraphcanvas, canvas))
+
+    assert not controller.is_charge_latched()
+    window.updateSantokerWarmupControls.assert_not_called()
+    canvas.drawmanual.assert_not_called()
+    assert canvas.timeindex == [-1]
+    assert canvas.autoChargeIdx == expected_auto_charge
+    assert trace == ['semaphore-acquired', 'semaphore-released']
+    canvas.adderror.assert_not_called()
 
 
 def test_existing_qx_preset_does_not_force_warmup_off_after_charge() -> None:
