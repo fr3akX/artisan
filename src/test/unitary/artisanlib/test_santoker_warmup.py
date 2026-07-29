@@ -657,6 +657,76 @@ def test_window_updates_compact_control_visibility(
     assert controls.target.isEnabled() is visible
 
 
+def test_window_enables_compact_button_when_ready_before_charge(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    window = SimpleNamespace(
+        app=SimpleNamespace(artisanviewerMode=False),
+        qmc=SimpleNamespace(mode_tempsliders='C', timeindex=[-1]),
+        santokerWarmup=True,
+        santoker=FakeWarmupDevice(ready=True, warmup=False),
+        santokerWarmupController=SantokerWarmupController(),
+        santokerWarmupControls=controls,
+        pushbuttonstyles={'OFF': '', 'ON': ''},
+    )
+
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+
+    assert controls.isVisible()
+    assert controls.button.isEnabled()
+    assert not controls.button.isChecked()
+    assert controls.target.isEnabled()
+
+
+def test_window_disables_and_unchecks_compact_button_after_charge(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    window = SimpleNamespace(
+        app=SimpleNamespace(artisanviewerMode=False),
+        qmc=SimpleNamespace(mode_tempsliders='C', timeindex=[0]),
+        santokerWarmup=True,
+        santoker=FakeWarmupDevice(ready=True, warmup=True),
+        santokerWarmupController=SantokerWarmupController(),
+        santokerWarmupControls=controls,
+        pushbuttonstyles={'OFF': '', 'ON': ''},
+    )
+
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+
+    assert controls.isVisible()
+    assert not controls.button.isEnabled()
+    assert not controls.button.isChecked()
+    assert controls.target.isEnabled()
+
+
+def test_window_readiness_callback_refreshes_compact_button(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    device = FakeWarmupDevice(ready=False, warmup=False)
+    window = SimpleNamespace(
+        app=SimpleNamespace(artisanviewerMode=False),
+        qmc=SimpleNamespace(mode_tempsliders='C', timeindex=[-1]),
+        santokerWarmup=True,
+        santoker=device,
+        santokerWarmupController=SantokerWarmupController(),
+        santokerWarmupControls=controls,
+        pushbuttonstyles={'OFF': '', 'ON': ''},
+    )
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+    assert not controls.button.isEnabled()
+
+    device.ready = True
+    ApplicationWindow.santokerWarmupReadyChanged(cast(ApplicationWindow, window), True)
+
+    assert controls.button.isEnabled()
+
+
 def test_x3_master_bluetooth_preset_contract() -> None:
     from artisanlib.santoker import Santoker
 

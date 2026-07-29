@@ -1449,6 +1449,7 @@ class ApplicationWindow(QMainWindow):
     santokerSendMessageSignal = pyqtSignal(bytes,int)
     santokerWarmupStateSignal = pyqtSignal(object)
     santokerWarmupTargetSignal = pyqtSignal(float)
+    santokerWarmupReadySignal = pyqtSignal(bool)
     santokerWarmupButtonStateSignal = pyqtSignal(bool)
     kaleidoSendMessageSignal = pyqtSignal(str,str)
     kaleidoSendMessageAwaitSignal = pyqtSignal(str,str,int,int)
@@ -4322,6 +4323,7 @@ class ApplicationWindow(QMainWindow):
         self.santokerSendMessageSignal.connect(self.santokerSendMessage)
         self.santokerWarmupStateSignal.connect(self.santokerWarmupStateChanged)
         self.santokerWarmupTargetSignal.connect(self.santokerWarmupTargetChanged)
+        self.santokerWarmupReadySignal.connect(self.santokerWarmupReadyChanged)
         self.santokerWarmupButtonStateSignal.connect(self.setSantokerWarmupButtonState, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
         self.kaleidoSendMessageSignal.connect(self.kaleidoSendMessage)
         self.kaleidoSendMessageAwaitSignal.connect(self.kaleidoSendMessageAwait)
@@ -12029,12 +12031,13 @@ class ApplicationWindow(QMainWindow):
         target = self.santokerWarmupController.target_for_display(unit)
         self.santokerWarmupControls.configureTarget(unit, target)
 
-        warmup_enabled = False
         ready = False
+        pre_charge = self.qmc.timeindex[0] == -1
+        warmup_enabled = False
         if self.santoker is not None:
             ready = self.santoker.isHeaderReady()
-            warmup_enabled = self.santoker.getWarmup() is True
-        safe_to_start = visible and ready and self.qmc.timeindex[0] == -1
+            warmup_enabled = pre_charge and self.santoker.getWarmup() is True
+        safe_to_start = visible and ready and pre_charge
 
         self.santokerWarmupControls.setVisible(visible)
         self.santokerWarmupControls.setState(warmup_enabled)
@@ -18063,14 +18066,19 @@ class ApplicationWindow(QMainWindow):
                 self.notificationManager.disableNotifications()
                 self.notificationManager.hideNotifications()
 
-    @pyqtSlot(bool)
-    def setSantokerWarmupButtonState(self, enabled:bool) -> None:
+    @pyqtSlot()
+    def refreshSantokerWarmupControls(self) -> None:
         controls = getattr(self, 'santokerWarmupControls', None)
         if controls is not None:
-            controls.setState(enabled)
-            style = self.pushbuttonstyles['ON' if enabled else 'OFF']
-            controls.setStyleSheet(style)
-            controls.button.setStyleSheet(style)
+            ApplicationWindow.updateSantokerWarmupControls(self)
+
+    @pyqtSlot(bool)
+    def santokerWarmupReadyChanged(self, _ready:bool) -> None:
+        ApplicationWindow.refreshSantokerWarmupControls(self)
+
+    @pyqtSlot(bool)
+    def setSantokerWarmupButtonState(self, enabled:bool) -> None:
+        ApplicationWindow.refreshSantokerWarmupControls(self)
         for button in find_warmup_buttons(self.extraeventsactionstrings):
             if button < len(self.buttonStates):
                 self.buttonStates[button] = int(enabled)
@@ -18080,13 +18088,16 @@ class ApplicationWindow(QMainWindow):
                 )
 
     def runSantokerWarmupCharge(self, action:Callable[[], None]) -> None:
-        if has_warmup_controls(
-            self.eventslidercommands, self.extraeventsactionstrings
-        ):
-            with self.santokerWarmupController.serialized():
+        try:
+            if has_warmup_controls(
+                self.eventslidercommands, self.extraeventsactionstrings
+            ):
+                with self.santokerWarmupController.serialized():
+                    action()
+            else:
                 action()
-        else:
-            action()
+        finally:
+            ApplicationWindow.refreshSantokerWarmupControls(self)
 
     @pyqtSlot(float)
     def santokerWarmupTargetChanged(self, temp_c:float) -> None:
