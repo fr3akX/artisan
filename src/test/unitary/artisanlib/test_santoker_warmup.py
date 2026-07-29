@@ -13,7 +13,7 @@ import pytest
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QCoreApplication, QEvent, QSettings, Qt
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QSlider
 
@@ -511,6 +511,7 @@ def test_target_field_edit_caches_while_inactive_and_sends_while_active(
 def test_worker_target_edit_queues_compact_refresh_to_gui_signal(
     qapplication: QApplication,
 ) -> None:
+    del qapplication
     from threading import Thread, get_ident
 
     class RecordingWarmupDevice(FakeWarmupDevice):
@@ -565,14 +566,9 @@ def test_worker_target_edit_queues_compact_refresh_to_gui_signal(
     assert controls.target.value() == 190
     assert hasattr(window, 'santokerWarmupControlsRefreshSignal')
 
-    for _ in range(10):
-        qapplication.processEvents()
-        if controls.target.value() == 205:
-            break
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
 
     assert controls.target.value() == 205
-    window.deleteLater()
-    qapplication.processEvents()
 
 
 def test_warmup_report_updates_compact_state_without_command(
