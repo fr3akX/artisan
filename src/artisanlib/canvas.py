@@ -8307,6 +8307,8 @@ class tgraphcanvas(QObject):
         # now clear all measurements and redraw
 
         self.clearMeasurements()
+        self.aw.santokerWarmupController.reset_charge()
+        self.aw.updateSantokerWarmupControls()
         #clear PhasesLCDs
         self.aw.updatePhasesLCDs()
         #clear AUC LCD
@@ -14397,25 +14399,27 @@ class tgraphcanvas(QObject):
                                 self.timeindex[0] = len(self.timex)-1
                             else:
                                 return
-                        else:
-                            if self.autoChargeIdx > 0:
-                                # prevent CHARGE out of index:
-                                if len(self.timex) > self.autoChargeIdx:
-                                    self.timeindex[0] = self.autoChargeIdx
-                                elif len(self.timex) > self.autoChargeIdx - 1:
-                                    # not yet enough readings
-                                    self.timeindex[0] = self.autoChargeIdx - 1
-                                else:
-                                    return
-                            elif len(self.timex) > 0:
-                                self.timeindex[0] = len(self.timex)-1
+                        elif self.autoChargeIdx > 0:
+                            # prevent CHARGE out of index:
+                            if len(self.timex) > self.autoChargeIdx:
+                                self.timeindex[0] = self.autoChargeIdx
+                            elif len(self.timex) > self.autoChargeIdx - 1:
+                                # not yet enough readings
+                                self.timeindex[0] = self.autoChargeIdx - 1
                             else:
-                                self.autoChargeIdx = 1 # set CHARGE on next (first) reading
-                                message = QApplication.translate('Message','Not enough data collected yet. Try again in a few seconds')
-                                self.aw.sendmessage(message)
                                 return
-                            if self.aw.pidcontrol.pidOnCHARGE and not self.aw.pidcontrol.pidActive: # Arduino/TC4, Hottop, MODBUS
-                                self.aw.pidcontrol.pidOn()
+                        elif len(self.timex) > 0:
+                            self.timeindex[0] = len(self.timex)-1
+                        else:
+                            self.autoChargeIdx = 1 # set CHARGE on next (first) reading
+                            message = QApplication.translate('Message','Not enough data collected yet. Try again in a few seconds')
+                            self.aw.sendmessage(message)
+                            return
+                        self.aw.santokerWarmupController.mark_charge()
+                        self.aw.updateSantokerWarmupControls()
+                        if ((self.device != 18 or self.aw.simulator is not None) and
+                                self.aw.pidcontrol.pidOnCHARGE and not self.aw.pidcontrol.pidActive): # Arduino/TC4, Hottop, MODBUS
+                            self.aw.pidcontrol.pidOn()
                         if self.chargeTimerPeriod > 0:
                             self.aw.setTimerColorSignal.emit('timer')
                         try:

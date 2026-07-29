@@ -12019,7 +12019,10 @@ class ApplicationWindow(QMainWindow):
         self.santokerWarmupControls.configureTarget(unit, target)
 
         ready = False
-        pre_charge = self.qmc.timeindex[0] == -1
+        pre_charge = (
+            self.qmc.timeindex[0] == -1
+            and not self.santokerWarmupController.is_charge_latched()
+        )
         warmup_enabled = False
         if self.santoker is not None:
             ready = self.santoker.isHeaderReady()

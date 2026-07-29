@@ -70,11 +70,26 @@ class SantokerWarmupController:
     _serialization_lock: RLock = field(
         default_factory=RLock, init=False, repr=False, compare=False
     )
+    _charge_latched: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
 
     @contextmanager
     def serialized(self) -> Iterator[None]:
         with self._serialization_lock:
             yield
+
+    def mark_charge(self) -> None:
+        with self.serialized():
+            self._charge_latched = True
+
+    def reset_charge(self) -> None:
+        with self.serialized():
+            self._charge_latched = False
+
+    def is_charge_latched(self) -> bool:
+        with self.serialized():
+            return self._charge_latched
 
     def set_target(
         self,
@@ -102,7 +117,7 @@ class SantokerWarmupController:
                 return WarmupResult.NO_CONNECTION
             if not device.isHeaderReady():
                 return WarmupResult.NOT_READY
-            if enabled and charge_index > -1:
+            if enabled and (self._charge_latched or charge_index > -1):
                 return WarmupResult.AFTER_CHARGE
             if not enabled and device.getWarmup() is not True:
                 return WarmupResult.OK
@@ -119,7 +134,7 @@ class SantokerWarmupController:
         device: SantokerWarmupDevice | None,
     ) -> bool:
         with self.serialized():
-            unsafe = enabled and charge_index > -1
+            unsafe = enabled and (self._charge_latched or charge_index > -1)
             if unsafe and device is not None and device.isHeaderReady():
                 device.setWarmup(False)
             return unsafe

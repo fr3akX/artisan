@@ -1,6 +1,8 @@
 import csv
 import os
+from collections.abc import Iterator
 from configparser import ConfigParser
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,6 +125,21 @@ def test_controller_rejects_unsafe_start(
     assert device is None or device.calls == []
 
 
+def test_charge_latch_blocks_on_until_reset() -> None:
+    from artisanlib.santoker_warmup import WarmupResult
+
+    controller = SantokerWarmupController()
+    device = FakeWarmupDevice()
+
+    controller.mark_charge()
+    assert controller.is_charge_latched()
+    assert controller.set_enabled(True, -1, device) is WarmupResult.AFTER_CHARGE
+
+    controller.reset_charge()
+    assert not controller.is_charge_latched()
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+
+
 def test_controller_starts_with_desired_target() -> None:
     from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 
@@ -168,6 +185,15 @@ def test_post_charge_on_report_is_forced_off() -> None:
     controller = SantokerWarmupController()
 
     assert controller.reconcile_reported_state(True, 10, device)
+    assert device.calls == [('enabled', False)]
+
+
+def test_charge_latch_forces_late_on_report_off_after_undo() -> None:
+    device = FakeWarmupDevice(warmup=True)
+    controller = SantokerWarmupController()
+    controller.mark_charge()
+
+    assert controller.reconcile_reported_state(True, -1, device)
     assert device.calls == [('enabled', False)]
 
 
@@ -487,18 +513,33 @@ def test_temperature_mode_switch_refreshes_compact_target_without_slider_side_ef
     for action in slider_actions:
         action.assert_not_called()
 
-def test_warmup_on_and_charge_are_serialized() -> None:
-    from threading import Barrier, Event, Thread
-    from types import SimpleNamespace
-    from unittest.mock import Mock
 
-    from artisanlib.santoker_warmup import SantokerWarmupController
+def test_warmup_on_and_charge_are_serialized(
+    qapplication: QApplication,
+) -> None:
+    from threading import Barrier, Event, Thread, get_ident
+
+    from artisanlib.canvas import tgraphcanvas
 
     target_started = Barrier(2)
     release_target = Event()
+    charge_waiting_for_lock = Event()
     on_completed = Event()
     call_order: list[str] = []
     errors: list[BaseException] = []
+    main_thread_id = get_ident()
+
+    class BarrierWarmupController(SantokerWarmupController):
+        observe_charge = False
+
+        @contextmanager
+        @override
+        def serialized(self) -> Iterator[None]:
+            if self.observe_charge and get_ident() == main_thread_id:
+                self.observe_charge = False
+                charge_waiting_for_lock.set()
+            with super().serialized():
+                yield
 
     class BlockingWarmupDevice(FakeWarmupDevice):
         @override
@@ -517,18 +558,107 @@ def test_warmup_on_and_charge_are_serialized() -> None:
                 on_completed.set()
             return True
 
+    @dataclass
+    class FakeSemaphore:
+        locked: bool = False
+
+        def acquire(self, _count: int) -> None:
+            assert not self.locked
+            self.locked = True
+
+        def available(self) -> int:
+            return int(not self.locked)
+
+        def release(self, _count: int) -> None:
+            assert self.locked
+            self.locked = False
+
+    @dataclass
+    class FakeChargeButton:
+        flat: bool = False
+        animating: bool = False
+
+        def isFlat(self) -> bool:
+            return self.flat
+
+        def setFlat(self, flat: bool) -> None:
+            self.flat = flat
+
+        def startAnimation(self) -> None:
+            self.animating = True
+
+        def stopAnimation(self) -> None:
+            self.animating = False
+
+    del qapplication
+    controls = SantokerWarmupControls()
+    controls.setState(True)
+    controls.button.setEnabled(True)
+    controller = BarrierWarmupController()
     device = BlockingWarmupDevice()
-    qmc = SimpleNamespace(timeindex=[-1])
-    window = SimpleNamespace(
-        eventslidercommands=['', '', 'santokerWarmupTemp({})', ''],
-        extraeventsactionstrings=['santokerWarmup(1 - $)'],
-        qmc=qmc,
-        santokerWarmup=True,
-        santoker=device,
-        santokerWarmupController=SantokerWarmupController(),
-        santokerWarmupButtonStateSignal=Mock(),
-        reportSantokerWarmupResult=Mock(),
+    window = compact_window(controls, controller, device)
+    window.santokerWarmupButtonStateSignal = Mock()
+    charge_button = FakeChargeButton()
+    window.buttonCHARGE = charge_button
+    window.ntb = SimpleNamespace(_nav_stack=list)
+    window.soundpopSignal = Mock()
+    window.pidcontrol = SimpleNamespace(pidOnCHARGE=False, pidActive=False)
+    window.setTimerColorSignal = Mock()
+    window.eventslidervisibilities = [False] * 4
+    window.arabicReshape = lambda text: text
+    window.onMarkMoveToNext = Mock()
+    window.openPropertiesSignal = Mock()
+
+    canvas = SimpleNamespace(
+        aw=window,
+        mode_tempsliders='C',
+        timeindex=[-1],
+        profileDataSemaphore=FakeSemaphore(),
+        flagstart=True,
+        fileDirtySignal=Mock(),
+        autoChargeIdx=0,
+        device=134,
+        timex=[5.0],
+        chargeTimerPeriod=0,
+        locktimex=False,
+        locktimex_start=0.0,
+        chargemintime=-120.0,
+        resetmaxtime=1200.0,
+        fixmaxtime=False,
+        endofx=1200.0,
+        xaxistosm=Mock(),
+        BTcurve=False,
+        ETcurve=False,
+        updateProjection=Mock(),
+        buttonactions=[6],
+        buttonactionstrings=['santokerWarmup(0);santoker(80,1)'],
+        timealign=Mock(),
+        LCDdecimalplaces=0,
+        temp2=[200.0],
+        mode='C',
+        roastpropertiesAutoOpenFlag=False,
+        l_annotations=[],
+        l_annotations_dict={},
+        ystep_down=0,
+        ystep_up=0,
+        _tgraphcanvas__dijkstra_to_ascii=lambda text: text,
+        adderror=Mock(),
     )
+    window.qmc = canvas
+    window.updateSantokerWarmupControls = lambda: ApplicationWindow.updateSantokerWarmupControls(
+        cast(ApplicationWindow, window)
+    )
+
+    def charge_event_action(_action: int, _command: str) -> None:
+        assert controller.is_charge_latched()
+        assert not controls.button.isChecked()
+        assert not controls.button.isEnabled()
+        assert ApplicationWindow.setSantokerWarmup(
+            cast(ApplicationWindow, window), False
+        )
+        call_order.append('raw:80')
+
+    window.eventactionx = charge_event_action
 
     def run_on() -> None:
         try:
@@ -538,40 +668,107 @@ def test_warmup_on_and_charge_are_serialized() -> None:
         except BaseException as exc:  # pragma: no cover - re-raised in main thread
             errors.append(exc)
 
-    def charge_action() -> None:
-        qmc.timeindex[0] = 0
-        call_order.append('charge')
-        assert on_completed.is_set()
-        assert ApplicationWindow.setSantokerWarmup(
-            cast(ApplicationWindow, window), False
-        )
-        call_order.append('raw:80')
-
-    def run_charge() -> None:
+    def release_on_when_charge_waits() -> None:
         try:
-            ApplicationWindow.runSantokerWarmupCharge(
-                cast(ApplicationWindow, window), charge_action
-            )
+            if not charge_waiting_for_lock.wait(timeout=3):
+                raise TimeoutError('CHARGE did not wait for the controller lock')
+            release_target.set()
         except BaseException as exc:  # pragma: no cover - re-raised in main thread
             errors.append(exc)
+
+    def charge_action() -> None:
+        call_order.append('charge')
+        assert on_completed.is_set()
+        tgraphcanvas._markCharge(cast(tgraphcanvas, canvas))
 
     on_thread = Thread(target=run_on)
     on_thread.start()
     target_started.wait(timeout=3)
 
-    charge_thread = Thread(target=run_charge)
-    charge_thread.start()
-    charge_thread.join(timeout=0.2)
-    release_target.set()
+    controller.observe_charge = True
+    release_thread = Thread(target=release_on_when_charge_waits)
+    release_thread.start()
+    ApplicationWindow.runSantokerWarmupCharge(
+        cast(ApplicationWindow, window), charge_action
+    )
     on_thread.join(timeout=3)
-    charge_thread.join(timeout=3)
+    release_thread.join(timeout=3)
 
     if errors:
         raise errors[0]
     assert not on_thread.is_alive()
-    assert not charge_thread.is_alive()
+    assert not release_thread.is_alive()
     assert call_order == ['target:190', 'on', 'charge', 'off', 'raw:80']
     assert call_order.index('off') < call_order.index('raw:80')
+    assert controller.is_charge_latched()
+    assert not controls.button.isChecked()
+    assert not controls.button.isEnabled()
+
+    ApplicationWindow.runSantokerWarmupCharge(
+        cast(ApplicationWindow, window),
+        lambda: tgraphcanvas._markCharge(cast(tgraphcanvas, canvas)),
+    )
+
+    assert canvas.timeindex[0] == -1
+    assert controller.is_charge_latched()
+    assert not controls.button.isChecked()
+    assert not controls.button.isEnabled()
+    before_rejected_on = call_order.copy()
+    assert not ApplicationWindow.setSantokerWarmup(
+        cast(ApplicationWindow, window), True
+    )
+    assert call_order == before_rejected_on
+
+    device.warmup = True
+    ApplicationWindow.santokerWarmupStateChanged(
+        cast(ApplicationWindow, window), True
+    )
+
+    assert call_order == before_rejected_on + ['off']
+    assert not controls.button.isChecked()
+    assert not controls.button.isEnabled()
+
+    device.ready = False
+    controller.reset_charge()
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+
+    assert not controller.is_charge_latched()
+    assert not controls.button.isEnabled()
+
+    device.ready = True
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), True
+    )
+
+    assert controls.button.isEnabled()
+    assert not controls.button.isChecked()
+
+
+def test_cancelled_reset_does_not_clear_charge_latch(
+    qapplication: QApplication,
+) -> None:
+    from artisanlib.canvas import tgraphcanvas
+
+    del qapplication
+    controller = SantokerWarmupController()
+    controller.mark_charge()
+    canvas = SimpleNamespace(
+        aw=SimpleNamespace(
+            centralWidget=Mock(return_value=None),
+            santokerWarmupController=controller,
+            updateSantokerWarmupControls=Mock(),
+        ),
+        checkSaved=Mock(return_value=False),
+    )
+
+    assert not tgraphcanvas.reset(
+        cast(tgraphcanvas, canvas),
+        redraw=False,
+        soundOn=False,
+        fireResetAction=False,
+    )
+    assert controller.is_charge_latched()
+    canvas.aw.updateSantokerWarmupControls.assert_not_called()
 
 
 def test_existing_qx_preset_does_not_force_warmup_off_after_charge() -> None:
