@@ -1010,7 +1010,8 @@ class TestSantokerWarmupProtocol:
         from artisanlib.santoker import Santoker
 
         sender = Santoker()
-        receiver = Santoker(connect_using_ble=True)
+        ready_handler = Mock()
+        receiver = Santoker(connect_using_ble=True, ready_handler=ready_handler)
         packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
 
         await read_packet(receiver, packet)
@@ -1018,6 +1019,24 @@ class TestSantokerWarmupProtocol:
         assert receiver.isHeaderReady()
         assert receiver.HEADER == Santoker.HEADER_WIFI
         assert receiver.getWarmupTarget() == 190.0
+        ready_handler.assert_called_once_with(True)
+
+    @pytest.mark.asyncio
+    async def test_readiness_handler_tracks_only_accepted_transitions(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        sender = Santoker()
+        ready_handler = Mock()
+        receiver = Santoker(connect_using_ble=True, ready_handler=ready_handler)
+        packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
+
+        await read_packet(receiver, packet)
+        await read_packet(receiver, packet)
+        receiver.resetProtocolState()
+        receiver.resetProtocolState()
+
+        assert ready_handler.call_args_list == [call(True), call(False)]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('corruption', ['crc', 'tail'])
@@ -1026,7 +1045,8 @@ class TestSantokerWarmupProtocol:
         from artisanlib.santoker import Santoker
 
         sender = Santoker()
-        receiver = Santoker(connect_using_ble=True)
+        ready_handler = Mock()
+        receiver = Santoker(connect_using_ble=True, ready_handler=ready_handler)
         packet = bytearray(sender.create_msg(Santoker.WARMUP_TEMP, 1900))
         if corruption == 'crc':
             packet[-5] ^= 0x01  # Santoker currently verifies the second CRC byte
@@ -1037,6 +1057,7 @@ class TestSantokerWarmupProtocol:
 
         assert not receiver.isHeaderReady()
         assert receiver.HEADER == Santoker.HEADER_BT
+        ready_handler.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_truncated_packet_does_not_set_header_ready(self) -> None:
@@ -1046,7 +1067,8 @@ class TestSantokerWarmupProtocol:
         from artisanlib.santoker import Santoker
 
         sender = Santoker()
-        receiver = Santoker(connect_using_ble=True)
+        ready_handler = Mock()
+        receiver = Santoker(connect_using_ble=True, ready_handler=ready_handler)
         packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
 
         with pytest.raises(asyncio.IncompleteReadError):
@@ -1054,6 +1076,7 @@ class TestSantokerWarmupProtocol:
 
         assert not receiver.isHeaderReady()
         assert receiver.HEADER == Santoker.HEADER_BT
+        ready_handler.assert_not_called()
 
     def test_protocol_reset_retains_desired_target(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
@@ -1078,15 +1101,37 @@ class TestSantokerWarmupProtocol:
         from artisanlib.santoker import Santoker
 
         state_handler = Mock()
-        callback_state: list[tuple[bool, bool | None, float]] = []
-        santoker = Santoker(
-            warmup_handler=state_handler,
-            disconnected_handler=lambda: callback_state.append(
+        callback_events: list[tuple[str, bool, bool | None, float]] = []
+        ready_handler = Mock(
+            side_effect=lambda ready: callback_events.append(
                 (
-                    santoker.isHeaderReady(),
+                    'ready',
+                    ready,
                     santoker.getWarmup(),
                     santoker.getWarmupTarget(),
                 )
+            )
+        )
+        callback_state: list[tuple[bool, bool | None, float]] = []
+        santoker = Santoker(
+            warmup_handler=state_handler,
+            ready_handler=ready_handler,
+            disconnected_handler=lambda: (
+                callback_events.append(
+                    (
+                        'disconnect',
+                        santoker.isHeaderReady(),
+                        santoker.getWarmup(),
+                        santoker.getWarmupTarget(),
+                    )
+                ),
+                callback_state.append(
+                    (
+                        santoker.isHeaderReady(),
+                        santoker.getWarmup(),
+                        santoker.getWarmupTarget(),
+                    )
+                ),
             ),
         )
         santoker._header_ready = True
@@ -1098,4 +1143,9 @@ class TestSantokerWarmupProtocol:
         santoker._disconnected_handler()
 
         assert callback_state == [(False, None, 195.0)]
+        assert callback_events == [
+            ('ready', False, True, 195.0),
+            ('disconnect', False, None, 195.0),
+        ]
         assert state_handler.call_args_list[-1] == call(None)
+        assert ready_handler.call_args_list == [call(False)]

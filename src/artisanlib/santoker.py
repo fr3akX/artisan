@@ -139,7 +139,7 @@ class Santoker(AsyncComm):
     ET_CALIB = b'\x88'
 
     __slots__ = [ 'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler', '_warmup_handler', '_warmup_temp_handler',
-                    '_board', '_bt', '_et', '_bt_ror', '_et_ror', '_ir',
+                    '_ready_handler', '_board', '_bt', '_et', '_bt_ror', '_et_ror', '_ir',
                     '_power', '_air', '_drum', '_CHARGE', '_DRY', '_FCs', '_SCs', '_DROP',
                     '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
                     '_connect_using_ble', '_ble_client' ]
@@ -155,7 +155,8 @@ class Santoker(AsyncComm):
                 drop_handler:Callable[[], None]|None = None,
                 warmup_handler:Callable[[bool | None], None]|None = None,
                 warmup_temp_handler:Callable[[float], None]|None = None,
-                warmup_target: float = DEFAULT_WARMUP_TEMP_C) -> None:
+                warmup_target: float = DEFAULT_WARMUP_TEMP_C,
+                ready_handler:Callable[[bool], None]|None = None) -> None:
 
         def on_disconnected() -> None:
             self.resetProtocolState()
@@ -176,6 +177,7 @@ class Santoker(AsyncComm):
         self._drop_handler:Callable[[], None]|None = drop_handler
         self._warmup_handler:Callable[[bool | None], None]|None = warmup_handler
         self._warmup_temp_handler:Callable[[float], None]|None = warmup_temp_handler
+        self._ready_handler:Callable[[bool], None]|None = ready_handler
 
         self._header_ready:bool = False
         self._warmup:bool | None = None
@@ -233,6 +235,15 @@ class Santoker(AsyncComm):
     def getWarmupTarget(self) -> float:
         return self._warmup_target
 
+    def _setHeaderReady(self, ready: bool) -> None:
+        if ready != self._header_ready:
+            self._header_ready = ready
+            if self._ready_handler is not None:
+                try:
+                    self._ready_handler(ready)
+                except Exception as e: # pylint: disable=broad-except
+                    _log.exception(e)
+
     def _setWarmupState(self, enabled: bool | None) -> None:
         if enabled != self._warmup:
             self._warmup = enabled
@@ -275,7 +286,7 @@ class Santoker(AsyncComm):
         self._drum = -1
 
     def resetProtocolState(self) -> None:
-        self._header_ready = False
+        self._setHeaderReady(False)
         self._reported_warmup_target = None
         self._setWarmupState(None)
 
@@ -435,7 +446,7 @@ class Santoker(AsyncComm):
             return
         # full message decoded
         self.HEADER = candidate_header
-        self._header_ready = True
+        self._setHeaderReady(True)
         self.register_reading(target, data)
 
     # send message interface
