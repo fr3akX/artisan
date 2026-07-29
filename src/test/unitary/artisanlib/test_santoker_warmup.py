@@ -226,10 +226,17 @@ def compact_window(
     unit: str = 'C',
     charge_index: int = -1,
     capability: bool = True,
+    monitoring: bool = True,
+    recording: bool = False,
 ) -> SimpleNamespace:
     window = SimpleNamespace(
         app=SimpleNamespace(artisanviewerMode=False),
-        qmc=SimpleNamespace(mode_tempsliders=unit, timeindex=[charge_index]),
+        qmc=SimpleNamespace(
+            mode_tempsliders=unit,
+            timeindex=[charge_index],
+            flagon=monitoring,
+            flagstart=recording,
+        ),
         santokerWarmup=capability,
         santoker=device,
         santokerWarmupController=controller,
@@ -350,7 +357,8 @@ def successful_reset_canvas(
         timex=[],
         timeindex=[0],
         mode_tempsliders='C',
-        flagon=False,
+        flagon=True,
+        flagstart=False,
         meterreads_default=[],
         crossmarker=False,
         disconnect_designer=Mock(),
@@ -533,7 +541,9 @@ def test_worker_target_edit_queues_compact_refresh_to_gui_signal(
     window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
     QMainWindow.__init__(window)
     window.app = SimpleNamespace(artisanviewerMode=False)
-    window.qmc = SimpleNamespace(mode_tempsliders='C', timeindex=[-1])
+    window.qmc = SimpleNamespace(
+        mode_tempsliders='C', timeindex=[-1], flagon=True, flagstart=False
+    )
     window.santokerWarmup = True
     window.santoker = device
     window.santokerWarmupController = controller
@@ -638,6 +648,8 @@ def test_temperature_mode_switch_refreshes_compact_target_without_slider_side_ef
         mode=new_unit,
         mode_tempsliders=initial_unit,
         timeindex=[-1],
+        flagon=True,
+        flagstart=False,
     )
     window.qmc = canvas
 
@@ -751,6 +763,7 @@ def test_warmup_on_and_charge_are_serialized(
         mode_tempsliders='C',
         timeindex=[-1],
         profileDataSemaphore=FakeSemaphore(),
+        flagon=True,
         flagstart=True,
         fileDirtySignal=Mock(),
         autoChargeIdx=0,
@@ -1088,7 +1101,7 @@ def test_existing_qx_preset_does_not_force_warmup_off_after_charge() -> None:
         buttonStates=[0] * 8,
         setExtraEventButtonStyleSignal=style_signal,
         setSantokerWarmupButtonState=Mock(),
-        qmc=SimpleNamespace(timeindex=[10]),
+        qmc=SimpleNamespace(timeindex=[10], flagon=True, flagstart=False),
         santoker=device,
         santokerWarmupController=SantokerWarmupController(),
         sendmessage=Mock(),
@@ -1111,7 +1124,7 @@ def test_window_rejected_warmup_restoration_uses_signal_from_worker_thread() -> 
 
     button_state_signal = Mock()
     window = SimpleNamespace(
-        qmc=SimpleNamespace(timeindex=[10]),
+        qmc=SimpleNamespace(timeindex=[10], flagon=True, flagstart=False),
         santoker=FakeWarmupDevice(),
         santokerWarmupController=SantokerWarmupController(),
         santokerWarmupButtonStateSignal=button_state_signal,
@@ -1337,17 +1350,34 @@ def test_failed_machine_selection_restores_warmup_capability() -> None:
 
 
 @pytest.mark.parametrize(
-    ('capability', 'viewer', 'visible'),
-    [(True, False, True), (False, False, False), (True, True, False)],
+    ('capability', 'viewer', 'monitoring', 'recording', 'visible'),
+    [
+        (True, False, False, False, False),
+        (True, False, True, False, True),
+        (True, False, False, True, True),
+        (False, False, True, False, False),
+        (True, True, True, False, False),
+    ],
+    ids=['fully-off', 'monitoring', 'recording', 'no-capability', 'viewer'],
 )
 def test_window_updates_compact_control_visibility(
-    qapplication: QApplication, capability: bool, viewer: bool, visible: bool
+    qapplication: QApplication,
+    capability: bool,
+    viewer: bool,
+    monitoring: bool,
+    recording: bool,
+    visible: bool,
 ) -> None:
     del qapplication
     controls = SantokerWarmupControls()
     window = SimpleNamespace(
         app=SimpleNamespace(artisanviewerMode=viewer),
-        qmc=SimpleNamespace(mode_tempsliders='C', timeindex=[-1]),
+        qmc=SimpleNamespace(
+            mode_tempsliders='C',
+            timeindex=[-1],
+            flagon=monitoring,
+            flagstart=recording,
+        ),
         santokerWarmup=capability,
         santoker=None,
         santokerWarmupController=SantokerWarmupController(),
@@ -1362,6 +1392,62 @@ def test_window_updates_compact_control_visibility(
     assert controls.target.isEnabled() is visible
 
 
+def test_warmup_target_survives_off_on_visibility_cycle(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    device = FakeWarmupDevice(ready=False, warmup=False)
+    window = compact_window(
+        controls,
+        controller,
+        device,
+        monitoring=False,
+        recording=False,
+    )
+
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+    assert controls.isHidden()
+
+    window.qmc.flagon = True
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+    assert controls.isVisible()
+    assert controls.target.value() == 205
+    assert controls.target.isEnabled()
+    assert not controls.button.isEnabled()
+
+    window.qmc.flagon = False
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+    assert controls.isHidden()
+    assert controller.desired_temp_c == 205.0
+    assert device.calls == []
+
+
+def test_transport_disconnect_keeps_warmup_visible_while_monitoring(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    window = compact_window(
+        controls,
+        SantokerWarmupController(desired_temp_c=205.0),
+        FakeWarmupDevice(ready=True, warmup=True),
+    )
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+    assert controls.button.isEnabled()
+    assert controls.button.isChecked()
+
+    window.santoker = None
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+
+    assert controls.isVisible()
+    assert controls.target.isEnabled()
+    assert not controls.button.isEnabled()
+    assert not controls.button.isChecked()
+    assert controls.target.value() == 205
+
+
 def test_window_enables_compact_button_when_ready_before_charge(
     qapplication: QApplication,
 ) -> None:
@@ -1369,7 +1455,9 @@ def test_window_enables_compact_button_when_ready_before_charge(
     controls = SantokerWarmupControls()
     window = SimpleNamespace(
         app=SimpleNamespace(artisanviewerMode=False),
-        qmc=SimpleNamespace(mode_tempsliders='C', timeindex=[-1]),
+        qmc=SimpleNamespace(
+            mode_tempsliders='C', timeindex=[-1], flagon=True, flagstart=False
+        ),
         santokerWarmup=True,
         santoker=FakeWarmupDevice(ready=True, warmup=False),
         santokerWarmupController=SantokerWarmupController(),
@@ -1392,7 +1480,9 @@ def test_window_disables_and_unchecks_compact_button_after_charge(
     controls = SantokerWarmupControls()
     window = SimpleNamespace(
         app=SimpleNamespace(artisanviewerMode=False),
-        qmc=SimpleNamespace(mode_tempsliders='C', timeindex=[0]),
+        qmc=SimpleNamespace(
+            mode_tempsliders='C', timeindex=[0], flagon=True, flagstart=False
+        ),
         santokerWarmup=True,
         santoker=FakeWarmupDevice(ready=True, warmup=True),
         santokerWarmupController=SantokerWarmupController(),
@@ -1416,7 +1506,12 @@ def test_window_readiness_callback_refreshes_compact_button(
     device = FakeWarmupDevice(ready=False, warmup=False)
     window = SimpleNamespace(
         app=SimpleNamespace(artisanviewerMode=False),
-        qmc=SimpleNamespace(mode_tempsliders='C', timeindex=[-1]),
+        qmc=SimpleNamespace(
+            mode_tempsliders='C',
+            timeindex=[-1],
+            flagon=True,
+            flagstart=False,
+        ),
         santokerWarmup=True,
         santoker=device,
         santokerWarmupController=SantokerWarmupController(),

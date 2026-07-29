@@ -12024,7 +12024,11 @@ class ApplicationWindow(QMainWindow):
             self.hideControls(False)
 
     def updateSantokerWarmupControls(self) -> None:
-        visible = bool(self.santokerWarmup) and not self.app.artisanviewerMode
+        visible = (
+            bool(self.santokerWarmup)
+            and not self.app.artisanviewerMode
+            and (self.qmc.flagon or self.qmc.flagstart)
+        )
         unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
         target = self.santokerWarmupController.target_for_display(unit)
         self.santokerWarmupControls.configureTarget(unit, target)
