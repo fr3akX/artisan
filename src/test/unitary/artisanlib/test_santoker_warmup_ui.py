@@ -1,4 +1,5 @@
 import os
+import platform
 from collections.abc import Generator
 from typing import cast
 from unittest.mock import Mock, call
@@ -7,9 +8,16 @@ import pytest
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QVBoxLayout
+from PyQt6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
@@ -40,6 +48,71 @@ def test_compact_controls_layout_and_defaults(qapplication: QApplication) -> Non
     assert not controls.button.isChecked()
     assert controls.button.focusPolicy() is Qt.FocusPolicy.NoFocus
     assert not controls.target.keyboardTracking()
+
+
+def test_compact_controls_match_top_button_layout_height(
+    qapplication: QApplication,
+) -> None:
+    parent = QWidget()
+    layout = QHBoxLayout(parent)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    top_button = QPushButton('ON')
+    native_height = top_button.sizeHint().height()
+    height = int(round(native_height * (2 if platform.system() == 'Windows' else 1.3)))
+    top_button.setFixedHeight(height)
+    controls = SantokerWarmupControls()
+    controls.setCompactHeight(height)
+    layout.addWidget(top_button)
+    layout.addWidget(controls)
+
+    parent.show()
+    qapplication.processEvents()
+
+    controls_layout = controls.layout()
+    assert controls.height() == top_button.height() == height
+    assert controls_layout is not None
+    assert (
+        controls.button.height()
+        + controls_layout.spacing()
+        + controls.target.height()
+        == height
+    )
+    assert parent.sizeHint().height() == height
+
+
+def test_warmup_spacing_collapses_with_hidden_control(
+    qapplication: QApplication,
+) -> None:
+    parent = QWidget()
+    layout = QHBoxLayout(parent)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    on_button = QPushButton('ON')
+    on_button.setFixedSize(60, 34)
+    controls = SantokerWarmupControls()
+    controls.setFixedSize(90, 34)
+    start_button = QPushButton('START')
+    start_button.setFixedSize(60, 34)
+    layout.addStretch()
+    layout.addWidget(on_button)
+    layout.addSpacing(10)
+    layout.addWidget(controls)
+    layout.addWidget(start_button)
+
+    parent.show()
+    qapplication.processEvents()
+
+    controls_right = controls.button.mapTo(
+        parent, QPoint(controls.button.width() - 1, 0)
+    ).x()
+    assert controls.x() - (on_button.x() + on_button.width()) == 10
+    assert start_button.x() - controls_right - 1 == 10
+
+    controls.hide()
+    qapplication.processEvents()
+
+    assert start_button.x() - (on_button.x() + on_button.width()) == 10
 
 
 def test_button_click_emits_enabled_state(qapplication: QApplication) -> None:  # noqa: ARG001
@@ -99,6 +172,36 @@ def test_typing_emits_only_after_commit(qapplication: QApplication) -> None:
     QTest.keyClick(line_edit, Qt.Key.Key_Return)  # type: ignore[call-overload]
     qapplication.processEvents()
 
+    assert controls.target.value() == 205
+    changed.assert_called_once_with(205)
+
+
+def test_typing_commits_once_on_focus_loss(qapplication: QApplication) -> None:
+    parent = QWidget()
+    layout = QVBoxLayout(parent)
+    controls = SantokerWarmupControls()
+    controls.configureTarget('C', 200.0)
+    focus_recipient = QLineEdit()
+    layout.addWidget(controls)
+    layout.addWidget(focus_recipient)
+    parent.show()
+    parent.activateWindow()
+    qapplication.processEvents()
+
+    changed = Mock()
+    controls.targetChanged.connect(changed)
+    line_edit = controls.target.lineEdit()
+    assert line_edit is not None
+    line_edit.setFocus()
+    line_edit.selectAll()
+    QTest.keyClicks(line_edit, '205')  # type: ignore[call-arg,arg-type]
+    qapplication.processEvents()
+    changed.assert_not_called()
+
+    focus_recipient.setFocus()
+    qapplication.processEvents()
+
+    assert focus_recipient.hasFocus()
     assert controls.target.value() == 205
     changed.assert_called_once_with(205)
 

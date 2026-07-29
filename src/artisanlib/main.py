@@ -3235,7 +3235,7 @@ class ApplicationWindow(QMainWindow):
         self.santokerWarmupControls.button.setStyleSheet(self.pushbuttonstyles['OFF'])
         self.santokerWarmupControls.setGraphicsEffect(self.makeShadow())
         self.santokerWarmupControls.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.santokerWarmupControls.setMinimumHeight(self.standard_button_height)
+        self.santokerWarmupControls.setCompactHeight(self.standard_button_height)
         self.santokerWarmupControls.enabledChanged.connect(self.setSantokerWarmup)
         self.santokerWarmupControls.targetChanged.connect(self.santokerWarmupTargetEdited)
         self.santokerWarmupControls.hide()
@@ -3959,7 +3959,6 @@ class ApplicationWindow(QMainWindow):
         self.level1layout.addWidget(self.buttonONOFF)
         self.level1layout.addSpacing(10)
         self.level1layout.addWidget(self.santokerWarmupControls)
-        self.level1layout.addSpacing(10)
         self.level1layout.addWidget(self.buttonSTARTSTOP)
         self.level1layout.addSpacing(15)
         self.level1layout.addWidget(self.buttonCONTROL)
@@ -5888,6 +5887,7 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot(bool)
     def openMachineSettings(self, _checked:bool = False) -> None:
         action = self.sender()
+        restore_machine_selection:Callable[[], None]|None = None
         try:
             if action and isinstance(action, QAction) and hasattr(action,'data') and hasattr(action,'text'):
                 label = (action.text() if action.data()[1] == '' else f'{action.data()[1]} {action.text()}')
@@ -5917,6 +5917,28 @@ class ApplicationWindow(QMainWindow):
                     org_roastersize = self.qmc.roastersize
                     org_roasterheating_setup = self.qmc.roasterheating_setup
                     org_roasterheating = self.qmc.roasterheating
+                    org_santoker_warmup = self.santokerWarmup
+
+                    def restore_selection() -> None:
+                        self.qmc.etypes = org_etypes
+                        self.qmc.device = org_device
+                        self.qmc.machinesetup = org_machinesetup
+                        self.modbus.host = org_modbus_host
+                        self.s7.host = org_s7_host
+                        self.ws.host = org_ws_host
+                        self.kaleidoHost = org_kaleido_host
+                        self.mugmaHost = org_mugma_host
+                        self.ser.comport = org_comport
+                        self.modbus.comport = org_modbus_comport
+                        self.qmc.roastersize_setup = org_roastersize_setup
+                        self.qmc.last_batchsize = org_last_batchsize
+                        self.qmc.roastersize = org_roastersize
+                        self.qmc.roasterheating_setup = org_roasterheating_setup
+                        self.qmc.roasterheating = org_roasterheating
+                        self.santokerWarmup = org_santoker_warmup
+                        self.updateSantokerWarmupControls()
+
+                    restore_machine_selection = restore_selection
                     # reset roaster_setup_default to ensure we do not offer a default from a previously loaded machine setup
                     self.qmc.roastersize_setup_default = 0
                     self.qmc.roasterheating_setup_default = 0
@@ -6157,22 +6179,7 @@ class ApplicationWindow(QMainWindow):
                             res = False
                     if not res:
                         # reset
-                        self.qmc.etypes= org_etypes
-                        self.qmc.device = org_device
-                        self.qmc.machinesetup = org_machinesetup
-                        self.modbus.host = org_modbus_host
-                        self.s7.host = org_s7_host
-                        self.ws.host = org_ws_host
-                        self.kaleidoHost = org_kaleido_host
-                        self.mugmaHost = org_mugma_host
-                        self.ser.comport = org_comport
-                        self.modbus.comport = org_modbus_comport
-                        self.qmc.roastersize_setup = org_roastersize_setup
-                        self.qmc.last_batchsize = org_last_batchsize
-                        self.qmc.roastersize = org_roastersize
-                        self.qmc.roasterheating_setup = org_roasterheating_setup
-                        self.qmc.roasterheating = org_roasterheating
-                        #
+                        restore_machine_selection()
                         self.sendmessage(QApplication.translate('Message','Action canceled'))
                     else:
                         # setup not canceled, we establish the last_batchsize
@@ -6182,6 +6189,11 @@ class ApplicationWindow(QMainWindow):
                 self.qmc.redraw(False,False)
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
+            if restore_machine_selection is not None:
+                try:
+                    restore_machine_selection()
+                except Exception as restore_error: # pylint: disable=broad-except
+                    _log.exception(restore_error)
 
     def populateThemeMenu(self) -> None:
         self.themeMenu.clear()
@@ -18275,6 +18287,16 @@ class ApplicationWindow(QMainWindow):
                 'DesignerPosition','PIDLCDGeometry','ScaleLCDGeometry', 'MainSplitter', 'StatisticsGeometry']:
             settings.remove(s)
 
+    def loadSantokerWarmupCapability(self, settings:QSettings, *, theme:bool) -> None:
+        if not theme:
+            self.santokerWarmup = toBool(settings.value('santokerWarmup', False))
+
+    def saveSantokerWarmupCapability(self, settings:QSettings,
+            default_settings:dict[str, Any]|None, *, read_defaults:bool) -> None:
+        ApplicationWindow.settingsSetValue(
+            settings, default_settings, 'santokerWarmup', self.santokerWarmup, read_defaults
+        )
+
     #loads the settings at the start of application. See the oppposite closeEventSettings()
     def settingsLoad(self, filename:str|None = None, theme:bool = False, machine:bool = False, redraw:bool = True) -> bool: # pyright: ignore [reportGeneralTypeIssues] # Code is too complex to analyze; reduce complexity by refactoring into subroutines or reducing
         res = False
@@ -18554,7 +18576,7 @@ class ApplicationWindow(QMainWindow):
             self.santokerPort = toInt(settings.value('santokerPort',self.santokerPort))
             self.santokerSerial = toBool(settings.value('santokerSerial',self.santokerSerial))
             self.santokerBLE = toBool(settings.value('santokerBLE',self.santokerBLE))
-            self.santokerWarmup = toBool(settings.value('santokerWarmup',self.santokerWarmup))
+            self.loadSantokerWarmupCapability(settings, theme=theme)
             if settings.contains('santokerEventFlags'):
                 self.santokerEventFlags = [toBool(x) for x in toList(settings.value('santokerEventFlags',self.santokerEventFlags))]
             self.kaleidoHost = toString(settings.value('kaleidoHost',self.kaleidoHost))
@@ -20638,7 +20660,9 @@ class ApplicationWindow(QMainWindow):
             self.settingsSetValue(settings, default_settings, 'santokerPort',self.santokerPort, read_defaults)
             self.settingsSetValue(settings, default_settings, 'santokerSerial',self.santokerSerial, read_defaults)
             self.settingsSetValue(settings, default_settings, 'santokerBLE',self.santokerBLE, read_defaults)
-            self.settingsSetValue(settings, default_settings, 'santokerWarmup',self.santokerWarmup, read_defaults)
+            self.saveSantokerWarmupCapability(
+                settings, default_settings, read_defaults=read_defaults
+            )
             self.settingsSetValue(settings, default_settings, 'santokerEventFlags',self.santokerEventFlags, read_defaults)
             self.settingsSetValue(settings, default_settings, 'kaleidoHost',self.kaleidoHost, read_defaults)
             self.settingsSetValue(settings, default_settings, 'kaleidoPort',self.kaleidoPort, read_defaults)

@@ -28,6 +28,8 @@ class SantokerWarmupControls(QFrame):
     enabledChanged = pyqtSignal(bool)
     targetChanged = pyqtSignal(int)
 
+    trailing_spacing = 10
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
@@ -42,13 +44,27 @@ class SantokerWarmupControls(QFrame):
         self.target.setToolTip(QApplication.translate('Tooltip', 'Warm-up target'))
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 0, self.trailing_spacing, 0)
         layout.setSpacing(2)
         layout.addWidget(self.button)
         layout.addWidget(self.target)
 
         self.button.clicked.connect(self.enabledChanged.emit)
         self.target.valueChanged.connect(self.targetChanged.emit)
+
+    def setCompactHeight(self, height: int) -> None:
+        layout = self.layout()
+        if layout is None:
+            return
+        fixed_height = max(2, height)
+        spacing = min(layout.spacing(), fixed_height - 2)
+        child_height = fixed_height - spacing
+        button_height = (child_height + 1) // 2
+        target_height = child_height - button_height
+        layout.setSpacing(spacing)
+        self.button.setFixedHeight(button_height)
+        self.target.setFixedHeight(target_height)
+        self.setFixedHeight(fixed_height)
 
     def configureTarget(self, unit: Literal['C', 'F'], value: float) -> None:
         was_blocked = self.target.blockSignals(True)

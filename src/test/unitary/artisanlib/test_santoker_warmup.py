@@ -7,14 +7,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast, override
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QMainWindow, QSlider
+from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtGui import QAction
+from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QSlider
 
 from artisanlib.main import ApplicationWindow
 from artisanlib.santoker_warmup import SantokerWarmupController
@@ -1139,6 +1140,204 @@ def test_window_rejected_warmup_restoration_uses_signal_from_worker_thread() -> 
     window.reportSantokerWarmupResult.assert_called_once_with(WarmupResult.AFTER_CHARGE)
     button_state_signal.emit.assert_called_once_with(False)
     assert window.santoker.calls == []
+
+
+def load_warmup_capability(
+    window: SimpleNamespace,
+    filename: Path,
+    *,
+    theme: bool = False,
+) -> None:
+    settings = QSettings(str(filename), QSettings.Format.IniFormat)
+    settings.beginGroup('Device')
+    try:
+        ApplicationWindow.loadSantokerWarmupCapability(
+            cast(ApplicationWindow, window), settings, theme=theme
+        )
+    finally:
+        settings.endGroup()
+
+
+def test_warmup_capability_defaults_false_for_legacy_settings(tmp_path: Path) -> None:
+    legacy = tmp_path / 'legacy.aset'
+    settings = QSettings(str(legacy), QSettings.Format.IniFormat)
+    settings.setValue('Mode', 'C')
+    settings.sync()
+    window = SimpleNamespace(santokerWarmup=True)
+
+    load_warmup_capability(window, legacy)
+
+    assert window.santokerWarmup is False
+
+
+def test_warmup_capability_machine_transition_x3_to_qx(tmp_path: Path) -> None:
+    machine_dir = Path(__file__).parents[3] / 'includes' / 'Machines' / 'Santoker'
+    window = SimpleNamespace()
+    window.santokerWarmup = False
+
+    load_warmup_capability(window, machine_dir / 'X3_Master_Bluetooth.aset')
+    assert bool(window.santokerWarmup)
+
+    load_warmup_capability(window, machine_dir / 'Q_+_X_Series_Bluetooth.aset')
+    assert not bool(window.santokerWarmup)
+
+    persistent = QSettings(
+        str(tmp_path / 'persistent.ini'), QSettings.Format.IniFormat
+    )
+    persistent.setValue('Device/santokerWarmup', True)
+    persistent.beginGroup('Device')
+    ApplicationWindow.saveSantokerWarmupCapability(
+        cast(ApplicationWindow, window),
+        persistent,
+        {'Device/santokerWarmup': False},
+        read_defaults=False,
+    )
+    persistent.endGroup()
+    assert not persistent.contains('Device/santokerWarmup')
+
+
+@pytest.mark.parametrize('capability', [False, True])
+def test_warmup_capability_qsettings_roundtrip(
+    tmp_path: Path, capability: bool
+) -> None:
+    filename = tmp_path / 'settings.aset'
+    settings = QSettings(str(filename), QSettings.Format.IniFormat)
+    settings.beginGroup('Device')
+    source = SimpleNamespace(santokerWarmup=capability)
+    ApplicationWindow.saveSantokerWarmupCapability(
+        cast(ApplicationWindow, source), settings, None, read_defaults=False
+    )
+    settings.endGroup()
+    settings.sync()
+
+    restored = SimpleNamespace(santokerWarmup=not capability)
+    load_warmup_capability(restored, filename)
+
+    assert restored.santokerWarmup is capability
+
+
+@pytest.mark.parametrize('capability', [False, True])
+def test_theme_load_preserves_warmup_capability(
+    tmp_path: Path, capability: bool
+) -> None:
+    theme = tmp_path / 'theme.athm'
+    settings = QSettings(str(theme), QSettings.Format.IniFormat)
+    settings.setValue('Device/santokerWarmup', not capability)
+    settings.sync()
+    window = SimpleNamespace(santokerWarmup=capability)
+
+    load_warmup_capability(window, theme, theme=True)
+
+    assert window.santokerWarmup is capability
+
+
+def machine_selection_window(
+    original_capability: bool,
+    target_capability: bool,
+    refreshes: list[bool],
+) -> tuple[SimpleNamespace, QAction]:
+    target_name = 'Santoker X3 Master BT' if target_capability else 'Santoker Q + X Series BT'
+    action = QAction(target_name)
+    action.setData(('target.aset', 'Santoker', 'Santoker'))
+    qmc = SimpleNamespace(
+        etypes=['Air', 'Drum', 'Damper', 'Burner', '--'],
+        etypesdefault=['Air', 'Drum', 'Damper', 'Burner', '--'],
+        device=134 if original_capability else 18,
+        extradevices=[],
+        machinesetup='original',
+        roastersize_setup=1.0,
+        last_batchsize=1000.0,
+        roastersize=1.0,
+        roasterheating_setup=1,
+        roasterheating=1,
+        roastersize_setup_default=1.0,
+        roasterheating_setup_default=1,
+        heating_types=['Electric'],
+        weight=(1.0, 0.0, 'Kg'),
+        redraw=Mock(),
+    )
+    window = SimpleNamespace(
+        qmc=qmc,
+        modbus=SimpleNamespace(
+            host='modbus',
+            default_host='default-modbus',
+            comport='COM1',
+            default_comport='COM0',
+            type=0,
+        ),
+        s7=SimpleNamespace(host='s7', default_host='default-s7'),
+        ws=SimpleNamespace(host='ws', default_host='default-ws'),
+        kaleidoHost='kaleido',
+        kaleido_default_host='default-kaleido',
+        mugmaHost='mugma',
+        mugma_default_host='default-mugma',
+        ser=SimpleNamespace(comport='COM1', default_comport='COM0'),
+        santokerSerial=False,
+        santokerBLE=False,
+        santokerWarmup=original_capability,
+        sender=lambda: action,
+        sendmessage=Mock(),
+        establish_etypes=Mock(),
+    )
+
+    def refresh() -> None:
+        refreshes.append(window.santokerWarmup)
+
+    def load_settings(**_kwargs: object) -> None:
+        window.santokerWarmup = target_capability
+        qmc.device = 999
+        qmc.roastersize_setup = 1.0
+        qmc.roasterheating_setup = 0
+        refresh()
+
+    window.updateSantokerWarmupControls = refresh
+    window.loadSettings = load_settings
+    return window, action
+
+
+@pytest.mark.parametrize(
+    ('original_capability', 'target_capability'),
+    [(False, True), (True, False)],
+)
+def test_canceled_machine_selection_restores_warmup_capability(
+    original_capability: bool,
+    target_capability: bool,
+) -> None:
+    refreshes: list[bool] = []
+    window, _action = machine_selection_window(
+        original_capability, target_capability, refreshes
+    )
+    dialog = Mock()
+    dialog.exec.return_value = False
+
+    with (
+        patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes),
+        patch('artisanlib.main.ArtisanComboBoxDialog', return_value=dialog),
+    ):
+        ApplicationWindow.openMachineSettings(cast(ApplicationWindow, window))
+
+    assert window.santokerWarmup is original_capability
+    assert refreshes == [target_capability, original_capability]
+
+
+def test_failed_machine_selection_restores_warmup_capability() -> None:
+    refreshes: list[bool] = []
+    window, _action = machine_selection_window(False, True, refreshes)
+
+    def failed_load(**_kwargs: object) -> None:
+        window.santokerWarmup = True
+        window.updateSantokerWarmupControls()
+        raise RuntimeError('machine load failed')
+
+    window.loadSettings = failed_load
+
+    with patch.object(
+        QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes
+    ):
+        ApplicationWindow.openMachineSettings(cast(ApplicationWindow, window))
+
+    assert window.santokerWarmup is False
+    assert refreshes == [True, False]
 
 
 @pytest.mark.parametrize(
