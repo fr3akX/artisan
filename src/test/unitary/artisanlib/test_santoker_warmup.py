@@ -56,6 +56,12 @@ class FakeWarmupDevice:
         return self.ready
 
 
+@dataclass
+class ParserWarmupDevice(FakeWarmupDevice):
+    def send_msg(self, target: bytes, value: int) -> None:
+        self.calls.append(('raw', (target, value)))
+
+
 def test_controller_converts_fahrenheit_and_updates_device() -> None:
     from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 
@@ -1021,6 +1027,51 @@ def test_cancelled_reset_does_not_clear_charge_latch(
     )
     assert controller.is_charge_latched()
     canvas.aw.updateSantokerWarmupControls.assert_not_called()
+
+
+def test_parser_executes_warmup_off_before_raw_santoker_command() -> None:
+    device = ParserWarmupDevice(warmup=True)
+    window = SimpleNamespace(
+        simulator=False,
+        qmc=SimpleNamespace(
+            weight=[0.0, 0.0, 'g'],
+            flagstart=False,
+            flagon=False,
+            timeindex=[-1],
+        ),
+        lastbuttonpressed=-1,
+        lastIOResult=None,
+        buttonlist=[],
+        buttonStates=[],
+        santokerWarmup=True,
+        santoker=device,
+        santokerWarmupController=SantokerWarmupController(),
+        santokerWarmupButtonStateSignal=Mock(),
+        reportSantokerWarmupResult=Mock(),
+    )
+
+    def set_warmup(enabled: bool) -> bool:
+        return ApplicationWindow.setSantokerWarmup(
+            cast(ApplicationWindow, window), enabled
+        )
+
+    window.setSantokerWarmup = set_warmup
+
+    def send_message(target: bytes, value: int) -> None:
+        ApplicationWindow.santokerSendMessage(
+            cast(ApplicationWindow, window), target, value
+        )
+
+    window.santokerSendMessageSignal = SimpleNamespace(emit=send_message)
+
+    ApplicationWindow.eventaction_internal(
+        cast(ApplicationWindow, window),
+        6,
+        'santokerWarmup(0);santoker(80,1)',
+        None,
+    )
+
+    assert device.calls == [('enabled', False), ('raw', (b'\x80', 1))]
 
 
 @pytest.mark.parametrize(

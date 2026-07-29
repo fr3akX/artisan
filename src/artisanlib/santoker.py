@@ -382,7 +382,10 @@ class Santoker(AsyncComm):
         elif target == self.WARMUP_TEMP:
             temp_c = value / 10.0
             if self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
-                changed = temp_c != self._reported_warmup_target
+                changed = (
+                    temp_c != self._reported_warmup_target
+                    or temp_c != self._warmup_target
+                )
                 self._reported_warmup_target = temp_c
                 self._warmup_target = temp_c
                 if changed and self._warmup_temp_handler is not None:

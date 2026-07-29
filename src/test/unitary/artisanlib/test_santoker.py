@@ -978,6 +978,22 @@ class TestSantokerWarmupProtocol:
         state_handler.assert_called_once_with(True)
         target_handler.assert_called_once_with(190.0)
 
+    def test_repeated_target_report_reconciles_local_target_update(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        target_handler = Mock()
+        santoker = Santoker(warmup_temp_handler=target_handler)
+        santoker._header_ready = True
+
+        santoker.register_reading(Santoker.WARMUP_TEMP, (1900).to_bytes(3, 'big'))
+        assert santoker.setWarmupTarget(200.0)
+        santoker.register_reading(Santoker.WARMUP_TEMP, (1900).to_bytes(3, 'big'))
+        santoker.register_reading(Santoker.WARMUP_TEMP, (1900).to_bytes(3, 'big'))
+
+        assert target_handler.call_args_list == [call(190.0), call(190.0)]
+        assert santoker.getWarmupTarget() == 190.0
+
     @pytest.mark.parametrize(
         ('target', 'data'),
         [
