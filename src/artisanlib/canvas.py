@@ -12304,7 +12304,7 @@ class tgraphcanvas(QObject):
             else:
                 self.aw.pidcontrol.conv2fahrenheit()
             self.mode_tempsliders = self.mode
-            self.aw.initializeSantokerWarmupSlider()
+            self.aw.updateSantokerWarmupControls()
 
     #sets the graph display in Fahrenheit mode
     def fahrenheitMode(self, setdefaultaxes:bool = True) -> None:

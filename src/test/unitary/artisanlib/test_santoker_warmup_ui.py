@@ -30,8 +30,12 @@ def test_compact_controls_layout_and_defaults(qapplication: QApplication) -> Non
 
     layout = controls.layout()
     assert isinstance(layout, QVBoxLayout)
-    assert layout.itemAt(0).widget() is controls.button
-    assert layout.itemAt(1).widget() is controls.target
+    button_item = layout.itemAt(0)
+    target_item = layout.itemAt(1)
+    assert button_item is not None
+    assert target_item is not None
+    assert button_item.widget() is controls.button
+    assert target_item.widget() is controls.target
     assert controls.button.isCheckable()
     assert not controls.button.isChecked()
     assert controls.button.focusPolicy() is Qt.FocusPolicy.NoFocus
@@ -85,13 +89,14 @@ def test_typing_emits_only_after_commit(qapplication: QApplication) -> None:
     controls.targetChanged.connect(changed)
 
     line_edit = controls.target.lineEdit()
+    assert line_edit is not None
     line_edit.setFocus()
     qapplication.processEvents()
     line_edit.setText('205')
 
     changed.assert_not_called()
 
-    QTest.keyClick(line_edit, Qt.Key.Key_Return)
+    QTest.keyClick(line_edit, Qt.Key.Key_Return)  # type: ignore[call-overload]
     qapplication.processEvents()
 
     assert controls.target.value() == 205

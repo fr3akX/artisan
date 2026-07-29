@@ -1102,8 +1102,14 @@ class TestSantokerWarmupProtocol:
 
         state_handler = Mock()
         callback_events: list[tuple[str, bool, bool | None, float]] = []
-        ready_handler = Mock(
-            side_effect=lambda ready: callback_events.append(
+        callback_state: list[tuple[bool, bool | None, float]] = []
+        ready_calls: list[bool] = []
+        santoker_ref: list[Santoker] = []
+
+        def ready_handler(ready: bool) -> None:
+            santoker = santoker_ref[0]
+            ready_calls.append(ready)
+            callback_events.append(
                 (
                     'ready',
                     ready,
@@ -1111,29 +1117,31 @@ class TestSantokerWarmupProtocol:
                     santoker.getWarmupTarget(),
                 )
             )
-        )
-        callback_state: list[tuple[bool, bool | None, float]] = []
+
+        def disconnected_handler() -> None:
+            santoker = santoker_ref[0]
+            callback_events.append(
+                (
+                    'disconnect',
+                    santoker.isHeaderReady(),
+                    santoker.getWarmup(),
+                    santoker.getWarmupTarget(),
+                )
+            )
+            callback_state.append(
+                (
+                    santoker.isHeaderReady(),
+                    santoker.getWarmup(),
+                    santoker.getWarmupTarget(),
+                )
+            )
+
         santoker = Santoker(
             warmup_handler=state_handler,
             ready_handler=ready_handler,
-            disconnected_handler=lambda: (
-                callback_events.append(
-                    (
-                        'disconnect',
-                        santoker.isHeaderReady(),
-                        santoker.getWarmup(),
-                        santoker.getWarmupTarget(),
-                    )
-                ),
-                callback_state.append(
-                    (
-                        santoker.isHeaderReady(),
-                        santoker.getWarmup(),
-                        santoker.getWarmupTarget(),
-                    )
-                ),
-            ),
+            disconnected_handler=disconnected_handler,
         )
+        santoker_ref.append(santoker)
         santoker._header_ready = True
         with patch.object(Santoker, 'send_msg'):
             assert santoker.setWarmupTarget(195.0)
@@ -1148,4 +1156,4 @@ class TestSantokerWarmupProtocol:
             ('disconnect', False, None, 195.0),
         ]
         assert state_handler.call_args_list[-1] == call(None)
-        assert ready_handler.call_args_list == [call(False)]
+        assert ready_calls == [False]

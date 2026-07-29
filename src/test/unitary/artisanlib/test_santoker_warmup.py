@@ -4,7 +4,8 @@ from configparser import ConfigParser
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast, override
+from typing import Literal, cast, override
+from unittest.mock import Mock
 
 import pytest
 
@@ -170,309 +171,239 @@ def test_post_charge_on_report_is_forced_off() -> None:
     assert device.calls == [('enabled', False)]
 
 
-def test_semantic_control_lookup() -> None:
-    from artisanlib.santoker_warmup import find_warmup_buttons, find_warmup_slider
+class ImmediateBoolSignal:
+    def __init__(self, slot: object) -> None:
+        self.slot = slot
+        self.emissions: list[bool] = []
 
-    assert find_warmup_slider([
-        'santoker(ca,{})',
-        '',
-        'santokerWarmupTemp({})',
-        'santoker(fa,{})',
-    ]) == 2
-    assert find_warmup_buttons([
-        'santoker(fa,10)',
-        'santokerWarmup(1 - $)',
-        'santokerWarmup(0)',
-    ]) == [1, 2]
+    def emit(self, enabled: bool) -> None:
+        self.emissions.append(enabled)
+        self.slot(enabled)  # type: ignore[operator]
 
 
-def test_window_updates_only_semantic_warmup_buttons() -> None:
-    from types import SimpleNamespace
+def compact_window(
+    controls: SantokerWarmupControls,
+    controller: SantokerWarmupController,
+    device: FakeWarmupDevice | None,
+    *,
+    unit: str = 'C',
+    charge_index: int = -1,
+    capability: bool = True,
+) -> SimpleNamespace:
+    window = SimpleNamespace(
+        app=SimpleNamespace(artisanviewerMode=False),
+        qmc=SimpleNamespace(mode_tempsliders=unit, timeindex=[charge_index]),
+        santokerWarmup=capability,
+        santoker=device,
+        santokerWarmupController=controller,
+        santokerWarmupControls=controls,
+        pushbuttonstyles={'OFF': 'off-style', 'ON': 'on-style'},
+        extraeventsactionstrings=[],
+        buttonStates=[],
+        setExtraEventButtonStyleSignal=Mock(),
+        reportSantokerWarmupResult=Mock(),
+        sendmessage=Mock(),
+    )
+    window.santokerWarmupButtonStateSignal = ImmediateBoolSignal(
+        lambda enabled: ApplicationWindow.setSantokerWarmupButtonState(
+            cast(ApplicationWindow, window), enabled
+        )
+    )
+    return window
+
+
+def test_reported_target_updates_spinbox_without_command(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
     from unittest.mock import Mock
 
-    style_signal = Mock()
-    window = SimpleNamespace(
-        extraeventsactionstrings=['santoker(fa,10)', 'santokerWarmup(1 - $)'],
-        buttonStates=[0, 0],
-        setExtraEventButtonStyleSignal=style_signal,
+    controls = SantokerWarmupControls()
+    device = FakeWarmupDevice()
+    controller = SantokerWarmupController()
+    changed = Mock()
+    controls.targetChanged.connect(changed)
+    window = compact_window(controls, controller, device, unit='C')
+
+    ApplicationWindow.santokerWarmupTargetChanged(
+        cast(ApplicationWindow, window), 205.0
     )
 
-    ApplicationWindow.setSantokerWarmupButtonState(cast(ApplicationWindow, window), True)
-
-    assert window.buttonStates == [0, 1]
-    style_signal.emit.assert_called_once_with(1, 'pressed')
-
-
-def test_window_moves_warmup_slider_without_firing_action() -> None:
-    from types import SimpleNamespace
-    from unittest.mock import Mock, call
-
-    from artisanlib.santoker_warmup import SantokerWarmupController
-
-    slider = Mock()
-    slider.blockSignals = Mock()
-    window = SimpleNamespace(
-        eventslidercommands=['', '', 'santokerWarmupTemp({})', ''],
-        extraeventsactionstrings=['santokerWarmup(1 - $)'],
-        eventslidermin=[0, 0, 100, 0],
-        eventslidermax=[100, 100, 300, 100],
-        qmc=SimpleNamespace(mode_tempsliders='C'),
-        santokerWarmupController=SantokerWarmupController(),
-        slider3=slider,
-        moveslider=Mock(),
-    )
-
-    ApplicationWindow.santokerWarmupTargetChanged(cast(ApplicationWindow, window), 190.0)
-
-    assert window.santokerWarmupController.desired_temp_c == 190.0
-    assert slider.blockSignals.call_args_list == [call(True), call(False)]
-    window.moveslider.assert_called_once_with(2, 190.0, forceLCDupdate=True)
+    assert controls.target.value() == 205
+    assert controller.desired_temp_c == 205.0
+    changed.assert_not_called()
+    assert device.calls == []
 
 
 @pytest.mark.parametrize(
-    ('current_unit', 'expected_target'), [('C', 190), ('F', 374)]
+    ('ready', 'charge_index', 'enabled'),
+    [(False, -1, False), (True, -1, True), (True, 0, False)],
+    ids=['not-ready', 'ready-before-charge', 'ready-after-charge'],
 )
-def test_warmup_preset_load_initializes_after_temperature_metadata(
-    current_unit: str, expected_target: int
+def test_compact_readiness_enables_only_before_charge(
+    qapplication: QApplication,
+    ready: bool,
+    charge_index: int,
+    enabled: bool,
 ) -> None:
-    from types import SimpleNamespace
-    from unittest.mock import Mock, call
-
-    from artisanlib.santoker_warmup import SantokerWarmupController
-
-    src_dir = Path(__file__).parents[3]
-    preset = src_dir / 'includes' / 'Machines' / 'Santoker' / 'X3_Master_Bluetooth.aset'
-    config = ConfigParser(interpolation=None, strict=False)
-    assert config.read(preset, encoding='utf-8') == [str(preset)]
-
-    commands = parse_ini_array(config.get('Sliders', 'slidercommands'))
-    min_values = [int(value) for value in parse_ini_array(config.get('Sliders', 'slidermin'))]
-    max_values = [int(value) for value in parse_ini_array(config.get('Sliders', 'slidermax'))]
-    temp_flags = [int(value) for value in parse_ini_array(
-        config.get('Sliders', 'eventslidertemp')
-    )]
-    preset_unit = config.get('Sliders', 'ModeTempSliders')
-    assert preset_unit == 'C'
-
-    # 300 reproduces the value left by premature Fahrenheit clamping.
-    displayed_values = [0, 0, 300, 0]
-    sliders = [Mock() for _ in range(4)]
-    for index, slider in enumerate(sliders):
-        slider.value.side_effect = lambda index=index: displayed_values[index]
-
-    def moveslider(index: int, value: float, *, forceLCDupdate: bool = False) -> None:
-        del forceLCDupdate
-        displayed_values[index] = int(round(value))
-
-    qmc = SimpleNamespace(mode_tempsliders=current_unit)
-    window = SimpleNamespace(
-        slider1=sliders[0],
-        slider2=sliders[1],
-        slider3=sliders[2],
-        slider4=sliders[3],
-        eventslidercommands=commands,
-        eventslidermin=min_values,
-        eventslidermax=max_values,
-        eventslidervalues=displayed_values,
-        eventslidertemp=[0, 0, 0, 0],
-        extraeventsactionstrings=['santokerWarmup(1 - $)'],
-        qmc=qmc,
-        santokerWarmupController=SantokerWarmupController(),
-        moveslider=moveslider,
-        updateSliderLCD=Mock(),
+    del qapplication
+    controls = SantokerWarmupControls()
+    window = compact_window(
+        controls,
+        SantokerWarmupController(),
+        FakeWarmupDevice(ready=ready, warmup=False),
+        charge_index=charge_index,
     )
 
-    # settingsLoad() applies base limits before loading the temperature metadata.
-    ApplicationWindow.updateSliderMinMax(cast(ApplicationWindow, window))
-    window.eventslidertemp = temp_flags
-    qmc.mode_tempsliders = preset_unit
-    if current_unit == 'F':
-        window.eventslidermin[2] = 212
-        window.eventslidermax[2] = 572
-    qmc.mode_tempsliders = current_unit
-    sliders[2].blockSignals.reset_mock()
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
 
-    ApplicationWindow.initializeSantokerWarmupSlider(
-        cast(ApplicationWindow, window)
+    assert controls.button.isEnabled() is enabled
+    assert not controls.button.isChecked()
+
+
+def test_compact_button_click_sends_target_before_enable(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    device = FakeWarmupDevice(ready=True, warmup=False)
+    window = compact_window(
+        controls,
+        SantokerWarmupController(desired_temp_c=205.0),
+        device,
+    )
+    controls.enabledChanged.connect(
+        lambda enabled: ApplicationWindow.setSantokerWarmup(
+            cast(ApplicationWindow, window), enabled
+        )
     )
 
-    assert displayed_values[2] == expected_target
-    assert window.santokerWarmupController.desired_temp_c == 190.0
-    assert sliders[2].blockSignals.call_args_list == [call(True), call(False)]
+    controls.button.click()
+
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+    assert controls.button.isChecked()
+    assert window.santokerWarmupButtonStateSignal.emissions == [True]
+
+
+def test_rejected_compact_button_click_restores_check_state(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    device = FakeWarmupDevice(ready=False, warmup=False)
+    window = compact_window(controls, SantokerWarmupController(), device)
+    controls.enabledChanged.connect(
+        lambda enabled: ApplicationWindow.setSantokerWarmup(
+            cast(ApplicationWindow, window), enabled
+        )
+    )
+
+    controls.button.click()
+
+    assert not controls.button.isChecked()
+    assert device.calls == []
+    assert window.santokerWarmupButtonStateSignal.emissions == [False]
+
+
+def test_target_field_edit_caches_while_inactive_and_sends_while_active(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    device = FakeWarmupDevice(ready=True, warmup=False)
+    controller = SantokerWarmupController()
+    window = compact_window(controls, controller, device)
+
+    ApplicationWindow.santokerWarmupTargetEdited(cast(ApplicationWindow, window), 205)
+
+    assert controller.desired_temp_c == 205.0
+    assert device.calls == []
+
+    device.warmup = True
+    ApplicationWindow.santokerWarmupTargetEdited(cast(ApplicationWindow, window), 210)
+
+    assert controller.desired_temp_c == 210.0
+    assert device.calls == [('target', 210.0)]
+
+
+def test_warmup_report_updates_compact_state_without_command(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    device = FakeWarmupDevice(ready=True, warmup=True)
+    window = compact_window(controls, SantokerWarmupController(), device)
+    changed = Mock()
+    controls.enabledChanged.connect(changed)
+
+    ApplicationWindow.santokerWarmupStateChanged(cast(ApplicationWindow, window), True)
+
+    assert controls.button.isChecked()
+    changed.assert_not_called()
+    assert device.calls == []
 
 
 @pytest.mark.parametrize(
-    (
-        'initial_unit',
-        'new_unit',
-        'initial_target',
-        'initial_min',
-        'initial_max',
-        'expected_target',
-        'expected_min',
-        'expected_max',
-    ),
-    [
-        ('C', 'F', 190, 100, 300, 374, 212, 572),
-        ('F', 'C', 374, 212, 572, 190, 100, 300),
-    ],
+    ('initial_unit', 'new_unit', 'expected_target'),
+    [('C', 'F', 374), ('F', 'C', 190)],
     ids=['celsius-to-fahrenheit', 'fahrenheit-to-celsius'],
 )
-def test_runtime_temperature_mode_switch_restores_warmup_target(
+def test_temperature_mode_switch_refreshes_compact_target_without_slider_side_effects(
     qapplication: QApplication,
     initial_unit: str,
     new_unit: str,
-    initial_target: int,
-    initial_min: int,
-    initial_max: int,
     expected_target: int,
-    expected_min: int,
-    expected_max: int,
 ) -> None:
-    from types import SimpleNamespace
+    del qapplication
     from unittest.mock import Mock
 
     from artisanlib.canvas import tgraphcanvas
-    from artisanlib.santoker_warmup import SantokerWarmupController
 
-    del qapplication
-    slider_values = [10, 20, initial_target, 40]
+    controls = SantokerWarmupControls()
+    controls.configureTarget(cast(Literal['C', 'F'], initial_unit), 190.0 if initial_unit == 'C' else 374.0)
+    slider_values = [10, 20, 30, 40]
     sliders = [QSlider(Qt.Orientation.Vertical) for _ in range(4)]
-    min_values = [0, 0, initial_min, 0]
-    max_values = [100, 100, initial_max, 100]
     for index, slider in enumerate(sliders):
-        slider.setRange(min_values[index], max_values[index])
+        slider.setRange(0, 500)
         slider.setValue(slider_values[index])
-
     slider_actions = [Mock() for _ in sliders]
     for slider, action in zip(sliders, slider_actions, strict=True):
         slider.valueChanged.connect(action)
-
-    controller = SantokerWarmupController()
     pidcontrol = SimpleNamespace(conv2celsius=Mock(), conv2fahrenheit=Mock())
-    window = SimpleNamespace(
-        slider1=sliders[0],
-        slider2=sliders[1],
-        slider3=sliders[2],
-        slider4=sliders[3],
-        eventslidercommands=['', '', 'santokerWarmupTemp({})', ''],
-        eventslidermin=min_values,
-        eventslidermax=max_values,
-        eventslidervalues=slider_values,
-        eventslidertemp=[0, 0, 1, 0],
-        santokerWarmupController=controller,
-        pidcontrol=pidcontrol,
-        updateSliderLCD=Mock(),
+    window = compact_window(controls, SantokerWarmupController(), None, unit=initial_unit)
+    window.slider1 = sliders[0]
+    window.slider2 = sliders[1]
+    window.slider3 = sliders[2]
+    window.slider4 = sliders[3]
+    window.eventslidermin = [100, 0, 0, 0]
+    window.eventslidermax = [300, 100, 100, 100]
+    window.eventslidervalues = slider_values
+    window.eventslidertemp = [1, 0, 0, 0]
+    window.eventslidercommands = ['', '', '', '']
+    window.pidcontrol = pidcontrol
+    window.updateSliderLCD = Mock()
+    window.updateSliderMinMax = lambda: ApplicationWindow.updateSliderMinMax(
+        cast(ApplicationWindow, window)
+    )
+    window.updateSantokerWarmupControls = lambda: ApplicationWindow.updateSantokerWarmupControls(
+        cast(ApplicationWindow, window)
     )
     canvas = SimpleNamespace(
         aw=window,
         mode=new_unit,
         mode_tempsliders=initial_unit,
+        timeindex=[-1],
     )
     window.qmc = canvas
-    window.moveslider = lambda index, value, forceLCDupdate=False: (
-        ApplicationWindow.moveslider(
-            cast(ApplicationWindow, window), index, value, forceLCDupdate
-        )
-    )
-    window.updateSliderMinMax = lambda: ApplicationWindow.updateSliderMinMax(
-        cast(ApplicationWindow, window)
-    )
-    window.initializeSantokerWarmupSlider = (
-        lambda: ApplicationWindow.initializeSantokerWarmupSlider(
-            cast(ApplicationWindow, window)
-        )
-    )
 
     tgraphcanvas.adjustTempSliders(cast(tgraphcanvas, canvas))
 
     assert canvas.mode_tempsliders == new_unit
-    assert sliders[2].minimum() == expected_min
-    assert sliders[2].maximum() == expected_max
-    assert sliders[2].value() == expected_target
-    assert slider_values == [10, 20, expected_target, 40]
-    assert controller.desired_temp_c == 190.0
-    assert [slider.value() for slider in sliders if slider is not sliders[2]] == [
-        10, 20, 40
-    ]
+    assert controls.target.value() == expected_target
+    assert window.santokerWarmupController.desired_temp_c == 190.0
+    assert [slider.value() for slider in sliders[1:]] == [20, 30, 40]
     for action in slider_actions:
         action.assert_not_called()
-
-
-def test_warmup_button_uses_real_no_event_processing_path() -> None:
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    from artisanlib.santoker_warmup import SantokerWarmupController
-
-    src_dir = Path(__file__).parents[3]
-    preset = src_dir / 'includes' / 'Machines' / 'Santoker' / 'X3_Master_Bluetooth.aset'
-    config = ConfigParser(interpolation=None, strict=False)
-    assert config.read(preset, encoding='utf-8') == [str(preset)]
-
-    actions = [int(value) for value in parse_ini_array(
-        config.get('ExtraEventButtons', 'extraeventsactions')
-    )]
-    action_strings = parse_ini_array(
-        config.get('ExtraEventButtons', 'extraeventsactionstrings')
-    )
-    event_types = [int(value) for value in parse_ini_array(
-        config.get('ExtraEventButtons', 'extraeventstypes')
-    )]
-    event_values = [float(value) for value in parse_ini_array(
-        config.get('ExtraEventButtons', 'extraeventsvalues')
-    )]
-    warmup_button = action_strings.index('santokerWarmup(1 - $)')
-
-    slider_values = [20, 30, 190, 40]
-    last_values = slider_values.copy()
-    block_ticks = [0, 0, 0, 0]
-    event_record_signal = Mock()
-    overwrite_signal = Mock()
-    eventaction = Mock()
-
-    def moveslider(slider: int, value: float) -> None:
-        slider_values[slider] = int(value)
-
-    controller = SantokerWarmupController()
-    window = SimpleNamespace(
-        extraeventstypes=event_types,
-        extraeventsvalues=event_values,
-        extraeventsactionstrings=action_strings,
-        extraeventsactions=actions,
-        mark_last_button_pressed=False,
-        lastbuttonpressed=-1,
-        qmc=SimpleNamespace(
-            eventsInternal2ExternalValue=lambda value: value,
-            flagstart=True,
-            eventRecordSignal=event_record_signal,
-            eventRecordOverwriteValueSignal=overwrite_signal,
-        ),
-        eventslidermax=[100, 100, 300, 100],
-        eventslidermin=[0, 0, 100, 0],
-        extraeventsactionslastvalue=last_values,
-        block_quantification_sampling_ticks=block_ticks,
-        sampling_ticks_to_block_quantifiction=4,
-        calcEventValue=lambda _event_type, value: value,
-        eventaction=eventaction,
-        moveslider=moveslider,
-        santokerWarmupController=controller,
-    )
-
-    ApplicationWindow.recordextraevent(
-        cast(ApplicationWindow, window), warmup_button, updateButtons=False
-    )
-
-    assert controller.desired_temp_c == 190.0
-    assert slider_values == [20, 30, 190, 40]
-    assert last_values == [20, 30, 190, 40]
-    assert block_ticks == [0, 0, 0, 0]
-    event_record_signal.emit.assert_not_called()
-    overwrite_signal.emit.assert_not_called()
-    eventaction.assert_called_once_with(
-        6, 'santokerWarmup(1 - $)', parallel=True, eventtype=-1
-    )
-
 
 def test_warmup_on_and_charge_are_serialized() -> None:
     from threading import Barrier, Event, Thread
@@ -510,6 +441,7 @@ def test_warmup_on_and_charge_are_serialized() -> None:
         eventslidercommands=['', '', 'santokerWarmupTemp({})', ''],
         extraeventsactionstrings=['santokerWarmup(1 - $)'],
         qmc=qmc,
+        santokerWarmup=True,
         santoker=device,
         santokerWarmupController=SantokerWarmupController(),
         santokerWarmupButtonStateSignal=Mock(),

@@ -224,8 +224,6 @@ from artisanlib.santoker_warmup import (
     SantokerWarmupController,
     WarmupResult,
     find_warmup_buttons,
-    find_warmup_slider,
-    has_warmup_controls,
 )
 from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
@@ -3239,7 +3237,7 @@ class ApplicationWindow(QMainWindow):
         self.santokerWarmupControls.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.santokerWarmupControls.setMinimumHeight(self.standard_button_height)
         self.santokerWarmupControls.enabledChanged.connect(self.setSantokerWarmup)
-        self.santokerWarmupControls.targetChanged.connect(self.setSantokerWarmupTarget)
+        self.santokerWarmupControls.targetChanged.connect(self.santokerWarmupTargetEdited)
         self.santokerWarmupControls.hide()
 
         #create START/STOP buttons
@@ -8869,20 +8867,7 @@ class ApplicationWindow(QMainWindow):
             self.slider4.blockSignals(False)
 
     def initializeSantokerWarmupSlider(self) -> None:
-        warmup_slider = find_warmup_slider(self.eventslidercommands)
-        if warmup_slider is None:
-            return
-        unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
-        widgets = [self.slider1, self.slider2, self.slider3, self.slider4]
-        widgets[warmup_slider].blockSignals(True)
-        try:
-            self.moveslider(
-                warmup_slider,
-                self.santokerWarmupController.target_for_display(unit),
-                forceLCDupdate=True,
-            )
-        finally:
-            widgets[warmup_slider].blockSignals(False)
+        self.updateSantokerWarmupControls()
 
     # creates a drop shadow effect
     def makeShadow(self, strong:bool = False) -> QGraphicsDropShadowEffect:
@@ -18074,11 +18059,17 @@ class ApplicationWindow(QMainWindow):
 
     @pyqtSlot(bool)
     def santokerWarmupReadyChanged(self, _ready:bool) -> None:
-        ApplicationWindow.refreshSantokerWarmupControls(self)
+        if bool(getattr(self, 'santokerWarmup', False)):
+            ApplicationWindow.refreshSantokerWarmupControls(self)
 
     @pyqtSlot(bool)
     def setSantokerWarmupButtonState(self, enabled:bool) -> None:
-        ApplicationWindow.refreshSantokerWarmupControls(self)
+        controls = getattr(self, 'santokerWarmupControls', None)
+        if controls is not None:
+            controls.setState(enabled)
+            style = self.pushbuttonstyles['ON' if enabled else 'OFF']
+            controls.setStyleSheet(style)
+            controls.button.setStyleSheet(style)
         for button in find_warmup_buttons(self.extraeventsactionstrings):
             if button < len(self.buttonStates):
                 self.buttonStates[button] = int(enabled)
@@ -18089,9 +18080,7 @@ class ApplicationWindow(QMainWindow):
 
     def runSantokerWarmupCharge(self, action:Callable[[], None]) -> None:
         try:
-            if has_warmup_controls(
-                self.eventslidercommands, self.extraeventsactionstrings
-            ):
+            if bool(getattr(self, 'santokerWarmup', False)):
                 with self.santokerWarmupController.serialized():
                     action()
             else:
@@ -18101,42 +18090,23 @@ class ApplicationWindow(QMainWindow):
 
     @pyqtSlot(float)
     def santokerWarmupTargetChanged(self, temp_c:float) -> None:
-        if not has_warmup_controls(
-            self.eventslidercommands, self.extraeventsactionstrings
-        ):
+        if not bool(getattr(self, 'santokerWarmup', False)):
             return
         self.santokerWarmupController.accept_reported_target(temp_c)
-        slider = find_warmup_slider(self.eventslidercommands)
-        if slider is None:
-            return
-        unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
-        value = self.santokerWarmupController.target_for_display(unit)
-        widgets = [
-            getattr(self, 'slider1', None),
-            getattr(self, 'slider2', None),
-            getattr(self, 'slider3', None),
-            getattr(self, 'slider4', None),
-        ]
-        widget = widgets[slider]
-        if widget is not None:
-            widget.blockSignals(True)
-        try:
-            self.moveslider(slider, value, forceLCDupdate=True)
-        finally:
-            if widget is not None:
-                widget.blockSignals(False)
         controls = getattr(self, 'santokerWarmupControls', None)
         if controls is not None:
-            self.updateSantokerWarmupControls()
+            unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
+            controls.configureTarget(
+                unit,
+                self.santokerWarmupController.target_for_display(unit),
+            )
 
     @pyqtSlot(object)
     def santokerWarmupStateChanged(self, state:object) -> None:
-        if not has_warmup_controls(
-            self.eventslidercommands, self.extraeventsactionstrings
-        ):
+        if not bool(getattr(self, 'santokerWarmup', False)):
             return
         if state is None:
-            self.setSantokerWarmupButtonState(False)
+            ApplicationWindow.setSantokerWarmupButtonState(self, False)
             return
         if not isinstance(state, bool):
             return
@@ -18145,7 +18115,7 @@ class ApplicationWindow(QMainWindow):
             self.qmc.timeindex[0],
             self.santoker,
         )
-        self.setSantokerWarmupButtonState(False if unsafe else state)
+        ApplicationWindow.setSantokerWarmupButtonState(self, False if unsafe else state)
         if unsafe:
             self.sendmessage(QApplication.translate(
                 'Message',
@@ -18170,17 +18140,26 @@ class ApplicationWindow(QMainWindow):
         if result in messages:
             self.sendmessage(messages[result])
 
+    @pyqtSlot(int)
+    def santokerWarmupTargetEdited(self, display_temp:int) -> None:
+        ApplicationWindow.setSantokerWarmupTarget(self, float(display_temp))
+
     def setSantokerWarmupTarget(self, display_temp:float) -> bool:
         unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
+        active_device = (
+            self.santoker
+            if self.santoker is not None and self.santoker.getWarmup() is True
+            else None
+        )
         result = self.santokerWarmupController.set_target(
             display_temp,
             unit,
-            self.santoker,
+            active_device,
         )
         self.reportSantokerWarmupResult(result)
         controls = getattr(self, 'santokerWarmupControls', None)
         if controls is not None:
-            self.updateSantokerWarmupControls()
+            ApplicationWindow.updateSantokerWarmupControls(self)
         return result is WarmupResult.OK
 
     def setSantokerWarmup(self, enabled:bool) -> bool:
