@@ -178,6 +178,11 @@
 </context><context>
     <name>Button</name>
     <message>
+        <location filename="../artisanlib/santoker_warmup_ui.py" line="34"/>
+        <source>WARM-UP</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
         <location filename="../artisanlib/colors.py" line="567"/>
         <location filename="../artisanlib/designer.py" line="244"/>
         <location filename="../artisanlib/phases.py" line="119"/>
@@ -20007,6 +20012,16 @@ Continue?</source>
     </message>
 </context><context>
     <name>Tooltip</name>
+    <message>
+        <location filename="../artisanlib/santoker_warmup_ui.py" line="37"/>
+        <source>Santoker warm-up</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_warmup_ui.py" line="42"/>
+        <source>Warm-up target</source>
+        <translation type="unfinished"/>
+    </message>
     <message>
         <location filename="../artisanlib/axis.py" line="83"/>
         <source>100% event values in step mode are aligned with the given y-axis value or the lowest phases limit if left empty</source>

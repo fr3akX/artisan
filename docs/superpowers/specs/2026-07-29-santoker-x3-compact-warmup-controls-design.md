@@ -1,7 +1,7 @@
 # Santoker X3 Compact Warm-up Controls Design
 
 **Date:** 2026-07-29
-**Status:** Approved in conversation; awaiting written-spec review
+**Status:** Implemented (Tasks 1–6 completed and reviewed through `8e40f62eb`; remaining protocol areas retain the static-analysis and hardware-verification caveats in `SANTOKER_X3_PREHEAT_PROTOCOL.md`)
 
 ## Purpose
 
