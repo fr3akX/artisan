@@ -8010,6 +8010,7 @@ class tgraphcanvas(QObject):
                 self.aw.eventactionx(self.xextrabuttonactions[0],self.xextrabuttonactionstrings[0])
             except Exception as e: # pylint: disable=broad-except
                 _log.exception(e)
+        reset_succeeded = False
         try:
             if self.designerflag:
                 # reset the users chosen widget visibility for the state
@@ -8296,6 +8297,7 @@ class tgraphcanvas(QObject):
             if self.crossmarker:
                 self.togglecrosslines()
 
+            reset_succeeded = True
         except Exception as ex: # pylint: disable=broad-except
             _log.exception(ex)
             _, _, exc_tb = sys.exc_info()
@@ -8354,6 +8356,11 @@ class tgraphcanvas(QObject):
 
 
         self.aw.sendmessage(QApplication.translate('Message','Scope has been reset'))
+
+        # reset the warm-up lifecycle only after all unrelated reset work completed
+        if reset_succeeded:
+            self.aw.santokerWarmupController.reset_charge()
+            self.aw.updateSantokerWarmupControls()
 
         #QApplication.processEvents() # this one seems to be needed for a proper redraw in fullscreen mode on OS X if a profile was loaded and NEW is pressed
         #   this processEvents() seems not to be needed any longer!?
@@ -12304,6 +12311,7 @@ class tgraphcanvas(QObject):
             else:
                 self.aw.pidcontrol.conv2fahrenheit()
             self.mode_tempsliders = self.mode
+            self.aw.updateSantokerWarmupControls()
 
     #sets the graph display in Fahrenheit mode
     def fahrenheitMode(self, setdefaultaxes:bool = True) -> None:
@@ -13231,7 +13239,12 @@ class tgraphcanvas(QObject):
                         dry_handler=lambda : (self.markDRYSignal.emit(False) if (len(self.aw.santokerEventFlags)>1 and self.aw.santokerEventFlags[1] and self.timeindex[1] == 0) else None),
                         fcs_handler=lambda : (self.markFCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>2 and self.aw.santokerEventFlags[2] and self.timeindex[2] == 0) else None),
                         scs_handler=lambda : (self.markSCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>4 and self.aw.santokerEventFlags[4] and self.timeindex[4] == 0) else None),
-                        drop_handler=lambda : (self.markDropSignal.emit(False) if (len(self.aw.santokerEventFlags)>6 and self.aw.santokerEventFlags[6] and self.timeindex[6] == 0) else None))
+                        drop_handler=lambda : (self.markDropSignal.emit(False) if (len(self.aw.santokerEventFlags)>6 and self.aw.santokerEventFlags[6] and self.timeindex[6] == 0) else None),
+                        warmup_handler=self.aw.santokerWarmupStateSignal.emit,
+                        warmup_temp_handler=self.aw.santokerWarmupTargetSignal.emit,
+                        warmup_target=self.aw.santokerWarmupController.desired_temp_c,
+                        ready_handler=self.aw.santokerWarmupReadySignal.emit)
+                    self.aw.santokerWarmupTargetSignal.emit(self.aw.santoker.getWarmupTarget())
                     self.aw.santoker.setLogging(self.device_logging)
                     self.aw.santoker.start()
                 elif self.device == 171:
@@ -14231,6 +14244,7 @@ class tgraphcanvas(QObject):
             self.aw.enableSaveActions()
             self.aw.resetCurveVisibilities()
             self.flagstart = False
+            self.aw.updateSantokerWarmupControls()
             if self.aw.simulator:
                 self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles_simulator['STOP'])
             else:
@@ -14342,6 +14356,9 @@ class tgraphcanvas(QObject):
     # if noaction is True, the button event action is not triggered
     @pyqtSlot(bool)
     def markCharge(self, noaction:bool = False) -> None:
+        self.aw.runSantokerWarmupCharge(lambda: self._markCharge(noaction))
+
+    def _markCharge(self, noaction:bool = False) -> None:
         zoomed_in: bool = False # True if zoomed in; in that case we prevent xaxistoxm to reset the x-axis limits (set_xlim)
         try:
             if self.aw.ntb._nav_stack(): # pylint: disable=protected-access
@@ -14388,25 +14405,27 @@ class tgraphcanvas(QObject):
                                 self.timeindex[0] = len(self.timex)-1
                             else:
                                 return
-                        else:
-                            if self.autoChargeIdx > 0:
-                                # prevent CHARGE out of index:
-                                if len(self.timex) > self.autoChargeIdx:
-                                    self.timeindex[0] = self.autoChargeIdx
-                                elif len(self.timex) > self.autoChargeIdx - 1:
-                                    # not yet enough readings
-                                    self.timeindex[0] = self.autoChargeIdx - 1
-                                else:
-                                    return
-                            elif len(self.timex) > 0:
-                                self.timeindex[0] = len(self.timex)-1
+                        elif self.autoChargeIdx > 0:
+                            # prevent CHARGE out of index:
+                            if len(self.timex) > self.autoChargeIdx:
+                                self.timeindex[0] = self.autoChargeIdx
+                            elif len(self.timex) > self.autoChargeIdx - 1:
+                                # not yet enough readings
+                                self.timeindex[0] = self.autoChargeIdx - 1
                             else:
-                                self.autoChargeIdx = 1 # set CHARGE on next (first) reading
-                                message = QApplication.translate('Message','Not enough data collected yet. Try again in a few seconds')
-                                self.aw.sendmessage(message)
                                 return
-                            if self.aw.pidcontrol.pidOnCHARGE and not self.aw.pidcontrol.pidActive: # Arduino/TC4, Hottop, MODBUS
-                                self.aw.pidcontrol.pidOn()
+                        elif len(self.timex) > 0:
+                            self.timeindex[0] = len(self.timex)-1
+                        else:
+                            self.autoChargeIdx = 1 # set CHARGE on next (first) reading
+                            message = QApplication.translate('Message','Not enough data collected yet. Try again in a few seconds')
+                            self.aw.sendmessage(message)
+                            return
+                        self.aw.santokerWarmupController.mark_charge()
+                        self.aw.updateSantokerWarmupControls()
+                        if ((self.device != 18 or self.aw.simulator is not None) and
+                                self.aw.pidcontrol.pidOnCHARGE and not self.aw.pidcontrol.pidActive): # Arduino/TC4, Hottop, MODBUS
+                            self.aw.pidcontrol.pidOn()
                         if self.chargeTimerPeriod > 0:
                             self.aw.setTimerColorSignal.emit('timer')
                         try:

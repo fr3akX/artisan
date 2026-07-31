@@ -49,8 +49,9 @@ dmypy.json
 # Linting
 .ruff_cache/
 
-# Augment AI assistant files
+# Agent workspaces
 .augment/
+.worktrees/
 
 # IDEs and editors
 .project

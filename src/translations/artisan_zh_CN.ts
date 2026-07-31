@@ -178,6 +178,11 @@
 </context><context>
     <name>Button</name>
     <message>
+        <location filename="../artisanlib/santoker_warmup_ui.py" line="34"/>
+        <source>WARM-UP</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
         <location filename="../artisanlib/colors.py" line="567"/>
         <location filename="../artisanlib/designer.py" line="244"/>
         <location filename="../artisanlib/phases.py" line="119"/>
@@ -17106,6 +17111,31 @@ It is advisable to save your current settings beforehand via menu Help &gt;&gt; 
         <translation>导入失败</translation>
     </message>
     <message>
+        <location filename="../artisanlib/main.py" line="18075"/>
+        <source>Santoker warm-up reported ON after CHARGE; sending OFF</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18082"/>
+        <source>Santoker roaster is not connected</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18085"/>
+        <source>Waiting for Santoker roaster data</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18088"/>
+        <source>Santoker warm-up is only available before CHARGE</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="18091"/>
+        <source>Santoker warm-up target must be between 100 and 300°C</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
         <location filename="../artisanlib/main.py" line="18140"/>
         <source>Your batch counter is currently turned off. Turn it on and set it to {} from the settings file to be imported?</source>
         <translation>您的批次计数器目前已关闭。请将其打开，并从要导入的设置文件中将其设置为 {}？</translation>
@@ -19991,6 +20021,16 @@ Continue?</source>
     </message>
 </context><context>
     <name>Tooltip</name>
+    <message>
+        <location filename="../artisanlib/santoker_warmup_ui.py" line="37"/>
+        <source>Santoker warm-up</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_warmup_ui.py" line="42"/>
+        <source>Warm-up target</source>
+        <translation type="unfinished"/>
+    </message>
     <message>
         <location filename="../artisanlib/axis.py" line="83"/>
         <source>100% event values in step mode are aligned with the given y-axis value or the lowest phases limit if left empty</source>
