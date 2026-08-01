@@ -37,7 +37,8 @@ from io import SEEK_END
 import json
 import math
 import re
-from typing import BinaryIO, Final, NoReturn, Protocol, TypeVar, cast, override, runtime_checkable
+from types import TracebackType
+from typing import BinaryIO, Final, NoReturn, Protocol, Self, TypeVar, cast, override, runtime_checkable
 from uuid import UUID
 
 import requests
@@ -81,6 +82,7 @@ _SHA256_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{64}$')
 _ALLOWED_ROAST_STATES: Final[frozenset[str]] = frozenset(
     {'awaiting_profile', 'parsed', 'parse_failed'}
 )
+_SESSION_TYPE: Final[type[requests.Session]] = requests.sessions.Session
 _FIXED_SESSION_HEADERS: Final[dict[str, str]] = {
     'Accept-Encoding': 'identity',
     'Cache-Control': 'no-store',
@@ -145,22 +147,52 @@ class RoastServerClient:
         self,
         origin: str,
         credential: str,
-        session: requests.Session | None = None,
     ) -> None:
         if credential == '':
             raise ValueError('credential must not be empty')
-        self._origin = canonical_origin(origin)
+        origin = canonical_origin(origin)
+        session = requests.Session()
+        if type(session) is not _SESSION_TYPE:
+            _close_owned_session(session)
+            raise TypeError('session factory must return an exact requests.Session')
+        try:
+            _sanitize_session(session, replace_adapters=True)
+        except ApiFailure:
+            _close_owned_session(session)
+            raise
+        self._origin = origin
         self._credential = credential
-        if session is not None and type(session) is not requests.Session:
-            raise TypeError('session must be an exact requests.Session')
-        self._session = requests.Session() if session is None else session
-        _sanitize_session(self._session, replace_adapters=True)
+        self._session: requests.Session | None = session
+        self._closed = False
 
     @override
     def __repr__(self) -> str:
         return '<RoastServerClient credential=<redacted>>'
 
+    def __enter__(self) -> Self:
+        self._require_open()
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._credential = ''
+        session = self._session
+        self._session = None
+        if session is not None:
+            _close_owned_session(session)
+
     def test_connection(self) -> ServerIdentity:
+        self._require_open()
         response = self._request('GET', '/api/v1/auth/me', stream=True)
         try:
             self._require_status(response, frozenset({200}))
@@ -169,6 +201,7 @@ class RoastServerClient:
             _close_response(response)
 
     def post_aroast(self, roast_uuid: UUID, aroast_json: bytes) -> None:
+        self._require_open()
         _require_bounded_bytes(aroast_json, maximum=MAX_JSON_BYTES, name='aroast JSON')
         response = self._request(
             'POST',
@@ -192,6 +225,7 @@ class RoastServerClient:
         metadata_json: bytes,
         snapshot: BinaryIO,
     ) -> RevisionUpload:
+        self._require_open()
         if _SHA256_RE.fullmatch(sha256) is None:
             raise ValueError('invalid SHA-256')
         if (
@@ -252,6 +286,7 @@ class RoastServerClient:
         cursor: str | None = None,
         limit: int = 50,
     ) -> RoastPage:
+        self._require_open()
         if isinstance(limit, bool) or not 1 <= limit <= 100:
             raise ValueError('invalid archive page limit')
         params: dict[str, str | int] = {'limit': limit}
@@ -303,6 +338,7 @@ class RoastServerClient:
             _close_response(response)
 
     def get_roast(self, roast_uuid: UUID) -> RoastDetail:
+        self._require_open()
         response = self._request(
             'GET',
             f'/api/v1/roasts/{roast_uuid.hex}',
@@ -330,6 +366,7 @@ class RoastServerClient:
         The destination must support truncation. The caller must discard it whenever
         the download fails. If a failed commit cannot be rolled back, it is closed.
         """
+        self._require_open()
         revision = detail.current_revision
         if revision is None:
             raise _fixed_api_failure(FailureKind.INVALID_RESPONSE, status_code=None)
@@ -380,6 +417,14 @@ class RoastServerClient:
         json_bytes: bytes | None = None,
         stream: bool = False,
     ) -> requests.Response:
+        self._require_open()
+        session = self._session
+        if session is None or type(session) is not _SESSION_TYPE:
+            raise _fixed_api_failure(
+                FailureKind.INVALID_RESPONSE,
+                status_code=None,
+                code='request_error',
+            )
         url = self._same_origin_url(path)
         headers = dict(_FIXED_SESSION_HEADERS)
         headers['Authorization'] = f'Bearer {self._credential}'
@@ -390,11 +435,11 @@ class RoastServerClient:
             headers['Content-Type'] = _JSON_CONTENT_TYPE
             request_data = json_bytes
 
-        _sanitize_session(self._session)
+        _sanitize_session(session)
         request_failure: ApiFailure | None = None
         response: requests.Response | None = None
         try:
-            response = self._session.request(
+            response = session.request(
                 method,
                 url,
                 params=params,
@@ -415,7 +460,7 @@ class RoastServerClient:
 
         sanitization_failure: ApiFailure | None = None
         try:
-            _sanitize_session(self._session)
+            _sanitize_session(session)
         except ApiFailure as error:
             sanitization_failure = error
         if sanitization_failure is not None:
@@ -427,6 +472,14 @@ class RoastServerClient:
             _close_response(response)
             raise security_failure
         return response
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise _fixed_api_failure(
+                FailureKind.OFFLINE,
+                status_code=None,
+                code='client_closed',
+            )
 
     def _same_origin_url(self, path: str) -> str:
         if (
@@ -585,6 +638,56 @@ class RoastServerClient:
 type ClientFactory = Callable[[str, str], RoastServerClient]
 
 
+def _close_owned_session(session: requests.Session) -> None:
+    adapters: tuple[BaseAdapter, ...] = ()
+    try:
+        adapters = tuple(session.adapters.values())
+        session.adapters = {}
+    except Exception:
+        pass
+    try:
+        session.headers.clear()
+    except Exception:
+        pass
+    try:
+        session.proxies.clear()
+    except Exception:
+        pass
+    try:
+        params = session.params
+        if isinstance(params, dict):
+            params.clear()
+        session.params = {}
+    except Exception:
+        pass
+    try:
+        session.hooks.clear()
+    except Exception:
+        pass
+    try:
+        session.cookies.clear()
+    except Exception:
+        pass
+    try:
+        session.auth = None
+        session.cert = None
+    except Exception:
+        pass
+    try:
+        _SESSION_TYPE.close(session)
+    except Exception:
+        pass
+    closed_adapter_ids: set[int] = set()
+    for adapter in adapters:
+        if id(adapter) in closed_adapter_ids:
+            continue
+        closed_adapter_ids.add(id(adapter))
+        try:
+            adapter.close()
+        except Exception:
+            pass
+
+
 def _sanitize_session(
     session: requests.Session,
     *,
@@ -618,6 +721,9 @@ def _sanitize_session(
         except Exception:
             failed = True
     try:
+        vars(session).pop('request', None)
+        vars(session).pop('send', None)
+        vars(session).pop('close', None)
         session.trust_env = False
         session.proxies = {}
         session.auth = None

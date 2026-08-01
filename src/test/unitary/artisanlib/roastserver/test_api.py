@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import inspect
 import io
 import json
 import secrets
@@ -250,7 +251,6 @@ class RecordingAdapter(HTTPAdapter):
         self._expected_authorization = f'Bearer {credential}'
         self._outcomes = iter(outcomes)
         self.calls: list[AdapterCall] = []
-        self.session: requests.Session | None = None
 
     @override
     def send(
@@ -381,8 +381,6 @@ def _install_test_adapter(
     session.mount(prefix, adapter)
     if replaced is not adapter:
         replaced.close()
-    if isinstance(adapter, RecordingAdapter):
-        adapter.session = session
     return session
 
 
@@ -413,13 +411,11 @@ def real_json_outcome(
 
 def real_client(
     *outcomes: RawOutcome | Exception,
-    hostile_session: requests.Session | None = None,
 ) -> tuple[RoastServerClient, requests.Session, NoNetworkAdapter, str]:
     credential = secrets.token_urlsafe(32)
-    session = requests.Session() if hostile_session is None else hostile_session
-    client = RoastServerClient('https://example.test', credential, session)
+    client = RoastServerClient('https://example.test', credential)
     adapter = NoNetworkAdapter(tuple(outcomes))
-    _install_test_adapter(client, adapter)
+    session = _install_test_adapter(client, adapter)
     return client, session, adapter, credential
 
 
@@ -543,8 +539,7 @@ def client_factory() -> ClientFactory:
         outcome: requests.Response | requests.RequestException,
     ) -> tuple[RoastServerClient, RecordingAdapter]:
         credential = secrets.token_urlsafe(32)
-        session = requests.Session()
-        client = RoastServerClient('https://example.test', credential, session)
+        client = RoastServerClient('https://example.test', credential)
         adapter = RecordingAdapter(credential, (outcome,))
         _install_test_adapter(client, adapter)
         return client, adapter
@@ -603,16 +598,39 @@ def invoke_json_endpoint(client: RoastServerClient, endpoint: str) -> object:
     raise AssertionError('unknown endpoint')
 
 
+def invoke_closed_endpoint(client: RoastServerClient, endpoint: str) -> object:
+    if endpoint == 'identity':
+        return client.test_connection()
+    if endpoint == 'aroast':
+        client.post_aroast(ROAST_UUID, b'')
+        return None
+    if endpoint == 'list':
+        return client.list_roasts(ArchiveFilters(), limit=0)
+    if endpoint == 'detail':
+        return client.get_roast(ROAST_UUID)
+    if endpoint == 'upload':
+        return client.upload_revision(
+            ROAST_UUID,
+            'invalid',
+            '',
+            b'',
+            SnapshotReadFailure(AssertionError('closed client read snapshot')),
+        )
+    if endpoint == 'download':
+        return client.download_revision(detail_for_download(), NonSeekableDestination())
+    raise AssertionError('unknown endpoint')
+
+
 def test_session_disables_proxy_inheritance_tls_bypass_and_redirects(
     client_factory: ClientFactory,
 ) -> None:
-    client, session = client_factory(json_response(200, valid_identity_payload()))
+    client, adapter = client_factory(json_response(200, valid_identity_payload()))
+    session = cast(requests.Session, vars(client)['_session'])
 
     client.test_connection()
 
-    assert session.session is not None
-    assert session.session.trust_env is False
-    request = session.calls[0]
+    assert session.trust_env is False
+    request = adapter.calls[0]
     assert request.verify is True
     assert request.timeout == (4.0, 10.0)
     assert request.method == 'GET'
@@ -620,7 +638,7 @@ def test_session_disables_proxy_inheritance_tls_bypass_and_redirects(
     assert request.headers['Cache-Control'] == 'no-store'
     assert request.headers['User-Agent'].startswith('Artisan/')
     assert request.headers['Authorization'] == 'Bearer <redacted>'
-    assert 'Authorization' not in session.session.headers
+    assert 'Authorization' not in session.headers
 
 
 def test_redirect_is_rejected_without_followup(client_factory: ClientFactory) -> None:
@@ -1154,8 +1172,7 @@ def test_arbitrary_error_body_and_authorization_never_reach_logs_or_failure(
 ) -> None:
     credential = secrets.token_urlsafe(48)
     body = f'<html>{credential} infrastructure diagnostic</html>'.encode()
-    session = requests.Session()
-    client = RoastServerClient('https://example.test', credential, session)
+    client = RoastServerClient('https://example.test', credential)
     adapter = RecordingAdapter(
         credential,
         (raw_response(502, body, {'Content-Length': str(len(body))}),),
@@ -1171,7 +1188,6 @@ def test_arbitrary_error_body_and_authorization_never_reach_logs_or_failure(
             repr(raised.value),
             repr(raised.value.failure),
             repr(client),
-            repr(session),
             repr(adapter),
             caplog.text,
         )
@@ -1182,24 +1198,34 @@ def test_arbitrary_error_body_and_authorization_never_reach_logs_or_failure(
     assert raised.value.failure.code == FailureKind.OFFLINE.value
 
 
-def test_session_subclasses_overriding_request_and_send_are_rejected() -> None:
+def test_public_constructor_has_no_transport_injection_parameter() -> None:
+    assert tuple(inspect.signature(RoastServerClient).parameters) == ('origin', 'credential')
+
+
+def test_session_factory_subclasses_overriding_request_and_send_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session = HostileSession()
+    monkeypatch.setattr(requests, 'Session', lambda: session)
 
     with pytest.raises(TypeError, match='exact requests.Session'):
-        RoastServerClient('https://example.test', secrets.token_urlsafe(32), session)
+        RoastServerClient('https://example.test', secrets.token_urlsafe(32))
 
     assert session.request_calls == 0
     assert session.send_calls == 0
 
 
-def test_hostile_pre_mounted_adapter_is_closed_removed_and_never_called() -> None:
-    session = requests.Session()
+def test_hostile_factory_adapter_is_closed_removed_and_never_called(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = requests.sessions.Session()
     inherited_adapters = tuple(session.adapters.values())
     hostile_adapter = NoNetworkAdapter((real_json_outcome(200, valid_identity_payload()),))
     session.mount('https://example.test/', hostile_adapter)
+    monkeypatch.setattr(requests, 'Session', lambda: session)
     credential = secrets.token_urlsafe(32)
 
-    client = RoastServerClient('https://example.test', credential, session)
+    client = RoastServerClient('https://example.test', credential)
 
     assert hostile_adapter.close_calls == 1
     assert hostile_adapter.calls == []
@@ -1220,14 +1246,11 @@ def test_hostile_pre_mounted_adapter_is_closed_removed_and_never_called() -> Non
 
 
 def test_loopback_http_uses_no_retry_default_without_environment_proxies() -> None:
-    session = requests.Session()
-    original_http_adapter = session.adapters['http://']
-    session.proxies = {'http': 'http://proxy.invalid'}
-    client = RoastServerClient('http://127.0.0.1:8000', secrets.token_urlsafe(32), session)
+    client = RoastServerClient('http://127.0.0.1:8000', secrets.token_urlsafe(32))
+    session = cast(requests.Session, vars(client)['_session'])
 
     default_http_adapter = session.adapters['http://']
     assert type(default_http_adapter) is HTTPAdapter
-    assert default_http_adapter is not original_http_adapter
     assert default_http_adapter.max_retries.total == 0
 
     trusted_adapter = NoNetworkAdapter((real_json_outcome(200, valid_identity_payload()),))
@@ -1239,14 +1262,16 @@ def test_loopback_http_uses_no_retry_default_without_environment_proxies() -> No
     assert trusted_adapter.calls[0].proxies == {}
 
 
-def test_real_session_is_fully_sanitized_and_prepared_request_is_pinned() -> None:
+def test_factory_session_is_fully_sanitized_and_prepared_request_is_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     hook_calls: list[str] = []
 
     def hostile_hook(response: requests.Response, **_kwargs: object) -> requests.Response:
         hook_calls.append('called')
         return response
 
-    session = requests.Session()
+    session = requests.sessions.Session()
     session.trust_env = True
     session.proxies = {'https': 'https://proxy.invalid'}
     vars(session)['auth'] = ('hostile-user', 'hostile-password')
@@ -1261,9 +1286,9 @@ def test_real_session_is_fully_sanitized_and_prepared_request_is_pinned() -> Non
         }
     )
     vars(session)['cert'] = '/private/client-certificate.pem'
+    monkeypatch.setattr(requests, 'Session', lambda: session)
     client, sanitized, adapter, credential = real_client(
         real_json_outcome(200, valid_identity_payload()),
-        hostile_session=session,
     )
 
     client.test_connection()
@@ -1303,6 +1328,89 @@ def test_real_session_is_fully_sanitized_and_prepared_request_is_pinned() -> Non
     assert call.proxies == {}
     assert call.stream is True
     assert adapter.responses[0].raw.closed
+
+
+def test_context_manager_closes_owned_session_and_adapters_once_and_wipes_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_close_calls: list[requests.Session] = []
+    original_session_close = requests.sessions.Session.close
+
+    def record_session_close(session: requests.Session) -> None:
+        session_close_calls.append(session)
+        original_session_close(session)
+
+    monkeypatch.setattr(requests.sessions.Session, 'close', record_session_close)
+    credential = secrets.token_urlsafe(48)
+    client = RoastServerClient('https://example.test', credential)
+    adapter = NoNetworkAdapter((real_json_outcome(200, valid_identity_payload()),))
+    session = _install_test_adapter(client, adapter)
+
+    with client as entered:
+        assert entered is client
+        assert entered.test_connection().user.id == ROAST_UUID
+
+    assert session_close_calls == [session]
+    assert adapter.close_calls == 1
+    assert vars(client)['_closed'] is True
+    assert vars(client)['_credential'] == ''
+    assert vars(client)['_session'] is None
+    assert session.headers == {}
+    assert len(session.cookies) == 0
+    assert session.adapters == {}
+
+    client.close()
+
+    assert session_close_calls == [session]
+    assert adapter.close_calls == 1
+    assert credential not in repr(client)
+
+
+def test_context_manager_closes_without_suppressing_exceptions() -> None:
+    client = RoastServerClient('https://example.test', secrets.token_urlsafe(32))
+
+    with pytest.raises(RuntimeError, match='context marker'), client:
+        raise RuntimeError('context marker')
+
+    assert vars(client)['_closed'] is True
+
+
+@pytest.mark.parametrize(
+    'endpoint',
+    ('identity', 'aroast', 'list', 'detail', 'upload', 'download'),
+)
+def test_every_endpoint_after_close_raises_same_fixed_unchained_failure(
+    endpoint: str,
+) -> None:
+    credential = secrets.token_urlsafe(48)
+    client = RoastServerClient('https://example.test', credential)
+    client.close()
+
+    with pytest.raises(ApiFailure) as raised:
+        invoke_closed_endpoint(client, endpoint)
+
+    assert raised.value.failure.kind is FailureKind.OFFLINE
+    assert raised.value.failure.code == 'client_closed'
+    assert raised.value.failure.retryable is False
+    assert raised.value.status_code is None
+    assert raised.value.retry_after_seconds is None
+    assert credential not in str(raised.value)
+    assert credential not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_enter_after_close_raises_fixed_unchained_failure() -> None:
+    client = RoastServerClient('https://example.test', secrets.token_urlsafe(32))
+    client.close()
+
+    with pytest.raises(ApiFailure) as raised:
+        client.__enter__()
+
+    assert raised.value.failure.kind is FailureKind.OFFLINE
+    assert raised.value.failure.code == 'client_closed'
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_real_session_redirect_is_one_adapter_call_and_response_is_closed() -> None:
