@@ -641,33 +641,34 @@ class Outbox:
                 raise OutboxError(_STAGE_TOKEN_ERROR)
             _stored_job_id(snapshot.staging_token)
             path_to_unlink: str | None = None
-            with self._filesystem_lock(), self._transaction() as connection:
-                namespace_id = self._namespace_id(
-                    connection, snapshot.namespace, create=False
-                )
-                if namespace_id is None:
-                    return
-                row = connection.execute(
-                    '''SELECT * FROM snapshot_staging
-                       WHERE token = ? AND namespace_id = ?''',
-                    (snapshot.staging_token, namespace_id),
-                ).fetchone()
-                if row is None:
-                    return
-                if not self._stage_matches_snapshot(row, snapshot):
-                    raise OutboxError(_STAGE_TOKEN_ERROR)
-                consumed = connection.execute(
-                    '''DELETE FROM snapshot_staging
-                       WHERE token = ? AND namespace_id = ?''',
-                    (snapshot.staging_token, namespace_id),
-                )
-                if consumed.rowcount != 1:
-                    raise OutboxError(_STAGE_TOKEN_ERROR)
-                path_to_unlink = self._release_snapshot_if_unreferenced(
-                    connection, namespace_id, sha256
-                )
-            if path_to_unlink is not None:
-                self._unlink_generated_snapshot(path_to_unlink)
+            with self._filesystem_lock():
+                with self._transaction() as connection:
+                    namespace_id = self._namespace_id(
+                        connection, snapshot.namespace, create=False
+                    )
+                    if namespace_id is None:
+                        return
+                    row = connection.execute(
+                        '''SELECT * FROM snapshot_staging
+                           WHERE token = ? AND namespace_id = ?''',
+                        (snapshot.staging_token, namespace_id),
+                    ).fetchone()
+                    if row is None:
+                        return
+                    if not self._stage_matches_snapshot(row, snapshot):
+                        raise OutboxError(_STAGE_TOKEN_ERROR)
+                    consumed = connection.execute(
+                        '''DELETE FROM snapshot_staging
+                           WHERE token = ? AND namespace_id = ?''',
+                        (snapshot.staging_token, namespace_id),
+                    )
+                    if consumed.rowcount != 1:
+                        raise OutboxError(_STAGE_TOKEN_ERROR)
+                    path_to_unlink = self._release_snapshot_if_unreferenced(
+                        connection, namespace_id, sha256
+                    )
+                if path_to_unlink is not None:
+                    self._unlink_generated_snapshot(path_to_unlink)
         except OutboxError:
             raise
         except (OSError, sqlite3.Error):

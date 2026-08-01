@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1302,6 +1303,75 @@ def test_discard_staged_snapshot_consumes_exact_token_and_releases_reference(
     assert first.absolute_path.exists()
     outbox.discard_staged_snapshot(second)
     assert not first.absolute_path.exists()
+
+
+def test_discard_holds_process_lock_through_unlink_before_same_hash_republishes(
+    tmp_path: Path,
+    saved_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / 'connector'
+    first = opened_outbox(root)
+    second = opened_outbox(root)
+    snapshot = first.snapshot_saved_file(NAMESPACE, saved_profile)
+    unlink_reached = Event()
+    second_lock_attempted = Event()
+    unlink_finished = Event()
+    first_lock_held = False
+    second_acquired_after_unlink: list[bool] = []
+    original_first_lock = first._filesystem_lock
+    original_second_lock = second._filesystem_lock
+    original_unlink = first._unlink_generated_snapshot
+
+    @contextmanager
+    def tracked_first_lock() -> Generator[None, None, None]:
+        nonlocal first_lock_held
+        with original_first_lock():
+            first_lock_held = True
+            try:
+                yield
+            finally:
+                first_lock_held = False
+
+    @contextmanager
+    def observed_second_lock() -> Generator[None, None, None]:
+        second_lock_attempted.set()
+        with original_second_lock():
+            second_acquired_after_unlink.append(unlink_finished.is_set())
+            yield
+
+    def blocked_unlink(relative_path: str) -> None:
+        unlink_reached.set()
+        assert second_lock_attempted.wait(5)
+        assert first_lock_held
+        connection = sqlite3.connect(database_path(root))
+        try:
+            assert connection.execute('SELECT count(*) FROM snapshot_staging').fetchone() == (0,)
+            assert connection.execute('SELECT count(*) FROM snapshots').fetchone() == (0,)
+        finally:
+            connection.close()
+        original_unlink(relative_path)
+        unlink_finished.set()
+
+    monkeypatch.setattr(first, '_filesystem_lock', tracked_first_lock)
+    monkeypatch.setattr(second, '_filesystem_lock', observed_second_lock)
+    monkeypatch.setattr(first, '_unlink_generated_snapshot', blocked_unlink)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            discarded = executor.submit(first.discard_staged_snapshot, snapshot)
+            assert unlink_reached.wait(5)
+            restaged = executor.submit(
+                second.snapshot_saved_file, NAMESPACE, saved_profile
+            )
+            discarded.result(timeout=5)
+            replacement = restaged.result(timeout=5)
+
+        assert second_acquired_after_unlink == [True]
+        assert replacement.absolute_path.read_bytes() == PROFILE_BYTES
+        second.discard_staged_snapshot(replacement)
+    finally:
+        first.close()
+        second.close()
 
 
 def test_enqueue_consumes_exact_unexpired_stage_token_once(

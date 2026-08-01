@@ -25,6 +25,7 @@ import ast
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime, timedelta
 import hashlib
+import math
 from pathlib import Path
 import secrets
 import threading
@@ -33,7 +34,7 @@ from types import TracebackType
 from typing import BinaryIO, Self, cast, override
 from uuid import UUID, uuid4
 
-from PyQt6.QtCore import QCoreApplication, QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtTest import QSignalSpy
 import pytest
 
@@ -261,9 +262,18 @@ class WallClock:
     def __init__(self, origin: datetime = NOW) -> None:
         self._origin = origin
         self._started = time.monotonic()
+        self._lock = threading.Lock()
+        self._calls: list[tuple[datetime, int]] = []
 
     def __call__(self) -> datetime:
-        return self._origin + timedelta(seconds=time.monotonic() - self._started)
+        result = self._origin + timedelta(seconds=time.monotonic() - self._started)
+        with self._lock:
+            self._calls.append((result, int(QThread.currentThreadId())))
+        return result
+
+    def last_call_in_thread(self, thread_id: int) -> datetime:
+        with self._lock:
+            return next(value for value, called_in in reversed(self._calls) if called_in == thread_id)
 
 
 class FakeCredentialStore:
@@ -573,7 +583,51 @@ class CommandBus(QObject):
     discard_worker = pyqtSignal(str)
     clear_worker = pyqtSignal(str)
     tick_worker = pyqtSignal()
+    probe_worker = pyqtSignal()
     stop_worker = pyqtSignal()
+
+
+class StockTimerProbe(QObject):
+    captured = pyqtSignal()
+
+    def __init__(
+        self,
+        worker: RoastServerWorker,
+        outbox: Outbox,
+        clock: WallClock,
+    ) -> None:
+        super().__init__()
+        self._worker = worker
+        self._outbox = outbox
+        self._clock = clock
+        self.timer: QTimer | None = None
+        self.observation: (
+            tuple[int, int, bool, datetime | None, datetime, datetime, int, bool, tuple[str, ...]]
+            | None
+        ) = None
+
+    @pyqtSlot()
+    def capture(self) -> None:
+        timer = self._worker._timer
+        if timer is None:
+            return
+        thread_id = int(QThread.currentThreadId())
+        due = self._outbox.next_due_at(NAMESPACE)
+        scheduled_at = self._clock.last_call_in_thread(thread_id)
+        observed_at = self._clock()
+        self.timer = timer
+        self.observation = (
+            timer.interval(),
+            timer.remainingTime(),
+            timer.isActive(),
+            due,
+            scheduled_at,
+            observed_at,
+            thread_id,
+            timer.parent() is self._worker,
+            tuple(type(child).__name__ for child in self._worker.children()),
+        )
+        self.captured.emit()
 
 
 class WorkerHarness:
@@ -625,8 +679,9 @@ class WorkerHarness:
         self.bus.clear_worker.connect(self.worker.clear_unused)
         self.bus.tick_worker.connect(self.worker.process_queue_once)
         self.bus.stop_worker.connect(self.worker.stop)
+        self.worker.stopped.connect(self.worker.deleteLater)
+        self.worker.destroyed.connect(self.thread.quit)
         self.thread.started.connect(self.worker.start)
-        self.thread.finished.connect(self.worker.deleteLater)
         self.thread.start()
         self.wait_until(lambda: self.timer is not None)
         self.cache.timer_stopped = lambda: self.timer is not None and not self.timer.logically_active
@@ -722,10 +777,12 @@ class WorkerHarness:
     def stop(self) -> None:
         if not self.thread.isRunning():
             return
-        spy = QSignalSpy(self.worker.stopped)
+        stopped = QSignalSpy(self.worker.stopped)
+        destroyed = QSignalSpy(self.worker.destroyed)
         self.bus.stop_worker.emit()
-        self.wait_until(lambda: len(spy) == 1)
-        self.thread.quit()
+        self.wait_until(lambda: len(stopped) == 1)
+        self.wait_until(lambda: len(destroyed) == 1)
+        self.wait_until(lambda: not self.thread.isRunning())
         assert self.thread.wait(2_000)
 
 
@@ -1539,7 +1596,7 @@ def test_stop_stops_timer_then_closes_all_stages_and_sqlite_on_worker_thread(
     assert worker_harness.cache.discard_calls[-1][0] == request.staged_path
 
 
-def test_stock_qtimer_automatically_delivers_persisted_retry_and_stops_active(
+def test_stock_qtimer_automatically_delivers_persisted_retry_and_destroys_in_affinity(
     tmp_path: Path,
     qcoreapplication: QCoreApplication,
 ) -> None:
@@ -1573,11 +1630,12 @@ def test_stock_qtimer_automatically_delivers_persisted_retry_and_stops_active(
     retry_failure = public_failure(FailureKind.OFFLINE, retryable=True)
     leased_first = setup.lease_next(NAMESPACE, clock())
     assert isinstance(leased_first, Job) and leased_first.lease_token is not None
+    first_due = clock() + timedelta(milliseconds=1_500)
     setup.mark_retry(
         first.id,
         leased_first.lease_token,
         clock(),
-        clock() + timedelta(milliseconds=350),
+        first_due,
         retry_failure,
     )
     leased_second = setup.lease_next(NAMESPACE, clock())
@@ -1611,52 +1669,111 @@ def test_stock_qtimer_automatically_delivers_persisted_retry_and_stops_active(
     )
     thread = QThread()
     bus = CommandBus()
+    probe = StockTimerProbe(worker, outbox, clock)
     worker.moveToThread(thread)
+    probe.moveToThread(thread)
     bus.configure_worker.connect(worker.configure)
+    bus.probe_worker.connect(probe.capture)
     bus.stop_worker.connect(worker.stop)
+    worker.stopped.connect(worker.deleteLater)
+    worker.stopped.connect(probe.deleteLater)
+    probe.destroyed.connect(thread.quit)
     thread.started.connect(worker.start)
     changed = QSignalSpy(worker.queueChanged)
     stopped = QSignalSpy(worker.stopped)
+    destroyed = QSignalSpy(worker.destroyed)
+    probe_destroyed = QSignalSpy(probe.destroyed)
+    captured = QSignalSpy(probe.captured)
     cache.timer_stopped = lambda: worker._timer is not None and not worker._timer.isActive()
-    started_at = time.monotonic()
-    thread.start()
-    bus.configure_worker.emit(
-        WorkerConfiguration(
-            origin=ORIGIN,
-            namespace=NAMESPACE,
-            enabled=True,
-            automatic_upload=True,
-            client_instance_uuid=CLIENT_UUID,
-            cache_limit_bytes=MIN_CACHE_LIMIT_BYTES,
+
+    def wait_until(predicate: Callable[[], bool], message: str, timeout: float = 8.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            qcoreapplication.processEvents()
+            if time.monotonic() >= deadline:
+                pytest.fail(message)
+            time.sleep(0.001)
+        qcoreapplication.processEvents()
+
+    timer_destroyed: QSignalSpy | None = None
+    try:
+        thread.start()
+        bus.configure_worker.emit(
+            WorkerConfiguration(
+                origin=ORIGIN,
+                namespace=NAMESPACE,
+                enabled=True,
+                automatic_upload=True,
+                client_instance_uuid=CLIENT_UUID,
+                cache_limit_bytes=MIN_CACHE_LIMIT_BYTES,
+            )
         )
-    )
+        wait_until(lambda: len(changed) > 0, 'stock timer worker did not configure')
+        bus.probe_worker.emit()
+        wait_until(lambda: len(captured) == 1, 'stock timer probe did not run')
+        assert probe.observation is not None and probe.timer is not None
+        (
+            interval,
+            remaining,
+            active,
+            due,
+            scheduled_at,
+            observed_at,
+            probe_thread,
+            timer_parented,
+            child_types,
+        ) = probe.observation
+        expected_interval = math.ceil(
+            max(0.0, (first_due - scheduled_at).total_seconds()) * 1_000
+        )
+        assert due == first_due
+        assert interval == expected_interval
+        assert remaining >= 0
+        assert abs(remaining - interval) <= 100
+        assert observed_at >= scheduled_at
+        assert active
+        assert probe_thread == cache.open_threads[0]
+        assert timer_parented
+        assert child_types == ('QTimer',)
+        timer_destroyed = QSignalSpy(probe.timer.destroyed)
 
-    deadline = time.monotonic() + 3
-    while not any(
-        isinstance(changed[index][0], QueueCounts)
-        and changed[index][0].complete == 1
-        for index in range(len(changed))
-    ):
-        qcoreapplication.processEvents()
-        if time.monotonic() >= deadline:
-            pytest.fail('stock timer did not deliver persisted retry within bound')
-        time.sleep(0.001)
-    delivered_at = time.monotonic()
-    bus.stop_worker.emit()
-    while len(stopped) == 0:
-        qcoreapplication.processEvents()
-        if time.monotonic() >= deadline:
-            pytest.fail('stock timer worker did not stop within bound')
-        time.sleep(0.001)
-    thread.quit()
-    assert thread.wait(2_000)
+        wait_until(
+            lambda: any(
+                isinstance(changed[index][0], QueueCounts)
+                and changed[index][0].complete == 1
+                for index in range(len(changed))
+            ),
+            'stock timer did not deliver persisted retry within generous bound',
+        )
+        bus.stop_worker.emit()
+        wait_until(lambda: len(stopped) == 1, 'stock timer worker did not stop')
+        wait_until(lambda: len(destroyed) == 1, 'stock timer worker was not destroyed')
+        wait_until(lambda: len(probe_destroyed) == 1, 'stock timer probe was not destroyed')
+        wait_until(lambda: not thread.isRunning(), 'stock timer thread did not quit')
+    finally:
+        if thread.isRunning() and len(stopped) == 0:
+            bus.stop_worker.emit()
+        if thread.isRunning():
+            deadline = time.monotonic() + 8
+            while (
+                thread.isRunning()
+                and (len(destroyed) == 0 or len(probe_destroyed) == 0)
+                and time.monotonic() < deadline
+            ):
+                qcoreapplication.processEvents()
+                time.sleep(0.001)
+        if thread.isRunning():
+            thread.quit()
+        assert thread.wait(8_000)
 
-    assert delivered_at - started_at < 0.9
+    assert len(destroyed) == 1
+    assert len(probe_destroyed) == 1
+    assert len(timer_destroyed) == 1
+    assert thread.children() == []
     assert outbox.complete_calls[-1][0] == first.id
     assert outbox.complete_calls[-1][3] == cache.open_threads[0]
     assert client.enter_threads == client.exit_threads == [cache.open_threads[0]]
-    counts = outbox.counts(NAMESPACE) if outbox._connection is not None else None
-    assert counts is None
+    assert outbox._connection is None
     reopened = Outbox(root, clock)
     reopened.open()
     try:
