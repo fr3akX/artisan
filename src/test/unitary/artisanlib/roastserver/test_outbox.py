@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
+import ctypes
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import errno
@@ -12,8 +13,9 @@ import sqlite3
 import stat
 import subprocess
 import sys
-from threading import Event
-from typing import TYPE_CHECKING, cast
+from threading import Barrier, Condition, Event
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 import pytest
@@ -116,6 +118,18 @@ def create_v1_database(root: Path, statements: tuple[str, ...] | None = None) ->
         connection.close()
 
 
+def create_v2_database(root: Path, statements: tuple[str, ...]) -> None:
+    root.mkdir(mode=0o700)
+    connection = sqlite3.connect(database_path(root))
+    try:
+        for statement in statements:
+            connection.execute(statement)
+        connection.execute('INSERT INTO schema_version(version) VALUES (2)')
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def test_schema_v1_migration_is_strict_transactional_and_versioned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -182,10 +196,68 @@ def with_wrong_v1_foreign_key(statements: tuple[str, ...]) -> tuple[str, ...]:
     )
 
 
+def with_uppercase_v1_state_literal(statements: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        statement.replace("'pending'", "'PENDING'")
+        if statement.startswith('CREATE TABLE jobs')
+        else statement
+        for statement in statements
+    )
+
+
+def with_wrong_v1_default(statements: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        statement.replace('DEFAULT 0', 'DEFAULT 1')
+        if statement.startswith('CREATE TABLE jobs')
+        else statement
+        for statement in statements
+    )
+
+
+def with_wrong_v1_check(statements: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        statement.replace('attempts >= 0', 'attempts > 0')
+        if statement.startswith('CREATE TABLE jobs')
+        else statement
+        for statement in statements
+    )
+
+
+def with_wrong_v1_index_properties(statements: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        statement.replace(
+            'CREATE INDEX jobs_ready_idx',
+            'CREATE UNIQUE INDEX jobs_ready_idx',
+        ).replace(
+            'ON jobs(namespace_id, state, next_attempt_at, created_at)',
+            "ON jobs(state, namespace_id, next_attempt_at, created_at) WHERE state = 'pending'",
+        )
+        if statement.startswith('CREATE INDEX jobs_ready_idx')
+        else statement
+        for statement in statements
+    )
+
+
 @pytest.mark.parametrize(
     'mutate',
-    [without_v1_index, with_wrong_v1_column_type, with_wrong_v1_foreign_key],
-    ids=['missing-index', 'wrong-column-type', 'wrong-foreign-key'],
+    [
+        without_v1_index,
+        with_wrong_v1_column_type,
+        with_wrong_v1_foreign_key,
+        with_uppercase_v1_state_literal,
+        with_wrong_v1_default,
+        with_wrong_v1_check,
+        with_wrong_v1_index_properties,
+    ],
+    ids=[
+        'missing-index',
+        'wrong-column-type',
+        'wrong-foreign-key',
+        'uppercase-state-literal',
+        'wrong-default',
+        'wrong-check',
+        'wrong-index-properties',
+    ],
 )
 def test_malformed_v1_schema_fingerprint_is_rejected_without_migration(
     tmp_path: Path,
@@ -213,6 +285,64 @@ def test_malformed_v2_index_is_rejected_on_reopen(tmp_path: Path) -> None:
     connection.close()
     with pytest.raises(OutboxError, match='schema'):
         opened_outbox(root)
+
+
+def test_v2_quoted_state_literal_case_is_exact(tmp_path: Path) -> None:
+    root = tmp_path / 'connector'
+    altered = tuple(
+        statement.replace("'pending'", "'PENDING'")
+        if statement.startswith('CREATE TABLE jobs')
+        else statement
+        for statement in outbox_module._SCHEMA_V2_STATEMENTS
+    )
+    create_v2_database(root, altered)
+    with pytest.raises(OutboxError, match='schema'):
+        opened_outbox(root)
+
+
+@pytest.mark.parametrize(
+    'persistent_object',
+    [
+        'CREATE TABLE unexpected_table (value INTEGER)',
+        'CREATE INDEX unexpected_index ON namespaces(origin)',
+        'CREATE VIEW unexpected_view AS SELECT id FROM namespaces',
+        '''CREATE TRIGGER unexpected_trigger AFTER INSERT ON namespaces
+           BEGIN SELECT NEW.id; END''',
+    ],
+    ids=['table', 'index', 'view', 'trigger'],
+)
+def test_v2_rejects_every_extra_persistent_schema_object(
+    tmp_path: Path, persistent_object: str
+) -> None:
+    root = tmp_path / 'connector'
+    outbox = opened_outbox(root)
+    outbox.close()
+    connection = sqlite3.connect(database_path(root))
+    connection.execute(persistent_object)
+    connection.commit()
+    connection.close()
+    with pytest.raises(OutboxError, match='schema'):
+        opened_outbox(root)
+
+
+def test_schema_fingerprint_captures_index_uniqueness_origin_partial_and_columns() -> None:
+    connection = sqlite3.connect(':memory:')
+    try:
+        connection.execute('CREATE TABLE sample (first TEXT, second TEXT, UNIQUE(first))')
+        connection.execute(
+            'CREATE UNIQUE INDEX sample_partial ON sample(second) WHERE second IS NOT NULL'
+        )
+        _objects, tables = outbox_module._schema_fingerprint(connection)
+    finally:
+        connection.close()
+    sample = tables[0]
+    indexes = {index[0][1]: index for index in sample[3]}
+    automatic = indexes['sqlite_autoindex_sample_1']
+    partial = indexes['sample_partial']
+    assert automatic[0][2:] == (1, 'u', 0)
+    assert automatic[1] == ((0, 0, 'first'),)
+    assert partial[0][2:] == (1, 'c', 1)
+    assert partial[1] == ((0, 1, 'second'),)
 
 
 def test_unknown_schema_version_is_rejected_without_changes(tmp_path: Path) -> None:
@@ -349,6 +479,30 @@ def test_sqlite_sidecar_symlinks_are_rejected_before_connection(
     with pytest.raises(OutboxError, match='SQLite|storage'):
         opened_outbox(root)
     assert target.read_bytes() == b'outside'
+
+
+def test_first_open_root_creation_race_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'connector'
+    original_lexists = os.path.lexists
+    root_checks = Barrier(2)
+
+    def racing_lexists(path: str | os.PathLike[str]) -> bool:
+        if Path(path) == root:
+            root_checks.wait(timeout=5)
+            return False
+        return original_lexists(path)
+
+    def open_instance(_index: int) -> Outbox:
+        return opened_outbox(root)
+
+    monkeypatch.setattr(os.path, 'lexists', racing_lexists)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        instances = tuple(executor.map(open_instance, range(2)))
+    for instance in instances:
+        instance.close()
+    assert root.is_dir()
 
 
 def test_open_enables_wal_foreign_keys_busy_timeout_and_private_permissions(tmp_path: Path) -> None:
@@ -1232,6 +1386,26 @@ def test_malformed_stored_json_is_rejected_on_read(outbox: Outbox) -> None:
         outbox.lease_next(NAMESPACE, NOW)
 
 
+@pytest.mark.parametrize('owner', ['stage', 'job'])
+def test_durable_owner_byte_count_must_match_snapshot_row(
+    outbox: Outbox, saved_profile: Path, owner: str
+) -> None:
+    snapshot = outbox.snapshot_saved_file(NAMESPACE, saved_profile)
+    if owner == 'job':
+        outbox.enqueue(NAMESPACE, snapshot, ROAST_UUID, METADATA, CLIENT_UUID)
+    outbox.close()
+    connection = sqlite3.connect(database_path(outbox.root))
+    connection.execute(
+        f'UPDATE {"snapshot_staging" if owner == "stage" else "jobs"} '
+        f'SET {"byte_count" if owner == "stage" else "snapshot_byte_count"} = ?',
+        (snapshot.byte_count + 1,),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(OutboxError, match='snapshot|byte count|ownership'):
+        opened_outbox(outbox.root)
+
+
 def test_failure_fields_and_pause_codes_reject_nonallowlisted_controls(outbox: Outbox) -> None:
     job = enqueue_fixture(outbox).job
     leased = outbox.lease_next(NAMESPACE, NOW)
@@ -1298,6 +1472,328 @@ def test_directory_fsync_failure_after_unlink_is_propagated(
     assert outbox.counts(NAMESPACE).complete == 1
 
 
+def test_windows_native_directory_flush_uses_write_access_flags_and_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    create_calls: list[tuple[object, ...]] = []
+    closed: list[int] = []
+    flush_result = True
+    last_error = 0
+
+    def create_file(*arguments: object) -> int:
+        create_calls.append(arguments)
+        return 100 + len(create_calls)
+
+    def close_handle(handle: int) -> bool:
+        closed.append(handle)
+        return True
+
+    def flush_file_buffers(_handle: int) -> bool:
+        return flush_result
+
+    kernel32 = SimpleNamespace(
+        CreateFileW=create_file,
+        CloseHandle=close_handle,
+        FlushFileBuffers=flush_file_buffers,
+    )
+    layer = object.__new__(outbox_module._WindowsNativeLayer)
+    layer._kernel32 = kernel32
+    layer._ctypes = SimpleNamespace(get_last_error=lambda: last_error)
+    layer._invalid_handle = -1
+
+    def directory_attributes(_handle: int) -> int:
+        return stat.FILE_ATTRIBUTE_DIRECTORY
+
+    monkeypatch.setattr(layer, '_attributes', directory_attributes)
+
+    layer.flush_directory(tmp_path)
+    assert create_calls
+    assert create_calls[-1][1] == layer._GENERIC_WRITE | layer._SYNCHRONIZE
+    assert all(
+        call[5]
+        == layer._FILE_FLAG_BACKUP_SEMANTICS | layer._FILE_FLAG_OPEN_REPARSE_POINT
+        for call in create_calls
+    )
+    assert closed
+
+    flush_result = False
+    last_error = 5
+    with pytest.raises(OSError) as raised:
+        layer.flush_directory(tmp_path)
+    assert raised.value.errno == 5
+
+
+def test_windows_native_publication_is_write_through_no_replace_and_fail_closed() -> None:
+    move_calls: list[tuple[object, ...]] = []
+    move_result = True
+    last_error = 0
+
+    def move_file(*arguments: object) -> bool:
+        move_calls.append(arguments)
+        return move_result
+
+    layer = object.__new__(outbox_module._WindowsNativeLayer)
+    layer._kernel32 = SimpleNamespace(MoveFileExW=move_file)
+    layer._ctypes = SimpleNamespace(get_last_error=lambda: last_error)
+    source = Path('temporary.alog')
+    destination = Path('published.alog')
+
+    layer.publish(source, destination)
+    assert move_calls == [(os.fspath(source), os.fspath(destination), layer._MOVEFILE_WRITE_THROUGH)]
+    publication_flags = cast(int, move_calls[0][2])
+    assert not publication_flags & layer._MOVEFILE_REPLACE_EXISTING
+
+    move_result = False
+    last_error = 183
+    with pytest.raises(FileExistsError):
+        layer.publish(source, destination)
+    last_error = 5
+    with pytest.raises(OSError) as raised:
+        layer.publish(source, destination)
+    assert raised.value.errno == 5
+
+
+def test_windows_fake_native_publication_reuses_eexist_without_snapshot_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecordingNative:
+        def __init__(self) -> None:
+            self.publications: list[tuple[Path, Path]] = []
+            self.file_flushes: list[int] = []
+            self.directory_flushes: list[Path] = []
+
+        @staticmethod
+        def open_readonly(path: Path, *, directory: bool = False) -> int:
+            flags = os.O_RDONLY
+            if directory:
+                flags |= getattr(os, 'O_DIRECTORY', 0)
+            return os.open(path, flags)
+
+        @staticmethod
+        def open_lock(path: Path) -> int:
+            return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+        @staticmethod
+        def set_private_permissions(path: Path, mode: int) -> None:
+            path.chmod(mode)
+
+        @staticmethod
+        def verify_private_permissions(path: Path, mode: int) -> None:
+            if stat.S_IMODE(path.stat().st_mode) != mode:
+                raise OSError(errno.EACCES, 'permissions')
+
+        def flush(self, descriptor: int, *, directory: bool) -> None:
+            del directory
+            self.file_flushes.append(descriptor)
+
+        def flush_directory(self, path: Path) -> None:
+            self.directory_flushes.append(path)
+
+        def publish(self, source: Path, destination: Path) -> None:
+            self.publications.append((source, destination))
+            if destination.exists():
+                raise FileExistsError(errno.EEXIST, 'exists')
+            source.rename(destination)
+
+        @staticmethod
+        def unlink(path: Path) -> None:
+            path.chmod(0o600)
+            path.unlink()
+
+    root = tmp_path / 'connector'
+    source_directory = root / NAMESPACE_DIGEST / 'snapshots'
+    source_directory.mkdir(parents=True, mode=0o700)
+    sha256 = hashlib.sha256(PROFILE_BYTES).hexdigest()
+    final_path = source_directory / sha256[:2] / f'{sha256}.alog'
+    first_temporary = source_directory / '.snapshot-first.tmp'
+    first_temporary.write_bytes(PROFILE_BYTES)
+    native = RecordingNative()
+    monkeypatch.setattr(outbox_module, '_IS_WINDOWS', True)
+    monkeypatch.setattr(outbox_module, '_HAS_DIRECTORY_FDS', False)
+    monkeypatch.setattr(outbox_module, '_WINDOWS_NATIVE', native)
+    outbox = Outbox(root, clock=lambda: NOW)
+
+    assert outbox._publish_temporary(
+        first_temporary, final_path, sha256, len(PROFILE_BYTES)
+    )
+    before = final_path.stat()
+    second_temporary = source_directory / '.snapshot-second.tmp'
+    second_temporary.write_bytes(PROFILE_BYTES)
+    assert not outbox._publish_temporary(
+        second_temporary, final_path, sha256, len(PROFILE_BYTES)
+    )
+    after = final_path.stat()
+
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert final_path.read_bytes() == PROFILE_BYTES
+    assert not second_temporary.exists()
+    assert len(native.publications) == 2
+    assert native.file_flushes == []
+    assert native.directory_flushes
+
+
+def _windows_acl_layer(
+    specs: tuple[tuple[int, int, int, bool], ...],
+) -> outbox_module._WindowsNativeLayer:
+    buffers: list[ctypes.Array[ctypes.c_char]] = []
+    matching_sids: set[int] = set()
+    for ace_type, ace_flags, mask, matches_sid in specs:
+        buffer = ctypes.create_string_buffer(
+            ctypes.sizeof(outbox_module._WindowsAccessAllowedAce) + 16
+        )
+        ace = ctypes.cast(
+            buffer, ctypes.POINTER(outbox_module._WindowsAccessAllowedAce)
+        ).contents
+        ace.Header.AceType = ace_type
+        ace.Header.AceFlags = ace_flags
+        ace.Header.AceSize = len(buffer)
+        ace.Mask = mask
+        sid_address = (
+            ctypes.addressof(buffer)
+            + outbox_module._WindowsAccessAllowedAce.SidStart.offset
+        )
+        if matches_sid:
+            matching_sids.add(sid_address)
+        buffers.append(buffer)
+
+    def get_acl_information(
+        _dacl: Any, information: Any, _size: int, _information_class: int
+    ) -> bool:
+        parsed = ctypes.cast(
+            information, ctypes.POINTER(outbox_module._WindowsAclSizeInformation)
+        ).contents
+        parsed.AceCount = len(buffers)
+        return True
+
+    def get_ace(_dacl: Any, index: int, pointer: Any) -> bool:
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(
+            ctypes.addressof(buffers[index])
+        )
+        return True
+
+    def equal_sid(left: Any, _right: Any) -> bool:
+        return ctypes.cast(left, ctypes.c_void_p).value in matching_sids
+
+    layer = object.__new__(outbox_module._WindowsNativeLayer)
+    layer._ctypes = ctypes
+    layer._advapi32 = SimpleNamespace(
+        GetAclInformation=get_acl_information,
+        GetAce=get_ace,
+        EqualSid=equal_sid,
+    )
+    return layer
+
+
+def test_windows_private_acl_parser_rejects_every_noncanonical_ace() -> None:
+    layer_type = outbox_module._WindowsNativeLayer
+    good = (
+        layer_type._ACCESS_ALLOWED_ACE_TYPE,
+        layer_type._OBJECT_INHERIT_ACE | layer_type._CONTAINER_INHERIT_ACE,
+        layer_type._FILE_ALL_ACCESS,
+        True,
+    )
+    expected_sid = ctypes.c_void_p(999)
+    _windows_acl_layer((good,))._verify_private_dacl(
+        ctypes.c_void_p(1), expected_sid, protected=True
+    )
+
+    bad_acls = (
+        (),
+        (good, good),
+        ((layer_type._ACCESS_DENIED_ACE_TYPE, good[1], good[2], True),),
+        ((17, good[1], good[2], True),),
+        ((good[0], good[1], good[2] ^ 1, True),),
+        ((good[0], good[1] | layer_type._INHERITED_ACE, good[2], True),),
+        ((good[0], good[1], good[2], False),),
+    )
+    for specs in bad_acls:
+        with pytest.raises(OSError, match='ACL'):
+            _windows_acl_layer(specs)._verify_private_dacl(
+                ctypes.c_void_p(1), expected_sid, protected=True
+            )
+    with pytest.raises(OSError, match='ACL'):
+        _windows_acl_layer((good,))._verify_private_dacl(
+            ctypes.c_void_p(1), expected_sid, protected=False
+        )
+
+
+def test_windows_native_reparse_and_flush_failure_seams_are_causal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+    layer = object.__new__(outbox_module._WindowsNativeLayer)
+
+    def create_file(*_arguments: object) -> int:
+        return 42
+
+    def close_handle(handle: int) -> bool:
+        closed.append(handle)
+        return True
+
+    layer._kernel32 = SimpleNamespace(
+        CreateFileW=create_file,
+        CloseHandle=close_handle,
+    )
+    layer._ctypes = SimpleNamespace(get_last_error=lambda: 0)
+    layer._invalid_handle = -1
+
+    def reparse_attributes(_handle: int) -> int:
+        return layer._FILE_ATTRIBUTE_REPARSE_POINT
+
+    monkeypatch.setattr(layer, '_attributes', reparse_attributes)
+    with pytest.raises(OSError, match='reparse'):
+        layer._open_one(tmp_path, layer._GENERIC_READ, layer._OPEN_EXISTING)
+    assert closed == [42]
+
+
+def test_windows_lock_seam_blocks_a_contender_until_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / 'windows.lock'
+    lock_path.write_bytes(b'0')
+    first = os.open(lock_path, os.O_RDWR)
+    second = os.open(lock_path, os.O_RDWR)
+    condition = Condition()
+    locked = False
+    contender_waiting = Event()
+    lk_lock = 1
+    lk_unlock = 2
+
+    def locking(_descriptor: int, operation: int, _length: int) -> None:
+        nonlocal locked
+        with condition:
+            if operation == lk_lock:
+                while locked:
+                    contender_waiting.set()
+                    condition.wait(timeout=5)
+                locked = True
+            else:
+                assert operation == lk_unlock
+                locked = False
+                condition.notify_all()
+
+    fake_msvcrt = SimpleNamespace(LK_LOCK=lk_lock, LK_UNLCK=lk_unlock, locking=locking)
+    original_import = outbox_module.importlib.import_module
+
+    def import_module(name: str) -> object:
+        return fake_msvcrt if name == 'msvcrt' else original_import(name)
+
+    monkeypatch.setattr(outbox_module, '_IS_WINDOWS', True)
+    monkeypatch.setattr(outbox_module.importlib, 'import_module', import_module)
+    try:
+        outbox_module._acquire_file_lock(first)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            contender = executor.submit(outbox_module._acquire_file_lock, second)
+            assert contender_waiting.wait(timeout=5)
+            assert not contender.done()
+            outbox_module._release_file_lock(first)
+            contender.result(timeout=5)
+        outbox_module._release_file_lock(second)
+    finally:
+        os.close(first)
+        os.close(second)
+
+
 def test_windows_native_failure_seams_fail_closed_without_sensitive_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1330,9 +1826,44 @@ def test_windows_native_failure_seams_fail_closed_without_sensitive_text(
 
 
 @pytest.mark.win32
-def test_windows_runtime_rejects_reparse_source_and_applies_private_acl(
-    tmp_path: Path,
+def test_windows_runtime_private_acl_publication_and_unlink(
+    tmp_path: Path, saved_profile: Path
 ) -> None:
+    root = tmp_path / 'connector'
+    first = opened_outbox(root)
+    second = opened_outbox(root)
+    try:
+        stage_a = first.snapshot_saved_file(NAMESPACE, saved_profile)
+        before = stage_a.absolute_path.stat()
+        descriptor = os.open(stage_a.absolute_path, os.O_RDONLY)
+        try:
+            stage_b = second.snapshot_saved_file(NAMESPACE, saved_profile)
+            after = stage_b.absolute_path.stat()
+            assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+            assert os.read(descriptor, len(PROFILE_BYTES)) == PROFILE_BYTES
+        finally:
+            os.close(descriptor)
+        native = outbox_module._WINDOWS_NATIVE
+        assert native is not None
+        native.verify_private_permissions(root, 0o700)
+        native.verify_private_permissions(stage_a.absolute_path, 0o400)
+        job_a = first.enqueue(NAMESPACE, stage_a, ROAST_UUID, METADATA, CLIENT_UUID).job
+        job_b = second.enqueue(
+            NAMESPACE, stage_b, OTHER_ROAST_UUID, METADATA, CLIENT_UUID
+        ).job
+        leased_a = first.lease_next(NAMESPACE, NOW)
+        assert leased_a is not None and leased_a.lease_token is not None
+        first.mark_complete(job_a.id, leased_a.lease_token, NOW)
+        assert stage_a.absolute_path.exists()
+        second.remove(job_b.id)
+        assert not stage_a.absolute_path.exists()
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.win32
+def test_windows_runtime_rejects_reparse_source(tmp_path: Path) -> None:
     root = tmp_path / 'connector'
     source_directory = tmp_path / 'source'
     source_directory.mkdir()
@@ -1347,17 +1878,12 @@ def test_windows_runtime_rejects_reparse_source_and_applies_private_acl(
     try:
         with pytest.raises(OutboxError, match='reparse'):
             outbox.snapshot_saved_file(NAMESPACE, link / source.name)
-        snapshot = outbox.snapshot_saved_file(NAMESPACE, source)
-        native = outbox_module._WINDOWS_NATIVE
-        assert native is not None
-        native.verify_private_permissions(root, 0o700)
-        native.verify_private_permissions(snapshot.absolute_path, 0o400)
     finally:
         outbox.close()
 
 
 @pytest.mark.win32
-def test_windows_runtime_rejects_generated_junction_and_publishes_without_clobber(
+def test_windows_runtime_rejects_generated_junction(
     tmp_path: Path, saved_profile: Path
 ) -> None:
     root = tmp_path / 'connector'
@@ -1380,24 +1906,51 @@ def test_windows_runtime_rejects_generated_junction_and_publishes_without_clobbe
     finally:
         outbox.close()
 
-    junction.rmdir()
+
+@pytest.mark.win32
+def test_windows_runtime_process_lock_blocks_a_second_instance(
+    tmp_path: Path, saved_profile: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'connector'
     first = opened_outbox(root)
     second = opened_outbox(root)
+    first_inside_lock = Event()
+    release_first = Event()
+    contender_attempted_lock = Event()
+    acquire_calls = 0
+    original_locked_snapshot = first._snapshot_saved_file_locked
+    original_acquire = outbox_module._acquire_file_lock
+
+    def blocked_snapshot(namespace: Namespace, source: Path) -> Snapshot:
+        first_inside_lock.set()
+        assert release_first.wait(timeout=5)
+        return original_locked_snapshot(namespace, source)
+
+    def recording_acquire(descriptor: int) -> None:
+        nonlocal acquire_calls
+        acquire_calls += 1
+        if acquire_calls == 2:
+            contender_attempted_lock.set()
+        original_acquire(descriptor)
+
+    monkeypatch.setattr(first, '_snapshot_saved_file_locked', blocked_snapshot)
+    monkeypatch.setattr(outbox_module, '_acquire_file_lock', recording_acquire)
     try:
-        stage_a = first.snapshot_saved_file(NAMESPACE, saved_profile)
-        stage_b = second.snapshot_saved_file(NAMESPACE, saved_profile)
-        assert stage_a.absolute_path == stage_b.absolute_path
-        job_a = first.enqueue(NAMESPACE, stage_a, ROAST_UUID, METADATA, CLIENT_UUID).job
-        job_b = second.enqueue(
-            NAMESPACE, stage_b, OTHER_ROAST_UUID, METADATA, CLIENT_UUID
-        ).job
-        leased_a = first.lease_next(NAMESPACE, NOW)
-        assert leased_a is not None and leased_a.lease_token is not None
-        first.mark_complete(job_a.id, leased_a.lease_token, NOW)
-        assert stage_a.absolute_path.exists()
-        second.remove(job_b.id)
-        assert not stage_a.absolute_path.exists()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(
+                first.snapshot_saved_file, NAMESPACE, saved_profile
+            )
+            assert first_inside_lock.wait(timeout=5)
+            second_future = executor.submit(
+                second.snapshot_saved_file, NAMESPACE, saved_profile
+            )
+            assert contender_attempted_lock.wait(timeout=5)
+            assert not second_future.done()
+            release_first.set()
+            first_future.result(timeout=5)
+            second_future.result(timeout=5)
     finally:
+        release_first.set()
         first.close()
         second.close()
 

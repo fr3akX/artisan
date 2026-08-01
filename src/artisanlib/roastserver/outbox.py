@@ -290,6 +290,46 @@ _SCHEMA_V2_STATEMENTS: tuple[str, ...] = (
 _CANONICAL_SCHEMA_V2_STATEMENTS: Final[tuple[str, ...]] = _SCHEMA_V2_STATEMENTS
 
 
+class _WindowsAclSizeInformation(ctypes.Structure):
+    _fields_ = [
+        ('AceCount', wintypes.DWORD),
+        ('AclBytesInUse', wintypes.DWORD),
+        ('AclBytesFree', wintypes.DWORD),
+    ]
+
+
+class _WindowsAceHeader(ctypes.Structure):
+    _fields_ = [
+        ('AceType', wintypes.BYTE),
+        ('AceFlags', wintypes.BYTE),
+        ('AceSize', wintypes.WORD),
+    ]
+
+
+class _WindowsAccessAllowedAce(ctypes.Structure):
+    _fields_ = [
+        ('Header', _WindowsAceHeader),
+        ('Mask', wintypes.DWORD),
+        ('SidStart', wintypes.DWORD),
+    ]
+
+
+type _SchemaPragmaRow = tuple[object, ...]
+type _SchemaObject = tuple[object, object, object]
+type _SchemaIndexFingerprint = tuple[
+    _SchemaPragmaRow, tuple[_SchemaPragmaRow, ...]
+]
+type _SchemaTableFingerprint = tuple[
+    str,
+    tuple[_SchemaPragmaRow, ...],
+    tuple[_SchemaPragmaRow, ...],
+    tuple[_SchemaIndexFingerprint, ...],
+]
+type _SchemaFingerprint = tuple[
+    tuple[_SchemaObject, ...], tuple[_SchemaTableFingerprint, ...]
+]
+
+
 class OutboxError(RuntimeError):
     pass
 
@@ -366,7 +406,9 @@ class _WindowsNativeApi(Protocol):
 
     def flush(self, descriptor: int, *, directory: bool) -> None: ...
 
-    def link(self, source: Path, destination: Path) -> None: ...
+    def flush_directory(self, path: Path) -> None: ...
+
+    def publish(self, source: Path, destination: Path) -> None: ...
 
     def unlink(self, path: Path) -> None: ...
 
@@ -382,6 +424,7 @@ class _WindowsNativeLayer:
 
     _GENERIC_READ = 0x80000000
     _GENERIC_WRITE = 0x40000000
+    _SYNCHRONIZE = 0x00100000
     _READ_CONTROL = 0x00020000
     _WRITE_DAC = 0x00040000
     _DELETE = 0x00010000
@@ -396,6 +439,13 @@ class _WindowsNativeLayer:
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
     _FILE_ATTRIBUTE_READONLY = 0x1
+    _ACCESS_ALLOWED_ACE_TYPE = 0x0
+    _ACCESS_DENIED_ACE_TYPE = 0x1
+    _OBJECT_INHERIT_ACE = 0x1
+    _CONTAINER_INHERIT_ACE = 0x2
+    _INHERITED_ACE = 0x10
+    _FILE_ALL_ACCESS = 0x001F01FF
+    _ACL_SIZE_INFORMATION_CLASS = 2
     _DACL_SECURITY_INFORMATION = 0x4
     _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
     _SE_FILE_OBJECT = 1
@@ -404,7 +454,8 @@ class _WindowsNativeLayer:
     _TOKEN_USER = 1
     _FILE_BASIC_INFO_CLASS = 0
     _FILE_DISPOSITION_INFO_CLASS = 4
-    _ERROR_INVALID_FUNCTION = 1
+    _MOVEFILE_REPLACE_EXISTING = 0x1
+    _MOVEFILE_WRITE_THROUGH = 0x8
 
     def __init__(self) -> None:
         self._ctypes: Any = ctypes
@@ -453,8 +504,8 @@ class _WindowsNativeLayer:
             self._kernel32.FlushFileBuffers, [wintypes.HANDLE], wintypes.BOOL
         )
         self._set_prototype(
-            self._kernel32.CreateHardLinkW,
-            [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPVOID],
+            self._kernel32.MoveFileExW,
+            [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD],
             wintypes.BOOL,
         )
         self._set_prototype(
@@ -498,6 +549,26 @@ class _WindowsNativeLayer:
             ],
             wintypes.BOOL,
         )
+        self._set_prototype(
+            self._advapi32.ConvertStringSidToSidW,
+            [wintypes.LPCWSTR, ctypes.POINTER(wintypes.LPVOID)],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.GetAclInformation,
+            [wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, ctypes.c_int],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.GetAce,
+            [wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID)],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.EqualSid,
+            [wintypes.LPVOID, wintypes.LPVOID],
+            wintypes.BOOL,
+        )
         security_info_arguments: list[Any] = [
             wintypes.HANDLE,
             ctypes.c_int,
@@ -525,17 +596,6 @@ class _WindowsNativeLayer:
                 ctypes.POINTER(wintypes.LPVOID),
             ],
             wintypes.DWORD,
-        )
-        self._set_prototype(
-            self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW,
-            [
-                wintypes.LPVOID,
-                wintypes.DWORD,
-                wintypes.DWORD,
-                ctypes.POINTER(wintypes.LPWSTR),
-                ctypes.POINTER(wintypes.DWORD),
-            ],
-            wintypes.BOOL,
         )
         self._set_prototype(
             self._advapi32.GetSecurityDescriptorControl,
@@ -806,6 +866,47 @@ class _WindowsNativeLayer:
                 self._close(handle)
         self.verify_private_permissions(path, mode)
 
+    def _verify_private_dacl(
+        self, dacl: Any, expected_sid: Any, *, protected: bool
+    ) -> None:
+        if not protected:
+            raise OSError(errno.EACCES, 'Windows ACL is not protected')
+        information = _WindowsAclSizeInformation()
+        if not self._advapi32.GetAclInformation(
+            dacl,
+            self._ctypes.byref(information),
+            self._ctypes.sizeof(information),
+            self._ACL_SIZE_INFORMATION_CLASS,
+        ):
+            raise self._error()
+        if information.AceCount != 1:
+            raise OSError(errno.EACCES, 'Windows ACL has unexpected entries')
+        ace_pointer = self._ctypes.c_void_p()
+        if not self._advapi32.GetAce(dacl, 0, self._ctypes.byref(ace_pointer)):
+            raise self._error()
+        if not ace_pointer.value:
+            raise OSError(errno.EACCES, 'Windows ACL entry is invalid')
+        header = self._ctypes.cast(
+            ace_pointer, self._ctypes.POINTER(_WindowsAceHeader)
+        ).contents
+        intended_flags = self._OBJECT_INHERIT_ACE | self._CONTAINER_INHERIT_ACE
+        if (
+            header.AceType != self._ACCESS_ALLOWED_ACE_TYPE
+            or header.AceFlags != intended_flags
+            or header.AceSize < self._ctypes.sizeof(_WindowsAccessAllowedAce)
+        ):
+            raise OSError(errno.EACCES, 'Windows ACL entry is not an exact allow ACE')
+        allow = self._ctypes.cast(
+            ace_pointer, self._ctypes.POINTER(_WindowsAccessAllowedAce)
+        ).contents
+        ace_sid = self._ctypes.c_void_p(
+            ace_pointer.value + _WindowsAccessAllowedAce.SidStart.offset
+        )
+        if allow.Mask != self._FILE_ALL_ACCESS or not self._advapi32.EqualSid(
+            ace_sid, expected_sid
+        ):
+            raise OSError(errno.EACCES, 'Windows ACL entry has the wrong SID or rights')
+
     def verify_private_permissions(self, path: Path, mode: int) -> None:
         handles = self._open_chain(
             path,
@@ -813,6 +914,7 @@ class _WindowsNativeLayer:
         )
         final = handles[-1]
         security_descriptor = self._ctypes.c_void_p()
+        expected_sid = self._ctypes.c_void_p()
         try:
             dacl = self._ctypes.c_void_p()
             result = self._advapi32.GetSecurityInfo(
@@ -827,63 +929,63 @@ class _WindowsNativeLayer:
             )
             if result != 0 or not dacl.value:
                 raise OSError(result, 'Windows ACL verification failed')
-            text = self._wintypes.LPWSTR()
-            length = self._wintypes.ULONG()
-            if not self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                security_descriptor,
-                self._SDDL_REVISION_1,
-                self._DACL_SECURITY_INFORMATION,
-                self._ctypes.byref(text),
-                self._ctypes.byref(length),
+            if not self._advapi32.ConvertStringSidToSidW(
+                self._current_user_sid_string(), self._ctypes.byref(expected_sid)
             ):
                 raise self._error()
-            try:
-                rendered = cast(str, text.value)
-                sid = self._current_user_sid_string()
-                control = self._wintypes.WORD()
-                revision = self._wintypes.DWORD()
-                if not self._advapi32.GetSecurityDescriptorControl(
-                    security_descriptor,
-                    self._ctypes.byref(control),
-                    self._ctypes.byref(revision),
-                ):
-                    raise self._error()
-                if (
-                    'D:' not in rendered
-                    or rendered.count('(A;') != 1
-                    or sid not in rendered
-                    or not control.value & 0x1000
-                ):
-                    raise OSError(errno.EACCES, 'Windows ACL is not private')
-            finally:
-                self._kernel32.LocalFree(text)
+            control = self._wintypes.WORD()
+            revision = self._wintypes.DWORD()
+            if not self._advapi32.GetSecurityDescriptorControl(
+                security_descriptor,
+                self._ctypes.byref(control),
+                self._ctypes.byref(revision),
+            ):
+                raise self._error()
+            self._verify_private_dacl(
+                dacl, expected_sid, protected=bool(control.value & 0x1000)
+            )
             readonly = bool(self._attributes(final) & self._FILE_ATTRIBUTE_READONLY)
             if readonly != (mode == 0o400):
                 raise OSError(errno.EACCES, 'Windows readonly state is invalid')
         finally:
+            if expected_sid.value:
+                self._kernel32.LocalFree(expected_sid)
             if security_descriptor.value:
                 self._kernel32.LocalFree(security_descriptor)
             for handle in reversed(handles):
                 self._close(handle)
 
     def flush(self, descriptor: int, *, directory: bool) -> None:
+        del directory
         msvcrt = cast(Any, importlib.import_module('msvcrt'))
 
         handle = msvcrt.get_osfhandle(descriptor)
         if not self._kernel32.FlushFileBuffers(handle):
-            error = self._ctypes.get_last_error()
-            if directory and error == self._ERROR_INVALID_FUNCTION:
-                return
-            raise OSError(error, 'Windows flush failed')
+            raise OSError(self._ctypes.get_last_error(), 'Windows flush failed')
 
-    def link(self, source: Path, destination: Path) -> None:
-        if not self._kernel32.CreateHardLinkW(
-            os.fspath(destination), os.fspath(source), None
+    def flush_directory(self, path: Path) -> None:
+        handles = self._open_chain(
+            path,
+            final_access=self._GENERIC_WRITE | self._SYNCHRONIZE,
+        )
+        try:
+            final = handles[-1]
+            if not self._attributes(final) & stat.FILE_ATTRIBUTE_DIRECTORY:
+                raise OSError(errno.ENOTDIR, 'Windows directory flush target is not a directory')
+            if not self._kernel32.FlushFileBuffers(final):
+                raise OSError(self._ctypes.get_last_error(), 'Windows directory flush failed')
+        finally:
+            for handle in reversed(handles):
+                self._close(handle)
+
+    def publish(self, source: Path, destination: Path) -> None:
+        if not self._kernel32.MoveFileExW(
+            os.fspath(source), os.fspath(destination), self._MOVEFILE_WRITE_THROUGH
         ):
             error = self._ctypes.get_last_error()
             if error in {80, 183}:
                 raise FileExistsError(errno.EEXIST, 'snapshot already exists')
-            raise OSError(error, 'Windows hard-link publication failed')
+            raise OSError(error, 'Windows write-through publication failed')
 
     def unlink(self, path: Path) -> None:
         handles = self._open_chain(
@@ -1630,19 +1732,20 @@ class Outbox:
             return frozenset(paths)
 
     def _prepare_root(self) -> None:
-        if os.path.lexists(self.root):
-            root_stat = os.lstat(self.root)
-            if stat.S_ISLNK(root_stat.st_mode) or _path_is_junction(self.root):
-                raise OutboxError('connector root must not be a symlink or reparse point')
-            if not stat.S_ISDIR(root_stat.st_mode):
-                raise OutboxError('connector root must be a directory')
-        else:
-            self.root.mkdir(parents=True, mode=0o700)
-            root_stat = os.lstat(self.root)
-            if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
-                raise OutboxError('connector root must be a private directory')
-            _fsync_directory(self.root.parent)
+        creation_observed = not os.path.lexists(self.root)
+        if creation_observed:
+            try:
+                self.root.mkdir(parents=True, mode=0o700)
+            except FileExistsError:
+                pass
+        root_stat = os.lstat(self.root)
+        if stat.S_ISLNK(root_stat.st_mode) or _path_is_junction(self.root):
+            raise OutboxError('connector root must not be a symlink or reparse point')
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise OutboxError('connector root must be a directory')
         _set_private_permissions(self.root, 0o700)
+        if creation_observed:
+            _fsync_directory(self.root.parent)
 
     def _secure_database_files_before_connect(self) -> None:
         self._ensure_private_database_file(self._database_path, create=True)
@@ -1727,37 +1830,19 @@ class Outbox:
             raise OutboxError('outbox schema migration failed') from None
 
     def _validate_schema_fingerprint(self, statements: tuple[str, ...]) -> None:
-        connection = self._require_connection()
-        expected: dict[tuple[str, str], str] = {}
-        for statement in statements:
-            match = re.match(r'^CREATE (TABLE|INDEX) ([a-z_]+)', statement)
-            if match is None:
-                raise OutboxError('outbox schema definition is invalid')
-            kind = match.group(1).lower()
-            expected[(kind, match.group(2))] = _normalize_schema_sql(statement)
-        actual_rows = connection.execute(
-            '''SELECT type, name, sql FROM sqlite_master
-               WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'index')'''
-        ).fetchall()
-        actual: dict[tuple[str, str], str] = {}
-        for row in actual_rows:
-            if not isinstance(row['type'], str) or not isinstance(row['name'], str):
-                raise OutboxError('outbox schema fingerprint is invalid')
-            if not isinstance(row['sql'], str):
-                raise OutboxError('outbox schema fingerprint is invalid')
-            actual[(row['type'], row['name'])] = _normalize_schema_sql(row['sql'])
+        try:
+            canonical = sqlite3.connect(':memory:')
+            try:
+                for statement in statements:
+                    canonical.execute(statement)
+                expected = _schema_fingerprint(canonical)
+            finally:
+                canonical.close()
+            actual = _schema_fingerprint(self._require_connection())
+        except sqlite3.Error:
+            raise OutboxError('outbox schema definition is invalid') from None
         if actual != expected:
             raise OutboxError('outbox schema fingerprint is invalid')
-
-        for table in (name for kind, name in expected if kind == 'table'):
-            columns = connection.execute(f'PRAGMA table_info({table})').fetchall()
-            if not columns or any(
-                not isinstance(row['name'], str) or not isinstance(row['type'], str)
-                for row in columns
-            ):
-                raise OutboxError('outbox schema columns are invalid')
-            connection.execute(f'PRAGMA foreign_key_list({table})').fetchall()
-            connection.execute(f'PRAGMA index_list({table})').fetchall()
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
         if _SCHEMA_V2_STATEMENTS != _CANONICAL_SCHEMA_V2_STATEMENTS:
@@ -1798,34 +1883,35 @@ class Outbox:
     def _validate_v1_rows(self) -> None:
         connection = self._require_connection()
         namespaces = self._stored_namespaces(connection)
-        snapshot_keys = self._validate_snapshot_rows(connection, namespaces)
+        snapshots = self._validate_snapshot_rows(connection, namespaces)
         for row in connection.execute('SELECT * FROM jobs').fetchall():
             namespace_id = _stored_positive_int(row['namespace_id'], 'namespace id', 2**63 - 1)
             namespace = namespaces.get(namespace_id)
             if namespace is None:
                 raise OutboxError('stored namespace reference is invalid')
             self._validate_job_row(row, namespace, schema_version=1)
-            snapshot_sha = row['snapshot_sha256']
-            if snapshot_sha is not None and (namespace_id, snapshot_sha) not in snapshot_keys:
-                raise OutboxError('stored snapshot reference is invalid')
+            self._validate_job_snapshot_owner(row, namespace_id, snapshots)
 
     def _validate_durable_rows(self) -> None:
         connection = self._require_connection()
         namespaces = self._stored_namespaces(connection)
-        snapshot_keys = self._validate_snapshot_rows(connection, namespaces)
+        snapshots = self._validate_snapshot_rows(connection, namespaces)
         for row in connection.execute('SELECT * FROM snapshot_staging').fetchall():
             token = _stored_job_id(row['token'])
             namespace_id = _stored_positive_int(row['namespace_id'], 'namespace id', 2**63 - 1)
             namespace = namespaces.get(namespace_id)
             sha256 = _stored_sha256(row['sha256'])
-            if namespace is None or (namespace_id, sha256) not in snapshot_keys:
+            snapshot = snapshots.get((namespace_id, sha256))
+            if namespace is None or snapshot is None:
                 raise OutboxError('stored stage reference is invalid')
             relative_path = _stored_snapshot_path(
                 row['relative_path'], _namespace_key(namespace), sha256
             )
-            if token == '' or relative_path == '':
-                raise OutboxError('stored stage is invalid')
-            _stored_positive_int(row['byte_count'], 'staged snapshot byte count', MAX_PROFILE_BYTES)
+            byte_count = _stored_positive_int(
+                row['byte_count'], 'staged snapshot byte count', MAX_PROFILE_BYTES
+            )
+            if token == '' or (relative_path, byte_count) != snapshot:
+                raise OutboxError('stored stage snapshot ownership is invalid')
             _stored_datetime(row['source_modified_at'])
             created = _stored_datetime(row['created_at'])
             expires = _stored_datetime(row['expires_at'])
@@ -1837,6 +1923,7 @@ class Outbox:
             if namespace is None:
                 raise OutboxError('stored namespace reference is invalid')
             self._validate_job_row(row, namespace, schema_version=2)
+            self._validate_job_snapshot_owner(row, namespace_id, snapshots)
 
     def _stored_namespaces(self, connection: sqlite3.Connection) -> dict[int, Namespace]:
         namespaces: dict[int, Namespace] = {}
@@ -1853,22 +1940,45 @@ class Outbox:
 
     def _validate_snapshot_rows(
         self, connection: sqlite3.Connection, namespaces: dict[int, Namespace]
-    ) -> set[tuple[int, str]]:
-        keys: set[tuple[int, str]] = set()
+    ) -> dict[tuple[int, str], tuple[str, int]]:
+        snapshots: dict[tuple[int, str], tuple[str, int]] = {}
         for row in connection.execute('SELECT * FROM snapshots').fetchall():
             namespace_id = _stored_positive_int(row['namespace_id'], 'namespace id', 2**63 - 1)
             namespace = namespaces.get(namespace_id)
             sha256 = _stored_sha256(row['sha256'])
             if namespace is None:
                 raise OutboxError('stored snapshot namespace is invalid')
-            _stored_snapshot_path(row['relative_path'], _namespace_key(namespace), sha256)
-            _stored_positive_int(row['byte_count'], 'snapshot byte count', MAX_PROFILE_BYTES)
+            relative_path = _stored_snapshot_path(
+                row['relative_path'], _namespace_key(namespace), sha256
+            )
+            byte_count = _stored_positive_int(
+                row['byte_count'], 'snapshot byte count', MAX_PROFILE_BYTES
+            )
             _stored_datetime(row['created_at'])
             key = (namespace_id, sha256)
-            if key in keys:
+            if key in snapshots:
                 raise OutboxError('stored snapshot is duplicated')
-            keys.add(key)
-        return keys
+            snapshots[key] = (relative_path, byte_count)
+        return snapshots
+
+    @staticmethod
+    def _validate_job_snapshot_owner(
+        row: sqlite3.Row,
+        namespace_id: int,
+        snapshots: dict[tuple[int, str], tuple[str, int]],
+    ) -> None:
+        if row['snapshot_sha256'] is None:
+            return
+        sha256 = _stored_sha256(row['snapshot_sha256'])
+        snapshot = snapshots.get((namespace_id, sha256))
+        if snapshot is None:
+            raise OutboxError('stored snapshot reference is invalid')
+        relative_path = row['snapshot_relative_path']
+        byte_count = _stored_positive_int(
+            row['snapshot_byte_count'], 'snapshot byte count', MAX_PROFILE_BYTES
+        )
+        if (relative_path, byte_count) != snapshot:
+            raise OutboxError('stored job snapshot ownership is invalid')
 
     def _validate_job_row(
         self, row: sqlite3.Row, namespace: Namespace, *, schema_version: int
@@ -2122,7 +2232,7 @@ class Outbox:
                     os.unlink(temporary_name, dir_fd=directory_fd)
                 else:
                     _secure_unlink(temporary_path)
-                _fsync_descriptor(directory_fd, directory=True)
+                _fsync_directory(directory)
             except FileNotFoundError:
                 pass
             raise
@@ -2139,7 +2249,7 @@ class Outbox:
                 os.unlink(temporary_path.name, dir_fd=directory_fd)
             else:
                 _secure_unlink(temporary_path)
-            _fsync_descriptor(directory_fd, directory=True)
+            _fsync_directory(temporary_path.parent)
         except FileNotFoundError:
             return
         finally:
@@ -2168,7 +2278,7 @@ class Outbox:
                         follow_symlinks=False,
                     )
                 elif _IS_WINDOWS:
-                    _require_windows_native().link(temporary_path, final_path)
+                    _require_windows_native().publish(temporary_path, final_path)
                 else:
                     os.link(temporary_path, final_path, follow_symlinks=False)
                 created = True
@@ -2180,17 +2290,18 @@ class Outbox:
                 return False
             try:
                 _set_private_permissions(final_path, 0o400)
-                descriptor = _open_path_readonly(final_path)
-                try:
-                    _fsync_descriptor(descriptor)
-                finally:
-                    os.close(descriptor)
-                _fsync_descriptor(destination_directory_fd, directory=True)
-                if _HAS_DIRECTORY_FDS:
-                    os.unlink(temporary_path.name, dir_fd=source_directory_fd)
-                else:
-                    _secure_unlink(temporary_path)
-                _fsync_descriptor(source_directory_fd, directory=True)
+                if not _IS_WINDOWS:
+                    descriptor = _open_path_readonly(final_path)
+                    try:
+                        _fsync_descriptor(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    _fsync_directory(final_path.parent)
+                    if _HAS_DIRECTORY_FDS:
+                        os.unlink(temporary_path.name, dir_fd=source_directory_fd)
+                    else:
+                        _secure_unlink(temporary_path)
+                    _fsync_directory(temporary_path.parent)
                 return True
             except BaseException:
                 if created:
@@ -2199,7 +2310,7 @@ class Outbox:
                             os.unlink(final_path.name, dir_fd=destination_directory_fd)
                         else:
                             _secure_unlink(final_path)
-                        _fsync_descriptor(destination_directory_fd, directory=True)
+                        _fsync_directory(final_path.parent)
                     except OSError:
                         pass
                 raise
@@ -2466,7 +2577,7 @@ class Outbox:
                 os.unlink(path.name, dir_fd=directory_fd)
             else:
                 _secure_unlink(path)
-            _fsync_descriptor(directory_fd, directory=True)
+            _fsync_directory(path.parent)
         finally:
             os.close(directory_fd)
 
@@ -2577,8 +2688,94 @@ def _schema_statement(statements: tuple[str, ...], kind: str, name: str) -> str:
     return matches[0]
 
 
+def _schema_fingerprint(connection: sqlite3.Connection) -> _SchemaFingerprint:
+    objects: tuple[_SchemaObject, ...] = tuple(
+        (
+            row[0],
+            row[1],
+            _normalize_schema_sql(row[2]) if isinstance(row[2], str) else row[2],
+        )
+        for row in connection.execute(
+            '''SELECT type, name, sql FROM sqlite_master
+               WHERE NOT (type = 'index' AND sql IS NULL
+                          AND name LIKE 'sqlite_autoindex_%')
+               ORDER BY type, name'''
+        ).fetchall()
+    )
+    tables = tuple(row[1] for row in objects if row[0] == 'table')
+    pragma_fingerprints: list[_SchemaTableFingerprint] = []
+    for table in tables:
+        if not isinstance(table, str):
+            raise sqlite3.DatabaseError('invalid schema object name')
+        quoted_table = _quote_sqlite_identifier(table)
+        columns = tuple(
+            tuple(row)
+            for row in connection.execute(f'PRAGMA table_info({quoted_table})').fetchall()
+        )
+        foreign_keys = tuple(
+            tuple(row)
+            for row in connection.execute(
+                f'PRAGMA foreign_key_list({quoted_table})'
+            ).fetchall()
+        )
+        index_rows = tuple(
+            tuple(row)
+            for row in connection.execute(f'PRAGMA index_list({quoted_table})').fetchall()
+        )
+        indexes: list[_SchemaIndexFingerprint] = []
+        for index in index_rows:
+            if len(index) != 5 or not isinstance(index[1], str):
+                raise sqlite3.DatabaseError('invalid schema index metadata')
+            quoted_index = _quote_sqlite_identifier(index[1])
+            index_info = tuple(
+                tuple(row)
+                for row in connection.execute(
+                    f'PRAGMA index_info({quoted_index})'
+                ).fetchall()
+            )
+            indexes.append((index, index_info))
+        pragma_fingerprints.append(
+            (table, columns, foreign_keys, tuple(indexes))
+        )
+    return objects, tuple(pragma_fingerprints)
+
+
+def _quote_sqlite_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
 def _normalize_schema_sql(value: str) -> str:
-    return re.sub(r'\s+', ' ', value.strip()).casefold()
+    result: list[str] = []
+    pending_space = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character.isspace():
+            pending_space = bool(result)
+            index += 1
+            continue
+        if pending_space:
+            result.append(' ')
+            pending_space = False
+        if character not in {'\'', '"', '`', '['}:
+            result.append(character.casefold())
+            index += 1
+            continue
+        closing = ']' if character == '[' else character
+        result.append(character)
+        index += 1
+        while index < len(value):
+            quoted = value[index]
+            result.append(quoted)
+            index += 1
+            if quoted != closing:
+                continue
+            if index < len(value) and value[index] == closing:
+                result.append(value[index])
+                index += 1
+                continue
+            break
+    return ''.join(result).strip()
 
 
 def _namespace_key(namespace: Namespace) -> str:
@@ -2789,11 +2986,11 @@ def _fsync_descriptor(descriptor: int, *, directory: bool = False) -> None:
 
 def _fsync_directory(path: Path) -> None:
     if _IS_WINDOWS:
-        descriptor = _require_windows_native().open_readonly(path, directory=True)
-    else:
-        flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0)
-        flags |= getattr(os, 'O_NOFOLLOW', 0)
-        descriptor = os.open(path, flags)
+        _require_windows_native().flush_directory(path)
+        return
+    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0)
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags)
     try:
         _fsync_descriptor(descriptor, directory=True)
     finally:

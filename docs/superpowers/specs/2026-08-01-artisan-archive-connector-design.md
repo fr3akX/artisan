@@ -161,7 +161,7 @@ Queue work never blocks saving, recording, or hardware operation. Worker state r
 
 ## Outbox persistence
 
-The outbox uses schema version 2. Opening a version-1 database first fingerprints the complete canonical version-1 tables, columns, declared types, SQL constraints, foreign keys, and indexes; only that exact unreleased schema migrates transactionally. Unknown or malformed schemas fail closed. Version 2 adds:
+The outbox uses schema version 2. Opening a version-1 database first fingerprints every persistent schema object and the complete canonical version-1 tables, quoted SQL literals, columns, declared types/defaults, SQL constraints, foreign keys, and indexes (including index columns, uniqueness, origin, and partial state); only that exact unreleased schema migrates transactionally. Version 2 is checked to the same exactness, and any extra view/trigger/object or malformed/unknown schema fails closed. Version 2 adds:
 
 - separate multi-owner `snapshot_staging` rows keyed by random token, with namespace, SHA-256, generated path, byte count, source timestamp, creation timestamp, and expiry;
 - a nullable unique random `lease_token` on each job attempt; and
@@ -226,7 +226,7 @@ Dialogs call controller methods; they do not perform HTTP or direct queue writes
 ## Security
 
 - Credential and authorization headers are always redacted.
-- Private directories/files use restrictive permissions. POSIX snapshot/database operations are descriptor-relative, no-follow, and no-clobber; Windows opens every component with native no-reparse handles, applies and verifies a private current-user DACL, and uses native flush semantics. Unsupported security APIs fail closed.
+- Private directories/files use restrictive permissions. POSIX security-critical opens, publication, and removal are descriptor-relative, no-follow, and no-clobber. Startup maintenance scans connector-generated names path-wise while holding the process lock, rejects links at every observed entry, and relies on the stated non-malicious-same-user boundary rather than claiming descriptor-relative scanning. Windows opens every component with native no-reparse handles, verifies an exact protected current-user-only DACL ACE-by-ACE, publishes with a native write-through no-replace move, and uses write-capable synchronized directory handles for metadata flushes. Unsupported security APIs and access-denied durability failures fail closed.
 - SQLite database/WAL/SHM paths are checked and hardened under the private root and connector process lock before SQLite can access existing entries.
 - The local same-user threat model assumes a non-malicious account and protects against accidental links/reparse points, stale permissions, crashes, and competing connector processes. A malicious process already running as the same user can normally modify that user’s private files/memory and is outside this boundary; no claim is made that advisory locks defend against such a process.
 - Cache/outbox filenames never use server-provided names.
@@ -261,7 +261,7 @@ Safe server validation messages may be retained when they match the versioned er
 - Multipart upload and checksum/idempotency contracts.
 - Retry classification and `Retry-After` bounds.
 - Strict v1 fingerprint/v2 migration, malformed schema/JSON/state rejection, multi-owner staging with real process barriers and abandoned expiry, duplicate enqueue, no-clobber/open-inode publication, tamper detection, fenced A/B leases, restart recovery, retry/failure/removal, fsync/permission failure, multiprocess cleanup, and snapshot job/stage reference tests.
-- Windows-marked runtime reparse/ACL/locking/publication/deletion tests plus platform-independent ctypes/native-failure seams; non-Windows validation does not claim Windows runtime execution.
+- Windows-marked runtime reparse/ACL/locking/publication/deletion tests plus platform-independent deterministic ctypes/native seams for exact ACL parsing, reparse rejection, write-capable flush success/failure, write-through no-replace publication, EEXIST reuse, and lock contention; non-Windows validation does not claim Windows runtime execution.
 - Cache publication, namespace isolation, corruption, checksum, pruning, and stale-open tests.
 - No-proxy and token-redaction tests.
 
