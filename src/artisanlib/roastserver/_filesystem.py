@@ -36,11 +36,16 @@ import importlib
 import os
 from pathlib import Path
 import stat
+import sys
 import threading
 from typing import Any, Final, NoReturn, Protocol, cast
+from uuid import uuid4
 
 _IS_WINDOWS: bool = os.name == 'nt'
 _HAS_DIRECTORY_FDS: Final[bool] = os.name != 'nt' and os.open in os.supports_dir_fd
+_QUARANTINE_PREFIX: Final[str] = '.artisan-quarantine-'
+_RENAME_NOREPLACE: Final[int] = 1
+_RENAME_EXCL_DARWIN: Final[int] = 0x4
 _UNSUPPORTED_DIRECTORY_SYNC_ERRNOS: Final[frozenset[int]] = frozenset(
     value
     for value in (
@@ -105,7 +110,13 @@ class _WindowsNativeApi(Protocol):
 
     def replace(self, source: Path, destination: Path) -> None: ...
 
+    def move_no_replace(self, source: Path, destination: Path) -> None: ...
+
     def unlink(self, path: Path) -> None: ...
+
+    def unlink_if_identity(
+        self, path: Path, expected_identity: tuple[int, int]
+    ) -> bool: ...
 
 
 class _WindowsNativeLayer:
@@ -682,13 +693,16 @@ class _WindowsNativeLayer:
                 self._close(handle)
 
     def publish(self, source: Path, destination: Path) -> None:
+        self.move_no_replace(source, destination)
+
+    def move_no_replace(self, source: Path, destination: Path) -> None:
         if not self._kernel32.MoveFileExW(
             os.fspath(source), os.fspath(destination), self._MOVEFILE_WRITE_THROUGH
         ):
             error = self._ctypes.get_last_error()
             if error in {80, 183}:
-                raise FileExistsError(errno.EEXIST, 'snapshot already exists')
-            raise OSError(error, 'Windows write-through publication failed')
+                raise FileExistsError(errno.EEXIST, 'destination already exists')
+            raise OSError(error, 'Windows write-through move failed')
 
     def replace(self, source: Path, destination: Path) -> None:
         if not self._kernel32.MoveFileExW(
@@ -708,19 +722,52 @@ class _WindowsNativeLayer:
             ),
         )
         try:
-            final = handles[-1]
-            self._set_readonly(final, False)
-            disposition = self._file_disposition_info(True)
-            if not self._kernel32.SetFileInformationByHandle(
-                final,
-                self._FILE_DISPOSITION_INFO_CLASS,
-                self._ctypes.byref(disposition),
-                self._ctypes.sizeof(disposition),
-            ):
-                raise self._error()
+            self._unlink_handle(handles[-1])
         finally:
             for handle in reversed(handles):
                 self._close(handle)
+
+    def unlink_if_identity(
+        self, path: Path, expected_identity: tuple[int, int]
+    ) -> bool:
+        msvcrt = cast(Any, importlib.import_module('msvcrt'))
+        handles = self._open_chain(
+            path,
+            final_access=(
+                self._DELETE
+                | self._GENERIC_READ
+                | self._FILE_READ_ATTRIBUTES
+                | self._FILE_WRITE_ATTRIBUTES
+            ),
+        )
+        final = handles.pop()
+        descriptor: int | None = None
+        try:
+            descriptor = cast(int, msvcrt.open_osfhandle(final, os.O_RDONLY))
+            final = 0
+            file_stat = os.fstat(descriptor)
+            if (file_stat.st_dev, file_stat.st_ino) != expected_identity:
+                return False
+            self._unlink_handle(cast(int, msvcrt.get_osfhandle(descriptor)))
+            return True
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            elif final:
+                self._close(final)
+            for handle in reversed(handles):
+                self._close(handle)
+
+    def _unlink_handle(self, handle: int) -> None:
+        self._set_readonly(handle, False)
+        disposition = self._file_disposition_info(True)
+        if not self._kernel32.SetFileInformationByHandle(
+            handle,
+            self._FILE_DISPOSITION_INFO_CLASS,
+            self._ctypes.byref(disposition),
+            self._ctypes.sizeof(disposition),
+        ):
+            raise self._error()
 
 
 def _load_windows_native() -> _WindowsNativeApi | None:
@@ -1156,38 +1203,237 @@ def replace_generated(root: Path, source: Path, destination: Path) -> None:
         os.close(destination_directory_fd)
 
 
-def unlink_generated_file(root: Path, path: Path, *, missing_ok: bool = False) -> bool:
-    _relative_parts(root, path)
-    directory_fd = open_generated_directory(root, path.parent)
+def generated_quarantine_identity(name: str) -> tuple[int, int] | None:
+    if not name.startswith(_QUARANTINE_PREFIX):
+        return None
+    components = name.removeprefix(_QUARANTINE_PREFIX).split('-')
+    if len(components) != 3:
+        return None
+    device_text, file_text, token = components
+    if (
+        not device_text
+        or not file_text
+        or len(token) != 32
+        or any(character not in '0123456789abcdef' for character in token)
+    ):
+        return None
     try:
-        try:
-            path_stat = (
-                os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
-                if _HAS_DIRECTORY_FDS
-                else os.lstat(path)
+        identity = int(device_text, 16), int(file_text, 16)
+    except ValueError:
+        return None
+    if device_text != f'{identity[0]:x}' or file_text != f'{identity[1]:x}':
+        return None
+    return identity
+
+
+def is_generated_quarantine_name(name: str) -> bool:
+    return generated_quarantine_identity(name) is not None
+
+
+def _posix_move_no_replace(
+    source_name: str, destination_name: str, directory_descriptor: int
+) -> None:
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, 'renameat2', None)
+    if renameat2 is not None:
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        if (
+            renameat2(
+                directory_descriptor,
+                source_bytes,
+                directory_descriptor,
+                destination_bytes,
+                _RENAME_NOREPLACE,
             )
-        except FileNotFoundError:
-            if missing_ok:
-                return False
-            raise
-        if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
-            _fail('generated removal target is invalid')
+            == 0
+        ):
+            return
+        error = ctypes.get_errno()
+        if error not in {
+            errno.EINVAL,
+            errno.ENOSYS,
+            getattr(errno, 'ENOTSUP', errno.EINVAL),
+            getattr(errno, 'EOPNOTSUPP', errno.EINVAL),
+        }:
+            raise OSError(error, 'atomic no-replace move failed')
+    if sys.platform == 'darwin':
+        renameatx_np = getattr(libc, 'renameatx_np', None)
+        if renameatx_np is not None:
+            renameatx_np.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameatx_np.restype = ctypes.c_int
+            if (
+                renameatx_np(
+                    directory_descriptor,
+                    source_bytes,
+                    directory_descriptor,
+                    destination_bytes,
+                    _RENAME_EXCL_DARWIN,
+                )
+                == 0
+            ):
+                return
+            error = ctypes.get_errno()
+            if error not in {errno.EINVAL, errno.ENOSYS}:
+                raise OSError(error, 'atomic no-replace move failed')
+    try:
+        os.stat(destination_name, dir_fd=directory_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError(errno.EEXIST, 'destination already exists')
+    os.rename(
+        source_name,
+        destination_name,
+        src_dir_fd=directory_descriptor,
+        dst_dir_fd=directory_descriptor,
+    )
+
+
+def _move_generated_no_replace(
+    source: Path, destination: Path, directory_descriptor: int
+) -> None:
+    if source.parent != destination.parent:
+        raise OSError(errno.EXDEV, 'quarantine move must stay in one directory')
+    if _IS_WINDOWS:
+        require_windows_native().move_no_replace(source, destination)
+    elif _HAS_DIRECTORY_FDS:
+        _posix_move_no_replace(source.name, destination.name, directory_descriptor)
+    else:
+        if os.path.lexists(destination):
+            raise FileExistsError(errno.EEXIST, 'destination already exists')
+        os.rename(source, destination)
+
+
+def _unlink_quarantined_generated_file(
+    root: Path,
+    quarantine_path: Path,
+    expected_identity: tuple[int, int],
+    directory_descriptor: int,
+) -> bool:
+    _relative_parts(root, quarantine_path)
+    if _IS_WINDOWS:
+        return require_windows_native().unlink_if_identity(
+            quarantine_path, expected_identity
+        )
+    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
+    flags |= getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    descriptor: int | None = None
+    try:
         if _HAS_DIRECTORY_FDS:
-            os.unlink(path.name, dir_fd=directory_fd)
+            descriptor = os.open(
+                quarantine_path.name, flags, dir_fd=directory_descriptor
+            )
         else:
-            secure_unlink(path)
+            descriptor = os.open(quarantine_path, flags)
+        descriptor_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(descriptor_stat.st_mode)
+            or (descriptor_stat.st_dev, descriptor_stat.st_ino) != expected_identity
+        ):
+            return False
+        entry_stat = (
+            os.stat(
+                quarantine_path.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if _HAS_DIRECTORY_FDS
+            else os.lstat(quarantine_path)
+        )
+        if (
+            not stat.S_ISREG(entry_stat.st_mode)
+            or stat.S_ISLNK(entry_stat.st_mode)
+            or (entry_stat.st_dev, entry_stat.st_ino) != expected_identity
+        ):
+            return False
+        if _HAS_DIRECTORY_FDS:
+            os.unlink(quarantine_path.name, dir_fd=directory_descriptor)
+        else:
+            secure_unlink(quarantine_path)
+        return True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def unlink_generated_file(
+    root: Path,
+    path: Path,
+    expected_identity: tuple[int, int],
+    *,
+    missing_ok: bool = False,
+) -> bool:
+    """Remove one generated identity without unlinking through its original name.
+
+    Callers serialize connector mutations with their process lock. The random
+    quarantine name closes accidental connector races; mutation by an
+    adversarial process running as the same user remains outside this boundary.
+    """
+
+    _relative_parts(root, path)
+    if any(type(value) is not int or value < 0 for value in expected_identity):
+        _fail('generated removal identity is invalid')
+    directory_descriptor = open_generated_directory(root, path.parent)
+    quarantine_path: Path | None = None
+    moved = False
+    try:
+        for _attempt in range(32):
+            candidate = path.parent / (
+                f'{_QUARANTINE_PREFIX}{expected_identity[0]:x}-'
+                f'{expected_identity[1]:x}-{uuid4().hex}'
+            )
+            try:
+                _move_generated_no_replace(path, candidate, directory_descriptor)
+            except FileExistsError:
+                continue
+            except FileNotFoundError:
+                if missing_ok:
+                    return False
+                _fail('generated removal target is unavailable')
+            quarantine_path = candidate
+            moved = True
+            break
+        if quarantine_path is None:
+            _fail('generated quarantine name is unavailable')
+        if not _unlink_quarantined_generated_file(
+            root, quarantine_path, expected_identity, directory_descriptor
+        ):
+            _fail('generated removal identity changed')
+        moved = False
         fsync_directory(path.parent)
         return True
-    except FilesystemError:
+    except BaseException as error:
+        if moved and quarantine_path is not None:
+            try:
+                _move_generated_no_replace(
+                    quarantine_path, path, directory_descriptor
+                )
+                moved = False
+                fsync_directory(path.parent)
+            except (OSError, FilesystemError):
+                pass
+        if isinstance(error, FilesystemError):
+            raise
+        if isinstance(error, OSError):
+            _fail('generated removal failed')
         raise
-    except FileNotFoundError:
-        if missing_ok:
-            return False
-        _fail('generated removal target is unavailable')
-    except OSError:
-        _fail('generated removal failed')
     finally:
-        os.close(directory_fd)
+        os.close(directory_descriptor)
 
 
 def open_path_readonly(
@@ -1390,6 +1636,8 @@ __all__ = [
     'fsync_descriptor',
     'fsync_directory',
     'generated_entry_stat',
+    'generated_quarantine_identity',
+    'is_generated_quarantine_name',
     'open_generated_directory',
     'open_generated_file',
     'open_generated_lock',

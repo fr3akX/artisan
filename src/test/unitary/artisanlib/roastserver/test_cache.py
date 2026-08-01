@@ -10,7 +10,8 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
-from typing import Any
+import threading
+from typing import Any, BinaryIO
 from uuid import UUID
 
 import pytest
@@ -40,7 +41,9 @@ class PortableWindowsCacheNative:
         self.permissions: list[tuple[Path, int]] = []
         self.flushes: list[tuple[str, object]] = []
         self.replacements: list[tuple[Path, Path]] = []
+        self.quarantine_moves: list[tuple[Path, Path]] = []
         self.removals: list[Path] = []
+        self.verified_removals: list[Path] = []
         self.reparse_path: Path | None = None
 
     def open_readonly(self, path: Path, *, directory: bool = False) -> int:
@@ -79,9 +82,23 @@ class PortableWindowsCacheNative:
         self.replacements.append((source, destination))
         os.replace(source, destination)
 
+    def move_no_replace(self, source: Path, destination: Path) -> None:
+        self.quarantine_moves.append((source, destination))
+        if destination.exists():
+            raise FileExistsError(errno.EEXIST, 'destination exists')
+        os.rename(source, destination)
+
     def unlink(self, path: Path) -> None:
         self.removals.append(path)
         path.unlink()
+
+    def unlink_if_identity(self, path: Path, expected_identity: tuple[int, int]) -> bool:
+        path_stat = path.stat()
+        if (path_stat.st_dev, path_stat.st_ino) != expected_identity:
+            return False
+        self.verified_removals.append(path)
+        path.unlink()
+        return True
 
 
 def namespace_for_test(
@@ -860,6 +877,193 @@ def test_prune_rejects_bool_negative_and_noninteger_limits(cache: CacheStore) ->
             cache.prune(NAMESPACE, value, frozenset())  # type: ignore[arg-type]
 
 
+def test_concurrent_staging_creation_and_close_are_linearized_without_descriptor_leaks(
+    cache: CacheStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert isinstance(cache._state_lock, type(threading.RLock()))
+    registered = threading.Event()
+    close_started = threading.Event()
+    allow_creation_to_return = threading.Event()
+    captured: list[cache_module._OwnedStage] = []
+    created: list[tuple[Path, BinaryIO]] = []
+    thread_failures: list[BaseException] = []
+    original_create = cache._new_staging_file_locked
+    original_cleanup = cache._cleanup_owned_stage
+
+    def state_lock_is_owned() -> bool:
+        is_owned = getattr(cache._state_lock, '_is_owned', None)
+        return callable(is_owned) and bool(is_owned())
+
+    def capture_registered_stage(namespace_key: str) -> tuple[Path, BinaryIO]:
+        assert state_lock_is_owned()
+        path, output = original_create(namespace_key)
+        captured.append(cache._staging[path])
+        registered.set()
+        assert allow_creation_to_return.wait(timeout=5)
+        return path, output
+
+    def verify_closed_cleanup(stage: cache_module._OwnedStage) -> bool:
+        assert state_lock_is_owned()
+        assert cache._closed
+        return original_cleanup(stage)
+
+    def create() -> None:
+        try:
+            created.append(cache.new_staging_file(NAMESPACE))
+        except BaseException as exc:
+            thread_failures.append(exc)
+
+    def close() -> None:
+        try:
+            close_started.set()
+            cache.close()
+        except BaseException as exc:
+            thread_failures.append(exc)
+
+    monkeypatch.setattr(cache, '_new_staging_file_locked', capture_registered_stage)
+    monkeypatch.setattr(cache, '_cleanup_owned_stage', verify_closed_cleanup)
+    creator = threading.Thread(target=create)
+    creator.start()
+    assert registered.wait(timeout=5)
+    closer = threading.Thread(target=close)
+    closer.start()
+    assert close_started.wait(timeout=5)
+    allow_creation_to_return.set()
+    creator.join(timeout=10)
+    closer.join(timeout=10)
+
+    assert not creator.is_alive() and not closer.is_alive()
+    assert thread_failures == []
+    assert len(created) == 1 and len(captured) == 1
+    path, output = created[0]
+    assert output.closed
+    assert not path.exists()
+    assert not path.with_suffix('.lock').exists()
+    with pytest.raises(OSError):
+        os.fstat(captured[0].lock_descriptor)
+    with pytest.raises(CacheError):
+        cache.new_staging_file(NAMESPACE)
+    cache.close()
+
+
+def test_discard_restores_replacement_swapped_after_identity_observation_before_move(
+    cache: CacheStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged, output = cache.new_staging_file(NAMESPACE)
+    output.write(PROFILE_BYTES)
+    output.flush()
+    alias = tmp_path / 'owned-stage-hardlink.part'
+    try:
+        os.link(staged, alias)
+    except OSError:
+        pytest.skip('hard-link creation unavailable')
+    replacement_bytes = b'replacement-after-identity-observation'
+    replacement = tmp_path / 'replacement.part'
+    replacement.write_bytes(replacement_bytes)
+    original_move = filesystem_module._move_generated_no_replace
+    replaced = False
+
+    def replace_before_atomic_move(
+        source: Path, destination: Path, directory_descriptor: int
+    ) -> None:
+        nonlocal replaced
+        if source == staged and not replaced:
+            replaced = True
+            os.replace(replacement, staged)
+        original_move(source, destination, directory_descriptor)
+
+    monkeypatch.setattr(
+        filesystem_module, '_move_generated_no_replace', replace_before_atomic_move
+    )
+    with pytest.raises(CacheError) as raised:
+        cache.discard_staging(staged)
+
+    assert raised.value.failure == cache_module.CACHE_FAILURE
+    assert replaced
+    assert output.closed
+    assert staged.read_bytes() == replacement_bytes
+    assert alias.read_bytes() == PROFILE_BYTES
+    assert not staged.with_suffix('.lock').exists()
+    assert not list(cache.root.rglob('.artisan-quarantine-*'))
+
+
+def test_discard_does_not_remove_replacement_installed_after_atomic_move(
+    cache: CacheStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged, output = cache.new_staging_file(NAMESPACE)
+    output.write(PROFILE_BYTES)
+    output.flush()
+    replacement_bytes = b'replacement-after-atomic-move'
+    original_unlink = filesystem_module._unlink_quarantined_generated_file
+    installed = False
+
+    def install_replacement_then_unlink(
+        root: Path,
+        quarantine_path: Path,
+        expected_identity: tuple[int, int],
+        directory_descriptor: int,
+    ) -> bool:
+        nonlocal installed
+        if not installed and expected_identity == cache._staging[staged].identity:
+            assert not staged.exists()
+            staged.write_bytes(replacement_bytes)
+            os.chmod(staged, 0o600)
+            installed = True
+        return original_unlink(
+            root, quarantine_path, expected_identity, directory_descriptor
+        )
+
+    monkeypatch.setattr(
+        filesystem_module,
+        '_unlink_quarantined_generated_file',
+        install_replacement_then_unlink,
+    )
+    cache.discard_staging(staged)
+
+    assert installed
+    assert output.closed
+    assert staged.read_bytes() == replacement_bytes
+    assert not staged.with_suffix('.lock').exists()
+    assert not list(cache.root.rglob('.artisan-quarantine-*'))
+
+
+def test_secure_removal_failure_restores_owned_path_and_still_releases_stage_lock(
+    cache: CacheStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged, output = cache.new_staging_file(NAMESPACE)
+    output.write(PROFILE_BYTES)
+    output.flush()
+    stage_identity = cache._staging[staged].identity
+    original_unlink = filesystem_module._unlink_quarantined_generated_file
+    failed = False
+
+    def fail_first_unlink(
+        root: Path,
+        quarantine_path: Path,
+        expected_identity: tuple[int, int],
+        directory_descriptor: int,
+    ) -> bool:
+        nonlocal failed
+        if not failed and expected_identity == stage_identity:
+            failed = True
+            raise OSError('injected quarantine removal failure')
+        return original_unlink(
+            root, quarantine_path, expected_identity, directory_descriptor
+        )
+
+    monkeypatch.setattr(
+        filesystem_module, '_unlink_quarantined_generated_file', fail_first_unlink
+    )
+    with pytest.raises(CacheError):
+        cache.discard_staging(staged)
+
+    assert failed
+    assert output.closed
+    assert staged.read_bytes() == PROFILE_BYTES
+    assert not staged.with_suffix('.lock').exists()
+    assert not list(cache.root.rglob('.artisan-quarantine-*'))
+
+
 def test_staging_discard_and_close_remove_all_owned_lock_pairs(cache: CacheStore) -> None:
     first_path, first_output = cache.new_staging_file(NAMESPACE)
     second_path, second_output = cache.new_staging_file(NAMESPACE)
@@ -908,6 +1112,9 @@ def test_close_attempts_every_stage_after_first_owned_removal_failure(
     assert not first_path.with_suffix('.lock').exists()
     assert not second_path.exists()
     assert not second_path.with_suffix('.lock').exists()
+    assert cache._staging == {}
+    cache.close()
+    assert first_path.exists()
 
 
 def test_restart_collects_orphan_profile_and_temp(cache: CacheStore) -> None:
@@ -926,6 +1133,43 @@ def test_restart_collects_orphan_profile_and_temp(cache: CacheStore) -> None:
     assert not orphan.exists()
     assert not temporary.exists()
     assert restarted.stats(NAMESPACE).revision_count == 0
+
+
+def test_restart_removes_only_identity_matching_quarantine_residue(
+    cache: CacheStore,
+) -> None:
+    temporary_directory = (
+        cache.root / NAMESPACE.key.removeprefix('namespace-sha256:') / 'tmp'
+    )
+    temporary_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    owned = temporary_directory / 'owned-residue'
+    owned.write_bytes(PROFILE_BYTES)
+    owned_stat = owned.stat()
+    owned_quarantine = temporary_directory / (
+        f'.artisan-quarantine-{owned_stat.st_dev:x}-{owned_stat.st_ino:x}-'
+        f'{UUID(int=9).hex}'
+    )
+    owned.rename(owned_quarantine)
+    restarted = CacheStore(cache.root)
+    assert not owned_quarantine.exists()
+    restarted.close()
+
+    expected = temporary_directory / 'expected-identity'
+    expected.write_bytes(b'expected')
+    expected_stat = expected.stat()
+    expected.unlink()
+    replacement_bytes = b'unowned-quarantine-replacement'
+    mismatched_quarantine = temporary_directory / (
+        f'.artisan-quarantine-{expected_stat.st_dev:x}-{expected_stat.st_ino:x}-'
+        f'{UUID(int=10).hex}'
+    )
+    mismatched_quarantine.write_bytes(replacement_bytes)
+
+    with pytest.raises(CacheError) as raised:
+        CacheStore(cache.root)
+
+    assert raised.value.failure == cache_module.CACHE_FAILURE
+    assert mismatched_quarantine.read_bytes() == replacement_bytes
 
 
 def test_restart_cleanup_never_converts_untrusted_temporary_mtime(
@@ -1251,8 +1495,11 @@ def test_portable_windows_seam_runs_complete_cache_publish_validate_and_remove_f
     assert any(mode == 0o600 for _path, mode in native.permissions)
     assert any(kind == 'descriptor' for kind, _value in native.flushes)
     assert any(kind == 'directory' for kind, _value in native.flushes)
-    assert cached.path in native.removals
-    assert cached.sidecar_path in native.removals
+    assert native.removals == []
+    assert len(native.verified_removals) >= 4
+    assert all(path.name.startswith('.artisan-quarantine-') for path in native.verified_removals)
+    assert any(source == cached.path for source, _destination in native.quarantine_moves)
+    assert any(source == cached.sidecar_path for source, _destination in native.quarantine_moves)
 
 
 def test_portable_windows_full_store_rejects_native_reparse_component(
@@ -1348,6 +1595,99 @@ def test_windows_nonblocking_stage_lock_uses_exact_contention_mode(
     finally:
         os.close(descriptor)
     assert calls == [(descriptor, 7, 1), (descriptor, 7, 1)]
+
+
+def test_windows_quarantine_move_is_write_through_and_never_replaces() -> None:
+    calls: list[tuple[object, ...]] = []
+    result = True
+    last_error = 0
+
+    def move_file(*arguments: object) -> bool:
+        calls.append(arguments)
+        return result
+
+    layer = object.__new__(filesystem_module._WindowsNativeLayer)
+    layer._kernel32 = type('Kernel', (), {'MoveFileExW': staticmethod(move_file)})()
+    layer._ctypes = type(
+        'Ctypes', (), {'get_last_error': staticmethod(lambda: last_error)}
+    )()
+    source = Path('profile.alog')
+    quarantine = Path('.artisan-quarantine-11111111111141118111111111111111')
+    layer.move_no_replace(source, quarantine)
+    assert calls == [
+        (os.fspath(source), os.fspath(quarantine), layer._MOVEFILE_WRITE_THROUGH)
+    ]
+
+    result = False
+    last_error = 183
+    with pytest.raises(FileExistsError):
+        layer.move_no_replace(source, quarantine)
+
+
+def test_windows_quarantine_unlink_verifies_and_deletes_through_same_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened_access: list[int] = []
+    deleted_handles: list[int] = []
+    closed_handles: list[int] = []
+    closed_descriptors: list[int] = []
+    identity = (17, 23)
+    layer = object.__new__(filesystem_module._WindowsNativeLayer)
+
+    def open_chain(
+        _path: Path,
+        *,
+        final_access: int,
+        final_disposition: int = layer._OPEN_EXISTING,
+    ) -> list[int]:
+        del final_disposition
+        opened_access.append(final_access)
+        return [10, 20, 30]
+
+    def open_osfhandle(handle: int, _flags: int) -> int:
+        return handle + 10
+
+    def get_osfhandle(descriptor: int) -> int:
+        return descriptor - 10
+
+    fake_msvcrt = type(
+        'Msvcrt',
+        (),
+        {
+            'open_osfhandle': staticmethod(open_osfhandle),
+            'get_osfhandle': staticmethod(get_osfhandle),
+        },
+    )
+    original_import = filesystem_module.importlib.import_module
+
+    def import_module(name: str) -> object:
+        if name == 'msvcrt':
+            return fake_msvcrt
+        return original_import(name)
+
+    monkeypatch.setattr(layer, '_open_chain', open_chain)
+    monkeypatch.setattr(layer, '_unlink_handle', deleted_handles.append)
+    monkeypatch.setattr(layer, '_close', closed_handles.append)
+    monkeypatch.setattr(filesystem_module.importlib, 'import_module', import_module)
+    def fstat(_descriptor: int) -> object:
+        return type('Stat', (), {'st_dev': 17, 'st_ino': 23})()
+
+    monkeypatch.setattr(filesystem_module.os, 'fstat', fstat)
+    monkeypatch.setattr(filesystem_module.os, 'close', closed_descriptors.append)
+
+    assert layer.unlink_if_identity(Path('quarantine.alog'), identity)
+    assert deleted_handles == [30]
+    assert closed_descriptors == [40]
+    assert closed_handles == [20, 10]
+    assert opened_access == [
+        layer._DELETE
+        | layer._GENERIC_READ
+        | layer._FILE_READ_ATTRIBUTES
+        | layer._FILE_WRITE_ATTRIBUTES
+    ]
+
+    assert not layer.unlink_if_identity(Path('quarantine.alog'), (17, 24))
+    assert deleted_handles == [30]
 
 
 def test_windows_replace_seam_is_write_through_and_replaces_atomically() -> None:

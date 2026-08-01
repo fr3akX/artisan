@@ -190,6 +190,7 @@ class CacheStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(os.path.abspath(os.fspath(root)))
         self._lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self._staging: dict[Path, _OwnedStage] = {}
         self._closed = False
         try:
@@ -202,18 +203,20 @@ class CacheStore:
             raise CacheError from None
 
     def __enter__(self) -> Self:
-        self._require_open()
-        return self
+        with self._state_lock:
+            self._require_open()
+            return self
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
     def new_staging_file(self, namespace: Namespace) -> tuple[Path, BinaryIO]:
         try:
-            self._require_open()
             namespace_key = _namespace_key(namespace)
-            with self._filesystem_lock():
-                return self._new_staging_file_locked(namespace_key)
+            with self._state_lock:
+                self._require_open()
+                with self._filesystem_lock():
+                    return self._new_staging_file_locked(namespace_key)
         except CacheError:
             raise
         except (OSError, ValueError, secure_filesystem.FilesystemError):
@@ -304,32 +307,34 @@ class CacheStore:
     def discard_staging(self, path: Path) -> None:
         staged = Path(path)
         try:
-            self._require_open()
-            with self._filesystem_lock():
-                stage = self._staging.get(staged)
-                if stage is None or self._cleanup_owned_stage(stage):
-                    raise CacheError
+            with self._state_lock:
+                self._require_open()
+                with self._filesystem_lock():
+                    stage = self._staging.get(staged)
+                    if stage is None or self._cleanup_owned_stage(stage):
+                        raise CacheError
         except CacheError:
             raise
         except (OSError, ValueError, secure_filesystem.FilesystemError):
             raise CacheError from None
 
     def close(self) -> None:
-        if self._closed:
-            return
         failed = False
-        try:
-            with self._filesystem_lock():
-                for stage in tuple(self._staging.values()):
-                    if self._cleanup_owned_stage(stage):
-                        failed = True
-        except CacheError:
-            failed = True
-            for stage in tuple(self._staging.values()):
-                if self._cleanup_owned_stage(stage):
-                    failed = True
-        finally:
+        with self._state_lock:
+            if self._closed:
+                return
             self._closed = True
+            stages = tuple(self._staging.values())
+            try:
+                with self._filesystem_lock():
+                    for stage in stages:
+                        if self._cleanup_owned_stage(stage):
+                            failed = True
+            except CacheError:
+                failed = True
+                for stage in stages:
+                    if stage.path in self._staging and self._release_owned_stage_handles(stage):
+                        failed = True
         if failed:
             raise CacheError
 
@@ -343,17 +348,18 @@ class CacheStore:
     ) -> CachedRevision:
         staged = Path(staged_path)
         try:
-            self._require_open()
-            with self._filesystem_lock():
-                try:
-                    return self._publish_locked(
-                        namespace, detail, receipt, staged, validated_at
-                    )
-                except BaseException:
-                    stage = self._staging.get(staged)
-                    if stage is not None and self._cleanup_owned_stage(stage):
-                        raise CacheError from None
-                    raise
+            with self._state_lock:
+                self._require_open()
+                with self._filesystem_lock():
+                    try:
+                        return self._publish_locked(
+                            namespace, detail, receipt, staged, validated_at
+                        )
+                    except BaseException:
+                        stage = self._staging.get(staged)
+                        if stage is not None and self._cleanup_owned_stage(stage):
+                            raise CacheError from None
+                        raise
         except CacheError:
             raise
         except (
@@ -496,22 +502,25 @@ class CacheStore:
         if not isinstance(protected_paths, frozenset):
             raise ValueError('protected paths are invalid')
         try:
-            self._require_open()
-            with self._filesystem_lock(), self._protected_paths(protected_paths) as protected:
-                revisions = list(self._scan_namespace(namespace))
-                protected_identities = frozenset(item.identity for item in protected)
-                total = sum(item.revision.byte_size for item in revisions)
-                candidates = sorted(revisions, key=_lru_key)
-                for cached in candidates:
-                    if total <= limit_bytes:
-                        break
-                    if self._path_identity(cached.path) in protected_identities:
-                        continue
-                    self._verify_protected_paths(protected)
-                    self._remove_pair(cached)
-                    revisions.remove(cached)
-                    total -= cached.revision.byte_size
-                return CacheStats(total, len(revisions))
+            with self._state_lock:
+                self._require_open()
+                with self._filesystem_lock(), self._protected_paths(
+                    protected_paths
+                ) as protected:
+                    revisions = list(self._scan_namespace(namespace))
+                    protected_identities = frozenset(item.identity for item in protected)
+                    total = sum(item.revision.byte_size for item in revisions)
+                    candidates = sorted(revisions, key=_lru_key)
+                    for cached in candidates:
+                        if total <= limit_bytes:
+                            break
+                        if self._path_identity(cached.path) in protected_identities:
+                            continue
+                        self._verify_protected_paths(protected)
+                        self._remove_pair(cached)
+                        revisions.remove(cached)
+                        total -= cached.revision.byte_size
+                    return CacheStats(total, len(revisions))
         except CacheError:
             raise
         except (
@@ -981,6 +990,14 @@ class CacheStore:
             for file_entry in os.scandir(roast_directory):
                 if secure_filesystem.directory_entry_is_reparse(file_entry):
                     raise CacheError
+                quarantine_identity = secure_filesystem.generated_quarantine_identity(
+                    file_entry.name
+                )
+                if quarantine_identity is not None:
+                    if not file_entry.is_file(follow_symlinks=False):
+                        raise CacheError
+                    self._discard_owned_path(Path(file_entry.path), quarantine_identity)
+                    continue
                 match = _CACHE_FILE_RE.fullmatch(file_entry.name)
                 if match is None or not file_entry.is_file(follow_symlinks=False):
                     raise CacheError
@@ -1004,6 +1021,14 @@ class CacheStore:
         for entry in os.scandir(temporary_directory):
             if secure_filesystem.directory_entry_is_reparse(entry):
                 raise CacheError
+            quarantine_identity = secure_filesystem.generated_quarantine_identity(
+                entry.name
+            )
+            if quarantine_identity is not None:
+                if not entry.is_file(follow_symlinks=False):
+                    raise CacheError
+                self._discard_owned_path(Path(entry.path), quarantine_identity)
+                continue
             match = _STAGE_FILE_RE.fullmatch(entry.name)
             if match is None or not entry.is_file(follow_symlinks=False):
                 raise CacheError
@@ -1165,8 +1190,21 @@ class CacheStore:
         return failed
 
     def _release_owned_stage(self, stage: _OwnedStage) -> bool:
+        failed = self._release_owned_stage_handles(stage)
+        try:
+            self._discard_owned_path(stage.lock_path, stage.lock_identity)
+        except BaseException:
+            failed = True
+        return failed
+
+    def _release_owned_stage_handles(self, stage: _OwnedStage) -> bool:
         self._staging.pop(stage.path, None)
         failed = False
+        if not stage.output.closed:
+            try:
+                stage.output.close()
+            except BaseException:
+                failed = True
         try:
             secure_filesystem.release_file_lock(stage.lock_descriptor)
         except BaseException:
@@ -1174,10 +1212,6 @@ class CacheStore:
         try:
             os.close(stage.lock_descriptor)
         except OSError:
-            failed = True
-        try:
-            self._discard_owned_path(stage.lock_path, stage.lock_identity)
-        except BaseException:
             failed = True
         return failed
 
@@ -1196,15 +1230,14 @@ class CacheStore:
         return failed
 
     def _discard_owned_path(self, path: Path, identity: tuple[int, int]) -> None:
-        if not os.path.lexists(path):
-            return
-        if self._path_identity(path) != identity:
-            raise CacheError
-        secure_filesystem.unlink_generated_file(self.root, path, missing_ok=False)
+        secure_filesystem.unlink_generated_file(
+            self.root, path, identity, missing_ok=True
+        )
 
     def _discard_generated(self, path: Path) -> None:
         try:
-            secure_filesystem.unlink_generated_file(self.root, path, missing_ok=True)
+            identity = self._path_identity(path)
+            self._discard_owned_path(path, identity)
         except (OSError, secure_filesystem.FilesystemError):
             if os.path.lexists(path):
                 raise CacheError from None
