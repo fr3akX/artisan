@@ -1523,6 +1523,108 @@ def test_windows_native_directory_flush_uses_write_access_flags_and_propagates(
     assert raised.value.errno == 5
 
 
+def test_windows_native_api_prototypes_match_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeFunction:
+        argtypes: list[object] | None = None
+        restype: object = None
+
+    class FakeLibrary:
+        def __init__(self) -> None:
+            self.functions: dict[str, FakeFunction] = {}
+
+        def __getattr__(self, name: str) -> FakeFunction:
+            return self.functions.setdefault(name, FakeFunction())
+
+    libraries = {'kernel32': FakeLibrary(), 'advapi32': FakeLibrary()}
+
+    def win_dll(name: str, **_kwargs: object) -> FakeLibrary:
+        return libraries[name]
+
+    monkeypatch.setitem(ctypes.__dict__, 'WinDLL', win_dll)
+    layer = outbox_module._WindowsNativeLayer()
+
+    set_information = libraries['kernel32'].SetFileInformationByHandle
+    assert set_information.argtypes == [
+        outbox_module.wintypes.HANDLE,
+        ctypes.c_int,
+        outbox_module.wintypes.LPVOID,
+        outbox_module.wintypes.DWORD,
+    ]
+    assert set_information.restype is outbox_module.wintypes.BOOL
+    assert libraries['advapi32'].GetLengthSid.argtypes == [outbox_module.wintypes.LPVOID]
+    assert libraries['advapi32'].GetLengthSid.restype is outbox_module.wintypes.DWORD
+    assert libraries['advapi32'].IsValidSid.argtypes == [outbox_module.wintypes.LPVOID]
+    assert libraries['advapi32'].IsValidSid.restype is outbox_module.wintypes.BOOL
+    assert layer._file_disposition_info is outbox_module._WindowsFileDispositionInfo
+
+
+def test_windows_native_unlink_uses_exact_file_disposition_info_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    information_calls: list[tuple[int, int, int]] = []
+    readonly_calls: list[tuple[int, bool]] = []
+    closed: list[int] = []
+    set_result = True
+    last_error = 0
+
+    def set_file_information(
+        _handle: int, information_class: int, information: Any, size: int
+    ) -> bool:
+        parsed = ctypes.cast(
+            information, ctypes.POINTER(outbox_module._WindowsFileDispositionInfo)
+        ).contents
+        information_calls.append((information_class, size, int(parsed.DeleteFile)))
+        return set_result
+
+    def close_handle(handle: int) -> bool:
+        closed.append(handle)
+        return True
+
+    layer = object.__new__(outbox_module._WindowsNativeLayer)
+    layer._kernel32 = SimpleNamespace(
+        SetFileInformationByHandle=set_file_information,
+        CloseHandle=close_handle,
+    )
+    layer._ctypes = SimpleNamespace(
+        byref=ctypes.byref,
+        sizeof=ctypes.sizeof,
+        get_last_error=lambda: last_error,
+    )
+    layer._file_disposition_info = outbox_module._WindowsFileDispositionInfo
+
+    def open_chain(
+        _path: Path, *, final_access: int, final_disposition: int = layer._OPEN_EXISTING
+    ) -> list[int]:
+        del final_access, final_disposition
+        return [10, 20, 30]
+
+    def set_readonly(handle: int, value: bool) -> None:
+        readonly_calls.append((handle, value))
+
+    monkeypatch.setattr(layer, '_open_chain', open_chain)
+    monkeypatch.setattr(layer, '_set_readonly', set_readonly)
+
+    assert outbox_module._WindowsFileDispositionInfo._fields_ == [
+        ('DeleteFile', outbox_module.wintypes.BOOLEAN)
+    ]
+    assert ctypes.sizeof(outbox_module._WindowsFileDispositionInfo) == 1
+    assert ctypes.alignment(outbox_module._WindowsFileDispositionInfo) == 1
+    assert outbox_module._WindowsFileDispositionInfo.DeleteFile.offset == 0
+    layer.unlink(Path('snapshot.alog'))
+    assert information_calls == [(layer._FILE_DISPOSITION_INFO_CLASS, 1, 1)]
+    assert readonly_calls == [(30, False)]
+    assert closed == [30, 20, 10]
+
+    set_result = False
+    last_error = 5
+    with pytest.raises(OSError) as raised:
+        layer.unlink(Path('snapshot.alog'))
+    assert raised.value.errno == 5
+    assert information_calls[-1] == (layer._FILE_DISPOSITION_INFO_CLASS, 1, 1)
+    assert readonly_calls[-1] == (30, False)
+    assert closed[-3:] == [30, 20, 10]
+
+
 def test_windows_native_publication_is_write_through_no_replace_and_fail_closed() -> None:
     move_calls: list[tuple[object, ...]] = []
     move_result = True
@@ -1632,29 +1734,45 @@ def test_windows_fake_native_publication_reuses_eexist_without_snapshot_flush(
     assert native.directory_flushes
 
 
+def _synthetic_windows_sid(subauthority: int = 21, *, valid: bool = True) -> bytes:
+    revision = 1 if valid else 2
+    return bytes((revision, 1, 0, 0, 0, 0, 0, 5)) + subauthority.to_bytes(4, 'little')
+
+
 def _windows_acl_layer(
-    specs: tuple[tuple[int, int, int, bool], ...],
-) -> outbox_module._WindowsNativeLayer:
+    specs: tuple[tuple[int, int, int, bool, int, bool], ...],
+) -> tuple[outbox_module._WindowsNativeLayer, ctypes.c_void_p]:
+    sid_offset = outbox_module._WindowsAccessAllowedAce.SidStart.offset
     buffers: list[ctypes.Array[ctypes.c_char]] = []
-    matching_sids: set[int] = set()
-    for ace_type, ace_flags, mask, matches_sid in specs:
-        buffer = ctypes.create_string_buffer(
-            ctypes.sizeof(outbox_module._WindowsAccessAllowedAce) + 16
-        )
+    for ace_type, ace_flags, mask, matches_sid, size_adjustment, valid_sid in specs:
+        sid = _synthetic_windows_sid(21 if matches_sid else 22, valid=valid_sid)
+        exact_size = sid_offset + len(sid)
+        buffer = ctypes.create_string_buffer(max(exact_size + max(size_adjustment, 0), exact_size))
         ace = ctypes.cast(
             buffer, ctypes.POINTER(outbox_module._WindowsAccessAllowedAce)
         ).contents
         ace.Header.AceType = ace_type
         ace.Header.AceFlags = ace_flags
-        ace.Header.AceSize = len(buffer)
+        ace.Header.AceSize = exact_size + size_adjustment
         ace.Mask = mask
-        sid_address = (
-            ctypes.addressof(buffer)
-            + outbox_module._WindowsAccessAllowedAce.SidStart.offset
-        )
-        if matches_sid:
-            matching_sids.add(sid_address)
+        ctypes.memmove(ctypes.addressof(buffer) + sid_offset, sid, len(sid))
         buffers.append(buffer)
+
+    expected_sid_buffer = ctypes.create_string_buffer(_synthetic_windows_sid())
+    expected_sid = ctypes.c_void_p(ctypes.addressof(expected_sid_buffer))
+
+    def sid_bytes(pointer: Any) -> bytes:
+        address = ctypes.cast(pointer, ctypes.c_void_p).value
+        assert address is not None
+        header = ctypes.string_at(address, 8)
+        return ctypes.string_at(address, 8 + 4 * header[1])
+
+    def is_valid_sid(pointer: Any) -> bool:
+        value = sid_bytes(pointer)
+        return value[0] == 1 and value[1] <= 15 and len(value) == 8 + 4 * value[1]
+
+    def get_length_sid(pointer: Any) -> int:
+        return len(sid_bytes(pointer))
 
     def get_acl_information(
         _dacl: Any, information: Any, _size: int, _information_class: int
@@ -1671,50 +1789,60 @@ def _windows_acl_layer(
         )
         return True
 
-    def equal_sid(left: Any, _right: Any) -> bool:
-        return ctypes.cast(left, ctypes.c_void_p).value in matching_sids
+    def equal_sid(left: Any, right: Any) -> bool:
+        # Keep the synthetic expected SID storage alive with the API seam.
+        assert expected_sid_buffer
+        return is_valid_sid(left) and is_valid_sid(right) and sid_bytes(left) == sid_bytes(right)
 
     layer = object.__new__(outbox_module._WindowsNativeLayer)
     layer._ctypes = ctypes
     layer._advapi32 = SimpleNamespace(
         GetAclInformation=get_acl_information,
         GetAce=get_ace,
+        GetLengthSid=get_length_sid,
+        IsValidSid=is_valid_sid,
         EqualSid=equal_sid,
     )
-    return layer
+    return layer, expected_sid
 
 
-def test_windows_private_acl_parser_rejects_every_noncanonical_ace() -> None:
+def test_windows_private_acl_parser_requires_exact_valid_sid_ace() -> None:
+    assert ctypes.sizeof(outbox_module._WindowsAceHeader) == 4
+    assert outbox_module._WindowsAccessAllowedAce.SidStart.offset == 8
+    assert ctypes.sizeof(outbox_module._WindowsAccessAllowedAce) == 12
+
     layer_type = outbox_module._WindowsNativeLayer
     good = (
         layer_type._ACCESS_ALLOWED_ACE_TYPE,
         layer_type._OBJECT_INHERIT_ACE | layer_type._CONTAINER_INHERIT_ACE,
         layer_type._FILE_ALL_ACCESS,
         True,
+        0,
+        True,
     )
-    expected_sid = ctypes.c_void_p(999)
-    _windows_acl_layer((good,))._verify_private_dacl(
-        ctypes.c_void_p(1), expected_sid, protected=True
-    )
+    layer, expected_sid = _windows_acl_layer((good,))
+    layer._verify_private_dacl(ctypes.c_void_p(1), expected_sid, protected=True)
 
     bad_acls = (
         (),
         (good, good),
-        ((layer_type._ACCESS_DENIED_ACE_TYPE, good[1], good[2], True),),
-        ((17, good[1], good[2], True),),
-        ((good[0], good[1], good[2] ^ 1, True),),
-        ((good[0], good[1] | layer_type._INHERITED_ACE, good[2], True),),
-        ((good[0], good[1], good[2], False),),
+        ((layer_type._ACCESS_DENIED_ACE_TYPE, *good[1:]),),
+        ((17, *good[1:]),),
+        ((good[0], good[1], good[2] ^ 1, *good[3:]),),
+        ((good[0], good[1] | layer_type._INHERITED_ACE, *good[2:]),),
+        ((good[0], good[1], good[2], False, good[4], good[5]),),
+        ((good[0], good[1], good[2], good[3], 4, good[5]),),
+        ((good[0], good[1], good[2], good[3], -4, good[5]),),
+        ((good[0], good[1], good[2], good[3], good[4], False),),
     )
     for specs in bad_acls:
+        bad_layer, bad_expected_sid = _windows_acl_layer(specs)
         with pytest.raises(OSError, match='ACL'):
-            _windows_acl_layer(specs)._verify_private_dacl(
-                ctypes.c_void_p(1), expected_sid, protected=True
+            bad_layer._verify_private_dacl(
+                ctypes.c_void_p(1), bad_expected_sid, protected=True
             )
     with pytest.raises(OSError, match='ACL'):
-        _windows_acl_layer((good,))._verify_private_dacl(
-            ctypes.c_void_p(1), expected_sid, protected=False
-        )
+        layer._verify_private_dacl(ctypes.c_void_p(1), expected_sid, protected=False)
 
 
 def test_windows_native_reparse_and_flush_failure_seams_are_causal(
@@ -1823,6 +1951,17 @@ def test_windows_native_failure_seams_fail_closed_without_sensitive_text(
         outbox_module._open_path_readonly(tmp_path / 'source.alog')
     assert reparse.value.__cause__ is None
     assert private_path not in repr(reparse.value)
+
+
+@pytest.mark.win32
+def test_windows_runtime_native_unlink_uses_file_disposition_info(tmp_path: Path) -> None:
+    path = tmp_path / 'native-unlink.alog'
+    path.write_bytes(PROFILE_BYTES)
+    native = outbox_module._WINDOWS_NATIVE
+    assert native is not None
+    native.set_private_permissions(path, 0o400)
+    native.unlink(path)
+    assert not path.exists()
 
 
 @pytest.mark.win32

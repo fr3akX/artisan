@@ -290,28 +290,40 @@ _SCHEMA_V2_STATEMENTS: tuple[str, ...] = (
 _CANONICAL_SCHEMA_V2_STATEMENTS: Final[tuple[str, ...]] = _SCHEMA_V2_STATEMENTS
 
 
+# ``ctypes.wintypes`` follows host C widths when imported off Windows. These
+# fixed-width aliases keep portable native seams byte-for-byte compatible with
+# the Win32 SDK without changing their ABI on Windows.
+_WindowsByte = ctypes.c_uint8
+_WindowsWord = ctypes.c_uint16
+_WindowsDword = ctypes.c_uint32
+
+
 class _WindowsAclSizeInformation(ctypes.Structure):
     _fields_ = [
-        ('AceCount', wintypes.DWORD),
-        ('AclBytesInUse', wintypes.DWORD),
-        ('AclBytesFree', wintypes.DWORD),
+        ('AceCount', _WindowsDword),
+        ('AclBytesInUse', _WindowsDword),
+        ('AclBytesFree', _WindowsDword),
     ]
 
 
 class _WindowsAceHeader(ctypes.Structure):
     _fields_ = [
-        ('AceType', wintypes.BYTE),
-        ('AceFlags', wintypes.BYTE),
-        ('AceSize', wintypes.WORD),
+        ('AceType', _WindowsByte),
+        ('AceFlags', _WindowsByte),
+        ('AceSize', _WindowsWord),
     ]
 
 
 class _WindowsAccessAllowedAce(ctypes.Structure):
     _fields_ = [
         ('Header', _WindowsAceHeader),
-        ('Mask', wintypes.DWORD),
-        ('SidStart', wintypes.DWORD),
+        ('Mask', _WindowsDword),
+        ('SidStart', _WindowsDword),
     ]
+
+
+class _WindowsFileDispositionInfo(ctypes.Structure):
+    _fields_ = [('DeleteFile', wintypes.BOOLEAN)]
 
 
 type _SchemaPragmaRow = tuple[object, ...]
@@ -569,6 +581,12 @@ class _WindowsNativeLayer:
             [wintypes.LPVOID, wintypes.LPVOID],
             wintypes.BOOL,
         )
+        self._set_prototype(
+            self._advapi32.GetLengthSid, [wintypes.LPVOID], wintypes.DWORD
+        )
+        self._set_prototype(
+            self._advapi32.IsValidSid, [wintypes.LPVOID], wintypes.BOOL
+        )
         security_info_arguments: list[Any] = [
             wintypes.HANDLE,
             ctypes.c_int,
@@ -633,12 +651,9 @@ class _WindowsNativeLayer:
                 ('FileAttributes', wintypes.DWORD),
             ]
 
-        class FileDispositionInfo(ctypes.Structure):
-            _fields_ = [('DeleteFile', wintypes.BOOL)]
-
         self._by_handle_information = ByHandleFileInformation
         self._file_basic_info = FileBasicInfo
-        self._file_disposition_info = FileDispositionInfo
+        self._file_disposition_info = _WindowsFileDispositionInfo
 
     @staticmethod
     def _set_prototype(function: Any, arguments: list[Any], result: Any) -> None:
@@ -890,18 +905,23 @@ class _WindowsNativeLayer:
             ace_pointer, self._ctypes.POINTER(_WindowsAceHeader)
         ).contents
         intended_flags = self._OBJECT_INHERIT_ACE | self._CONTAINER_INHERIT_ACE
+        sid_offset = _WindowsAccessAllowedAce.SidStart.offset
         if (
             header.AceType != self._ACCESS_ALLOWED_ACE_TYPE
             or header.AceFlags != intended_flags
-            or header.AceSize < self._ctypes.sizeof(_WindowsAccessAllowedAce)
+            or header.AceSize < sid_offset + 8
+            or header.AceSize % self._ctypes.sizeof(_WindowsDword) != 0
         ):
             raise OSError(errno.EACCES, 'Windows ACL entry is not an exact allow ACE')
         allow = self._ctypes.cast(
             ace_pointer, self._ctypes.POINTER(_WindowsAccessAllowedAce)
         ).contents
-        ace_sid = self._ctypes.c_void_p(
-            ace_pointer.value + _WindowsAccessAllowedAce.SidStart.offset
-        )
+        ace_sid = self._ctypes.c_void_p(ace_pointer.value + sid_offset)
+        if not self._advapi32.IsValidSid(ace_sid):
+            raise OSError(errno.EACCES, 'Windows ACL entry contains an invalid SID')
+        sid_length = self._advapi32.GetLengthSid(ace_sid)
+        if header.AceSize != sid_offset + sid_length:
+            raise OSError(errno.EACCES, 'Windows ACL entry has trailing or missing bytes')
         if allow.Mask != self._FILE_ALL_ACCESS or not self._advapi32.EqualSid(
             ace_sid, expected_sid
         ):
