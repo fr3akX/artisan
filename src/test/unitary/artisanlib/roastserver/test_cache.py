@@ -193,9 +193,15 @@ RECEIPT = DownloadReceipt(
 )
 
 
+def opened_cache(root: Path) -> CacheStore:
+    store = CacheStore(root)
+    store.open()
+    return store
+
+
 @pytest.fixture
 def cache(tmp_path: Path) -> CacheStore:
-    return CacheStore(tmp_path / 'cache')
+    return opened_cache(tmp_path / 'cache')
 
 
 def stage_bytes(cache: CacheStore, namespace: Namespace, data: bytes) -> Path:
@@ -286,6 +292,39 @@ def three_cached_revisions(cache: CacheStore) -> tuple[CachedRevision, ...]:
 def assert_no_temporary_files(cache: CacheStore) -> None:
     assert not list(cache.root.rglob('*.part'))
     assert not [path for path in cache.root.rglob('*.lock') if path.name != '.cache.lock']
+
+
+def test_constructor_is_memory_only_and_open_is_explicit_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / 'lazy-cache'
+    calls: list[int] = []
+    original = filesystem_module.prepare_private_root
+
+    def record_open(path: Path) -> None:
+        calls.append(threading.get_ident())
+        original(path)
+
+    monkeypatch.setattr(filesystem_module, 'prepare_private_root', record_open)
+    constructor_thread = threading.get_ident()
+
+    store = CacheStore(root)
+
+    assert calls == []
+    assert not root.exists()
+    with pytest.raises(CacheError):
+        store.stats(NAMESPACE)
+    opener = threading.Thread(target=store.open)
+    opener.start()
+    opener.join(timeout=5)
+    assert not opener.is_alive()
+    assert len(calls) == 1
+    assert calls[0] != constructor_thread
+    store.open()
+    assert len(calls) == 1
+    assert store.stats(NAMESPACE).revision_count == 0
+    store.close()
 
 
 def test_publish_uses_generated_path_and_public_canonical_sidecar(
@@ -656,9 +695,9 @@ def test_offline_rows_are_latest_per_roast_newest_first_filtered_and_stale(
 
 def test_cache_reopens_from_sidecars_after_restart(tmp_path: Path) -> None:
     root = tmp_path / 'cache'
-    first = CacheStore(root)
+    first = opened_cache(root)
     cached = publish_revision(first)
-    second = CacheStore(root)
+    second = opened_cache(root)
     assert second.list_offline(NAMESPACE, ArchiveFilters()).items == (cached,)
     assert second.validate(cached) == cached
 
@@ -694,7 +733,7 @@ def test_generated_directory_symlink_is_rejected_without_escape(tmp_path: Path) 
     except OSError:
         pytest.skip('symlink creation unavailable')
     with pytest.raises(CacheError):
-        CacheStore(root)
+        opened_cache(root)
     assert not list(outside.iterdir())
 
 
@@ -707,7 +746,7 @@ def test_root_symlink_is_rejected(tmp_path: Path) -> None:
     except OSError:
         pytest.skip('symlink creation unavailable')
     with pytest.raises(CacheError):
-        CacheStore(root)
+        opened_cache(root)
 
 
 def test_prune_is_deterministic_lru_and_never_deletes_protected_identity(
@@ -1129,7 +1168,7 @@ def test_restart_collects_orphan_profile_and_temp(cache: CacheStore) -> None:
     temporary.write_bytes(b'temporary')
     stale_time = (NOW - timedelta(days=2)).timestamp()
     os.utime(temporary, (stale_time, stale_time))
-    restarted = CacheStore(cache.root)
+    restarted = opened_cache(cache.root)
     assert not orphan.exists()
     assert not temporary.exists()
     assert restarted.stats(NAMESPACE).revision_count == 0
@@ -1150,7 +1189,7 @@ def test_restart_removes_only_identity_matching_quarantine_residue(
         f'{UUID(int=9).hex}'
     )
     owned.rename(owned_quarantine)
-    restarted = CacheStore(cache.root)
+    restarted = opened_cache(cache.root)
     assert not owned_quarantine.exists()
     restarted.close()
 
@@ -1166,7 +1205,7 @@ def test_restart_removes_only_identity_matching_quarantine_residue(
     mismatched_quarantine.write_bytes(replacement_bytes)
 
     with pytest.raises(CacheError) as raised:
-        CacheStore(cache.root)
+        opened_cache(cache.root)
 
     assert raised.value.failure == cache_module.CACHE_FAILURE
     assert mismatched_quarantine.read_bytes() == replacement_bytes
@@ -1189,7 +1228,7 @@ def test_restart_cleanup_never_converts_untrusted_temporary_mtime(
             raise OverflowError('injected untrusted timestamp')
 
     monkeypatch.setattr(cache_module, 'datetime', RaisingDateTime)
-    restarted = CacheStore(cache.root)
+    restarted = opened_cache(cache.root)
     assert not temporary.exists()
     restarted.close()
 
@@ -1211,6 +1250,7 @@ root, namespace_json, ready, release = sys.argv[1:]
 namespace_data = json.loads(namespace_json)
 namespace = Namespace(namespace_data[0], UUID(namespace_data[1]), namespace_data[2])
 store = CacheStore(Path(root))
+store.open()
 path, output = store.new_staging_file(namespace)
 with output:
     output.write(b'active-stage')
@@ -1258,7 +1298,7 @@ else:
     old = datetime(2000, 1, 1, tzinfo=UTC).timestamp()
     os.utime(active_path, (old, old))
     os.utime(active_path.with_suffix('.lock'), (old, old))
-    observer = CacheStore(root)
+    observer = opened_cache(root)
     assert active_path.exists()
     assert active_path.with_suffix('.lock').exists()
     observer.close()
@@ -1273,7 +1313,7 @@ else:
     crashed.communicate(timeout=20)
     assert crashed.returncode == 17
     assert abandoned_path.exists()
-    recovered = CacheStore(root)
+    recovered = opened_cache(root)
     assert not abandoned_path.exists()
     assert not abandoned_path.with_suffix('.lock').exists()
     recovered.close()
@@ -1305,6 +1345,7 @@ detail = parse_roast_detail(payload)
 revision = detail.current_revision
 assert revision is not None
 store = CacheStore(Path(root))
+store.open()
 path, output = store.new_staging_file(namespace)
 with output:
     output.write(profile)
@@ -1361,7 +1402,7 @@ store.close()
         if process.returncode != 0:
             failures.append((stdout + stderr).decode('utf-8', errors='replace'))
     assert not failures
-    reopened = CacheStore(root)
+    reopened = opened_cache(root)
     assert reopened.stats(NAMESPACE).revision_count == 1
     cached = reopened.list_offline(NAMESPACE, ArchiveFilters()).items[0]
     assert reopened.validate(cached).path.read_bytes() == profile
@@ -1480,7 +1521,7 @@ def test_portable_windows_seam_runs_complete_cache_publish_validate_and_remove_f
     monkeypatch.setattr(filesystem_module, 'release_file_lock', release)
     monkeypatch.setattr(filesystem_module, 'try_acquire_file_lock', try_acquire)
 
-    store = CacheStore(tmp_path / 'cache')
+    store = opened_cache(tmp_path / 'cache')
     cached = publish_revision(store)
     assert store.validate(cached) == cached
     stats = store.clear_unused(NAMESPACE, frozenset())
@@ -1524,7 +1565,7 @@ def test_portable_windows_full_store_rejects_native_reparse_component(
     monkeypatch.setattr(filesystem_module, 'release_file_lock', release)
 
     with pytest.raises(CacheError):
-        CacheStore(root)
+        opened_cache(root)
 
 
 @pytest.mark.win32
@@ -1532,7 +1573,7 @@ def test_portable_windows_full_store_rejects_native_reparse_component(
 def test_windows_runtime_cache_applies_acl_replaces_flushes_validates_and_deletes(
     tmp_path: Path,
 ) -> None:
-    store = CacheStore(tmp_path / 'cache')
+    store = opened_cache(tmp_path / 'cache')
     cached = publish_revision(store)
     filesystem_module.verify_private_permissions(store.root, 0o700)
     filesystem_module.verify_private_permissions(cached.path, 0o600)
@@ -1559,7 +1600,7 @@ def test_windows_runtime_cache_rejects_reparse_namespace(
     except OSError:
         pytest.skip('Windows symlink creation is unavailable')
     with pytest.raises(CacheError):
-        CacheStore(root)
+        opened_cache(root)
     assert not list(outside.iterdir())
 
 

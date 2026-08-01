@@ -26,6 +26,7 @@ from collections.abc import Callable, Generator
 from datetime import UTC, datetime, timedelta
 import hashlib
 from pathlib import Path
+import secrets
 import threading
 import time
 from types import TracebackType
@@ -62,9 +63,21 @@ from artisanlib.roastserver.contract import (
     RoastSummary,
     ServerIdentity,
 )
-from artisanlib.roastserver.metadata import ProjectedMetadata
-from artisanlib.roastserver.outbox import EnqueueResult, FailedJob, Job, Outbox, Snapshot
-from artisanlib.roastserver.settings import CredentialStoreError, namespace_for
+from artisanlib.roastserver.metadata import ProjectedMetadata, project_profile
+from artisanlib.roastserver.outbox import (
+    EnqueueResult,
+    FailedJob,
+    Job,
+    Outbox,
+    QueueCounts,
+    Snapshot,
+)
+from artisanlib.roastserver.settings import (
+    MAX_CACHE_LIMIT_BYTES,
+    MIN_CACHE_LIMIT_BYTES,
+    CredentialStoreError,
+    namespace_for,
+)
 from artisanlib.roastserver.worker import (
     BrowseRequest,
     CachedOpenRequest,
@@ -85,7 +98,6 @@ ROAST_UUID = UUID('22222222-2222-4222-8222-222222222222')
 CLIENT_UUID = UUID('33333333-3333-4333-8333-333333333333')
 USER_ID = UUID('44444444-4444-4444-8444-444444444444')
 NAMESPACE = namespace_for(ORIGIN, ORGANIZATION_ID)
-SECRET = 'ephemeral-worker-secret-do-not-expose'
 PROFILE_BYTES = repr({'roastUUID': str(ROAST_UUID), 'title': 'Worker roast'}).encode('utf-8')
 PROFILE_SHA256 = hashlib.sha256(PROFILE_BYTES).hexdigest()
 IDENTITY = ServerIdentity(
@@ -93,6 +105,20 @@ IDENTITY = ServerIdentity(
     organization=IdentityOrganization(ORGANIZATION_ID, 'Roastery', 'roastery'),
     role='admin',
 )
+
+
+def secret_digest(value: str) -> str:
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def assert_secret_absent(secret: str, value: object) -> None:
+    if secret in repr(value):
+        pytest.fail('runtime secret exposed by public value', pytrace=False)
+
+
+def assert_secret_absent_from_file(secret: str, path: Path) -> None:
+    if secret.encode('utf-8') in path.read_bytes():
+        pytest.fail('runtime secret persisted to connector storage', pytrace=False)
 
 
 def public_failure(
@@ -231,9 +257,19 @@ class MutableClock:
             self._now += timedelta(seconds=seconds)
 
 
+class WallClock:
+    def __init__(self, origin: datetime = NOW) -> None:
+        self._origin = origin
+        self._started = time.monotonic()
+
+    def __call__(self) -> datetime:
+        return self._origin + timedelta(seconds=time.monotonic() - self._started)
+
+
 class FakeCredentialStore:
-    def __init__(self) -> None:
-        self.values: dict[str, str] = {ORIGIN: SECRET}
+    def __init__(self, credential_provider: Callable[[], str]) -> None:
+        self._credential_provider = credential_provider
+        self._active = True
         self.get_calls: list[tuple[str, int]] = []
         self.set_calls: list[tuple[str, str, int]] = []
         self.delete_calls: list[tuple[str, int]] = []
@@ -243,19 +279,27 @@ class FakeCredentialStore:
         self.get_calls.append((origin, int(QThread.currentThreadId())))
         if self.failure is not None:
             raise self.failure
-        return self.values.get(origin)
+        return self._credential_provider() if origin == ORIGIN and self._active else None
 
     def set(self, origin: str, credential: str) -> None:
-        self.set_calls.append((origin, credential, int(QThread.currentThreadId())))
+        self.set_calls.append(
+            (origin, secret_digest(credential), int(QThread.currentThreadId()))
+        )
         if self.failure is not None:
             raise self.failure
-        self.values[origin] = credential
 
     def delete(self, origin: str) -> None:
         self.delete_calls.append((origin, int(QThread.currentThreadId())))
         if self.failure is not None:
             raise self.failure
-        self.values.pop(origin, None)
+        if origin == ORIGIN:
+            self._active = False
+
+    def remove_active(self) -> None:
+        self._active = False
+
+    def restore_active(self) -> None:
+        self._active = True
 
 
 class FakeClient:
@@ -358,7 +402,9 @@ class FakeClientFactory:
         self.calls: list[tuple[str, str, int]] = []
 
     def __call__(self, origin: str, credential: str) -> FakeClient:
-        self.calls.append((origin, credential, int(QThread.currentThreadId())))
+        self.calls.append(
+            (origin, secret_digest(credential), int(QThread.currentThreadId()))
+        )
         return self.client
 
 
@@ -390,7 +436,7 @@ class RecordingOutbox(Outbox):
         self, namespace: Namespace, now: datetime, lease_seconds: int = 60
     ) -> Job | None:
         result = super().lease_next(namespace, now, lease_seconds)
-        if result is not None:
+        if isinstance(result, Job):
             self.leased.append(result)
         return result
 
@@ -441,7 +487,9 @@ class RecordingOutbox(Outbox):
 
 class RecordingCache(CacheStore):
     def __init__(self, root: Path) -> None:
+        self.constructor_thread = int(QThread.currentThreadId())
         super().__init__(root)
+        self.open_threads: list[int] = []
         self.discard_calls: list[tuple[Path, int]] = []
         self.publish_calls: list[tuple[Path, int]] = []
         self.clear_calls: list[tuple[Namespace, frozenset[Path], int]] = []
@@ -450,6 +498,11 @@ class RecordingCache(CacheStore):
         self.timer_stopped: Callable[[], bool] = lambda: False
         self.timer_was_stopped_on_close: list[bool] = []
         self.fail_next_discard = False
+
+    @override
+    def open(self) -> None:
+        self.open_threads.append(int(QThread.currentThreadId()))
+        super().open()
 
     @override
     def discard_staging(self, path: Path) -> None:
@@ -533,7 +586,8 @@ class WorkerHarness:
         self.tmp_path = tmp_path
         self.app = app
         self.clock = clock or MutableClock()
-        self.credentials = FakeCredentialStore()
+        self.ephemeral_secret = secrets.token_urlsafe(32)
+        self.credentials = FakeCredentialStore(lambda: self.ephemeral_secret)
         self.client = FakeClient()
         self.client_factory = FakeClientFactory(self.client)
         self.outbox = RecordingOutbox(tmp_path / 'outbox', self.clock)
@@ -649,8 +703,10 @@ class WorkerHarness:
         self.bus.tick_worker.emit()
         self.wait_until(lambda: len(self.queue_spy) > before)
 
-    def request_connection_test(self, credential: str = SECRET) -> str:
-        request_id = self.secret_vault.put(ConnectionTestRequest(ORIGIN, credential))
+    def request_connection_test(self, credential: str | None = None) -> str:
+        request_id = self.secret_vault.put(
+            ConnectionTestRequest(ORIGIN, credential or self.ephemeral_secret)
+        )
         self.bus.test_worker.emit(request_id)
         return request_id
 
@@ -691,12 +747,13 @@ def worker_harness(
 
 
 def test_opaque_vault_and_secret_request_repr_are_redacted() -> None:
+    secret = secrets.token_urlsafe(32)
     vault: OpaqueVault[ConnectionTestRequest] = OpaqueVault()
-    request = ConnectionTestRequest(ORIGIN, SECRET)
+    request = ConnectionTestRequest(ORIGIN, secret)
     request_id = vault.put(request)
 
-    assert SECRET not in repr(request)
-    assert SECRET not in repr(vault)
+    assert_secret_absent(secret, request)
+    assert_secret_absent(secret, vault)
     assert vault.contains(request_id)
     assert vault.size() == 1
     assert vault.take(request_id) is request
@@ -723,19 +780,24 @@ def test_start_timer_and_public_connection_signal_run_on_worker_thread(
     payload = worker_harness.wait_for_spy(spy, 0)
 
     assert payload == [request_id, IDENTITY]
-    assert SECRET not in repr(payload)
+    assert_secret_absent(worker_harness.ephemeral_secret, payload)
     assert signal_threads == [worker_harness.worker_thread_id]
     assert signal_threads[0] != worker_harness.ui_thread_id
     assert worker_harness.timer is not None
     assert worker_harness.timer.thread() is worker_harness.thread
-    assert worker_harness.credentials.set_calls[-1][:2] == (ORIGIN, SECRET)
+    assert worker_harness.cache.constructor_thread == worker_harness.ui_thread_id
+    assert worker_harness.cache.open_threads == [worker_harness.worker_thread_id]
+    assert worker_harness.credentials.set_calls[-1][:2] == (
+        ORIGIN,
+        secret_digest(worker_harness.ephemeral_secret),
+    )
     assert worker_harness.credentials.set_calls[-1][2] == worker_harness.worker_thread_id
     assert len(worker_harness.client.enter_threads) == len(worker_harness.client.exit_threads) == 1
     assert worker_harness.client.enter_threads == worker_harness.client.exit_threads
     for root in (worker_harness.outbox.root, worker_harness.cache.root):
         for path in root.rglob('*'):
             if path.is_file():
-                assert SECRET.encode('utf-8') not in path.read_bytes()
+                assert_secret_absent_from_file(worker_harness.ephemeral_secret, path)
 
 
 def test_connection_writes_keyring_only_after_success_and_fixed_keyring_failure(
@@ -746,21 +808,96 @@ def test_connection_writes_keyring_only_after_success_and_fixed_keyring_failure(
     worker_harness.client.failure_method = 'test_connection'
     worker_harness.client.failure = api_failure(401)
 
-    first_id = worker_harness.request_connection_test('first-candidate')
+    first_candidate = secrets.token_urlsafe(32)
+    first_id = worker_harness.request_connection_test(first_candidate)
     first_payload = worker_harness.wait_for_spy(failed, 0)
     assert first_payload == [first_id, public_failure(FailureKind.CREDENTIAL_REJECTED, retryable=False)]
-    assert all(call[1] != 'first-candidate' for call in worker_harness.credentials.set_calls)
+    if any(
+        call[1] == secret_digest(first_candidate)
+        for call in worker_harness.credentials.set_calls
+    ):
+        pytest.fail('rejected runtime credential was persisted', pytrace=False)
     assert worker_harness.credentials.delete_calls == []
 
     worker_harness.client.failure_method = None
     worker_harness.credentials.failure = CredentialStoreError('backend leaked detail')
-    second_id = worker_harness.request_connection_test('second-candidate')
+    second_candidate = secrets.token_urlsafe(32)
+    second_id = worker_harness.request_connection_test(second_candidate)
     second_payload = worker_harness.wait_for_spy(failed, 1)
     assert len(tested) == 0
     assert second_payload == [second_id, public_failure(FailureKind.KEYRING, retryable=False)]
     assert 'backend leaked detail' not in repr(second_payload)
-    assert 'second-candidate' not in repr(second_payload)
+    assert_secret_absent(second_candidate, second_payload)
     assert len(worker_harness.client.enter_threads) == len(worker_harness.client.exit_threads)
+
+
+def test_ui_interruption_cancels_blocked_call_and_ignores_queued_backlog(
+    worker_harness: WorkerHarness,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    tested = QSignalSpy(worker_harness.worker.connectionTested)
+    staged = QSignalSpy(worker_harness.worker.downloadStaged)
+    archived = QSignalSpy(worker_harness.worker.archivePageReady)
+    stopped = QSignalSpy(worker_harness.worker.stopped)
+
+    def block(method: str) -> None:
+        if method == 'test_connection':
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError('blocked fake timed out')
+
+    blocked_candidate = secrets.token_urlsafe(32)
+    queued_candidate = secrets.token_urlsafe(32)
+    worker_harness.client.callback = block
+    worker_harness.request_connection_test(blocked_candidate)
+    assert entered.wait(timeout=2)
+
+    followup_connection = worker_harness.secret_vault.put(
+        ConnectionTestRequest(ORIGIN, queued_candidate)
+    )
+    source = worker_harness.tmp_path / 'queued.alog'
+    source.write_bytes(PROFILE_BYTES)
+    followup_profile = worker_harness.profile_vault.put(
+        SavedProfileRequest(
+            NAMESPACE,
+            source,
+            ProfileData(roastUUID=str(ROAST_UUID)),
+            False,
+        )
+    )
+    browse_id = worker_harness.command_vault.put(
+        BrowseRequest(NAMESPACE, ArchiveFilters(), None, True)
+    )
+    online_id = worker_harness.command_vault.put(
+        OnlineOpenRequest(NAMESPACE, ROAST_UUID)
+    )
+    clear_id = worker_harness.command_vault.put(
+        ClearUnusedRequest(NAMESPACE, frozenset())
+    )
+    worker_harness.bus.test_worker.emit(followup_connection)
+    worker_harness.bus.enqueue_worker.emit(followup_profile)
+    worker_harness.bus.browse_worker.emit(browse_id)
+    worker_harness.bus.online_worker.emit(online_id)
+    worker_harness.bus.clear_worker.emit(clear_id)
+    worker_harness.thread.requestInterruption()
+    worker_harness.bus.stop_worker.emit()
+    release.set()
+
+    worker_harness.wait_until(lambda: len(stopped) == 1)
+    assert len(tested) == 0
+    assert len(staged) == 0
+    assert len(archived) == 0
+    assert worker_harness.credentials.set_calls == []
+    assert worker_harness.outbox.enqueued == []
+    assert worker_harness.client.calls == [('test_connection',)]
+    assert worker_harness.client.enter_threads == worker_harness.client.exit_threads
+    assert len(worker_harness.client.exit_threads) == 1
+    assert worker_harness.secret_vault.size() == 0
+    assert worker_harness.profile_vault.size() == 0
+    assert worker_harness.command_vault.size() == 0
+    worker_harness.thread.quit()
+    assert worker_harness.thread.wait(2_000)
 
 
 def test_delivery_posts_aroast_before_exact_snapshot_upload(
@@ -871,11 +1008,14 @@ def test_retry_timestamp_survives_worker_restart(
     assert retry_at == worker_harness.clock.now + timedelta(seconds=5)
     worker_harness.stop()
 
-    worker_harness.clock.advance(5)
     restarted = WorkerHarness(
         worker_harness.tmp_path, qcoreapplication, worker_harness.clock
     )
     try:
+        assert restarted.timer is not None
+        restarted.wait_until(lambda: bool(restarted.timer and restarted.timer.delays))
+        assert restarted.timer.delays[-1][0] == 5_000
+        worker_harness.clock.advance(5)
         restarted.run_one_queue_tick()
         leased = restarted.outbox.leased[-1]
         assert leased.id == job.id
@@ -889,6 +1029,32 @@ def test_retry_timestamp_survives_worker_restart(
         assert restarted.outbox.counts(NAMESPACE).complete == 1
     finally:
         restarted.stop()
+
+
+def test_real_snapshot_corruption_updates_failed_counts_and_stops_polling(
+    worker_harness: WorkerHarness,
+) -> None:
+    job = worker_harness.enqueue_saved_profile()
+    assert job.snapshot_path is not None
+    job.snapshot_path.unlink()
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    timer = worker_harness.timer
+    assert timer is not None
+    worker_harness.wait_until(lambda: len(timer.delays) > 0)
+    delays_before = len(timer.delays)
+
+    worker_harness.run_one_queue_tick()
+
+    assert worker_harness.wait_for_spy(failed, 0) == [
+        'queue',
+        public_failure(FailureKind.LOCAL_PROFILE, retryable=False),
+    ]
+    counts = worker_harness.outbox.counts(NAMESPACE)
+    assert counts.pending == 0 and counts.failed == 1
+    failed_jobs = worker_harness.outbox.failed_jobs(NAMESPACE)
+    assert len(failed_jobs) == 1 and failed_jobs[0].id == job.id
+    assert worker_harness.client.calls == []
+    assert len(timer.delays) == delays_before
 
 
 def test_401_fences_attempt_then_pauses_without_deleting_credential(
@@ -989,7 +1155,8 @@ def test_interruption_leaves_lease_for_expiry_recovery(
             thread.requestInterruption()
 
     worker_harness.client.callback = interrupt
-    worker_harness.run_one_queue_tick()
+    worker_harness.bus.tick_worker.emit()
+    worker_harness.wait_until(lambda: len(worker_harness.client.exit_threads) == 1)
 
     leased = worker_harness.outbox.leased[-1]
     assert leased.lease_token is not None
@@ -1019,10 +1186,10 @@ def test_disable_missing_credential_restore_and_namespace_switch_are_isolated(
     worker_harness.run_one_queue_tick()
     assert len(worker_harness.client.calls) == calls_before
 
-    worker_harness.credentials.values.pop(ORIGIN)
+    worker_harness.credentials.remove_active()
     worker_harness.configure(enabled=True)
     assert worker_harness.outbox.counts(NAMESPACE).paused == 1
-    worker_harness.credentials.values[ORIGIN] = SECRET
+    worker_harness.credentials.restore_active()
     worker_harness.configure(enabled=True)
     assert worker_harness.outbox.counts(NAMESPACE).pending == 1
 
@@ -1054,6 +1221,33 @@ def test_disable_missing_credential_restore_and_namespace_switch_are_isolated(
     assert job.id
 
 
+@pytest.mark.parametrize(
+    'cache_limit_bytes',
+    [MIN_CACHE_LIMIT_BYTES - 1, MAX_CACHE_LIMIT_BYTES + 1],
+)
+def test_configuration_rejects_cache_limits_outside_settings_bounds(
+    worker_harness: WorkerHarness,
+    cache_limit_bytes: int,
+) -> None:
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    worker_harness.bus.configure_worker.emit(
+        WorkerConfiguration(
+            origin=ORIGIN,
+            namespace=NAMESPACE,
+            enabled=True,
+            automatic_upload=True,
+            client_instance_uuid=CLIENT_UUID,
+            cache_limit_bytes=cache_limit_bytes,
+        )
+    )
+
+    payload = worker_harness.wait_for_spy(failed, 0)
+    assert payload == [
+        'configure',
+        public_failure(FailureKind.INVALID_RESPONSE, retryable=False),
+    ]
+
+
 def test_failed_job_retry_remove_and_immutable_aggregate_signals(
     worker_harness: WorkerHarness,
 ) -> None:
@@ -1062,11 +1256,12 @@ def test_failed_job_retry_remove_and_immutable_aggregate_signals(
     worker_harness.client.failure = api_failure(400)
     failed_jobs = QSignalSpy(worker_harness.worker.failedJobsChanged)
     worker_harness.run_one_queue_tick()
+    worker_harness.wait_until(lambda: len(failed_jobs) > 0)
 
     failed_payload = cast(tuple[FailedJob, ...], failed_jobs[-1][0])
     assert len(failed_payload) == 1
     assert failed_payload[0].id == job.id
-    assert SECRET not in repr(failed_payload)
+    assert_secret_absent(worker_harness.ephemeral_secret, failed_payload)
 
     before = len(worker_harness.queue_spy)
     worker_harness.bus.retry_worker.emit(job.id)
@@ -1214,19 +1409,75 @@ def test_online_interruption_discards_stage_before_ui_handoff(
     assert worker_harness.cache.discard_calls[0][1] == worker_harness.worker_thread_id
 
 
-def test_publish_vault_loss_and_invalid_publish_discard_pending_stage(
+@pytest.mark.parametrize('enabled', [False, True], ids=['disable', 'switch'])
+def test_configuration_transition_discards_and_fences_downloaded_stage(
+    worker_harness: WorkerHarness,
+    enabled: bool,
+) -> None:
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    published = QSignalSpy(worker_harness.worker.cachePublished)
+    _online_id, request = worker_harness.open_online()
+    assert request.staged_path.exists()
+    other_namespace = namespace_for(
+        ORIGIN, UUID('55555555-5555-4555-8555-555555555555')
+    )
+
+    worker_harness.configure(
+        namespace=other_namespace if enabled else NAMESPACE,
+        enabled=enabled,
+    )
+
+    assert not request.staged_path.exists()
+    assert worker_harness.cache.discard_calls[-1][0] == request.staged_path
+    publish_id = worker_harness.command_vault.put(request)
+    worker_harness.bus.publish_worker.emit(publish_id)
+    payload = worker_harness.wait_for_spy(failed, 0)
+    assert payload == [publish_id, public_failure(FailureKind.CACHE_CORRUPT, retryable=False)]
+    assert len(published) == 0
+
+
+def test_unknown_and_malformed_publish_ids_do_not_consume_pending_stages(
     worker_harness: WorkerHarness,
 ) -> None:
     failed = QSignalSpy(worker_harness.worker.operationFailed)
-    _online_id, request = worker_harness.open_online()
+    _first_id, first = worker_harness.open_online()
+    _second_id, second = worker_harness.open_online()
 
     worker_harness.bus.publish_worker.emit('f' * 32)
-    payload = worker_harness.wait_for_spy(failed, 0)
+    worker_harness.wait_for_spy(failed, 0)
+    malformed_id = worker_harness.command_vault.put(object())
+    worker_harness.bus.publish_worker.emit(malformed_id)
+    worker_harness.wait_for_spy(failed, 1)
 
-    assert payload[0] == 'f' * 32
-    assert cast(PublicFailure, payload[1]).kind is FailureKind.CACHE_CORRUPT
-    assert not request.staged_path.exists()
-    assert worker_harness.cache.discard_calls[-1][0] == request.staged_path
+    assert first.staged_path.exists()
+    assert second.staged_path.exists()
+    assert worker_harness.cache.discard_calls == []
+
+
+def test_delayed_duplicate_publish_and_discard_affect_only_the_exact_stage(
+    worker_harness: WorkerHarness,
+) -> None:
+    published = QSignalSpy(worker_harness.worker.cachePublished)
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    _first_id, first = worker_harness.open_online()
+    _second_id, second = worker_harness.open_online()
+    first_publish_id = worker_harness.command_vault.put(first)
+    worker_harness.bus.publish_worker.emit(first_publish_id)
+    worker_harness.wait_for_spy(published, 0)
+
+    duplicate_publish_id = worker_harness.command_vault.put(first)
+    worker_harness.bus.publish_worker.emit(duplicate_publish_id)
+    worker_harness.wait_for_spy(failed, 0)
+    assert second.staged_path.exists()
+
+    before = len(worker_harness.cache.discard_calls)
+    worker_harness.bus.discard_worker.emit(str(second.staged_path))
+    worker_harness.wait_until(lambda: len(worker_harness.cache.discard_calls) > before)
+    worker_harness.bus.discard_worker.emit(str(second.staged_path))
+    worker_harness.wait_for_spy(failed, 1)
+
+    assert len(worker_harness.cache.discard_calls) == before + 1
+    assert not second.staged_path.exists()
 
 
 def test_publish_failure_is_consumed_by_cache_without_double_discard(
@@ -1271,6 +1522,7 @@ def test_clear_unused_unions_open_and_outbox_protected_paths(
 def test_stop_stops_timer_then_closes_all_stages_and_sqlite_on_worker_thread(
     worker_harness: WorkerHarness,
 ) -> None:
+    worker_harness.enqueue_saved_profile()
     _online_id, request = worker_harness.open_online()
     assert request.staged_path.exists()
     assert worker_harness.timer is not None and worker_harness.timer.logically_active
@@ -1285,6 +1537,135 @@ def test_stop_stops_timer_then_closes_all_stages_and_sqlite_on_worker_thread(
     assert worker_harness.outbox.closed_threads[-1] == worker_harness.worker_thread_id
     assert not request.staged_path.exists()
     assert worker_harness.cache.discard_calls[-1][0] == request.staged_path
+
+
+def test_stock_qtimer_automatically_delivers_persisted_retry_and_stops_active(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    clock = WallClock()
+    root = tmp_path / 'outbox'
+    setup = Outbox(root, clock)
+    setup.open()
+    first_source = tmp_path / 'first.alog'
+    first_source.write_bytes(PROFILE_BYTES)
+    first_profile = ProfileData(roastUUID=str(ROAST_UUID), title='Worker roast')
+    first_snapshot = setup.snapshot_saved_file(NAMESPACE, first_source)
+    first = setup.enqueue(
+        NAMESPACE,
+        first_snapshot,
+        ROAST_UUID,
+        project_profile(first_profile, first_snapshot.source_modified_at),
+        CLIENT_UUID,
+    ).job
+    second_uuid = UUID('66666666-6666-4666-8666-666666666666')
+    second_profile = ProfileData(roastUUID=str(second_uuid), title='Later roast')
+    second_source = tmp_path / 'second.alog'
+    second_source.write_bytes(repr(second_profile).encode('utf-8'))
+    second_snapshot = setup.snapshot_saved_file(NAMESPACE, second_source)
+    second = setup.enqueue(
+        NAMESPACE,
+        second_snapshot,
+        second_uuid,
+        project_profile(second_profile, second_snapshot.source_modified_at),
+        CLIENT_UUID,
+    ).job
+    retry_failure = public_failure(FailureKind.OFFLINE, retryable=True)
+    leased_first = setup.lease_next(NAMESPACE, clock())
+    assert isinstance(leased_first, Job) and leased_first.lease_token is not None
+    setup.mark_retry(
+        first.id,
+        leased_first.lease_token,
+        clock(),
+        clock() + timedelta(milliseconds=350),
+        retry_failure,
+    )
+    leased_second = setup.lease_next(NAMESPACE, clock())
+    assert isinstance(leased_second, Job) and leased_second.lease_token is not None
+    setup.mark_retry(
+        second.id,
+        leased_second.lease_token,
+        clock(),
+        clock() + timedelta(seconds=10),
+        retry_failure,
+    )
+    setup.close()
+
+    secret = secrets.token_urlsafe(32)
+    credentials = FakeCredentialStore(lambda: secret)
+    client = FakeClient()
+    outbox = RecordingOutbox(root, clock)
+    cache = RecordingCache(tmp_path / 'cache')
+    credential_vault: OpaqueVault[ConnectionTestRequest] = OpaqueVault()
+    profile_vault: OpaqueVault[SavedProfileRequest] = OpaqueVault()
+    command_vault: OpaqueVault[object] = OpaqueVault()
+    worker = RoastServerWorker(
+        outbox=outbox,
+        cache=cache,
+        credentials=credentials,
+        client_factory=cast(ClientFactory, FakeClientFactory(client)),
+        clock=clock,
+        credential_vault=credential_vault,
+        profile_vault=profile_vault,
+        command_vault=command_vault,
+    )
+    thread = QThread()
+    bus = CommandBus()
+    worker.moveToThread(thread)
+    bus.configure_worker.connect(worker.configure)
+    bus.stop_worker.connect(worker.stop)
+    thread.started.connect(worker.start)
+    changed = QSignalSpy(worker.queueChanged)
+    stopped = QSignalSpy(worker.stopped)
+    cache.timer_stopped = lambda: worker._timer is not None and not worker._timer.isActive()
+    started_at = time.monotonic()
+    thread.start()
+    bus.configure_worker.emit(
+        WorkerConfiguration(
+            origin=ORIGIN,
+            namespace=NAMESPACE,
+            enabled=True,
+            automatic_upload=True,
+            client_instance_uuid=CLIENT_UUID,
+            cache_limit_bytes=MIN_CACHE_LIMIT_BYTES,
+        )
+    )
+
+    deadline = time.monotonic() + 3
+    while not any(
+        isinstance(changed[index][0], QueueCounts)
+        and changed[index][0].complete == 1
+        for index in range(len(changed))
+    ):
+        qcoreapplication.processEvents()
+        if time.monotonic() >= deadline:
+            pytest.fail('stock timer did not deliver persisted retry within bound')
+        time.sleep(0.001)
+    delivered_at = time.monotonic()
+    bus.stop_worker.emit()
+    while len(stopped) == 0:
+        qcoreapplication.processEvents()
+        if time.monotonic() >= deadline:
+            pytest.fail('stock timer worker did not stop within bound')
+        time.sleep(0.001)
+    thread.quit()
+    assert thread.wait(2_000)
+
+    assert delivered_at - started_at < 0.9
+    assert outbox.complete_calls[-1][0] == first.id
+    assert outbox.complete_calls[-1][3] == cache.open_threads[0]
+    assert client.enter_threads == client.exit_threads == [cache.open_threads[0]]
+    counts = outbox.counts(NAMESPACE) if outbox._connection is not None else None
+    assert counts is None
+    reopened = Outbox(root, clock)
+    reopened.open()
+    try:
+        persisted = reopened.counts(NAMESPACE)
+        assert persisted.complete == 1 and persisted.retrying == 1
+    finally:
+        reopened.close()
+    assert cache.timer_was_stopped_on_close == [True]
+    assert_secret_absent(secret, changed)
 
 
 def test_worker_module_has_no_plus_dependency() -> None:

@@ -62,11 +62,22 @@ from artisanlib.roastserver.contract import (
 )
 from artisanlib.roastserver.metadata import project_profile
 from artisanlib.roastserver.origin import SettingsError, canonical_origin
-from artisanlib.roastserver.outbox import Job, Outbox, OutboxError
-from artisanlib.roastserver.settings import CredentialStore, CredentialStoreError, namespace_for
+from artisanlib.roastserver.outbox import (
+    Job,
+    LeaseFailure,
+    Outbox,
+    OutboxError,
+    Snapshot,
+)
+from artisanlib.roastserver.settings import (
+    MAX_CACHE_LIMIT_BYTES,
+    MIN_CACHE_LIMIT_BYTES,
+    CredentialStore,
+    CredentialStoreError,
+    namespace_for,
+)
 
 _REQUEST_ID_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
-_QUEUE_IDLE_MILLISECONDS: Final[int] = 1_000
 _MAX_TIMER_MILLISECONDS: Final[int] = 2_147_483_647
 _LEASE_SECONDS: Final[int] = 60
 
@@ -223,6 +234,7 @@ class RoastServerWorker(QObject):
         self._stop_event = threading.Event()
         self._started = False
         self._outbox_open = False
+        self._cache_open = False
         self._stopped = False
 
     @override
@@ -231,17 +243,30 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot()
     def start(self) -> None:
-        if self._started or self._stopped:
+        if self._started or self._stopped or self._interrupted():
             return
         self._started = True
         timer = self._timer_factory(self)
         timer.setSingleShot(True)
         timer.timeout.connect(self.process_queue_once)
         self._timer = timer
+        if self._cancelled():
+            return
         try:
             self._outbox.open()
             self._outbox_open = True
+            if self._cancelled():
+                return
+            self._cache.open()
+            self._cache_open = True
+            if self._cancelled():
+                return
             self._outbox.recover_expired_leases(self._now())
+            if self._cancelled():
+                return
+        except CacheError as error:
+            self._emit_failure('start', error.failure)
+            return
         except (OutboxError, OSError, ValueError):
             self._emit_failure('start', _failure(FailureKind.LOCAL_PROFILE))
             return
@@ -250,11 +275,20 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot(object)
     def configure(self, value: object) -> None:
+        if self._cancelled():
+            return
         configuration = _valid_configuration(value)
         if configuration is None:
             self._emit_failure('configure', _failure(FailureKind.INVALID_RESPONSE))
             return
         previous = self._configuration
+        old_namespace = previous.namespace if previous is not None else None
+        if old_namespace is not None and (
+            old_namespace != configuration.namespace or not configuration.enabled
+        ):
+            self._discard_namespace_stages(old_namespace)
+        if self._cancelled():
+            return
         self._configuration = configuration
         self._credential = None
         if not self._started or not self._outbox_open or self._stopped:
@@ -272,6 +306,8 @@ class RoastServerWorker(QObject):
             old_namespace != configuration.namespace or not configuration.enabled
         ):
             self._pause_namespace(old_namespace, 'connector_disabled')
+        if self._cancelled():
+            return
 
         namespace = configuration.namespace
         if not configuration.enabled or namespace is None:
@@ -285,11 +321,15 @@ class RoastServerWorker(QObject):
         try:
             credential = self._credentials.get(configuration.origin)
         except CredentialStoreError:
+            if self._cancelled():
+                return
             self._pause_namespace(namespace, 'credential_removed')
             self.onlineChanged.emit(False)
             self._stop_timer()
             self._emit_failure('configure', _failure(FailureKind.KEYRING))
             self._emit_aggregates(namespace)
+            return
+        if self._cancelled():
             return
         if credential is None or credential == '':
             self._pause_namespace(namespace, 'credential_removed')
@@ -305,9 +345,11 @@ class RoastServerWorker(QObject):
             self._credential = None
             self._emit_failure('configure', _failure(FailureKind.LOCAL_PROFILE))
             self._stop_timer()
+        if self._cancelled():
+            return
         self._emit_aggregates(namespace)
         if self._credential is not None:
-            self._schedule_at(self._now())
+            self._schedule_next(namespace)
 
     @pyqtSlot(str)
     def test_connection(self, opaque_id: str) -> None:
@@ -316,38 +358,55 @@ class RoastServerWorker(QObject):
         credential = ''
         try:
             request = self._credential_vault.take(opaque_id)
+            if self._cancelled():
+                return
             if not _valid_connection_request(request):
                 raise ValueError
             credential = request.credential
             with self._client_factory(request.origin, credential) as client:
+                if self._cancelled():
+                    return
                 identity = client.test_connection()
+                if self._cancelled():
+                    return
             if not isinstance(identity, ServerIdentity):
                 raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
+            if self._cancelled():
+                return
             self._credentials.set(request.origin, credential)
+            if self._cancelled():
+                return
         except KeyError:
-            self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
             return
         except CredentialStoreError:
-            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
             return
         except ApiFailure as error:
-            self.onlineChanged.emit(False)
-            self._emit_failure(request_id, error.failure)
+            if not self._cancelled():
+                self.onlineChanged.emit(False)
+                self._emit_failure(request_id, error.failure)
             return
         except _DeliveryFailure as error:
-            self._emit_failure(request_id, error.failure)
+            if not self._cancelled():
+                self._emit_failure(request_id, error.failure)
             return
         except (TypeError, ValueError):
-            self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
             return
         except Exception:  # pylint: disable=broad-exception-caught
-            self.onlineChanged.emit(False)
-            self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            if not self._cancelled():
+                self.onlineChanged.emit(False)
+                self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
             return
         finally:
             request = None
             credential = ''
-        self.connectionTested.emit(request_id, identity)
+        if not self._cancelled():
+            self.connectionTested.emit(request_id, identity)
 
     @pyqtSlot(str)
     def enqueue_saved(self, opaque_id: str) -> None:
@@ -355,7 +414,10 @@ class RoastServerWorker(QObject):
         try:
             request = self._profile_vault.take(opaque_id)
         except KeyError:
-            self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
+            return
+        if self._cancelled():
             return
         configuration = self._configuration
         if (
@@ -368,17 +430,24 @@ class RoastServerWorker(QObject):
         ):
             self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
             return
+        snapshot: Snapshot | None = None
         try:
             snapshot = self._outbox.snapshot_saved_file(request.namespace, request.path)
+            if self._cancelled():
+                return
             profile = (
                 request.profile
                 if request.profile is not None
                 else self._profile_loader(snapshot.absolute_path)
             )
+            if self._cancelled():
+                return
             if not isinstance(profile, dict):
                 raise ValueError
             roast_uuid = _profile_roast_uuid(profile)
             metadata = project_profile(profile, snapshot.source_modified_at)
+            if self._cancelled():
+                return
             self._outbox.enqueue(
                 request.namespace,
                 snapshot,
@@ -386,15 +455,28 @@ class RoastServerWorker(QObject):
                 metadata,
                 configuration.client_instance_uuid,
             )
+            snapshot = None
+            if self._cancelled():
+                return
             if self._credential is None:
                 self._outbox.pause_namespace(
                     request.namespace, self._now(), 'credential_removed'
                 )
         except (OutboxError, OSError, RecursionError, SyntaxError, TypeError, ValueError):
-            self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
+        finally:
+            if snapshot is not None:
+                try:
+                    self._outbox.discard_staged_snapshot(snapshot)
+                except OutboxError:
+                    if not self._cancelled():
+                        self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
+        if self._cancelled():
+            return
         self._emit_aggregates(request.namespace)
         if self._credential is not None:
-            self._schedule_at(self._now())
+            self._schedule_next(request.namespace)
 
     @pyqtSlot()
     def process_queue_once(self) -> None:
@@ -419,25 +501,37 @@ class RoastServerWorker(QObject):
         now = self._now()
         try:
             self._outbox.recover_expired_leases(now)
-            job = self._outbox.lease_next(namespace, now, _LEASE_SECONDS)
+            if self._cancelled():
+                return
+            outcome = self._outbox.lease_next(namespace, now, _LEASE_SECONDS)
         except (OutboxError, OSError, ValueError):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
             self._emit_aggregates(namespace)
-            self._schedule_idle()
+            self._stop_timer()
             return
-        if job is None:
+        if self._cancelled():
+            return
+        if outcome is None:
             self._emit_aggregates(namespace)
-            self._schedule_idle()
+            self._schedule_next(namespace)
+            return
+        if isinstance(outcome, LeaseFailure):
+            self._emit_failure('queue', outcome.failure)
+            self._emit_aggregates(namespace)
+            self._schedule_next(namespace)
             return
 
-        self._deliver_job(configuration, job)
-        self._emit_aggregates(namespace)
+        if self._cancelled():
+            return
+        self._deliver_job(configuration, outcome)
+        if not self._cancelled():
+            self._emit_aggregates(namespace)
 
     def _deliver_job(self, configuration: WorkerConfiguration, job: Job) -> None:
         token = job.lease_token
         if token is None:
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
-            self._schedule_idle()
+            self._schedule_next(job.namespace)
             return
         failure: PublicFailure | None = None
         retry_after: int | None = None
@@ -462,38 +556,42 @@ class RoastServerWorker(QObject):
         now = self._now()
         if failure is None:
             if self._commit_complete(job, token, now):
+                if self._cancelled():
+                    return
                 self.onlineChanged.emit(True)
-                self._schedule_at(now)
-            else:
-                self._schedule_idle()
+            self._schedule_next(job.namespace)
             return
 
         if status_code == 401 or failure.kind is FailureKind.CREDENTIAL_REJECTED:
             if self._commit_retry(job, token, now, now, failure):
+                if self._cancelled():
+                    return
                 self._pause_namespace(job.namespace, 'credential_rejected')
+                if self._cancelled():
+                    return
                 self._credential = None
                 self.onlineChanged.emit(False)
                 self._stop_timer()
             else:
-                self._schedule_idle()
+                self._schedule_next(job.namespace)
             self._emit_failure('queue', failure)
             return
 
         if failure.retryable:
             delay = _retry_delay(job.attempts, retry_after)
             next_attempt_at = now + timedelta(seconds=delay)
-            if self._commit_retry(job, token, now, next_attempt_at, failure):
-                self._schedule_at(next_attempt_at)
-            else:
-                self._schedule_idle()
+            self._commit_retry(job, token, now, next_attempt_at, failure)
+            if self._cancelled():
+                return
+            self._schedule_next(job.namespace)
             self.onlineChanged.emit(False)
             self._emit_failure('queue', failure)
             return
 
-        if self._commit_failed(job, token, now, failure):
-            self._schedule_at(now)
-        else:
-            self._schedule_idle()
+        self._commit_failed(job, token, now, failure)
+        if self._cancelled():
+            return
+        self._schedule_next(job.namespace)
         self._emit_failure('queue', failure)
 
     def _execute_delivery(
@@ -515,7 +613,11 @@ class RoastServerWorker(QObject):
         except OSError:
             raise _DeliveryFailure(_failure(FailureKind.LOCAL_PROFILE)) from None
         with snapshot, self._client_factory(configuration.origin, credential) as client:
+            if self._cancelled():
+                return
             client.post_aroast(job.roast_uuid, job.aroast_json.encode('utf-8'))
+            if self._cancelled():
+                return
             upload = client.upload_revision(
                 job.roast_uuid,
                 job.content_sha256,
@@ -523,6 +625,8 @@ class RoastServerWorker(QObject):
                 job.revision_json.encode('utf-8'),
                 snapshot,
             )
+            if self._cancelled():
+                return
         if not _upload_matches(upload, job):
             raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
 
@@ -580,9 +684,13 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot(str)
     def retry_job(self, job_id: str) -> None:
+        if self._cancelled():
+            return
         namespace = self._current_namespace()
         if namespace is None or not self._failed_job_is_current(namespace, job_id):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+            return
+        if self._cancelled():
             return
         try:
             self._outbox.retry_now(job_id, self._now())
@@ -591,22 +699,31 @@ class RoastServerWorker(QObject):
                     namespace, self._now(), 'credential_removed'
                 )
         except (OutboxError, ValueError):
-            self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+            if not self._cancelled():
+                self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+        if self._cancelled():
+            return
         self._emit_aggregates(namespace)
         if self._credential is not None:
-            self._schedule_at(self._now())
+            self._schedule_next(namespace)
 
     @pyqtSlot(str)
     def remove_job(self, job_id: str) -> None:
+        if self._cancelled():
+            return
         namespace = self._current_namespace()
         if namespace is None or not self._failed_job_is_current(namespace, job_id):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
             return
+        if self._cancelled():
+            return
         try:
             self._outbox.remove(job_id)
         except (OutboxError, ValueError):
-            self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
-        self._emit_aggregates(namespace)
+            if not self._cancelled():
+                self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+        if not self._cancelled():
+            self._emit_aggregates(namespace)
 
     def _failed_job_is_current(self, namespace: Namespace, job_id: str) -> bool:
         try:
@@ -620,7 +737,10 @@ class RoastServerWorker(QObject):
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
-            self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            return
+        if self._cancelled():
             return
         if not isinstance(value, BrowseRequest) or not self._namespace_is_current(
             value.namespace
@@ -635,20 +755,32 @@ class RoastServerWorker(QObject):
             return
         try:
             with self._client_factory(configuration.origin, credential) as client:
+                if self._cancelled():
+                    return
                 page = client.list_roasts(request.filters, cursor=request.cursor, limit=50)
+                if self._cancelled():
+                    return
             if not isinstance(page, RoastPage):
                 raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
         except ApiFailure as error:
+            if self._cancelled():
+                return
             self._handle_nonqueue_api_failure(request_id, request.namespace, error)
             self._browse_fallback(request_id, request, error.failure, emit_failure=False)
             return
         except _DeliveryFailure as error:
+            if self._cancelled():
+                return
             self._browse_fallback(request_id, request, error.failure)
             return
         except Exception:  # pylint: disable=broad-exception-caught
+            if self._cancelled():
+                return
             self._browse_fallback(
                 request_id, request, _failure(FailureKind.INVALID_RESPONSE)
             )
+            return
+        if self._cancelled():
             return
         self.archivePageReady.emit(request_id, page)
         self.onlineChanged.emit(True)
@@ -661,15 +793,19 @@ class RoastServerWorker(QObject):
         *,
         emit_failure: bool = True,
     ) -> None:
+        if self._cancelled():
+            return
         if emit_failure:
             self._emit_failure(request_id, failure)
         self.onlineChanged.emit(False)
         try:
             page = self._cache.list_offline(request.namespace, request.filters)
         except CacheError as error:
-            self._emit_failure(request_id, error.failure)
+            if not self._cancelled():
+                self._emit_failure(request_id, error.failure)
             return
-        self.archivePageReady.emit(request_id, page)
+        if not self._cancelled():
+            self.archivePageReady.emit(request_id, page)
 
     @pyqtSlot(str)
     def open_online(self, opaque_id: str) -> None:
@@ -677,7 +813,10 @@ class RoastServerWorker(QObject):
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
-            self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            return
+        if self._cancelled():
             return
         if not isinstance(value, OnlineOpenRequest) or not self._namespace_is_current(
             value.namespace
@@ -695,7 +834,11 @@ class RoastServerWorker(QObject):
         staged_path: Path | None = None
         try:
             with self._client_factory(configuration.origin, credential) as client:
+                if self._cancelled():
+                    return
                 detail_value: object = client.get_roast(request.roast_uuid)
+                if self._cancelled():
+                    return
                 if (
                     not isinstance(detail_value, RoastDetail)
                     or detail_value.roast_uuid != request.roast_uuid
@@ -704,13 +847,18 @@ class RoastServerWorker(QObject):
                     raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
                 detail = detail_value
                 staged_path, output = self._cache.new_staging_file(request.namespace)
+                if self._cancelled():
+                    self._discard_stage(staged_path)
+                    return
                 receipt = client.download_revision(detail, output)
+                if self._cancelled():
+                    self._discard_stage(staged_path)
+                    return
             publish_request = PublishRequest(detail, receipt, staged_path)
             if not _valid_publish_request(publish_request):
                 raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
-            if self._interrupted():
+            if self._cancelled():
                 self._discard_stage(staged_path)
-                self._stop_timer()
                 return
             self._pending_stages[staged_path] = _PendingStage(
                 request.namespace, publish_request
@@ -718,22 +866,29 @@ class RoastServerWorker(QObject):
         except ApiFailure as error:
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            self._handle_nonqueue_api_failure(request_id, request.namespace, error)
+            if not self._cancelled():
+                self._handle_nonqueue_api_failure(request_id, request.namespace, error)
             return
         except CacheError as error:
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            self._emit_failure(request_id, error.failure)
+            if not self._cancelled():
+                self._emit_failure(request_id, error.failure)
             return
         except _DeliveryFailure as error:
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            self._emit_failure(request_id, error.failure)
+            if not self._cancelled():
+                self._emit_failure(request_id, error.failure)
             return
         except Exception:  # pylint: disable=broad-exception-caught
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
+            return
+        if self._cancelled():
+            self._discard_stage(staged_path)
             return
         self.downloadStaged.emit(request_id, publish_request)
         self.onlineChanged.emit(True)
@@ -744,7 +899,10 @@ class RoastServerWorker(QObject):
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
-            self._emit_failure(request_id, CACHE_FAILURE)
+            if not self._cancelled():
+                self._emit_failure(request_id, CACHE_FAILURE)
+            return
+        if self._cancelled():
             return
         if not isinstance(value, CachedOpenRequest) or not self._namespace_is_current(
             value.cached.namespace
@@ -754,9 +912,11 @@ class RoastServerWorker(QObject):
         try:
             cached = self._cache.validate(value.cached)
         except CacheError as error:
-            self._emit_failure(request_id, error.failure)
+            if not self._cancelled():
+                self._emit_failure(request_id, error.failure)
             return
-        self.cachedReady.emit(request_id, cached)
+        if not self._cancelled():
+            self.cachedReady.emit(request_id, cached)
 
     @pyqtSlot(str)
     def publish_staged(self, opaque_id: str) -> None:
@@ -764,25 +924,30 @@ class RoastServerWorker(QObject):
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
-            self._discard_all_stages()
-            self._emit_failure(request_id, CACHE_FAILURE)
+            if not self._cancelled():
+                self._emit_failure(request_id, CACHE_FAILURE)
+            return
+        if self._cancelled():
+            if isinstance(value, PublishRequest):
+                pending = self._pending_stages.get(value.staged_path)
+                if pending is not None and pending.request == value:
+                    self._discard_stage(value.staged_path)
             return
         if not isinstance(value, PublishRequest):
-            self._discard_all_stages()
             self._emit_failure(request_id, CACHE_FAILURE)
             return
         request = value
         pending = self._pending_stages.get(request.staged_path)
         if pending is None or pending.request != request or not _valid_publish_request(request):
-            if pending is None:
-                self._discard_all_stages()
-            else:
-                self._discard_stage(request.staged_path)
             self._emit_failure(request_id, CACHE_FAILURE)
             return
         if self._interrupted():
             self._discard_stage(request.staged_path)
             self._stop_timer()
+            return
+        if not self._namespace_is_current(pending.namespace):
+            self._discard_stage(request.staged_path)
+            self._emit_failure(request_id, CACHE_FAILURE)
             return
         self._pending_stages.pop(request.staged_path, None)
         try:
@@ -794,16 +959,22 @@ class RoastServerWorker(QObject):
                 self._now(),
             )
         except CacheError as error:
-            self._emit_failure(request_id, error.failure)
+            if not self._cancelled():
+                self._emit_failure(request_id, error.failure)
             return
         except Exception:  # pylint: disable=broad-exception-caught
-            self._emit_failure(request_id, CACHE_FAILURE)
+            if not self._cancelled():
+                self._emit_failure(request_id, CACHE_FAILURE)
+            return
+        if self._cancelled():
             return
         self.cachePublished.emit(request_id, cached)
         self._prune_to_limit(request_id, pending.namespace)
 
     @pyqtSlot(str)
     def discard_staged(self, staged_path_text: str) -> None:
+        if self._cancelled():
+            return
         matching = next(
             (
                 path
@@ -813,7 +984,6 @@ class RoastServerWorker(QObject):
             None,
         )
         if matching is None:
-            self._discard_all_stages()
             self._emit_failure('discard', CACHE_FAILURE)
             return
         self._discard_stage(matching)
@@ -825,7 +995,10 @@ class RoastServerWorker(QObject):
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
-            self._emit_failure(request_id, CACHE_FAILURE)
+            if not self._cancelled():
+                self._emit_failure(request_id, CACHE_FAILURE)
+            return
+        if self._cancelled():
             return
         if not _valid_clear_request(value):
             self._emit_failure(request_id, CACHE_FAILURE)
@@ -834,30 +1007,40 @@ class RoastServerWorker(QObject):
         if not self._namespace_is_current(request.namespace):
             self._emit_failure(request_id, CACHE_FAILURE)
             return
-        self._open_cache_paths = request.open_paths
         try:
             protected = request.open_paths | self._outbox.protected_paths(
                 request.namespace
             )
+            if self._cancelled():
+                return
             stats = self._cache.clear_unused(request.namespace, protected)
         except (CacheError, OutboxError, OSError, ValueError):
-            self._emit_failure(request_id, CACHE_FAILURE)
+            if not self._cancelled():
+                self._emit_failure(request_id, CACHE_FAILURE)
             return
-        self.cacheStatsChanged.emit(stats)
+        if not self._cancelled():
+            self._open_cache_paths = request.open_paths
+            self.cacheStatsChanged.emit(stats)
 
     def _prune_to_limit(self, operation: str, namespace: Namespace) -> None:
+        if self._cancelled():
+            return
         configuration = self._configuration
         if configuration is None or configuration.namespace != namespace:
             return
         try:
             protected = self._open_cache_paths | self._outbox.protected_paths(namespace)
+            if self._cancelled():
+                return
             stats = self._cache.prune(
                 namespace, configuration.cache_limit_bytes, protected
             )
         except (CacheError, OutboxError, OSError, ValueError):
-            self._emit_failure(operation, CACHE_FAILURE)
+            if not self._cancelled():
+                self._emit_failure(operation, CACHE_FAILURE)
             return
-        self.cacheStatsChanged.emit(stats)
+        if not self._cancelled():
+            self.cacheStatsChanged.emit(stats)
 
     def _discard_stage(self, path: Path) -> bool:
         try:
@@ -872,9 +1055,21 @@ class RoastServerWorker(QObject):
         for path in tuple(self._pending_stages):
             self._discard_stage(path)
 
+    def _discard_namespace_stages(self, namespace: Namespace) -> None:
+        for path, pending in tuple(self._pending_stages.items()):
+            if pending.namespace != namespace:
+                continue
+            self._pending_stages.pop(path, None)
+            try:
+                self._cache.discard_staging(path)
+            except CacheError:
+                self._emit_failure('discard', CACHE_FAILURE)
+
     def _handle_nonqueue_api_failure(
         self, operation: str, namespace: Namespace, error: ApiFailure
     ) -> None:
+        if self._cancelled():
+            return
         if error.status_code == 401 or error.failure.kind is FailureKind.CREDENTIAL_REJECTED:
             self._pause_namespace(namespace, 'credential_rejected')
             self._credential = None
@@ -883,7 +1078,7 @@ class RoastServerWorker(QObject):
         self._emit_failure(operation, error.failure)
 
     def _pause_namespace(self, namespace: Namespace, code: str) -> None:
-        if not self._outbox_open:
+        if self._cancelled() or not self._outbox_open:
             return
         try:
             self._outbox.pause_namespace(namespace, self._now(), code)
@@ -891,21 +1086,28 @@ class RoastServerWorker(QObject):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
 
     def _emit_aggregates(self, namespace: Namespace | None) -> None:
-        if namespace is None or not self._outbox_open:
+        if self._cancelled() or namespace is None or not self._outbox_open:
             return
         try:
             counts = self._outbox.counts(namespace)
         except OutboxError:
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
         else:
+            if self._cancelled():
+                return
             self.queueChanged.emit(counts)
+        if self._cancelled():
+            return
         try:
             failed = self._outbox.failed_jobs(namespace)
         except OutboxError:
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
         else:
+            if self._cancelled():
+                return
             self.failedJobsChanged.emit(failed)
-        self._emit_cache_stats(namespace=namespace, matching_operation='cache')
+        if not self._cancelled():
+            self._emit_cache_stats(namespace=namespace, matching_operation='cache')
 
     def _emit_cache_stats(
         self,
@@ -914,14 +1116,16 @@ class RoastServerWorker(QObject):
         matching_operation: str,
     ) -> None:
         selected = namespace or self._current_namespace()
-        if selected is None:
+        if self._cancelled() or selected is None or not self._cache_open:
             return
         try:
             stats = self._cache.stats(selected)
         except CacheError as error:
-            self._emit_failure(matching_operation, error.failure)
+            if not self._cancelled():
+                self._emit_failure(matching_operation, error.failure)
         else:
-            self.cacheStatsChanged.emit(stats)
+            if not self._cancelled():
+                self.cacheStatsChanged.emit(stats)
 
     @pyqtSlot()
     def stop(self) -> None:
@@ -939,6 +1143,7 @@ class RoastServerWorker(QObject):
         except CacheError as error:
             self._emit_failure('stop', error.failure)
         finally:
+            self._cache_open = False
             self._pending_stages.clear()
         if self._outbox_open:
             try:
@@ -968,16 +1173,33 @@ class RoastServerWorker(QObject):
             isinstance(thread, QThread) and thread.isInterruptionRequested()
         )
 
+    def _cancelled(self) -> bool:
+        cancelled = self._stopped or self._interrupted()
+        if cancelled:
+            self._stop_timer()
+        return cancelled
+
     def _now(self) -> datetime:
         now = self._clock()
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError('worker clock must return an aware datetime')
         return now.astimezone(UTC)
 
-    def _schedule_idle(self) -> None:
-        timer = self._timer
-        if timer is not None and not self._interrupted() and self._credential is not None:
-            timer.start(_QUEUE_IDLE_MILLISECONDS)
+    def _schedule_next(self, namespace: Namespace) -> None:
+        if self._interrupted() or self._credential is None:
+            return
+        try:
+            due = self._outbox.next_due_at(namespace)
+        except (OutboxError, ValueError):
+            self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+            self._stop_timer()
+            return
+        if self._cancelled():
+            return
+        if due is None:
+            self._stop_timer()
+            return
+        self._schedule_at(due)
 
     def _schedule_at(self, due: datetime) -> None:
         timer = self._timer
@@ -1038,7 +1260,7 @@ def _valid_configuration(value: object) -> WorkerConfiguration | None:
         or type(automatic_upload) is not bool
         or not isinstance(client_instance_uuid, UUID)
         or type(cache_limit_bytes) is not int
-        or cache_limit_bytes < 0
+        or not MIN_CACHE_LIMIT_BYTES <= cache_limit_bytes <= MAX_CACHE_LIMIT_BYTES
     ):
         return None
     origin_value: object = value.origin

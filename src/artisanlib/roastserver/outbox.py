@@ -345,6 +345,40 @@ class Job:
     updated_at: datetime
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class LeaseFailure(Job):
+    failure: PublicFailure
+
+    def __init__(self, job: Job, failure: PublicFailure) -> None:
+        Job.__init__(
+            self,
+            id=job.id,
+            namespace=job.namespace,
+            roast_uuid=job.roast_uuid,
+            content_sha256=job.content_sha256,
+            snapshot_sha256=job.snapshot_sha256,
+            snapshot_path=job.snapshot_path,
+            snapshot_byte_count=job.snapshot_byte_count,
+            aroast_json=job.aroast_json,
+            revision_json=job.revision_json,
+            idempotency_key=job.idempotency_key,
+            state=job.state,
+            attempts=job.attempts,
+            next_attempt_at=job.next_attempt_at,
+            lease_expires_at=job.lease_expires_at,
+            lease_token=job.lease_token,
+            error_code=job.error_code,
+            error_message=job.error_message,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+        )
+        object.__setattr__(self, 'failure', failure)
+
+    @property
+    def job(self) -> Job:
+        return self
+
+
 @dataclass(frozen=True, slots=True)
 class QueueCounts:
     pending: int
@@ -593,6 +627,52 @@ class Outbox:
                 except OSError:
                     pass
 
+    def discard_staged_snapshot(self, snapshot: Snapshot) -> None:
+        try:
+            namespace_key = _namespace_key(snapshot.namespace)
+            sha256 = _stored_sha256(snapshot.sha256)
+            relative_path = _snapshot_relative_path(namespace_key, sha256)
+            if (
+                snapshot.relative_path != relative_path
+                or snapshot.absolute_path != self.root / relative_path
+                or snapshot.byte_count < 1
+                or snapshot.byte_count > MAX_PROFILE_BYTES
+            ):
+                raise OutboxError(_STAGE_TOKEN_ERROR)
+            _stored_job_id(snapshot.staging_token)
+            path_to_unlink: str | None = None
+            with self._filesystem_lock(), self._transaction() as connection:
+                namespace_id = self._namespace_id(
+                    connection, snapshot.namespace, create=False
+                )
+                if namespace_id is None:
+                    return
+                row = connection.execute(
+                    '''SELECT * FROM snapshot_staging
+                       WHERE token = ? AND namespace_id = ?''',
+                    (snapshot.staging_token, namespace_id),
+                ).fetchone()
+                if row is None:
+                    return
+                if not self._stage_matches_snapshot(row, snapshot):
+                    raise OutboxError(_STAGE_TOKEN_ERROR)
+                consumed = connection.execute(
+                    '''DELETE FROM snapshot_staging
+                       WHERE token = ? AND namespace_id = ?''',
+                    (snapshot.staging_token, namespace_id),
+                )
+                if consumed.rowcount != 1:
+                    raise OutboxError(_STAGE_TOKEN_ERROR)
+                path_to_unlink = self._release_snapshot_if_unreferenced(
+                    connection, namespace_id, sha256
+                )
+            if path_to_unlink is not None:
+                self._unlink_generated_snapshot(path_to_unlink)
+        except OutboxError:
+            raise
+        except (OSError, sqlite3.Error):
+            raise OutboxError(_OUTBOX_STORAGE_ERROR) from None
+
     def enqueue(
         self,
         namespace: Namespace,
@@ -745,12 +825,6 @@ class Outbox:
                 or candidate.snapshot_byte_count is None
             ):
                 raise OutboxError('queued snapshot is unavailable')
-            _verify_snapshot_content(
-                candidate.snapshot_path,
-                candidate.snapshot_sha256,
-                candidate.snapshot_byte_count,
-                require_private=True,
-            )
             lease_token = uuid4().hex
             cursor = connection.execute(
                 '''UPDATE jobs
@@ -765,7 +839,65 @@ class Outbox:
             leased = connection.execute('SELECT * FROM jobs WHERE id = ?', (row['id'],)).fetchone()
             if leased is None:
                 raise OutboxError('leased outbox job disappeared')
-            return self._row_to_job(leased, namespace)
+            leased_job = self._row_to_job(leased, namespace)
+            try:
+                _verify_snapshot_content(
+                    candidate.snapshot_path,
+                    candidate.snapshot_sha256,
+                    candidate.snapshot_byte_count,
+                    require_private=True,
+                )
+            except OutboxError:
+                failure = PublicFailure(
+                    kind=FailureKind.LOCAL_PROFILE,
+                    code=FailureKind.LOCAL_PROFILE.value,
+                    message=FAILURE_MESSAGES[FailureKind.LOCAL_PROFILE],
+                    retryable=False,
+                )
+                error_code, error_message = _failure_fields(failure)
+                failed = connection.execute(
+                    '''UPDATE jobs
+                       SET state = 'failed', next_attempt_at = NULL,
+                           lease_expires_at = NULL, lease_token = NULL,
+                           error_code = ?, error_message = ?, updated_at = ?
+                       WHERE id = ? AND state = 'leased' AND lease_token = ?
+                         AND lease_expires_at > ?''',
+                    (
+                        error_code,
+                        error_message,
+                        now_text,
+                        row['id'],
+                        lease_token,
+                        now_text,
+                    ),
+                )
+                if failed.rowcount != 1:
+                    raise OutboxError(_LEASE_LOST) from None
+                return LeaseFailure(leased_job, failure)
+            return leased_job
+
+    def next_due_at(self, namespace: Namespace) -> datetime | None:
+        with _storage_boundary(), self._lock:
+            connection = self._require_connection()
+            namespace_id = self._namespace_id(connection, namespace, create=False)
+            if namespace_id is None:
+                return None
+            row = connection.execute(
+                '''SELECT CASE state
+                         WHEN 'pending' THEN created_at
+                         WHEN 'retry_wait' THEN next_attempt_at
+                         ELSE lease_expires_at
+                       END AS due_at
+                   FROM jobs
+                   WHERE namespace_id = ?
+                     AND state IN ('pending', 'retry_wait', 'leased')
+                   ORDER BY due_at, created_at, rowid
+                   LIMIT 1''',
+                (namespace_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return _stored_datetime(row['due_at'])
 
     def mark_complete(self, job_id: str, lease_token: str, now: datetime) -> None:
         try:

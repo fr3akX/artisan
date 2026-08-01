@@ -27,7 +27,14 @@ from artisanlib.roastserver.contract import (
     Namespace,
     PublicFailure,
 )
-from artisanlib.roastserver.outbox import EnqueueResult, Job, Outbox, OutboxError, Snapshot
+from artisanlib.roastserver.outbox import (
+    EnqueueResult,
+    Job,
+    LeaseFailure,
+    Outbox,
+    OutboxError,
+    Snapshot,
+)
 
 if TYPE_CHECKING:
     from artisanlib.roastserver.metadata import ProjectedMetadata
@@ -1282,6 +1289,21 @@ def test_completion_does_not_collect_snapshot_owned_by_an_unexpired_stage(
     assert second.created and second.job.snapshot_path == second_stage.absolute_path
 
 
+def test_discard_staged_snapshot_consumes_exact_token_and_releases_reference(
+    outbox: Outbox,
+    saved_profile: Path,
+) -> None:
+    first = outbox.snapshot_saved_file(NAMESPACE, saved_profile)
+    second = outbox.snapshot_saved_file(NAMESPACE, saved_profile)
+
+    outbox.discard_staged_snapshot(first)
+    assert first.absolute_path.exists()
+    outbox.discard_staged_snapshot(first)
+    assert first.absolute_path.exists()
+    outbox.discard_staged_snapshot(second)
+    assert not first.absolute_path.exists()
+
+
 def test_enqueue_consumes_exact_unexpired_stage_token_once(
     outbox: Outbox, saved_profile: Path
 ) -> None:
@@ -1347,15 +1369,103 @@ def test_lease_seconds_requires_exact_bounded_integer(
         outbox.lease_next(NAMESPACE, NOW, cast('int', lease_seconds))
 
 
-def test_snapshot_tamper_is_detected_before_lease(outbox: Outbox) -> None:
+@pytest.mark.parametrize(
+    'corruption',
+    ['missing', 'hash', 'size', 'permission'],
+)
+def test_snapshot_corruption_atomically_fails_exact_fenced_candidate(
+    outbox: Outbox,
+    corruption: str,
+) -> None:
     job = enqueue_fixture(outbox).job
     assert job.snapshot_path is not None
-    if os.name != 'nt':
+    if corruption == 'missing':
+        job.snapshot_path.unlink()
+    elif corruption == 'permission':
+        if os.name == 'nt':
+            pytest.skip('POSIX mode corruption case')
         job.snapshot_path.chmod(0o600)
-    job.snapshot_path.write_bytes(b'x' * len(PROFILE_BYTES))
-    with pytest.raises(OutboxError, match='snapshot'):
-        outbox.lease_next(NAMESPACE, NOW)
+    else:
+        if os.name != 'nt':
+            job.snapshot_path.chmod(0o600)
+        replacement = b'x' * (
+            len(PROFILE_BYTES) if corruption == 'hash' else len(PROFILE_BYTES) + 1
+        )
+        job.snapshot_path.write_bytes(replacement)
+        if os.name != 'nt':
+            job.snapshot_path.chmod(0o400)
+
+    outcome = outbox.lease_next(NAMESPACE, NOW)
+
+    assert isinstance(outcome, LeaseFailure)
+    assert outcome.job.id == job.id
+    assert outcome.job.lease_token is not None
+    assert outcome.failure == PublicFailure(
+        kind=FailureKind.LOCAL_PROFILE,
+        code=FailureKind.LOCAL_PROFILE.value,
+        message=FAILURE_MESSAGES[FailureKind.LOCAL_PROFILE],
+        retryable=False,
+    )
+    assert outcome.job.attempts == 1
+    counts = outbox.counts(NAMESPACE)
+    assert counts.pending == 0 and counts.failed == 1
+    failed = outbox.failed_jobs(NAMESPACE)
+    assert len(failed) == 1
+    assert failed[0].id == job.id
+    assert failed[0].error_code == FailureKind.LOCAL_PROFILE.value
+    assert failed[0].error_message == FAILURE_MESSAGES[FailureKind.LOCAL_PROFILE]
+    outbox.remove(job.id)
+    assert outbox.counts(NAMESPACE).failed == 0
+    assert not job.snapshot_path.exists()
+
+
+def test_corrupt_candidate_failure_preserves_shared_snapshot_reference(
+    outbox: Outbox,
+) -> None:
+    source = outbox.root.parent / 'shared-corrupt.alog'
+    source.write_bytes(PROFILE_BYTES)
+    first_stage = outbox.snapshot_saved_file(NAMESPACE, source)
+    second_stage = outbox.snapshot_saved_file(NAMESPACE, source)
+    first = outbox.enqueue(
+        NAMESPACE, first_stage, ROAST_UUID, METADATA, CLIENT_UUID
+    ).job
+    second = outbox.enqueue(
+        NAMESPACE, second_stage, OTHER_ROAST_UUID, METADATA, CLIENT_UUID
+    ).job
+    assert first.snapshot_path is not None
+    if os.name != 'nt':
+        first.snapshot_path.chmod(0o600)
+    first.snapshot_path.write_bytes(b'x' * len(PROFILE_BYTES))
+    if os.name != 'nt':
+        first.snapshot_path.chmod(0o400)
+
+    outcome = outbox.lease_next(NAMESPACE, NOW)
+    assert isinstance(outcome, LeaseFailure)
+    assert outcome.job.id == first.id
+    outbox.remove(first.id)
+
+    assert first.snapshot_path.exists()
     assert outbox.counts(NAMESPACE).pending == 1
+    second_outcome = outbox.lease_next(NAMESPACE, NOW)
+    assert isinstance(second_outcome, LeaseFailure)
+    assert second_outcome.job.id == second.id
+
+
+def test_next_due_at_is_namespace_scoped_and_uses_persisted_state_times(
+    outbox: Outbox,
+) -> None:
+    assert outbox.next_due_at(NAMESPACE) is None
+    job = enqueue_fixture(outbox).job
+    assert outbox.next_due_at(NAMESPACE) == job.created_at
+    assert outbox.next_due_at(OTHER_NAMESPACE) is None
+
+    leased = outbox.lease_next(NAMESPACE, NOW, lease_seconds=60)
+    assert isinstance(leased, Job)
+    assert leased.lease_token is not None
+    assert outbox.next_due_at(NAMESPACE) == NOW + timedelta(seconds=60)
+    retry_at = NOW + timedelta(minutes=7, microseconds=321)
+    outbox.mark_retry(job.id, leased.lease_token, NOW, retry_at, FAILURE)
+    assert outbox.next_due_at(NAMESPACE) == retry_at
 
 
 @pytest.mark.parametrize(

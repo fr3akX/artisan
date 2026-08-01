@@ -192,20 +192,28 @@ class CacheStore:
         self._lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._staging: dict[Path, _OwnedStage] = {}
+        self._opened = False
         self._closed = False
-        try:
-            secure_filesystem.prepare_private_root(self.root)
-            with self._filesystem_lock():
-                self._startup_maintenance()
-        except CacheError:
-            raise
-        except (OSError, ValueError, secure_filesystem.FilesystemError):
-            raise CacheError from None
+
+    def open(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise CacheError
+            if self._opened:
+                return
+            try:
+                secure_filesystem.prepare_private_root(self.root)
+                with self._filesystem_lock():
+                    self._startup_maintenance()
+            except CacheError:
+                raise
+            except (OSError, ValueError, secure_filesystem.FilesystemError):
+                raise CacheError from None
+            self._opened = True
 
     def __enter__(self) -> Self:
-        with self._state_lock:
-            self._require_open()
-            return self
+        self.open()
+        return self
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
@@ -324,6 +332,9 @@ class CacheStore:
             if self._closed:
                 return
             self._closed = True
+            if not self._opened:
+                return
+            self._opened = False
             stages = tuple(self._staging.values())
             try:
                 with self._filesystem_lock():
@@ -384,23 +395,25 @@ class CacheStore:
             roast_hex = _uuid_hex(roast_uuid)
             revision = _revision_number(revision_number)
             digest = _sha256(sha256)
-            with self._filesystem_lock():
-                path = self._profile_path(namespace_key, roast_hex, revision, digest)
-                sidecar_path = path.with_suffix('.json')
-                profile_exists = os.path.lexists(path)
-                sidecar_exists = os.path.lexists(sidecar_path)
-                if not profile_exists and not sidecar_exists:
-                    return None
-                if not profile_exists or not sidecar_exists:
-                    raise CacheError
-                cached = self._load_pair(namespace, path, sidecar_path)
-                if (
-                    cached.roast.roast_uuid != roast_uuid
-                    or cached.revision.revision_number != revision
-                    or cached.revision.sha256 != digest
-                ):
-                    raise CacheError
-                return cached
+            with self._state_lock:
+                self._require_open()
+                with self._filesystem_lock():
+                    path = self._profile_path(namespace_key, roast_hex, revision, digest)
+                    sidecar_path = path.with_suffix('.json')
+                    profile_exists = os.path.lexists(path)
+                    sidecar_exists = os.path.lexists(sidecar_path)
+                    if not profile_exists and not sidecar_exists:
+                        return None
+                    if not profile_exists or not sidecar_exists:
+                        raise CacheError
+                    cached = self._load_pair(namespace, path, sidecar_path)
+                    if (
+                        cached.roast.roast_uuid != roast_uuid
+                        or cached.revision.revision_number != revision
+                        or cached.revision.sha256 != digest
+                    ):
+                        raise CacheError
+                    return cached
         except CacheError:
             raise
         except (
@@ -415,24 +428,27 @@ class CacheStore:
 
     def validate(self, cached: CachedRevision) -> CachedRevision:
         try:
-            with self._filesystem_lock():
-                namespace_key = _namespace_key(cached.namespace)
-                expected_path = self._profile_path(
-                    namespace_key,
-                    _uuid_hex(cached.roast.roast_uuid),
-                    _revision_number(cached.revision.revision_number),
-                    _sha256(cached.revision.sha256),
-                )
-                if cached.path != expected_path or cached.sidecar_path != expected_path.with_suffix(
-                    '.json'
-                ):
-                    raise CacheError
-                loaded = self._load_pair(
-                    cached.namespace, cached.path, cached.sidecar_path
-                )
-                if loaded != cached:
-                    raise CacheError
-                return loaded
+            with self._state_lock:
+                self._require_open()
+                with self._filesystem_lock():
+                    namespace_key = _namespace_key(cached.namespace)
+                    expected_path = self._profile_path(
+                        namespace_key,
+                        _uuid_hex(cached.roast.roast_uuid),
+                        _revision_number(cached.revision.revision_number),
+                        _sha256(cached.revision.sha256),
+                    )
+                    if (
+                        cached.path != expected_path
+                        or cached.sidecar_path != expected_path.with_suffix('.json')
+                    ):
+                        raise CacheError
+                    loaded = self._load_pair(
+                        cached.namespace, cached.path, cached.sidecar_path
+                    )
+                    if loaded != cached:
+                        raise CacheError
+                    return loaded
         except CacheError:
             raise
         except (
@@ -448,21 +464,23 @@ class CacheStore:
     def list_offline(self, namespace: Namespace, filters: ArchiveFilters) -> CachedPage:
         normalized = validate_archive_filters(filters)
         try:
-            with self._filesystem_lock():
-                revisions = self._scan_namespace(namespace)
-                latest: dict[UUID, CachedRevision] = {}
-                for cached in revisions:
-                    current = latest.get(cached.roast.roast_uuid)
-                    if current is None or _latest_key(cached) > _latest_key(current):
-                        latest[cached.roast.roast_uuid] = cached
-                items = [
-                    cached
-                    for cached in latest.values()
-                    if _matches_filters(cached.roast, normalized)
-                ]
-                items.sort(key=lambda cached: cached.roast.roast_uuid.hex)
-                items.sort(key=lambda cached: cached.roast.roast_at, reverse=True)
-                return CachedPage(tuple(items))
+            with self._state_lock:
+                self._require_open()
+                with self._filesystem_lock():
+                    revisions = self._scan_namespace(namespace)
+                    latest: dict[UUID, CachedRevision] = {}
+                    for cached in revisions:
+                        current = latest.get(cached.roast.roast_uuid)
+                        if current is None or _latest_key(cached) > _latest_key(current):
+                            latest[cached.roast.roast_uuid] = cached
+                    items = [
+                        cached
+                        for cached in latest.values()
+                        if _matches_filters(cached.roast, normalized)
+                    ]
+                    items.sort(key=lambda cached: cached.roast.roast_uuid.hex)
+                    items.sort(key=lambda cached: cached.roast.roast_at, reverse=True)
+                    return CachedPage(tuple(items))
         except CacheError:
             raise
         except (
@@ -477,8 +495,10 @@ class CacheStore:
 
     def stats(self, namespace: Namespace) -> CacheStats:
         try:
-            with self._filesystem_lock():
-                return _stats(self._scan_namespace(namespace))
+            with self._state_lock:
+                self._require_open()
+                with self._filesystem_lock():
+                    return _stats(self._scan_namespace(namespace))
         except CacheError:
             raise
         except (
@@ -1243,7 +1263,7 @@ class CacheStore:
                 raise CacheError from None
 
     def _require_open(self) -> None:
-        if self._closed:
+        if not self._opened or self._closed:
             raise CacheError
 
     @contextmanager
