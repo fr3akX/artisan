@@ -622,9 +622,9 @@ git commit -m "feat(roastserver): project bounded roast metadata"
   - `snapshot_saved_file(namespace: Namespace, source: Path) -> Snapshot`
   - `enqueue(namespace: Namespace, snapshot: Snapshot, roast_uuid: UUID, metadata: ProjectedMetadata, client_uuid: UUID) -> EnqueueResult`
   - `lease_next(namespace: Namespace, now: datetime, lease_seconds: int = 60) -> Job | None`
-  - `mark_complete(job_id: str, now: datetime) -> None`
-  - `mark_retry(job_id: str, now: datetime, next_attempt_at: datetime, failure: PublicFailure) -> None`
-  - `mark_failed(job_id: str, now: datetime, failure: PublicFailure) -> None`
+  - `mark_complete(job_id: str, lease_token: str, now: datetime) -> None`
+  - `mark_retry(job_id: str, lease_token: str, now: datetime, next_attempt_at: datetime, failure: PublicFailure) -> None`
+  - `mark_failed(job_id: str, lease_token: str, now: datetime, failure: PublicFailure) -> None`
   - `pause_namespace(namespace: Namespace, now: datetime, code: str) -> int`
   - `resume_namespace(namespace: Namespace, now: datetime) -> int`
   - `retry_now(job_id: str, now: datetime) -> None`, `remove(job_id: str) -> None`
@@ -659,7 +659,7 @@ def test_expired_lease_recovers_after_restart(tmp_path: Path) -> None:
     assert second.lease_next(NAMESPACE, NOW + timedelta(seconds=61)).id == job.id
 ```
 
-Also cover schema version migration rollback, WAL/foreign keys/busy timeout, O_NOFOLLOW behavior where available, symlink rejection everywhere, 16 MiB exact/overflow, source inode/size/mtime change during copy, atomic temp cleanup, restrictive permissions where supported, namespace isolation, deterministic idempotency key, completed dedup, persisted attempts/backoff fields, paused/failed counts, retry-now, failed details bounds, removal with shared references, and orphan snapshot collection after simulated crash.
+Also cover strict canonical-v1 fingerprinting and transactional v1-to-v2 migration rollback; malformed columns/types/SQL/FKs/indexes and malformed/duplicate/non-object/noncanonical JSON; WAL/foreign keys/busy timeout; secure database/sidecar establishment; POSIX descriptor-relative no-follow and Windows native reparse/ACL failure seams; 16 MiB exact/overflow; source inode/size/mtime change; atomic no-clobber publication preserving an existing/open inode; restrictive read-only/private permissions; propagated file/directory durability failures; namespace isolation; deterministic idempotency; concurrent same-hash stages with distinct tokens; a real process barrier that opens between snapshot and enqueue; abandoned-stage expiry/cleanup; snapshot tamper before lease; stale attempt A after recovery/re-lease B; lease expiry CAS; pause/remove invalidation; exact bounded integer lease durations; safe public failure allowlists/control rejection; deduplication, counts, retry-now, and shared-reference/stage cleanup.
 
 - [ ] **Step 2: Run outbox tests and verify RED**
 
@@ -670,9 +670,9 @@ cd src
 
 Expected: import fails because `outbox.py` is absent.
 
-- [ ] **Step 3: Implement schema version 1 and atomic operations**
+- [ ] **Step 3: Implement strict schema version 2, staging ownership, and fenced atomic operations**
 
-Use these immutable row/view shapes; a completed job has all three snapshot fields set to `None` after ownership release:
+Use these immutable row/view shapes; `Snapshot` carries its one-use random staging owner and a completed job has all three snapshot fields plus lease fields set to `None` after ownership release:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -683,6 +683,7 @@ class Snapshot:
     absolute_path: Path
     byte_count: int
     source_modified_at: datetime
+    staging_token: str
 
 @dataclass(frozen=True, slots=True)
 class Job:
@@ -700,6 +701,7 @@ class Job:
     attempts: int
     next_attempt_at: datetime | None
     lease_expires_at: datetime | None
+    lease_token: str | None
     error_code: str | None
     error_message: str | None
     created_at: datetime
@@ -730,7 +732,7 @@ class EnqueueResult:
     created: bool
 ```
 
-Use this schema verbatim inside a transactional migration; timestamps are canonical aware UTC text and UUIDs are lowercase 32-hex:
+The SQL block below is the canonical version-1 fingerprint accepted as migration input, not the final schema. Compare its normalized `sqlite_master` SQL plus table/index/foreign-key pragmas exactly before changing it; any malformed or unknown unreleased queue schema fails closed. Timestamps are canonical aware UTC text and UUIDs are lowercase 32-hex:
 
 ```sql
 CREATE TABLE schema_version (
@@ -780,7 +782,28 @@ CREATE INDEX jobs_ready_idx
   ON jobs(namespace_id, state, next_attempt_at, created_at);
 ```
 
-Open with `PRAGMA journal_mode=WAL`, `foreign_keys=ON`, and `busy_timeout=5000`. Use `BEGIN IMMEDIATE` for lease/state/reference transitions. Generate paths only as `<namespace-key>/snapshots/<sha-prefix>/<sha>.alog`; reject any stored path that is absolute or whose normalized parts contain `..`. On completion/removal, null the job snapshot columns, prove zero remaining references in the same transaction, delete the snapshot row, commit, then unlink; startup removes unindexed generated files. The idempotency key is exactly `archive-v1:{client_uuid.hex}:{roast_uuid.hex}:{sha256}`.
+Transactionally rebuild that canonical input as schema version 2. Version 2 changes `schema_version` to `CHECK (version = 2)`, adds nullable unique `jobs.lease_token TEXT CHECK (lease_token IS NULL OR length(lease_token) = 32)`, enforces leased/non-leased token+expiry and complete/active snapshot state checks, and adds exactly:
+
+```sql
+CREATE TABLE snapshot_staging (
+    token TEXT PRIMARY KEY CHECK (length(token) = 32),
+    namespace_id INTEGER NOT NULL,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    relative_path TEXT NOT NULL,
+    byte_count INTEGER NOT NULL CHECK (byte_count BETWEEN 1 AND 16777216),
+    source_modified_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY(namespace_id, sha256)
+      REFERENCES snapshots(namespace_id, sha256) ON DELETE CASCADE
+);
+CREATE INDEX snapshot_staging_expiry_idx
+  ON snapshot_staging(expires_at);
+```
+
+Open with `PRAGMA journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, and `busy_timeout=5000`. Securely establish the database and any existing WAL/SHM sidecars inside the verified private root while holding the cross-process lock before SQLite access. `snapshot_saved_file()` holds that lock through atomic no-clobber publication, read-only/private hardening, directory durability, and durable insertion of a random expiring `snapshot_staging` row; same-hash owners coexist. `enqueue()` atomically validates and consumes exactly its unexpired token. Startup expires stages and deletes a snapshot row/file only when no job and no unexpired stage references it; unindexed crash residue is then collected.
+
+Generate paths only as `<namespace-key>/snapshots/<sha-prefix>/<sha>.alog`; reject absolute, noncanonical, or traversing stored paths. POSIX operations are descriptor-relative/no-follow; Windows operations use native no-reparse handles componentwise, private ACL application+verification, and flush semantics, failing closed. Existing content is verified and reused without inode replacement. Verify read-only/private size and SHA before leasing. Every lease gets a random unique token; complete/retry/fail uses `WHERE id=? AND state='leased' AND lease_token=? AND lease_expires_at>?` and raises exactly `OutboxError('lease_lost')` unless one row changes. Recovery, pause, and removal clear/invalidate ownership. Completion/removal deletes the snapshot only after proving no job/stage owner in the same transaction. Validate canonical duplicate-free JSON objects and durable state on write/read, expose only fixed allowlisted failure text/codes, reject controls, propagate supported durability failures, and require `type(lease_seconds) is int` in `1..86400`. The idempotency key remains exactly `archive-v1:{client_uuid.hex}:{roast_uuid.hex}:{sha256}`.
 
 - [ ] **Step 4: Run outbox tests GREEN**
 
@@ -916,12 +939,17 @@ Use a fake client factory and real temporary Outbox/CacheStore. Invoke slots on 
 ```python
 def test_delivery_posts_aroast_before_exact_snapshot_upload(worker_harness) -> None:
     job = worker_harness.enqueue_saved_profile()
+    complete = Mock(wraps=worker_harness.outbox.mark_complete)
+    worker_harness.outbox.mark_complete = complete
     worker_harness.run_one_queue_tick()
     assert worker_harness.client.calls == [
         ('post_aroast', job.roast_uuid, job.aroast_json.encode()),
         ('upload_revision', job.roast_uuid, job.content_sha256,
          job.idempotency_key, job.revision_json.encode(), job.snapshot_sha256),
     ]
+    leased = worker_harness.last_leased_job
+    assert leased.lease_token is not None
+    complete.assert_called_once_with(leased.id, leased.lease_token, worker_harness.now)
     assert worker_harness.outbox.counts(NAMESPACE).complete == 1
     assert not job.snapshot_path.exists()
 
@@ -941,7 +969,7 @@ def test_public_signals_are_emitted_on_worker_thread_without_secret(worker_harne
     assert worker_harness.signal_thread != worker_harness.ui_thread
 ```
 
-Test transient delays `min(5 * 2 ** (attempts - 1), 300)` and `max(backoff, retry_after)`, persisted retry after restart, permanent 4xx/local corruption failure, expired lease recovery, interruption leaving a lease recoverable, disabled/removal pause, credential restoration resume, duplicate/current-hash success, queue counts, failed-job retry/remove, browse retained-cache fallback, online detail/download staging, cached validation, cache pruning, and each safe signal payload.
+Test transient delays `min(5 * 2 ** (attempts - 1), 300)` and `max(backoff, retry_after)`, persisted retry after restart, permanent 4xx/local corruption failure, expired lease recovery, interruption leaving a lease recoverable, stale attempt A being unable to complete/retry/fail after recovery and lease B, disabled/removal pause, credential restoration resume, duplicate/current-hash success, queue counts, failed-job retry/remove, browse retained-cache fallback, online detail/download staging, cached validation, cache pruning, and each safe signal payload. Every terminal/retry assertion must prove the worker passes the token returned on that exact lease.
 
 - [ ] **Step 2: Run worker tests and verify RED**
 
@@ -1030,7 +1058,7 @@ class RoastServerWorker(QObject):
     stopped = pyqtSignal()
 ```
 
-Create the `QTimer` in `start()` after the worker has moved threads. Each timeout leases at most one job, executes compatible metadata then multipart upload, commits one terminal/retry state, emits public aggregates, and schedules the next due timestamp. Candidate credentials and `ProfileData` live only in separate injected `OpaqueVault` instances; their signals contain request IDs only. For connection testing, take the candidate, call `/auth/me`, write keyring only after success, discard the local reference in `finally`, then emit identity. On startup/configuration retrieve the active credential directly from `CredentialStore` in the worker. On delivery call `upload_revision(job.roast_uuid, job.content_sha256, job.idempotency_key, job.revision_json.encode('utf-8'), snapshot_file)` and require its parsed response to match the job. For cache pruning, union the controller-provided open cache paths with `Outbox.protected_paths()` before deletion, even though upload snapshots live under a separate generated subtree. On stop, set a `threading.Event`, stop the timer, close SQLite, remove staged temp files, and emit `stopped`; never call `QThread.terminate()`.
+Create the `QTimer` in `start()` after the worker has moved threads. Each timeout leases at most one job, executes compatible metadata then multipart upload, commits one terminal/retry state, emits public aggregates, and schedules the next due timestamp. Candidate credentials and `ProfileData` live only in separate injected `OpaqueVault` instances; their signals contain request IDs only. For connection testing, take the candidate, call `/auth/me`, write keyring only after success, discard the local reference in `finally`, then emit identity. On startup/configuration retrieve the active credential directly from `CredentialStore` in the worker. On delivery, require `job.lease_token is not None`, call `upload_revision(job.roast_uuid, job.content_sha256, job.idempotency_key, job.revision_json.encode('utf-8'), snapshot_file)`, and require its parsed response to match the job. Commit only through `mark_complete(job.id, job.lease_token, now)`, `mark_retry(job.id, job.lease_token, now, next_attempt_at, failure)`, or `mark_failed(job.id, job.lease_token, now, failure)`; treat fixed `lease_lost` as stale ownership and never retry a transition with a newer token. For cache pruning, union the controller-provided open cache paths with `Outbox.protected_paths()` before deletion, even though upload snapshots live under a separate generated subtree. On stop, set a `threading.Event`, stop the timer, close SQLite, remove staged temp files, and emit `stopped`; never call `QThread.terminate()`.
 
 - [ ] **Step 4: Run worker, outbox, and cache tests GREEN**
 

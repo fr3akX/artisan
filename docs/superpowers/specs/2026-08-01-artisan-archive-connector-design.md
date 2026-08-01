@@ -130,10 +130,11 @@ After successful serialization:
 1. Require a canonical roast UUID in the saved profile and a local `.alog` path.
 2. Open the saved path without following symlinks where supported and enforce the local 16 MiB profile ceiling.
 3. Read exact bytes, compute SHA-256, and confirm the file remains the same size/identity through the snapshot operation.
-4. Atomically publish an immutable content-addressed snapshot under the connector’s private application-data directory.
-5. Build bounded compatible metadata from the in-memory saved profile.
-6. Insert or resolve a SQLite job keyed by organization, roast UUID, and SHA-256.
-7. Use the deterministic idempotency key `archive-v1:<client-instance-uuid>:<roast-uuid>:<sha256>`.
+4. Atomically publish an immutable content-addressed snapshot under the connector’s private application-data directory without replacing an existing inode.
+5. While retaining the cross-process filesystem lock, durably insert a random, expiring, one-use staging owner for that namespace/SHA and return its token with the snapshot. Concurrent same-hash staging owners coexist.
+6. Build bounded compatible metadata from the in-memory saved profile.
+7. In one transaction, validate and consume exactly that unexpired staging token, then insert or resolve a SQLite job keyed by organization, roast UUID, and SHA-256.
+8. Use the deterministic idempotency key `archive-v1:<client-instance-uuid>:<roast-uuid>:<sha256>`.
 
 The queue owns the snapshot. Later edits to the original path cannot change queued bytes. Duplicate pending, completed, or idempotently acknowledged UUID/hash uploads do not create duplicate work.
 
@@ -144,7 +145,7 @@ The worker:
 1. Posts compatible metadata to `/api/v1/aroast` using the profile modification timestamp.
 2. Uploads the exact snapshot to `/api/v1/roasts/{uuid}/revisions` as multipart fields `profile`, `sha256`, `idempotency_key`, and bounded `metadata`.
 3. Validates roast UUID, returned revision SHA-256, revision number, state, and links.
-4. Marks the job complete and releases its snapshot when no other job references it.
+4. Marks the job complete using the unique token returned for that exact unexpired lease and releases its snapshot only when no job or unexpired staging owner references it.
 
 The server’s idempotent current-hash response is success. Reverting to an older non-current hash remains a new server revision according to the server contract.
 
@@ -160,19 +161,17 @@ Queue work never blocks saving, recording, or hardware operation. Worker state r
 
 ## Outbox persistence
 
-The SQLite database uses WAL mode, foreign keys, busy timeout, and explicit transactions. Tables store:
+The outbox uses schema version 2. Opening a version-1 database first fingerprints the complete canonical version-1 tables, columns, declared types, SQL constraints, foreign keys, and indexes; only that exact unreleased schema migrates transactionally. Unknown or malformed schemas fail closed. Version 2 adds:
 
-- connector namespace;
-- job UUID;
-- roast UUID and SHA-256;
-- snapshot relative path and byte count;
-- deterministic JSON metadata;
-- idempotency key;
-- state (`pending`, `leased`, `retry_wait`, `paused`, `failed`, `complete`);
-- attempts, next-attempt timestamp, lease expiry, stable error code/message; and
-- created/updated timestamps.
+- separate multi-owner `snapshot_staging` rows keyed by random token, with namespace, SHA-256, generated path, byte count, source timestamp, creation timestamp, and expiry;
+- a nullable unique random `lease_token` on each job attempt; and
+- database and read-time state invariants for snapshot ownership, completion, retry/failure details, and lease token/expiry nullability.
 
-On startup, expired leased jobs return to pending. Schema migration is versioned and transactional. Removing a job deletes a snapshot only after proving no remaining reference. Paths are generated internally and cannot escape the private root.
+The SQLite database uses WAL mode, full synchronous commits, foreign keys, busy timeout, and `BEGIN IMMEDIATE` transitions. Tables store connector namespace, job/roast UUIDs, SHA-256, snapshot relative path/size, canonical duplicate-free JSON-object metadata, deterministic idempotency key, state (`pending`, `leased`, `retry_wait`, `paused`, `failed`, `complete`), attempts, next-attempt timestamp, lease expiry/token, allowlisted stable error code/message, and created/updated/completed timestamps.
+
+`snapshot_saved_file()` retains the cross-process filesystem lock through publication, file/directory durability, and staging-row commit. `enqueue()` atomically validates and consumes only its unexpired token. Startup expires abandoned stages and deletes a snapshot row/file only after proving that no job and no unexpired stage references it; unindexed publication-crash residue is then collected. Same-hash stages and jobs may share one immutable file without replacing its inode.
+
+Every lease creates a unique token. Complete, retry, and fail require `(job_id, lease_token, now, ...)` and compare-and-swap only a currently leased row whose token matches and whose expiry is strictly after `now`; stale ownership yields the fixed `lease_lost` error. Recovery, namespace pause, and job removal invalidate the token. Before leasing, the indexed generated path, private read-only state, byte count, and SHA-256 are verified. Paths are generated internally and cannot escape the private root.
 
 ## Browse and download data flow
 
@@ -227,7 +226,9 @@ Dialogs call controller methods; they do not perform HTTP or direct queue writes
 ## Security
 
 - Credential and authorization headers are always redacted.
-- Private directories/files use restrictive permissions where supported.
+- Private directories/files use restrictive permissions. POSIX snapshot/database operations are descriptor-relative, no-follow, and no-clobber; Windows opens every component with native no-reparse handles, applies and verifies a private current-user DACL, and uses native flush semantics. Unsupported security APIs fail closed.
+- SQLite database/WAL/SHM paths are checked and hardened under the private root and connector process lock before SQLite can access existing entries.
+- The local same-user threat model assumes a non-malicious account and protects against accidental links/reparse points, stale permissions, crashes, and competing connector processes. A malicious process already running as the same user can normally modify that user’s private files/memory and is outside this boundary; no claim is made that advisory locks defend against such a process.
 - Cache/outbox filenames never use server-provided names.
 - No untrusted response is passed to `eval`, pickle, shell commands, filesystem paths, or Qt rich text.
 - UI strings use plain text and fixed translations.
@@ -259,7 +260,8 @@ Safe server validation messages may be retained when they match the versioned er
 - Metadata boundary and determinism tests.
 - Multipart upload and checksum/idempotency contracts.
 - Retry classification and `Retry-After` bounds.
-- SQLite migration, duplicate enqueue, leases, restart recovery, retry, failure, removal, and snapshot reference tests.
+- Strict v1 fingerprint/v2 migration, malformed schema/JSON/state rejection, multi-owner staging with real process barriers and abandoned expiry, duplicate enqueue, no-clobber/open-inode publication, tamper detection, fenced A/B leases, restart recovery, retry/failure/removal, fsync/permission failure, multiprocess cleanup, and snapshot job/stage reference tests.
+- Windows-marked runtime reparse/ACL/locking/publication/deletion tests plus platform-independent ctypes/native-failure seams; non-Windows validation does not claim Windows runtime execution.
 - Cache publication, namespace isolation, corruption, checksum, pruning, and stale-open tests.
 - No-proxy and token-redaction tests.
 

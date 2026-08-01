@@ -28,25 +28,30 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import errno
 import hashlib
 import importlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import sqlite3
 import stat
 import threading
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from artisanlib.roastserver.contract import (
+    FAILURE_MESSAGES,
     MAX_ERROR_MESSAGE_CODE_POINTS,
     MAX_METADATA_BYTES,
     MAX_PROFILE_BYTES,
+    FailureKind,
     Namespace,
     PublicFailure,
 )
@@ -54,11 +59,18 @@ from artisanlib.roastserver.contract import (
 if TYPE_CHECKING:
     from artisanlib.roastserver.metadata import ProjectedMetadata
 
-_SCHEMA_VERSION: Final[int] = 1
+_SCHEMA_VERSION: Final[int] = 2
 _DATABASE_NAME: Final[str] = 'outbox.sqlite3'
 _BUSY_TIMEOUT_MS: Final[int] = 5000
 _COPY_CHUNK_BYTES: Final[int] = 1024 * 1024
+_STAGING_SECONDS: Final[int] = 15 * 60
+_MAX_LEASE_SECONDS: Final[int] = 24 * 60 * 60
 _FAILURE_CODE_CHARS: Final[int] = 100
+_OUTBOX_STORAGE_ERROR: Final[str] = 'outbox storage operation failed'
+_SNAPSHOT_STORAGE_ERROR: Final[str] = 'saved profile could not be staged'
+_STAGE_TOKEN_ERROR: Final[str] = 'snapshot staging token is invalid or expired'
+_LEASE_LOST: Final[str] = 'lease_lost'
+_IS_WINDOWS: bool = os.name == 'nt'
 _NAMESPACE_KEY_RE: Final[re.Pattern[str]] = re.compile(r'^namespace-sha256:([0-9a-f]{64})$')
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{64}$')
 _UUID_HEX_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
@@ -69,8 +81,90 @@ _HAS_DIRECTORY_FDS: Final[bool] = os.name != 'nt' and os.open in os.supports_dir
 _JOB_STATES: Final[frozenset[str]] = frozenset(
     {'pending', 'leased', 'retry_wait', 'paused', 'failed', 'complete'}
 )
+_PUBLIC_FAILURE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        *(kind.value for kind in FailureKind),
+        'archive_unavailable',
+        'authentication_required',
+        'chart_unavailable',
+        'client_closed',
+        'connection_error',
+        'idempotency_conflict',
+        'internal_error',
+        'invalid_metadata',
+        'invalid_profile',
+        'invalid_request',
+        'not_found',
+        'object_store_unavailable',
+        'parser_busy',
+        'parser_timeout',
+        'payload_too_large',
+        'quota_exceeded',
+        'request_error',
+        'roast_uuid_mismatch',
+        'roast_uuid_missing',
+        'service_unavailable',
+        'timeout',
+        'tls_error',
+    }
+)
+_FAILURE_CODES_BY_KIND: Final[dict[FailureKind, frozenset[str]]] = {
+    FailureKind.OFFLINE: frozenset(
+        {
+            'archive_unavailable',
+            'connection_error',
+            'internal_error',
+            'object_store_unavailable',
+            'offline',
+            'parser_busy',
+            'parser_timeout',
+            'service_unavailable',
+            'timeout',
+            'tls_error',
+        }
+    ),
+    FailureKind.CREDENTIAL_REJECTED: frozenset(
+        {'authentication_required', 'credential_rejected'}
+    ),
+    FailureKind.RATE_LIMITED: frozenset({'rate_limited'}),
+    FailureKind.INVALID_RESPONSE: frozenset(
+        {'client_closed', 'invalid_response', 'request_error'}
+    ),
+    FailureKind.PROFILE_REJECTED: frozenset(
+        {
+            'chart_unavailable',
+            'checksum_mismatch',
+            'idempotency_conflict',
+            'invalid_metadata',
+            'invalid_profile',
+            'invalid_request',
+            'not_found',
+            'payload_too_large',
+            'profile_rejected',
+            'quota_exceeded',
+            'roast_uuid_mismatch',
+            'roast_uuid_missing',
+        }
+    ),
+    FailureKind.LOCAL_PROFILE: frozenset({'local_profile'}),
+    FailureKind.CHECKSUM_MISMATCH: frozenset({'checksum_mismatch'}),
+    FailureKind.CACHE_CORRUPT: frozenset({'cache_corrupt'}),
+    FailureKind.KEYRING: frozenset({'keyring'}),
+}
+_PAUSE_CODES: Final[frozenset[str]] = frozenset(
+    {'connector_disabled', 'credential_rejected', 'credential_removed'}
+)
+_UNSUPPORTED_DIRECTORY_SYNC_ERRNOS: Final[frozenset[int]] = frozenset(
+    value
+    for value in (
+        errno.EINVAL,
+        getattr(errno, 'ENOTSUP', None),
+        getattr(errno, 'EOPNOTSUPP', None),
+    )
+    if isinstance(value, int)
+)
 
-_SCHEMA_STATEMENTS: tuple[str, ...] = (
+_SCHEMA_V1_STATEMENTS: tuple[str, ...] = (
     '''CREATE TABLE schema_version (
     version INTEGER NOT NULL CHECK (version = 1)
 )''',
@@ -118,6 +212,83 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
   ON jobs(namespace_id, state, next_attempt_at, created_at)''',
 )
 
+_SCHEMA_V2_STATEMENTS: tuple[str, ...] = (
+    '''CREATE TABLE schema_version (
+    version INTEGER NOT NULL CHECK (version = 2)
+)''',
+    _SCHEMA_V1_STATEMENTS[1],
+    _SCHEMA_V1_STATEMENTS[2],
+    '''CREATE TABLE snapshot_staging (
+    token TEXT PRIMARY KEY CHECK (length(token) = 32),
+    namespace_id INTEGER NOT NULL,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    relative_path TEXT NOT NULL,
+    byte_count INTEGER NOT NULL CHECK (byte_count BETWEEN 1 AND 16777216),
+    source_modified_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY(namespace_id, sha256)
+      REFERENCES snapshots(namespace_id, sha256) ON DELETE CASCADE
+)''',
+    '''CREATE TABLE jobs (
+    id TEXT PRIMARY KEY CHECK (length(id) = 32),
+    namespace_id INTEGER NOT NULL REFERENCES namespaces(id) ON DELETE CASCADE,
+    roast_uuid TEXT NOT NULL CHECK (length(roast_uuid) = 32),
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    snapshot_sha256 TEXT,
+    snapshot_relative_path TEXT,
+    snapshot_byte_count INTEGER,
+    aroast_json TEXT NOT NULL,
+    revision_json TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) <= 255),
+    state TEXT NOT NULL CHECK (state IN
+      ('pending','leased','retry_wait','paused','failed','complete')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at TEXT,
+    lease_expires_at TEXT,
+    lease_token TEXT UNIQUE CHECK (lease_token IS NULL OR length(lease_token) = 32),
+    error_code TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(namespace_id, roast_uuid, content_sha256),
+    FOREIGN KEY(namespace_id, snapshot_sha256)
+      REFERENCES snapshots(namespace_id, sha256),
+    CHECK ((state = 'complete' AND snapshot_sha256 IS NULL
+                              AND snapshot_relative_path IS NULL
+                              AND snapshot_byte_count IS NULL
+                              AND completed_at IS NOT NULL)
+        OR (state != 'complete' AND snapshot_sha256 IS NOT NULL
+                                AND snapshot_relative_path IS NOT NULL
+                                AND snapshot_byte_count IS NOT NULL
+                                AND completed_at IS NULL)),
+    CHECK ((state = 'leased' AND lease_expires_at IS NOT NULL
+                              AND lease_token IS NOT NULL)
+        OR (state != 'leased' AND lease_expires_at IS NULL
+                               AND lease_token IS NULL)),
+    CHECK ((state = 'pending' AND next_attempt_at IS NULL
+                              AND error_code IS NULL AND error_message IS NULL)
+        OR (state = 'leased' AND next_attempt_at IS NULL
+                             AND error_code IS NULL AND error_message IS NULL)
+        OR (state = 'retry_wait' AND next_attempt_at IS NOT NULL
+                                 AND error_code IS NOT NULL
+                                 AND error_message IS NOT NULL)
+        OR (state = 'paused' AND error_code IS NOT NULL
+                             AND error_message IS NULL)
+        OR (state = 'failed' AND next_attempt_at IS NULL
+                             AND error_code IS NOT NULL
+                             AND error_message IS NOT NULL)
+        OR (state = 'complete' AND next_attempt_at IS NULL
+                               AND error_code IS NULL AND error_message IS NULL))
+)''',
+    '''CREATE INDEX jobs_ready_idx
+  ON jobs(namespace_id, state, next_attempt_at, created_at)''',
+    '''CREATE INDEX snapshot_staging_expiry_idx
+  ON snapshot_staging(expires_at)''',
+)
+_CANONICAL_SCHEMA_V2_STATEMENTS: Final[tuple[str, ...]] = _SCHEMA_V2_STATEMENTS
+
 
 class OutboxError(RuntimeError):
     pass
@@ -131,6 +302,7 @@ class Snapshot:
     absolute_path: Path
     byte_count: int
     source_modified_at: datetime
+    staging_token: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +321,7 @@ class Job:
     attempts: int
     next_attempt_at: datetime | None
     lease_expires_at: datetime | None
+    lease_token: str | None
     error_code: str | None
     error_message: str | None
     created_at: datetime
@@ -182,6 +355,581 @@ class EnqueueResult:
     created: bool
 
 
+class _WindowsNativeApi(Protocol):
+    def open_readonly(self, path: Path, *, directory: bool = False) -> int: ...
+
+    def open_lock(self, path: Path) -> int: ...
+
+    def set_private_permissions(self, path: Path, mode: int) -> None: ...
+
+    def verify_private_permissions(self, path: Path, mode: int) -> None: ...
+
+    def flush(self, descriptor: int, *, directory: bool) -> None: ...
+
+    def link(self, source: Path, destination: Path) -> None: ...
+
+    def unlink(self, path: Path) -> None: ...
+
+
+class _WindowsNativeLayer:
+    """Small Win32 handle boundary, loaded only on Windows.
+
+    Directory components are opened with FILE_FLAG_OPEN_REPARSE_POINT and held
+    without FILE_SHARE_DELETE while the next component is opened. All reparse
+    points are rejected. DACLs contain one full-control ACE for the current
+    process user and are protected from inheritance.
+    """
+
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
+    _READ_CONTROL = 0x00020000
+    _WRITE_DAC = 0x00040000
+    _DELETE = 0x00010000
+    _FILE_READ_ATTRIBUTES = 0x80
+    _FILE_WRITE_ATTRIBUTES = 0x100
+    _FILE_SHARE_READ = 0x1
+    _FILE_SHARE_WRITE = 0x2
+    _FILE_SHARE_DELETE = 0x4
+    _OPEN_EXISTING = 3
+    _OPEN_ALWAYS = 4
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    _FILE_ATTRIBUTE_READONLY = 0x1
+    _DACL_SECURITY_INFORMATION = 0x4
+    _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+    _SE_FILE_OBJECT = 1
+    _SDDL_REVISION_1 = 1
+    _TOKEN_QUERY = 0x8
+    _TOKEN_USER = 1
+    _FILE_BASIC_INFO_CLASS = 0
+    _FILE_DISPOSITION_INFO_CLASS = 4
+    _ERROR_INVALID_FUNCTION = 1
+
+    def __init__(self) -> None:
+        self._ctypes: Any = ctypes
+        self._wintypes: Any = wintypes
+        win_dll = cast(Any, ctypes.__dict__['WinDLL'])
+        self._kernel32 = win_dll('kernel32', use_last_error=True)
+        self._advapi32 = win_dll('advapi32', use_last_error=True)
+        self._invalid_handle = ctypes.c_void_p(-1).value
+
+        self._set_prototype(
+            self._kernel32.CreateFileW,
+            [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ],
+            wintypes.HANDLE,
+        )
+        self._set_prototype(
+            self._kernel32.CloseHandle, [wintypes.HANDLE], wintypes.BOOL
+        )
+        self._set_prototype(
+            self._kernel32.GetFileInformationByHandle,
+            [wintypes.HANDLE, wintypes.LPVOID],
+            wintypes.BOOL,
+        )
+        self._set_prototype(self._kernel32.GetCurrentProcess, [], wintypes.HANDLE)
+        self._set_prototype(
+            self._kernel32.LocalFree, [wintypes.HLOCAL], wintypes.HLOCAL
+        )
+        self._set_prototype(
+            self._kernel32.GetFileInformationByHandleEx,
+            [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._kernel32.SetFileInformationByHandle,
+            [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._kernel32.FlushFileBuffers, [wintypes.HANDLE], wintypes.BOOL
+        )
+        self._set_prototype(
+            self._kernel32.CreateHardLinkW,
+            [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPVOID],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.OpenProcessToken,
+            [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.GetTokenInformation,
+            [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.ConvertSidToStringSidW,
+            [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.LPVOID),
+                ctypes.POINTER(wintypes.DWORD),
+            ],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.GetSecurityDescriptorDacl,
+            [
+                wintypes.LPVOID,
+                ctypes.POINTER(wintypes.BOOL),
+                ctypes.POINTER(wintypes.LPVOID),
+                ctypes.POINTER(wintypes.BOOL),
+            ],
+            wintypes.BOOL,
+        )
+        security_info_arguments: list[Any] = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+        ]
+        self._set_prototype(
+            self._advapi32.SetSecurityInfo,
+            security_info_arguments,
+            wintypes.DWORD,
+        )
+        self._set_prototype(
+            self._advapi32.GetSecurityInfo,
+            [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.LPVOID),
+                ctypes.POINTER(wintypes.LPVOID),
+                ctypes.POINTER(wintypes.LPVOID),
+                ctypes.POINTER(wintypes.LPVOID),
+                ctypes.POINTER(wintypes.LPVOID),
+            ],
+            wintypes.DWORD,
+        )
+        self._set_prototype(
+            self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW,
+            [
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.LPWSTR),
+                ctypes.POINTER(wintypes.DWORD),
+            ],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._advapi32.GetSecurityDescriptorControl,
+            [
+                wintypes.LPVOID,
+                ctypes.POINTER(wintypes.WORD),
+                ctypes.POINTER(wintypes.DWORD),
+            ],
+            wintypes.BOOL,
+        )
+
+        class ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ('dwFileAttributes', wintypes.DWORD),
+                ('ftCreationTimeLow', wintypes.DWORD),
+                ('ftCreationTimeHigh', wintypes.DWORD),
+                ('ftLastAccessTimeLow', wintypes.DWORD),
+                ('ftLastAccessTimeHigh', wintypes.DWORD),
+                ('ftLastWriteTimeLow', wintypes.DWORD),
+                ('ftLastWriteTimeHigh', wintypes.DWORD),
+                ('dwVolumeSerialNumber', wintypes.DWORD),
+                ('nFileSizeHigh', wintypes.DWORD),
+                ('nFileSizeLow', wintypes.DWORD),
+                ('nNumberOfLinks', wintypes.DWORD),
+                ('nFileIndexHigh', wintypes.DWORD),
+                ('nFileIndexLow', wintypes.DWORD),
+            ]
+
+        class FileBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ('CreationTime', ctypes.c_longlong),
+                ('LastAccessTime', ctypes.c_longlong),
+                ('LastWriteTime', ctypes.c_longlong),
+                ('ChangeTime', ctypes.c_longlong),
+                ('FileAttributes', wintypes.DWORD),
+            ]
+
+        class FileDispositionInfo(ctypes.Structure):
+            _fields_ = [('DeleteFile', wintypes.BOOL)]
+
+        self._by_handle_information = ByHandleFileInformation
+        self._file_basic_info = FileBasicInfo
+        self._file_disposition_info = FileDispositionInfo
+
+    @staticmethod
+    def _set_prototype(function: Any, arguments: list[Any], result: Any) -> None:
+        function.argtypes = arguments
+        function.restype = result
+
+    def _error(self) -> OSError:
+        return OSError(self._ctypes.get_last_error(), 'Windows filesystem operation failed')
+
+    def _close(self, handle: int) -> None:
+        if not self._kernel32.CloseHandle(handle):
+            raise self._error()
+
+    def _attributes(self, handle: int) -> int:
+        information = self._by_handle_information()
+        if not self._kernel32.GetFileInformationByHandle(handle, self._ctypes.byref(information)):
+            raise self._error()
+        return cast(int, information.dwFileAttributes)
+
+    def _open_one(self, path: Path, access: int, disposition: int) -> int:
+        handle = self._kernel32.CreateFileW(
+            os.fspath(path),
+            access,
+            self._FILE_SHARE_READ | self._FILE_SHARE_WRITE,
+            None,
+            disposition,
+            self._FILE_FLAG_BACKUP_SEMANTICS | self._FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle == self._invalid_handle:
+            raise self._error()
+        try:
+            if self._attributes(handle) & self._FILE_ATTRIBUTE_REPARSE_POINT:
+                raise OSError(errno.ELOOP, 'reparse point rejected')
+        except BaseException:
+            self._close(handle)
+            raise
+        return cast(int, handle)
+
+    def _open_chain(
+        self,
+        path: Path,
+        *,
+        final_access: int,
+        final_disposition: int = _OPEN_EXISTING,
+    ) -> list[int]:
+        absolute = Path(os.path.abspath(os.fspath(path)))
+        if not absolute.anchor:
+            raise OSError(errno.EINVAL, 'absolute path required')
+        current = Path(absolute.anchor)
+        handles: list[int] = []
+        try:
+            handles.append(self._open_one(current, self._GENERIC_READ, self._OPEN_EXISTING))
+            for index, component in enumerate(absolute.parts[1:]):
+                if component in {'', '.', '..'}:
+                    raise OSError(errno.EINVAL, 'invalid path component')
+                current /= component
+                final = index == len(absolute.parts[1:]) - 1
+                handles.append(
+                    self._open_one(
+                        current,
+                        final_access if final else self._GENERIC_READ,
+                        final_disposition if final else self._OPEN_EXISTING,
+                    )
+                )
+            return handles
+        except BaseException:
+            for handle in reversed(handles):
+                try:
+                    self._close(handle)
+                except OSError:
+                    pass
+            raise
+
+    def open_readonly(self, path: Path, *, directory: bool = False) -> int:
+        msvcrt = cast(Any, importlib.import_module('msvcrt'))
+
+        handles = self._open_chain(path, final_access=self._GENERIC_READ)
+        final = handles.pop()
+        try:
+            attributes = self._attributes(final)
+            is_directory = bool(attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+            if is_directory != directory:
+                raise OSError(errno.EISDIR if is_directory else errno.ENOTDIR, 'wrong file type')
+            descriptor = cast(int, msvcrt.open_osfhandle(final, os.O_RDONLY))
+            final = 0
+            return descriptor
+        finally:
+            if final:
+                self._close(final)
+            for handle in reversed(handles):
+                self._close(handle)
+
+    def open_lock(self, path: Path) -> int:
+        msvcrt = cast(Any, importlib.import_module('msvcrt'))
+
+        handles = self._open_chain(
+            path,
+            final_access=(
+                self._GENERIC_READ | self._GENERIC_WRITE | self._FILE_WRITE_ATTRIBUTES
+            ),
+            final_disposition=self._OPEN_ALWAYS,
+        )
+        final = handles.pop()
+        try:
+            descriptor = cast(int, msvcrt.open_osfhandle(final, os.O_RDWR))
+            final = 0
+            return descriptor
+        finally:
+            if final:
+                self._close(final)
+            for handle in reversed(handles):
+                self._close(handle)
+
+    def _current_user_sid_string(self) -> str:
+        ctypes = self._ctypes
+        token = self._wintypes.HANDLE()
+        if not self._advapi32.OpenProcessToken(
+            self._kernel32.GetCurrentProcess(), self._TOKEN_QUERY, ctypes.byref(token)
+        ):
+            raise self._error()
+        try:
+            required = self._wintypes.DWORD()
+            self._advapi32.GetTokenInformation(
+                token, self._TOKEN_USER, None, 0, ctypes.byref(required)
+            )
+            buffer = ctypes.create_string_buffer(required.value)
+            if not self._advapi32.GetTokenInformation(
+                token,
+                self._TOKEN_USER,
+                buffer,
+                required,
+                ctypes.byref(required),
+            ):
+                raise self._error()
+            sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+            sid_text = self._wintypes.LPWSTR()
+            if not self._advapi32.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
+                raise self._error()
+            try:
+                return cast(str, sid_text.value)
+            finally:
+                self._kernel32.LocalFree(sid_text)
+        finally:
+            self._close(cast(int, token.value))
+
+    def _security_descriptor(self, sid: str) -> tuple[Any, Any]:
+        ctypes = self._ctypes
+        descriptor = ctypes.c_void_p()
+        size = self._wintypes.DWORD()
+        sddl = f'D:P(A;OICI;FA;;;{sid})'
+        if not self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl,
+            self._SDDL_REVISION_1,
+            ctypes.byref(descriptor),
+            ctypes.byref(size),
+        ):
+            raise self._error()
+        dacl_present = self._wintypes.BOOL()
+        dacl_defaulted = self._wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        if not self._advapi32.GetSecurityDescriptorDacl(
+            descriptor,
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl),
+            ctypes.byref(dacl_defaulted),
+        ) or not dacl_present.value or not dacl.value:
+            self._kernel32.LocalFree(descriptor)
+            raise self._error()
+        return descriptor, dacl
+
+    def _set_readonly(self, handle: int, readonly: bool) -> None:
+        information = self._file_basic_info()
+        if not self._kernel32.GetFileInformationByHandleEx(
+            handle,
+            self._FILE_BASIC_INFO_CLASS,
+            self._ctypes.byref(information),
+            self._ctypes.sizeof(information),
+        ):
+            raise self._error()
+        if readonly:
+            information.FileAttributes |= self._FILE_ATTRIBUTE_READONLY
+        else:
+            information.FileAttributes &= ~self._FILE_ATTRIBUTE_READONLY
+        if not self._kernel32.SetFileInformationByHandle(
+            handle,
+            self._FILE_BASIC_INFO_CLASS,
+            self._ctypes.byref(information),
+            self._ctypes.sizeof(information),
+        ):
+            raise self._error()
+
+    def set_private_permissions(self, path: Path, mode: int) -> None:
+        handles = self._open_chain(
+            path,
+            final_access=(
+                self._GENERIC_READ
+                | self._READ_CONTROL
+                | self._WRITE_DAC
+                | self._FILE_READ_ATTRIBUTES
+                | self._FILE_WRITE_ATTRIBUTES
+            ),
+        )
+        final = handles[-1]
+        descriptor: Any = None
+        try:
+            sid = self._current_user_sid_string()
+            descriptor, dacl = self._security_descriptor(sid)
+            result = self._advapi32.SetSecurityInfo(
+                final,
+                self._SE_FILE_OBJECT,
+                self._DACL_SECURITY_INFORMATION | self._PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                dacl,
+                None,
+            )
+            if result != 0:
+                raise OSError(result, 'Windows ACL operation failed')
+            self._set_readonly(final, mode == 0o400)
+        finally:
+            if descriptor is not None:
+                self._kernel32.LocalFree(descriptor)
+            for handle in reversed(handles):
+                self._close(handle)
+        self.verify_private_permissions(path, mode)
+
+    def verify_private_permissions(self, path: Path, mode: int) -> None:
+        handles = self._open_chain(
+            path,
+            final_access=self._GENERIC_READ | self._READ_CONTROL | self._FILE_READ_ATTRIBUTES,
+        )
+        final = handles[-1]
+        security_descriptor = self._ctypes.c_void_p()
+        try:
+            dacl = self._ctypes.c_void_p()
+            result = self._advapi32.GetSecurityInfo(
+                final,
+                self._SE_FILE_OBJECT,
+                self._DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                self._ctypes.byref(dacl),
+                None,
+                self._ctypes.byref(security_descriptor),
+            )
+            if result != 0 or not dacl.value:
+                raise OSError(result, 'Windows ACL verification failed')
+            text = self._wintypes.LPWSTR()
+            length = self._wintypes.ULONG()
+            if not self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                security_descriptor,
+                self._SDDL_REVISION_1,
+                self._DACL_SECURITY_INFORMATION,
+                self._ctypes.byref(text),
+                self._ctypes.byref(length),
+            ):
+                raise self._error()
+            try:
+                rendered = cast(str, text.value)
+                sid = self._current_user_sid_string()
+                control = self._wintypes.WORD()
+                revision = self._wintypes.DWORD()
+                if not self._advapi32.GetSecurityDescriptorControl(
+                    security_descriptor,
+                    self._ctypes.byref(control),
+                    self._ctypes.byref(revision),
+                ):
+                    raise self._error()
+                if (
+                    'D:' not in rendered
+                    or rendered.count('(A;') != 1
+                    or sid not in rendered
+                    or not control.value & 0x1000
+                ):
+                    raise OSError(errno.EACCES, 'Windows ACL is not private')
+            finally:
+                self._kernel32.LocalFree(text)
+            readonly = bool(self._attributes(final) & self._FILE_ATTRIBUTE_READONLY)
+            if readonly != (mode == 0o400):
+                raise OSError(errno.EACCES, 'Windows readonly state is invalid')
+        finally:
+            if security_descriptor.value:
+                self._kernel32.LocalFree(security_descriptor)
+            for handle in reversed(handles):
+                self._close(handle)
+
+    def flush(self, descriptor: int, *, directory: bool) -> None:
+        msvcrt = cast(Any, importlib.import_module('msvcrt'))
+
+        handle = msvcrt.get_osfhandle(descriptor)
+        if not self._kernel32.FlushFileBuffers(handle):
+            error = self._ctypes.get_last_error()
+            if directory and error == self._ERROR_INVALID_FUNCTION:
+                return
+            raise OSError(error, 'Windows flush failed')
+
+    def link(self, source: Path, destination: Path) -> None:
+        if not self._kernel32.CreateHardLinkW(
+            os.fspath(destination), os.fspath(source), None
+        ):
+            error = self._ctypes.get_last_error()
+            if error in {80, 183}:
+                raise FileExistsError(errno.EEXIST, 'snapshot already exists')
+            raise OSError(error, 'Windows hard-link publication failed')
+
+    def unlink(self, path: Path) -> None:
+        handles = self._open_chain(
+            path,
+            final_access=(
+                self._DELETE | self._FILE_READ_ATTRIBUTES | self._FILE_WRITE_ATTRIBUTES
+            ),
+        )
+        try:
+            final = handles[-1]
+            self._set_readonly(final, False)
+            disposition = self._file_disposition_info(True)
+            if not self._kernel32.SetFileInformationByHandle(
+                final,
+                self._FILE_DISPOSITION_INFO_CLASS,
+                self._ctypes.byref(disposition),
+                self._ctypes.sizeof(disposition),
+            ):
+                raise self._error()
+        finally:
+            for handle in reversed(handles):
+                self._close(handle)
+
+
+def _load_windows_native() -> _WindowsNativeApi | None:
+    if not _IS_WINDOWS:
+        return None
+    try:
+        return _WindowsNativeLayer()
+    except Exception as exc:
+        raise RuntimeError('Windows secure filesystem APIs are unavailable') from exc
+
+
+_WINDOWS_NATIVE: _WindowsNativeApi | None = _load_windows_native()
+
+
+@contextmanager
+def _storage_boundary() -> Iterator[None]:
+    try:
+        yield
+    except OutboxError:
+        raise
+    except (OSError, sqlite3.Error):
+        raise OutboxError(_OUTBOX_STORAGE_ERROR) from None
+
+
 class Outbox:
     def __init__(self, root: Path, clock: Callable[[], datetime]) -> None:
         self.root = Path(os.path.abspath(os.fspath(root)))
@@ -195,11 +943,11 @@ class Outbox:
             if self._connection is not None:
                 return
             _datetime_text(self._clock())
-            self._prepare_root()
             connection: sqlite3.Connection | None = None
-            with self._filesystem_lock():
-                self._reject_database_symlink()
-                try:
+            try:
+                self._prepare_root()
+                with self._filesystem_lock():
+                    self._secure_database_files_before_connect()
                     connection = sqlite3.connect(
                         self._database_path,
                         timeout=_BUSY_TIMEOUT_MS / 1000,
@@ -213,29 +961,44 @@ class Outbox:
                     )
                     if journal_mode.lower() != 'wal':
                         raise OutboxError('SQLite WAL mode is unavailable')
+                    connection.execute('PRAGMA synchronous=FULL')
                     connection.execute('PRAGMA foreign_keys=ON')
                     if connection.execute('PRAGMA foreign_keys').fetchone()[0] != 1:
                         raise OutboxError('SQLite foreign keys are unavailable')
                     self._connection = connection
                     self._migrate()
-                    self._collect_unindexed_files()
+                    self._validate_durable_rows()
+                    self._expire_stages_and_collect(self._clock())
+                    self._harden_indexed_snapshots()
                     self._harden_database_files()
-                except BaseException:
-                    self._connection = None
-                    if connection is not None:
-                        connection.close()
-                    raise
+            except OutboxError:
+                self._connection = None
+                if connection is not None:
+                    connection.close()
+                raise
+            except (OSError, sqlite3.Error):
+                self._connection = None
+                if connection is not None:
+                    connection.close()
+                raise OutboxError(_OUTBOX_STORAGE_ERROR) from None
 
     def close(self) -> None:
         with self._lock:
             connection = self._connection
-            self._connection = None
-            if connection is not None:
-                connection.close()
-            self._harden_database_files()
+            if connection is None:
+                return
+            try:
+                with self._filesystem_lock():
+                    self._connection = None
+                    connection.close()
+                    self._harden_database_files()
+            except OutboxError:
+                raise
+            except (OSError, sqlite3.Error):
+                raise OutboxError(_OUTBOX_STORAGE_ERROR) from None
 
     def database_pragmas(self) -> tuple[str, bool, int]:
-        with self._lock:
+        with _storage_boundary(), self._lock:
             connection = self._require_connection()
             journal = cast(str, connection.execute('PRAGMA journal_mode').fetchone()[0]).lower()
             foreign_keys = bool(connection.execute('PRAGMA foreign_keys').fetchone()[0])
@@ -244,26 +1007,36 @@ class Outbox:
 
     def recover_expired_leases(self, now: datetime) -> int:
         now_text = _datetime_text(now)
-        with self._transaction() as connection:
+        with _storage_boundary(), self._filesystem_lock(), self._transaction() as connection:
             cursor = connection.execute(
                 '''UPDATE jobs
-                   SET state = 'pending', next_attempt_at = NULL,
-                       lease_expires_at = NULL, error_code = NULL,
-                       error_message = NULL, updated_at = ?
-                   WHERE state = 'leased' AND lease_expires_at <= ?''',
+                       SET state = 'pending', next_attempt_at = NULL,
+                           lease_expires_at = NULL, lease_token = NULL,
+                           error_code = NULL, error_message = NULL, updated_at = ?
+                       WHERE state = 'leased' AND lease_expires_at <= ?''',
                 (now_text, now_text),
             )
             return cursor.rowcount
 
     def snapshot_saved_file(self, namespace: Namespace, source: Path) -> Snapshot:
-        with self._filesystem_lock():
-            return self._snapshot_saved_file_locked(namespace, source)
+        try:
+            with self._filesystem_lock():
+                return self._snapshot_saved_file_locked(namespace, source)
+        except OutboxError:
+            raise
+        except (OSError, sqlite3.Error):
+            raise OutboxError(_SNAPSHOT_STORAGE_ERROR) from None
 
     def _snapshot_saved_file_locked(self, namespace: Namespace, source: Path) -> Snapshot:
         namespace_key = _namespace_key(namespace)
         source_path = Path(source)
-        source_fd = _open_path_readonly(source_path)
+        try:
+            source_fd = _open_path_readonly(source_path)
+        except OutboxError:
+            raise
         temporary_path: Path | None = None
+        published_path: Path | None = None
+        published_created = False
         try:
             before = os.fstat(source_fd)
             _require_regular_file(before, 'saved profile')
@@ -291,8 +1064,53 @@ class Outbox:
 
             relative_path = _snapshot_relative_path(namespace_key, sha256)
             final_path = self.root / relative_path
-            self._publish_temporary(temporary_path, final_path)
+            published_created = self._publish_temporary(
+                temporary_path, final_path, sha256, byte_count
+            )
             temporary_path = None
+            published_path = final_path
+            token = uuid4().hex
+            created_at = self._clock()
+            created_text = _datetime_text(created_at)
+            expires_text = _datetime_text(created_at + timedelta(seconds=_STAGING_SECONDS))
+            source_modified_text = _datetime_text(source_modified_at)
+            with self._transaction() as connection:
+                namespace_id = self._namespace_id(connection, namespace, create=True)
+                if namespace_id is None:
+                    raise OutboxError('namespace was not persisted')
+                connection.execute(
+                    '''INSERT OR IGNORE INTO snapshots
+                       (namespace_id, sha256, relative_path, byte_count, created_at)
+                       VALUES (?, ?, ?, ?, ?)''',
+                    (namespace_id, sha256, relative_path, byte_count, created_text),
+                )
+                row = connection.execute(
+                    '''SELECT relative_path, byte_count FROM snapshots
+                       WHERE namespace_id = ? AND sha256 = ?''',
+                    (namespace_id, sha256),
+                ).fetchone()
+                if (
+                    row is None
+                    or row['relative_path'] != relative_path
+                    or row['byte_count'] != byte_count
+                ):
+                    raise OutboxError('snapshot index conflicts with generated content')
+                connection.execute(
+                    '''INSERT INTO snapshot_staging
+                       (token, namespace_id, sha256, relative_path, byte_count,
+                        source_modified_at, created_at, expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (
+                        token,
+                        namespace_id,
+                        sha256,
+                        relative_path,
+                        byte_count,
+                        source_modified_text,
+                        created_text,
+                        expires_text,
+                    ),
+                )
             return Snapshot(
                 namespace=namespace,
                 sha256=sha256,
@@ -300,11 +1118,19 @@ class Outbox:
                 absolute_path=final_path,
                 byte_count=byte_count,
                 source_modified_at=source_modified_at,
+                staging_token=token,
             )
+        except BaseException:
+            if published_created and published_path is not None:
+                self._discard_unowned_publication(namespace, published_path)
+            raise
         finally:
             os.close(source_fd)
             if temporary_path is not None:
-                self._discard_temporary(temporary_path)
+                try:
+                    self._discard_temporary(temporary_path)
+                except OSError:
+                    pass
 
     def enqueue(
         self,
@@ -314,8 +1140,13 @@ class Outbox:
         metadata: ProjectedMetadata,
         client_uuid: UUID,
     ) -> EnqueueResult:
-        with self._filesystem_lock():
-            return self._enqueue_locked(namespace, snapshot, roast_uuid, metadata, client_uuid)
+        try:
+            with self._filesystem_lock():
+                return self._enqueue_locked(namespace, snapshot, roast_uuid, metadata, client_uuid)
+        except OutboxError:
+            raise
+        except (OSError, sqlite3.Error):
+            raise OutboxError(_OUTBOX_STORAGE_ERROR) from None
 
     def _enqueue_locked(
         self,
@@ -326,7 +1157,6 @@ class Outbox:
         client_uuid: UUID,
     ) -> EnqueueResult:
         namespace_key = _namespace_key(namespace)
-        self._validate_snapshot(namespace, namespace_key, snapshot)
         aroast_json = _metadata_text(metadata.aroast_json, 'aroast')
         revision_json = _metadata_text(metadata.revision_json, 'revision')
         roast_hex = _uuid_hex(roast_uuid, 'roast UUID')
@@ -335,32 +1165,24 @@ class Outbox:
         idempotency_key = f'archive-v1:{client_hex}:{roast_hex}:{snapshot.sha256}'
         path_to_unlink: str | None = None
         with self._transaction() as connection:
-            namespace_id = self._namespace_id(connection, namespace, create=True)
+            namespace_id = self._namespace_id(connection, namespace, create=False)
             if namespace_id is None:
-                raise OutboxError('namespace was not persisted')
-            connection.execute(
-                '''INSERT OR IGNORE INTO snapshots
-                   (namespace_id, sha256, relative_path, byte_count, created_at)
-                   VALUES (?, ?, ?, ?, ?)''',
-                (
-                    namespace_id,
-                    snapshot.sha256,
-                    snapshot.relative_path,
-                    snapshot.byte_count,
-                    now_text,
-                ),
-            )
-            indexed = connection.execute(
-                '''SELECT relative_path, byte_count FROM snapshots
-                   WHERE namespace_id = ? AND sha256 = ?''',
-                (namespace_id, snapshot.sha256),
+                raise OutboxError(_STAGE_TOKEN_ERROR)
+            stage = connection.execute(
+                '''SELECT * FROM snapshot_staging
+                   WHERE token = ? AND namespace_id = ? AND expires_at > ?''',
+                (snapshot.staging_token, namespace_id, now_text),
             ).fetchone()
-            if (
-                indexed is None
-                or indexed['relative_path'] != snapshot.relative_path
-                or indexed['byte_count'] != snapshot.byte_count
-            ):
-                raise OutboxError('snapshot index conflicts with generated content')
+            if stage is None or not self._stage_matches_snapshot(stage, snapshot):
+                raise OutboxError(_STAGE_TOKEN_ERROR)
+            self._validate_snapshot(namespace, namespace_key, snapshot)
+            consumed = connection.execute(
+                '''DELETE FROM snapshot_staging
+                   WHERE token = ? AND namespace_id = ? AND expires_at > ?''',
+                (snapshot.staging_token, namespace_id, now_text),
+            )
+            if consumed.rowcount != 1:
+                raise OutboxError(_STAGE_TOKEN_ERROR)
             existing = connection.execute(
                 '''SELECT * FROM jobs
                    WHERE namespace_id = ? AND roast_uuid = ? AND content_sha256 = ?''',
@@ -379,10 +1201,10 @@ class Outbox:
                        (id, namespace_id, roast_uuid, content_sha256,
                         snapshot_sha256, snapshot_relative_path, snapshot_byte_count,
                         aroast_json, revision_json, idempotency_key, state,
-                        attempts, next_attempt_at, lease_expires_at,
+                        attempts, next_attempt_at, lease_expires_at, lease_token,
                         error_code, error_message, created_at, updated_at, completed_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
-                               0, NULL, NULL, NULL, NULL, ?, ?, NULL)''',
+                               0, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)''',
                     (
                         job_id,
                         namespace_id,
@@ -406,16 +1228,40 @@ class Outbox:
             self._unlink_generated_snapshot(path_to_unlink)
         return result
 
+    @staticmethod
+    def _stage_matches_snapshot(row: sqlite3.Row, snapshot: Snapshot) -> bool:
+        try:
+            return (
+                _stored_job_id(row['token']) == snapshot.staging_token
+                and _stored_sha256(row['sha256']) == snapshot.sha256
+                and row['relative_path'] == snapshot.relative_path
+                and _stored_positive_int(
+                    row['byte_count'], 'staged snapshot byte count', MAX_PROFILE_BYTES
+                )
+                == snapshot.byte_count
+                and _stored_datetime(row['source_modified_at']) == snapshot.source_modified_at
+            )
+        except OutboxError:
+            return False
+
     def lease_next(
         self, namespace: Namespace, now: datetime, lease_seconds: int = 60
     ) -> Job | None:
-        if isinstance(lease_seconds, bool) or lease_seconds <= 0:
-            raise ValueError('lease_seconds must be a positive integer')
+        with _storage_boundary(), self._filesystem_lock():
+            return self._lease_next_locked(namespace, now, lease_seconds)
+
+    def _lease_next_locked(
+        self, namespace: Namespace, now: datetime, lease_seconds: int
+    ) -> Job | None:
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= _MAX_LEASE_SECONDS:
+            raise ValueError(
+                f'lease_seconds must be an integer between 1 and {_MAX_LEASE_SECONDS}'
+            )
         now_text = _datetime_text(now)
         try:
             lease_expires_text = _datetime_text(now + timedelta(seconds=lease_seconds))
         except OverflowError as exc:
-            raise ValueError('lease duration is out of range') from exc
+            raise ValueError('lease_seconds is out of range') from exc
         with self._transaction() as connection:
             namespace_id = self._namespace_id(connection, namespace, create=False)
             if namespace_id is None:
@@ -431,43 +1277,65 @@ class Outbox:
             ).fetchone()
             if row is None:
                 return None
-            connection.execute(
+            candidate = self._row_to_job(row, namespace)
+            if (
+                candidate.snapshot_path is None
+                or candidate.snapshot_sha256 is None
+                or candidate.snapshot_byte_count is None
+            ):
+                raise OutboxError('queued snapshot is unavailable')
+            _verify_snapshot_content(
+                candidate.snapshot_path,
+                candidate.snapshot_sha256,
+                candidate.snapshot_byte_count,
+                require_private=True,
+            )
+            lease_token = uuid4().hex
+            cursor = connection.execute(
                 '''UPDATE jobs
                    SET state = 'leased', attempts = attempts + 1,
-                       next_attempt_at = NULL, lease_expires_at = ?,
+                       next_attempt_at = NULL, lease_expires_at = ?, lease_token = ?,
                        error_code = NULL, error_message = NULL, updated_at = ?
-                   WHERE id = ?''',
-                (lease_expires_text, now_text, row['id']),
+                   WHERE id = ? AND state IN ('pending', 'retry_wait')''',
+                (lease_expires_text, lease_token, now_text, row['id']),
             )
+            if cursor.rowcount != 1:
+                raise OutboxError(_LEASE_LOST)
             leased = connection.execute('SELECT * FROM jobs WHERE id = ?', (row['id'],)).fetchone()
             if leased is None:
                 raise OutboxError('leased outbox job disappeared')
             return self._row_to_job(leased, namespace)
 
-    def mark_complete(self, job_id: str, now: datetime) -> None:
-        with self._filesystem_lock():
-            self._mark_complete_locked(job_id, now)
+    def mark_complete(self, job_id: str, lease_token: str, now: datetime) -> None:
+        try:
+            with self._filesystem_lock():
+                self._mark_complete_locked(job_id, lease_token, now)
+        except OutboxError:
+            raise
+        except (OSError, sqlite3.Error):
+            raise OutboxError(_OUTBOX_STORAGE_ERROR) from None
 
-    def _mark_complete_locked(self, job_id: str, now: datetime) -> None:
+    def _mark_complete_locked(self, job_id: str, lease_token: str, now: datetime) -> None:
         job_hex = _job_id(job_id)
+        token_hex = _lease_token(lease_token)
         now_text = _datetime_text(now)
         path_to_unlink: str | None = None
         with self._transaction() as connection:
-            row = self._job_for_transition(connection, job_hex)
-            if row['state'] == 'complete':
-                return
-            self._require_state(row, 'leased')
-            snapshot_sha256 = cast(str, row['snapshot_sha256'])
-            connection.execute(
+            row = self._leased_job_for_transition(connection, job_hex, token_hex, now_text)
+            snapshot_sha256 = _stored_sha256(row['snapshot_sha256'])
+            cursor = connection.execute(
                 '''UPDATE jobs
                    SET snapshot_sha256 = NULL, snapshot_relative_path = NULL,
                        snapshot_byte_count = NULL, state = 'complete',
-                       next_attempt_at = NULL, lease_expires_at = NULL,
+                       next_attempt_at = NULL, lease_expires_at = NULL, lease_token = NULL,
                        error_code = NULL, error_message = NULL,
                        updated_at = ?, completed_at = ?
-                   WHERE id = ?''',
-                (now_text, now_text, job_hex),
+                   WHERE id = ? AND state = 'leased' AND lease_token = ?
+                     AND lease_expires_at > ?''',
+                (now_text, now_text, job_hex, token_hex, now_text),
             )
+            if cursor.rowcount != 1:
+                raise OutboxError(_LEASE_LOST)
             path_to_unlink = self._release_snapshot_if_unreferenced(
                 connection, cast(int, row['namespace_id']), snapshot_sha256
             )
@@ -477,54 +1345,102 @@ class Outbox:
     def mark_retry(
         self,
         job_id: str,
+        lease_token: str,
+        now: datetime,
+        next_attempt_at: datetime,
+        failure: PublicFailure,
+    ) -> None:
+        with _storage_boundary(), self._filesystem_lock():
+            self._mark_retry_locked(job_id, lease_token, now, next_attempt_at, failure)
+
+    def _mark_retry_locked(
+        self,
+        job_id: str,
+        lease_token: str,
         now: datetime,
         next_attempt_at: datetime,
         failure: PublicFailure,
     ) -> None:
         job_hex = _job_id(job_id)
+        token_hex = _lease_token(lease_token)
         now_text = _datetime_text(now)
         next_attempt_text = _datetime_text(next_attempt_at)
         if next_attempt_at.astimezone(UTC) < now.astimezone(UTC):
             raise ValueError('next attempt cannot be before now')
         error_code, error_message = _failure_fields(failure)
         with self._transaction() as connection:
-            row = self._job_for_transition(connection, job_hex)
-            self._require_state(row, 'leased')
-            connection.execute(
+            self._leased_job_for_transition(connection, job_hex, token_hex, now_text)
+            cursor = connection.execute(
                 '''UPDATE jobs
                    SET state = 'retry_wait', next_attempt_at = ?,
-                       lease_expires_at = NULL, error_code = ?,
+                       lease_expires_at = NULL, lease_token = NULL, error_code = ?,
                        error_message = ?, updated_at = ?
-                   WHERE id = ?''',
-                (next_attempt_text, error_code, error_message, now_text, job_hex),
+                   WHERE id = ? AND state = 'leased' AND lease_token = ?
+                     AND lease_expires_at > ?''',
+                (
+                    next_attempt_text,
+                    error_code,
+                    error_message,
+                    now_text,
+                    job_hex,
+                    token_hex,
+                    now_text,
+                ),
             )
+            if cursor.rowcount != 1:
+                raise OutboxError(_LEASE_LOST)
 
-    def mark_failed(self, job_id: str, now: datetime, failure: PublicFailure) -> None:
+    def mark_failed(
+        self,
+        job_id: str,
+        lease_token: str,
+        now: datetime,
+        failure: PublicFailure,
+    ) -> None:
+        with _storage_boundary(), self._filesystem_lock():
+            self._mark_failed_locked(job_id, lease_token, now, failure)
+
+    def _mark_failed_locked(
+        self,
+        job_id: str,
+        lease_token: str,
+        now: datetime,
+        failure: PublicFailure,
+    ) -> None:
         job_hex = _job_id(job_id)
+        token_hex = _lease_token(lease_token)
         now_text = _datetime_text(now)
         error_code, error_message = _failure_fields(failure)
         with self._transaction() as connection:
-            row = self._job_for_transition(connection, job_hex)
-            self._require_state(row, 'leased')
-            connection.execute(
+            self._leased_job_for_transition(connection, job_hex, token_hex, now_text)
+            cursor = connection.execute(
                 '''UPDATE jobs
                    SET state = 'failed', next_attempt_at = NULL,
-                       lease_expires_at = NULL, error_code = ?,
+                       lease_expires_at = NULL, lease_token = NULL, error_code = ?,
                        error_message = ?, updated_at = ?
-                   WHERE id = ?''',
-                (error_code, error_message, now_text, job_hex),
+                   WHERE id = ? AND state = 'leased' AND lease_token = ?
+                     AND lease_expires_at > ?''',
+                (error_code, error_message, now_text, job_hex, token_hex, now_text),
             )
+            if cursor.rowcount != 1:
+                raise OutboxError(_LEASE_LOST)
 
     def pause_namespace(self, namespace: Namespace, now: datetime, code: str) -> int:
+        with _storage_boundary(), self._filesystem_lock():
+            return self._pause_namespace_locked(namespace, now, code)
+
+    def _pause_namespace_locked(
+        self, namespace: Namespace, now: datetime, code: str
+    ) -> int:
         now_text = _datetime_text(now)
-        bounded_code = _bounded_text(code, _FAILURE_CODE_CHARS, 'pause code')
+        bounded_code = _pause_code(code)
         with self._transaction() as connection:
             namespace_id = self._namespace_id(connection, namespace, create=False)
             if namespace_id is None:
                 return 0
             cursor = connection.execute(
                 '''UPDATE jobs
-                   SET state = 'paused', lease_expires_at = NULL,
+                   SET state = 'paused', lease_expires_at = NULL, lease_token = NULL,
                        error_code = ?, error_message = NULL, updated_at = ?
                    WHERE namespace_id = ?
                      AND state IN ('pending', 'leased', 'retry_wait')''',
@@ -533,6 +1449,10 @@ class Outbox:
             return cursor.rowcount
 
     def resume_namespace(self, namespace: Namespace, now: datetime) -> int:
+        with _storage_boundary(), self._filesystem_lock():
+            return self._resume_namespace_locked(namespace, now)
+
+    def _resume_namespace_locked(self, namespace: Namespace, now: datetime) -> int:
         now_text = _datetime_text(now)
         with self._transaction() as connection:
             namespace_id = self._namespace_id(connection, namespace, create=False)
@@ -545,13 +1465,34 @@ class Outbox:
                            THEN 'retry_wait'
                          ELSE 'pending'
                        END,
-                       error_code = NULL, error_message = NULL, updated_at = ?
+                       error_code = CASE
+                         WHEN next_attempt_at IS NOT NULL AND next_attempt_at > ?
+                           THEN 'offline'
+                         ELSE NULL
+                       END,
+                       error_message = CASE
+                         WHEN next_attempt_at IS NOT NULL AND next_attempt_at > ?
+                           THEN ?
+                         ELSE NULL
+                       END,
+                       updated_at = ?
                    WHERE namespace_id = ? AND state = 'paused' ''',
-                (now_text, now_text, namespace_id),
+                (
+                    now_text,
+                    now_text,
+                    now_text,
+                    FAILURE_MESSAGES[FailureKind.OFFLINE],
+                    now_text,
+                    namespace_id,
+                ),
             )
             return cursor.rowcount
 
     def retry_now(self, job_id: str, now: datetime) -> None:
+        with _storage_boundary(), self._filesystem_lock():
+            self._retry_now_locked(job_id, now)
+
+    def _retry_now_locked(self, job_id: str, now: datetime) -> None:
         job_hex = _job_id(job_id)
         now_text = _datetime_text(now)
         with self._transaction() as connection:
@@ -562,15 +1503,20 @@ class Outbox:
             connection.execute(
                 '''UPDATE jobs
                    SET state = 'pending', next_attempt_at = NULL,
-                       lease_expires_at = NULL, error_code = NULL,
+                       lease_expires_at = NULL, lease_token = NULL, error_code = NULL,
                        error_message = NULL, updated_at = ?
                    WHERE id = ?''',
                 (now_text, job_hex),
             )
 
     def remove(self, job_id: str) -> None:
-        with self._filesystem_lock():
-            self._remove_locked(job_id)
+        try:
+            with self._filesystem_lock():
+                self._remove_locked(job_id)
+        except OutboxError:
+            raise
+        except (OSError, sqlite3.Error):
+            raise OutboxError(_OUTBOX_STORAGE_ERROR) from None
 
     def _remove_locked(self, job_id: str) -> None:
         job_hex = _job_id(job_id)
@@ -584,13 +1530,13 @@ class Outbox:
             connection.execute('DELETE FROM jobs WHERE id = ?', (job_hex,))
             if snapshot_sha256 is not None:
                 path_to_unlink = self._release_snapshot_if_unreferenced(
-                    connection, namespace_id, snapshot_sha256
+                    connection, namespace_id, _stored_sha256(snapshot_sha256)
                 )
         if path_to_unlink is not None:
             self._unlink_generated_snapshot(path_to_unlink)
 
     def counts(self, namespace: Namespace) -> QueueCounts:
-        with self._lock:
+        with _storage_boundary(), self._lock:
             connection = self._require_connection()
             namespace_id = self._namespace_id(connection, namespace, create=False)
             if namespace_id is None:
@@ -616,42 +1562,44 @@ class Outbox:
             )
 
     def failed_jobs(self, namespace: Namespace) -> tuple[FailedJob, ...]:
-        with self._lock:
+        with _storage_boundary(), self._lock:
             connection = self._require_connection()
             namespace_id = self._namespace_id(connection, namespace, create=False)
             if namespace_id is None:
                 return ()
             rows = connection.execute(
-                '''SELECT id, roast_uuid, content_sha256, attempts,
-                          next_attempt_at, error_code, error_message, updated_at
-                   FROM jobs
+                '''SELECT * FROM jobs
                    WHERE namespace_id = ? AND state = 'failed'
                    ORDER BY updated_at DESC, id''',
                 (namespace_id,),
             ).fetchall()
             failed: list[FailedJob] = []
             for row in rows:
-                error_code = row['error_code']
-                error_message = row['error_message']
-                if not isinstance(error_code, str) or not isinstance(error_message, str):
+                job = self._row_to_job(row, namespace)
+                if job.error_code is None or job.error_message is None:
                     raise OutboxError('failed outbox job has incomplete details')
                 failed.append(
                     FailedJob(
-                        id=_stored_job_id(row['id']),
-                        roast_uuid=_stored_uuid(row['roast_uuid']),
-                        sha256=_stored_sha256(row['content_sha256']),
-                        attempts=_stored_nonnegative_int(row['attempts'], 'attempts'),
-                        next_attempt_at=_optional_stored_datetime(row['next_attempt_at']),
-                        error_code=error_code[:_FAILURE_CODE_CHARS],
-                        error_message=error_message[:MAX_ERROR_MESSAGE_CODE_POINTS],
-                        updated_at=_stored_datetime(row['updated_at']),
+                        id=job.id,
+                        roast_uuid=job.roast_uuid,
+                        sha256=job.content_sha256,
+                        attempts=job.attempts,
+                        next_attempt_at=job.next_attempt_at,
+                        error_code=job.error_code,
+                        error_message=job.error_message,
+                        updated_at=job.updated_at,
                     )
                 )
             return tuple(failed)
 
     def protected_paths(self, namespace: Namespace) -> frozenset[Path]:
-        with self._filesystem_lock():
-            return self._protected_paths_locked(namespace)
+        try:
+            with self._filesystem_lock():
+                return self._protected_paths_locked(namespace)
+        except OutboxError:
+            raise
+        except (OSError, sqlite3.Error):
+            raise OutboxError(_OUTBOX_STORAGE_ERROR) from None
 
     def _protected_paths_locked(self, namespace: Namespace) -> frozenset[Path]:
         namespace_key = _namespace_key(namespace)
@@ -661,7 +1609,8 @@ class Outbox:
             if namespace_id is None:
                 return frozenset()
             rows = connection.execute(
-                '''SELECT DISTINCT snapshot_sha256, snapshot_relative_path
+                '''SELECT DISTINCT snapshot_sha256, snapshot_relative_path,
+                                  snapshot_byte_count
                    FROM jobs
                    WHERE namespace_id = ? AND snapshot_sha256 IS NOT NULL''',
                 (namespace_id,),
@@ -672,16 +1621,19 @@ class Outbox:
                 relative_path = _stored_snapshot_path(
                     row['snapshot_relative_path'], namespace_key, sha256
                 )
+                byte_count = _stored_positive_int(
+                    row['snapshot_byte_count'], 'snapshot byte count', MAX_PROFILE_BYTES
+                )
                 path = self.root / relative_path
-                _verify_regular_path(path, 'snapshot')
+                _verify_snapshot_content(path, sha256, byte_count, require_private=True)
                 paths.add(path)
             return frozenset(paths)
 
     def _prepare_root(self) -> None:
         if os.path.lexists(self.root):
             root_stat = os.lstat(self.root)
-            if stat.S_ISLNK(root_stat.st_mode):
-                raise OutboxError('connector root must not be a symlink')
+            if stat.S_ISLNK(root_stat.st_mode) or _path_is_junction(self.root):
+                raise OutboxError('connector root must not be a symlink or reparse point')
             if not stat.S_ISDIR(root_stat.st_mode):
                 raise OutboxError('connector root must be a directory')
         else:
@@ -689,16 +1641,50 @@ class Outbox:
             root_stat = os.lstat(self.root)
             if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
                 raise OutboxError('connector root must be a private directory')
+            _fsync_directory(self.root.parent)
         _set_private_permissions(self.root, 0o700)
 
-    def _reject_database_symlink(self) -> None:
-        if not os.path.lexists(self._database_path):
+    def _secure_database_files_before_connect(self) -> None:
+        self._ensure_private_database_file(self._database_path, create=True)
+        for suffix in ('-wal', '-shm'):
+            path = Path(f'{self._database_path}{suffix}')
+            if os.path.lexists(path):
+                self._ensure_private_database_file(path, create=False)
+
+    def _ensure_private_database_file(self, path: Path, *, create: bool) -> None:
+        flags = os.O_RDWR | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        created = False
+        if create and not os.path.lexists(path):
+            flags |= os.O_CREAT | os.O_EXCL
+            created = True
+        try:
+            if _IS_WINDOWS:
+                if created:
+                    descriptor = os.open(path, flags, 0o600)
+                else:
+                    descriptor = _open_path_readonly(path)
+            else:
+                root_fd = self._open_generated_directory(self.root)
+                try:
+                    descriptor = os.open(path.name, flags, 0o600, dir_fd=root_fd)
+                finally:
+                    os.close(root_fd)
+        except FileExistsError:
+            self._ensure_private_database_file(path, create=False)
             return
-        database_stat = os.lstat(self._database_path)
-        if stat.S_ISLNK(database_stat.st_mode):
-            raise OutboxError('outbox database must not be a symlink')
-        if not stat.S_ISREG(database_stat.st_mode):
-            raise OutboxError('outbox database must be a regular file')
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise OutboxError('SQLite files must not be symlinks') from None
+            raise
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise OutboxError('SQLite files must be regular files')
+        finally:
+            os.close(descriptor)
+        _set_private_permissions(path, 0o600)
+        if created:
+            _fsync_directory(self.root)
 
     def _migrate(self) -> None:
         connection = self._require_connection()
@@ -713,109 +1699,359 @@ class Outbox:
             if 'schema_version' not in tables:
                 if tables:
                     raise OutboxError('outbox schema is unversioned')
-                for statement in _SCHEMA_STATEMENTS:
+                for statement in _SCHEMA_V2_STATEMENTS:
                     connection.execute(statement)
-                connection.execute('INSERT INTO schema_version(version) VALUES (?)', (_SCHEMA_VERSION,))
+                connection.execute('INSERT INTO schema_version(version) VALUES (2)')
             else:
                 versions = connection.execute('SELECT version FROM schema_version').fetchall()
-                if len(versions) != 1 or versions[0]['version'] != _SCHEMA_VERSION:
+                if len(versions) != 1 or type(versions[0]['version']) is not int:
                     raise OutboxError('unsupported outbox schema version')
-                expected = {'schema_version', 'namespaces', 'snapshots', 'jobs'}
-                if tables != expected:
-                    raise OutboxError('outbox schema is incomplete')
+                version = versions[0]['version']
+                if version == 1:
+                    self._validate_schema_fingerprint(_SCHEMA_V1_STATEMENTS)
+                    self._validate_v1_rows()
+                    self._migrate_v1_to_v2(connection)
+                elif version == 2:
+                    self._validate_schema_fingerprint(_SCHEMA_V2_STATEMENTS)
+                else:
+                    raise OutboxError('unsupported outbox schema version')
+            self._validate_schema_fingerprint(_SCHEMA_V2_STATEMENTS)
+            foreign_key_errors = connection.execute('PRAGMA foreign_key_check').fetchall()
+            if foreign_key_errors:
+                raise OutboxError('outbox schema foreign keys are invalid')
             connection.commit()
-        except BaseException:
+        except BaseException as exc:
             connection.rollback()
-            raise
+            if isinstance(exc, OutboxError):
+                raise
+            raise OutboxError('outbox schema migration failed') from None
+
+    def _validate_schema_fingerprint(self, statements: tuple[str, ...]) -> None:
+        connection = self._require_connection()
+        expected: dict[tuple[str, str], str] = {}
+        for statement in statements:
+            match = re.match(r'^CREATE (TABLE|INDEX) ([a-z_]+)', statement)
+            if match is None:
+                raise OutboxError('outbox schema definition is invalid')
+            kind = match.group(1).lower()
+            expected[(kind, match.group(2))] = _normalize_schema_sql(statement)
+        actual_rows = connection.execute(
+            '''SELECT type, name, sql FROM sqlite_master
+               WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'index')'''
+        ).fetchall()
+        actual: dict[tuple[str, str], str] = {}
+        for row in actual_rows:
+            if not isinstance(row['type'], str) or not isinstance(row['name'], str):
+                raise OutboxError('outbox schema fingerprint is invalid')
+            if not isinstance(row['sql'], str):
+                raise OutboxError('outbox schema fingerprint is invalid')
+            actual[(row['type'], row['name'])] = _normalize_schema_sql(row['sql'])
+        if actual != expected:
+            raise OutboxError('outbox schema fingerprint is invalid')
+
+        for table in (name for kind, name in expected if kind == 'table'):
+            columns = connection.execute(f'PRAGMA table_info({table})').fetchall()
+            if not columns or any(
+                not isinstance(row['name'], str) or not isinstance(row['type'], str)
+                for row in columns
+            ):
+                raise OutboxError('outbox schema columns are invalid')
+            connection.execute(f'PRAGMA foreign_key_list({table})').fetchall()
+            connection.execute(f'PRAGMA index_list({table})').fetchall()
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        if _SCHEMA_V2_STATEMENTS != _CANONICAL_SCHEMA_V2_STATEMENTS:
+            raise OutboxError('outbox schema migration failed')
+        connection.execute('DROP INDEX jobs_ready_idx')
+        connection.execute('ALTER TABLE jobs RENAME TO jobs_v1')
+        connection.execute(_schema_statement(_SCHEMA_V2_STATEMENTS, 'TABLE', 'jobs'))
+        connection.execute(
+            '''INSERT INTO jobs
+               (id, namespace_id, roast_uuid, content_sha256,
+                snapshot_sha256, snapshot_relative_path, snapshot_byte_count,
+                aroast_json, revision_json, idempotency_key, state, attempts,
+                next_attempt_at, lease_expires_at, lease_token, error_code,
+                error_message, created_at, updated_at, completed_at)
+               SELECT id, namespace_id, roast_uuid, content_sha256,
+                      snapshot_sha256, snapshot_relative_path, snapshot_byte_count,
+                      aroast_json, revision_json, idempotency_key,
+                      CASE WHEN state = 'leased' THEN 'pending' ELSE state END,
+                      attempts,
+                      CASE WHEN state = 'leased' THEN NULL ELSE next_attempt_at END,
+                      NULL, NULL,
+                      CASE WHEN state = 'leased' THEN NULL ELSE error_code END,
+                      CASE WHEN state = 'leased' THEN NULL ELSE error_message END,
+                      created_at, updated_at, completed_at
+               FROM jobs_v1'''
+        )
+        connection.execute('DROP TABLE jobs_v1')
+        connection.execute(_schema_statement(_SCHEMA_V2_STATEMENTS, 'INDEX', 'jobs_ready_idx'))
+        connection.execute('ALTER TABLE schema_version RENAME TO schema_version_v1')
+        connection.execute(_schema_statement(_SCHEMA_V2_STATEMENTS, 'TABLE', 'schema_version'))
+        connection.execute('INSERT INTO schema_version(version) VALUES (2)')
+        connection.execute('DROP TABLE schema_version_v1')
+        connection.execute(_schema_statement(_SCHEMA_V2_STATEMENTS, 'TABLE', 'snapshot_staging'))
+        connection.execute(
+            _schema_statement(_SCHEMA_V2_STATEMENTS, 'INDEX', 'snapshot_staging_expiry_idx')
+        )
+
+    def _validate_v1_rows(self) -> None:
+        connection = self._require_connection()
+        namespaces = self._stored_namespaces(connection)
+        snapshot_keys = self._validate_snapshot_rows(connection, namespaces)
+        for row in connection.execute('SELECT * FROM jobs').fetchall():
+            namespace_id = _stored_positive_int(row['namespace_id'], 'namespace id', 2**63 - 1)
+            namespace = namespaces.get(namespace_id)
+            if namespace is None:
+                raise OutboxError('stored namespace reference is invalid')
+            self._validate_job_row(row, namespace, schema_version=1)
+            snapshot_sha = row['snapshot_sha256']
+            if snapshot_sha is not None and (namespace_id, snapshot_sha) not in snapshot_keys:
+                raise OutboxError('stored snapshot reference is invalid')
+
+    def _validate_durable_rows(self) -> None:
+        connection = self._require_connection()
+        namespaces = self._stored_namespaces(connection)
+        snapshot_keys = self._validate_snapshot_rows(connection, namespaces)
+        for row in connection.execute('SELECT * FROM snapshot_staging').fetchall():
+            token = _stored_job_id(row['token'])
+            namespace_id = _stored_positive_int(row['namespace_id'], 'namespace id', 2**63 - 1)
+            namespace = namespaces.get(namespace_id)
+            sha256 = _stored_sha256(row['sha256'])
+            if namespace is None or (namespace_id, sha256) not in snapshot_keys:
+                raise OutboxError('stored stage reference is invalid')
+            relative_path = _stored_snapshot_path(
+                row['relative_path'], _namespace_key(namespace), sha256
+            )
+            if token == '' or relative_path == '':
+                raise OutboxError('stored stage is invalid')
+            _stored_positive_int(row['byte_count'], 'staged snapshot byte count', MAX_PROFILE_BYTES)
+            _stored_datetime(row['source_modified_at'])
+            created = _stored_datetime(row['created_at'])
+            expires = _stored_datetime(row['expires_at'])
+            if expires <= created:
+                raise OutboxError('stored stage expiry is invalid')
+        for row in connection.execute('SELECT * FROM jobs').fetchall():
+            namespace_id = _stored_positive_int(row['namespace_id'], 'namespace id', 2**63 - 1)
+            namespace = namespaces.get(namespace_id)
+            if namespace is None:
+                raise OutboxError('stored namespace reference is invalid')
+            self._validate_job_row(row, namespace, schema_version=2)
+
+    def _stored_namespaces(self, connection: sqlite3.Connection) -> dict[int, Namespace]:
+        namespaces: dict[int, Namespace] = {}
+        for row in connection.execute('SELECT * FROM namespaces').fetchall():
+            namespace_id = _stored_positive_int(row['id'], 'namespace id', 2**63 - 1)
+            origin = _stored_text(row['origin'], 'namespace origin')
+            organization = _stored_uuid(row['organization_uuid'])
+            key = _stored_sha256(row['namespace_key'])
+            namespace = Namespace(origin, organization, f'namespace-sha256:{key}')
+            if _namespace_key(namespace) != key or namespace_id in namespaces:
+                raise OutboxError('stored namespace is invalid')
+            namespaces[namespace_id] = namespace
+        return namespaces
+
+    def _validate_snapshot_rows(
+        self, connection: sqlite3.Connection, namespaces: dict[int, Namespace]
+    ) -> set[tuple[int, str]]:
+        keys: set[tuple[int, str]] = set()
+        for row in connection.execute('SELECT * FROM snapshots').fetchall():
+            namespace_id = _stored_positive_int(row['namespace_id'], 'namespace id', 2**63 - 1)
+            namespace = namespaces.get(namespace_id)
+            sha256 = _stored_sha256(row['sha256'])
+            if namespace is None:
+                raise OutboxError('stored snapshot namespace is invalid')
+            _stored_snapshot_path(row['relative_path'], _namespace_key(namespace), sha256)
+            _stored_positive_int(row['byte_count'], 'snapshot byte count', MAX_PROFILE_BYTES)
+            _stored_datetime(row['created_at'])
+            key = (namespace_id, sha256)
+            if key in keys:
+                raise OutboxError('stored snapshot is duplicated')
+            keys.add(key)
+        return keys
+
+    def _validate_job_row(
+        self, row: sqlite3.Row, namespace: Namespace, *, schema_version: int
+    ) -> None:
+        state = row['state']
+        if not isinstance(state, str) or state not in _JOB_STATES:
+            raise OutboxError('stored outbox state is invalid')
+        snapshot_values = (
+            row['snapshot_sha256'],
+            row['snapshot_relative_path'],
+            row['snapshot_byte_count'],
+        )
+        if state == 'complete':
+            if any(value is not None for value in snapshot_values) or row['completed_at'] is None:
+                raise OutboxError('completed outbox ownership is invalid')
+        elif any(value is None for value in snapshot_values) or row['completed_at'] is not None:
+            raise OutboxError('active outbox ownership is invalid')
+        lease_token = row['lease_token'] if schema_version == 2 else None
+        if state == 'leased':
+            if row['lease_expires_at'] is None or (schema_version == 2 and lease_token is None):
+                raise OutboxError('stored lease is invalid')
+        elif row['lease_expires_at'] is not None or lease_token is not None:
+            raise OutboxError('stored lease is invalid')
+        if state == 'retry_wait' and (
+            row['next_attempt_at'] is None
+            or row['error_code'] is None
+            or row['error_message'] is None
+        ):
+            raise OutboxError('stored retry state is invalid')
+        if state == 'failed' and (
+            row['next_attempt_at'] is not None
+            or row['error_code'] is None
+            or row['error_message'] is None
+        ):
+            raise OutboxError('stored failed state is invalid')
+        self._row_to_job(row, namespace, schema_version=schema_version)
+
+    def _harden_indexed_snapshots(self) -> None:
+        connection = self._require_connection()
+        rows = connection.execute(
+            '''SELECT n.namespace_key, s.sha256, s.relative_path, s.byte_count
+               FROM snapshots AS s
+               JOIN namespaces AS n ON n.id = s.namespace_id'''
+        ).fetchall()
+        for row in rows:
+            namespace_key = _stored_sha256(row['namespace_key'])
+            sha256 = _stored_sha256(row['sha256'])
+            relative_path = _stored_snapshot_path(
+                row['relative_path'], namespace_key, sha256
+            )
+            byte_count = _stored_positive_int(
+                row['byte_count'], 'snapshot byte count', MAX_PROFILE_BYTES
+            )
+            path = self.root / relative_path
+            _set_private_permissions(path, 0o400)
+            _verify_snapshot_content(path, sha256, byte_count, require_private=True)
+
+    def _expire_stages_and_collect(self, now: datetime) -> None:
+        now_text = _datetime_text(now)
+        paths_to_unlink: list[str] = []
+        with self._transaction() as connection:
+            connection.execute('DELETE FROM snapshot_staging WHERE expires_at <= ?', (now_text,))
+            rows = connection.execute(
+                '''SELECT s.namespace_id, s.sha256, s.relative_path
+                   FROM snapshots AS s
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM jobs AS j
+                       WHERE j.namespace_id = s.namespace_id
+                         AND j.snapshot_sha256 = s.sha256)
+                     AND NOT EXISTS (
+                       SELECT 1 FROM snapshot_staging AS st
+                       WHERE st.namespace_id = s.namespace_id
+                         AND st.sha256 = s.sha256
+                         AND st.expires_at > ?)''',
+                (now_text,),
+            ).fetchall()
+            for row in rows:
+                namespace_row = connection.execute(
+                    'SELECT namespace_key FROM namespaces WHERE id = ?',
+                    (row['namespace_id'],),
+                ).fetchone()
+                if namespace_row is None:
+                    raise OutboxError('stored snapshot namespace is invalid')
+                path = _stored_snapshot_path(
+                    row['relative_path'],
+                    _stored_sha256(namespace_row['namespace_key']),
+                    _stored_sha256(row['sha256']),
+                )
+                paths_to_unlink.append(path)
+                connection.execute(
+                    'DELETE FROM snapshots WHERE namespace_id = ? AND sha256 = ?',
+                    (row['namespace_id'], row['sha256']),
+                )
+        for path in paths_to_unlink:
+            self._unlink_generated_snapshot(path)
+        self._collect_unindexed_files()
 
     def _collect_unindexed_files(self) -> None:
-        with self._transaction() as connection:
-            rows = connection.execute(
-                '''SELECT n.namespace_key, s.sha256, s.relative_path
-                   FROM snapshots AS s
-                   JOIN namespaces AS n ON n.id = s.namespace_id'''
-            ).fetchall()
-            indexed: set[str] = set()
-            for row in rows:
-                namespace_key = cast(str, row['namespace_key'])
-                if _SHA256_RE.fullmatch(namespace_key) is None:
-                    raise OutboxError('stored namespace key is invalid')
-                sha256 = _stored_sha256(row['sha256'])
-                indexed.add(_stored_snapshot_path(row['relative_path'], namespace_key, sha256))
-            changed_directories: set[Path] = set()
-            for namespace_entry in os.scandir(self.root):
-                if not _SHA256_RE.fullmatch(namespace_entry.name):
+        connection = self._require_connection()
+        rows = connection.execute(
+            '''SELECT n.namespace_key, s.sha256, s.relative_path
+               FROM snapshots AS s
+               JOIN namespaces AS n ON n.id = s.namespace_id'''
+        ).fetchall()
+        indexed: set[str] = set()
+        for row in rows:
+            namespace_key = _stored_sha256(row['namespace_key'])
+            sha256 = _stored_sha256(row['sha256'])
+            indexed.add(_stored_snapshot_path(row['relative_path'], namespace_key, sha256))
+        changed_directories: set[Path] = set()
+        for namespace_entry in os.scandir(self.root):
+            if not _SHA256_RE.fullmatch(namespace_entry.name):
+                continue
+            if _directory_entry_is_reparse(namespace_entry):
+                raise OutboxError('generated namespace directory must not be a reparse point')
+            if not namespace_entry.is_dir(follow_symlinks=False):
+                continue
+            namespace_path = Path(namespace_entry.path)
+            self._harden_directory(namespace_path)
+            snapshots_path = namespace_path / 'snapshots'
+            if not os.path.lexists(snapshots_path):
+                continue
+            self._require_directory_path(snapshots_path)
+            self._harden_directory(snapshots_path)
+            for prefix_entry in os.scandir(snapshots_path):
+                if _directory_entry_is_reparse(prefix_entry):
+                    raise OutboxError('snapshot directory entries must not be reparse points')
+                if (
+                    prefix_entry.is_file(follow_symlinks=False)
+                    and _TEMP_FILE_RE.fullmatch(prefix_entry.name) is not None
+                ):
+                    _secure_unlink(Path(prefix_entry.path))
+                    changed_directories.add(snapshots_path)
                     continue
-                if namespace_entry.is_symlink():
-                    raise OutboxError('generated namespace directory must not be a symlink')
-                if not namespace_entry.is_dir(follow_symlinks=False):
+                if _PREFIX_RE.fullmatch(prefix_entry.name) is None:
                     continue
-                namespace_path = Path(namespace_entry.path)
-                self._harden_directory(namespace_path)
-                snapshots_path = namespace_path / 'snapshots'
-                if not os.path.lexists(snapshots_path):
+                if not prefix_entry.is_dir(follow_symlinks=False):
                     continue
-                self._require_directory_path(snapshots_path)
-                self._harden_directory(snapshots_path)
-                for prefix_entry in os.scandir(snapshots_path):
-                    if prefix_entry.is_symlink():
-                        raise OutboxError('snapshot directory entries must not be symlinks')
-                    if (
-                        prefix_entry.is_file(follow_symlinks=False)
-                        and _TEMP_FILE_RE.fullmatch(prefix_entry.name) is not None
-                    ):
-                        Path(prefix_entry.path).unlink()
-                        changed_directories.add(snapshots_path)
+                prefix_path = Path(prefix_entry.path)
+                self._harden_directory(prefix_path)
+                for file_entry in os.scandir(prefix_path):
+                    if _directory_entry_is_reparse(file_entry):
+                        raise OutboxError('snapshot files must not be reparse points')
+                    relative = (
+                        f'{namespace_entry.name}/snapshots/'
+                        f'{prefix_entry.name}/{file_entry.name}'
+                    )
+                    snapshot_match = _SNAPSHOT_FILE_RE.fullmatch(file_entry.name)
+                    is_generated = (
+                        snapshot_match is not None
+                        and snapshot_match.group(1).startswith(prefix_entry.name)
+                    )
+                    is_temporary = _TEMP_FILE_RE.fullmatch(file_entry.name) is not None
+                    if not file_entry.is_file(follow_symlinks=False):
                         continue
-                    if _PREFIX_RE.fullmatch(prefix_entry.name) is None:
-                        continue
-                    if not prefix_entry.is_dir(follow_symlinks=False):
-                        continue
-                    prefix_path = Path(prefix_entry.path)
-                    self._harden_directory(prefix_path)
-                    for file_entry in os.scandir(prefix_path):
-                        if file_entry.is_symlink():
-                            raise OutboxError('snapshot files must not be symlinks')
-                        relative = (
-                            f'{namespace_entry.name}/snapshots/'
-                            f'{prefix_entry.name}/{file_entry.name}'
-                        )
-                        snapshot_match = _SNAPSHOT_FILE_RE.fullmatch(file_entry.name)
-                        is_generated = (
-                            snapshot_match is not None
-                            and snapshot_match.group(1).startswith(prefix_entry.name)
-                        )
-                        is_temporary = _TEMP_FILE_RE.fullmatch(file_entry.name) is not None
-                        if not file_entry.is_file(follow_symlinks=False):
-                            continue
-                        if is_temporary or (is_generated and relative not in indexed):
-                            Path(file_entry.path).unlink()
-                            changed_directories.add(prefix_path)
-            for directory in changed_directories:
-                _fsync_directory(directory)
+                    if is_temporary or (is_generated and relative not in indexed):
+                        _secure_unlink(Path(file_entry.path))
+                        changed_directories.add(prefix_path)
+        for directory in changed_directories:
+            _fsync_directory(directory)
 
     def _namespace_id(
         self, connection: sqlite3.Connection, namespace: Namespace, *, create: bool
     ) -> int | None:
         namespace_key = _namespace_key(namespace)
         organization_uuid = _uuid_hex(namespace.organization_id, 'organization UUID')
-        row = connection.execute(
+        rows = connection.execute(
             '''SELECT id, origin, organization_uuid, namespace_key
                FROM namespaces
                WHERE (origin = ? AND organization_uuid = ?) OR namespace_key = ?''',
             (namespace.origin, organization_uuid, namespace_key),
         ).fetchall()
-        if row:
-            if len(row) != 1:
+        if rows:
+            if len(rows) != 1:
                 raise OutboxError('namespace index is inconsistent')
-            existing = row[0]
+            existing = rows[0]
             if (
                 existing['origin'] != namespace.origin
                 or existing['organization_uuid'] != organization_uuid
                 or existing['namespace_key'] != namespace_key
             ):
                 raise OutboxError('namespace identity conflicts with stored data')
-            return cast(int, existing['id'])
+            return _stored_positive_int(existing['id'], 'namespace id', 2**63 - 1)
         if not create:
             return None
         cursor = connection.execute(
@@ -876,16 +2112,19 @@ class Outbox:
                 _write_all(temporary_fd, chunk)
             if byte_count < 1:
                 raise OutboxError('saved profile size is outside the supported range')
-            os.fsync(temporary_fd)
+            _fsync_descriptor(temporary_fd)
         except BaseException:
             if temporary_fd is not None:
                 os.close(temporary_fd)
                 temporary_fd = None
-            with suppress(OSError):
+            try:
                 if _HAS_DIRECTORY_FDS:
                     os.unlink(temporary_name, dir_fd=directory_fd)
                 else:
-                    temporary_path.unlink()
+                    _secure_unlink(temporary_path)
+                _fsync_descriptor(directory_fd, directory=True)
+            except FileNotFoundError:
+                pass
             raise
         finally:
             if temporary_fd is not None:
@@ -894,21 +2133,21 @@ class Outbox:
         return digest.hexdigest(), byte_count, temporary_path
 
     def _discard_temporary(self, temporary_path: Path) -> None:
+        directory_fd = self._open_generated_directory(temporary_path.parent)
         try:
-            directory_fd = self._open_generated_directory(temporary_path.parent)
-        except (OSError, OutboxError):
+            if _HAS_DIRECTORY_FDS:
+                os.unlink(temporary_path.name, dir_fd=directory_fd)
+            else:
+                _secure_unlink(temporary_path)
+            _fsync_descriptor(directory_fd, directory=True)
+        except FileNotFoundError:
             return
-        try:
-            with suppress(OSError):
-                if _HAS_DIRECTORY_FDS:
-                    os.unlink(temporary_path.name, dir_fd=directory_fd)
-                else:
-                    temporary_path.unlink()
-                _fsync_descriptor(directory_fd)
         finally:
             os.close(directory_fd)
 
-    def _publish_temporary(self, temporary_path: Path, final_path: Path) -> None:
+    def _publish_temporary(
+        self, temporary_path: Path, final_path: Path, sha256: str, byte_count: int
+    ) -> bool:
         self._ensure_generated_directory(final_path.parent)
         try:
             temporary_path.relative_to(self.root)
@@ -917,34 +2156,53 @@ class Outbox:
             raise OutboxError('snapshot publication path is invalid') from exc
         source_directory_fd = self._open_generated_directory(temporary_path.parent)
         destination_directory_fd = self._open_generated_directory(final_path.parent)
+        created = False
         try:
-            if _HAS_DIRECTORY_FDS:
-                try:
-                    existing = os.stat(
+            try:
+                if _HAS_DIRECTORY_FDS:
+                    os.link(
+                        temporary_path.name,
                         final_path.name,
-                        dir_fd=destination_directory_fd,
+                        src_dir_fd=source_directory_fd,
+                        dst_dir_fd=destination_directory_fd,
                         follow_symlinks=False,
                     )
-                except FileNotFoundError:
-                    existing = None
-            else:
-                existing = os.lstat(final_path) if os.path.lexists(final_path) else None
-            if existing is not None:
-                if stat.S_ISLNK(existing.st_mode):
-                    raise OutboxError('generated snapshot path must not be a symlink')
-                if not stat.S_ISREG(existing.st_mode):
-                    raise OutboxError('generated snapshot path must be a regular file')
-            if _HAS_DIRECTORY_FDS:
-                os.replace(
-                    temporary_path.name,
-                    final_path.name,
-                    src_dir_fd=source_directory_fd,
-                    dst_dir_fd=destination_directory_fd,
+                elif _IS_WINDOWS:
+                    _require_windows_native().link(temporary_path, final_path)
+                else:
+                    os.link(temporary_path, final_path, follow_symlinks=False)
+                created = True
+            except FileExistsError:
+                _verify_snapshot_content(
+                    final_path, sha256, byte_count, require_private=True
                 )
-            else:
-                os.replace(temporary_path, final_path)
-            _fsync_descriptor(source_directory_fd)
-            _fsync_descriptor(destination_directory_fd)
+                self._discard_temporary(temporary_path)
+                return False
+            try:
+                _set_private_permissions(final_path, 0o400)
+                descriptor = _open_path_readonly(final_path)
+                try:
+                    _fsync_descriptor(descriptor)
+                finally:
+                    os.close(descriptor)
+                _fsync_descriptor(destination_directory_fd, directory=True)
+                if _HAS_DIRECTORY_FDS:
+                    os.unlink(temporary_path.name, dir_fd=source_directory_fd)
+                else:
+                    _secure_unlink(temporary_path)
+                _fsync_descriptor(source_directory_fd, directory=True)
+                return True
+            except BaseException:
+                if created:
+                    try:
+                        if _HAS_DIRECTORY_FDS:
+                            os.unlink(final_path.name, dir_fd=destination_directory_fd)
+                        else:
+                            _secure_unlink(final_path)
+                        _fsync_descriptor(destination_directory_fd, directory=True)
+                    except OSError:
+                        pass
+                raise
         finally:
             os.close(source_directory_fd)
             os.close(destination_directory_fd)
@@ -964,26 +2222,14 @@ class Outbox:
         if snapshot.byte_count < 1 or snapshot.byte_count > MAX_PROFILE_BYTES:
             raise OutboxError('snapshot size is invalid')
         _datetime_text(snapshot.source_modified_at)
-        descriptor = _open_path_readonly(expected_absolute)
-        digest = hashlib.sha256()
-        byte_count = 0
-        try:
-            descriptor_stat = os.fstat(descriptor)
-            _require_regular_file(descriptor_stat, 'snapshot')
-            while True:
-                chunk = os.read(descriptor, _COPY_CHUNK_BYTES)
-                if not chunk:
-                    break
-                byte_count += len(chunk)
-                if byte_count > MAX_PROFILE_BYTES:
-                    raise OutboxError('snapshot size is invalid')
-                digest.update(chunk)
-        finally:
-            os.close(descriptor)
-        if byte_count != snapshot.byte_count or digest.hexdigest() != sha256:
-            raise OutboxError('snapshot content does not match its address')
+        _stored_job_id(snapshot.staging_token)
+        _verify_snapshot_content(
+            expected_absolute, sha256, snapshot.byte_count, require_private=True
+        )
 
-    def _row_to_job(self, row: sqlite3.Row, namespace: Namespace) -> Job:
+    def _row_to_job(
+        self, row: sqlite3.Row, namespace: Namespace, *, schema_version: int = 2
+    ) -> Job:
         namespace_key = _namespace_key(namespace)
         state_value = row['state']
         if not isinstance(state_value, str) or state_value not in _JOB_STATES:
@@ -1016,27 +2262,81 @@ class Outbox:
                 row['snapshot_relative_path'], namespace_key, snapshot_sha256
             )
             snapshot_path = self.root / relative_path
-            _verify_regular_path(snapshot_path, 'snapshot')
             snapshot_byte_count = _stored_positive_int(
                 row['snapshot_byte_count'], 'snapshot byte count', MAX_PROFILE_BYTES
             )
+        content_sha256 = _stored_sha256(row['content_sha256'])
+        if snapshot_sha256 is not None and snapshot_sha256 != content_sha256:
+            raise OutboxError('stored snapshot address is inconsistent')
+        aroast_json = _stored_metadata_text(row['aroast_json'], 'aroast')
+        revision_json = _stored_metadata_text(row['revision_json'], 'revision')
+        roast_uuid = _stored_uuid(row['roast_uuid'])
+        idempotency_key = _stored_text(row['idempotency_key'], 'idempotency key')
+        expected_suffix = f':{roast_uuid.hex}:{content_sha256}'
+        if (
+            not idempotency_key.startswith('archive-v1:')
+            or not idempotency_key.endswith(expected_suffix)
+            or len(idempotency_key) != len('archive-v1:') + 32 + len(expected_suffix)
+            or _UUID_HEX_RE.fullmatch(idempotency_key.split(':')[1]) is None
+        ):
+            raise OutboxError('stored idempotency key is invalid')
+        lease_token_value = row['lease_token'] if schema_version == 2 else None
+        lease_token = None if lease_token_value is None else _stored_job_id(lease_token_value)
+        next_attempt_at = _optional_stored_datetime(row['next_attempt_at'])
+        lease_expires_at = _optional_stored_datetime(row['lease_expires_at'])
+        completed_at = _optional_stored_datetime(row['completed_at'])
+        error_code = _optional_stored_failure_code(row['error_code'])
+        error_message = _optional_stored_failure_message(row['error_message'])
+        if state == 'leased':
+            if lease_expires_at is None or (schema_version == 2 and lease_token is None):
+                raise OutboxError('stored lease is invalid')
+        elif lease_expires_at is not None or lease_token is not None:
+            raise OutboxError('stored lease is invalid')
+        if state == 'complete' and completed_at is None:
+            raise OutboxError('stored completion is invalid')
+        if state != 'complete' and completed_at is not None:
+            raise OutboxError('stored completion is invalid')
+        if state in {'pending', 'leased', 'complete'} and (
+            next_attempt_at is not None or error_code is not None or error_message is not None
+        ):
+            raise OutboxError('stored outbox state details are invalid')
+        if state == 'retry_wait' and (
+            next_attempt_at is None or error_code is None or error_message is None
+        ):
+            raise OutboxError('stored retry state is invalid')
+        if state == 'paused' and (
+            error_code not in _PAUSE_CODES or error_message is not None
+        ):
+            raise OutboxError('stored pause state is invalid')
+        if (
+            state in {'retry_wait', 'failed'}
+            and error_code is not None
+            and error_message is not None
+            and not _stored_failure_pair_is_valid(error_code, error_message)
+        ):
+            raise OutboxError('stored failure details are invalid')
+        if state == 'failed' and (
+            next_attempt_at is not None or error_code is None or error_message is None
+        ):
+            raise OutboxError('stored failed state is invalid')
         return Job(
             id=_stored_job_id(row['id']),
             namespace=namespace,
-            roast_uuid=_stored_uuid(row['roast_uuid']),
-            content_sha256=_stored_sha256(row['content_sha256']),
+            roast_uuid=roast_uuid,
+            content_sha256=content_sha256,
             snapshot_sha256=snapshot_sha256,
             snapshot_path=snapshot_path,
             snapshot_byte_count=snapshot_byte_count,
-            aroast_json=_stored_text(row['aroast_json'], 'aroast metadata'),
-            revision_json=_stored_text(row['revision_json'], 'revision metadata'),
-            idempotency_key=_stored_text(row['idempotency_key'], 'idempotency key'),
+            aroast_json=aroast_json,
+            revision_json=revision_json,
+            idempotency_key=idempotency_key,
             state=state,
             attempts=_stored_nonnegative_int(row['attempts'], 'attempts'),
-            next_attempt_at=_optional_stored_datetime(row['next_attempt_at']),
-            lease_expires_at=_optional_stored_datetime(row['lease_expires_at']),
-            error_code=_optional_stored_text(row['error_code'], 'error code'),
-            error_message=_optional_stored_text(row['error_message'], 'error message'),
+            next_attempt_at=next_attempt_at,
+            lease_expires_at=lease_expires_at,
+            lease_token=lease_token,
+            error_code=error_code,
+            error_message=error_message,
             created_at=_stored_datetime(row['created_at']),
             updated_at=_stored_datetime(row['updated_at']),
         )
@@ -1045,6 +2345,23 @@ class Outbox:
         row = connection.execute('SELECT * FROM jobs WHERE id = ?', (job_id,)).fetchone()
         if row is None:
             raise KeyError(job_id)
+        return cast(sqlite3.Row, row)
+
+    def _leased_job_for_transition(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        lease_token: str,
+        now_text: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            '''SELECT * FROM jobs
+               WHERE id = ? AND state = 'leased' AND lease_token = ?
+                 AND lease_expires_at > ?''',
+            (job_id, lease_token, now_text),
+        ).fetchone()
+        if row is None:
+            raise OutboxError(_LEASE_LOST)
         return cast(sqlite3.Row, row)
 
     @staticmethod
@@ -1060,7 +2377,12 @@ class Outbox:
                WHERE namespace_id = ? AND snapshot_sha256 = ?''',
             (namespace_id, sha256),
         ).fetchone()[0]
-        if references != 0:
+        stages = connection.execute(
+            '''SELECT count(*) FROM snapshot_staging
+               WHERE namespace_id = ? AND sha256 = ? AND expires_at > ?''',
+            (namespace_id, sha256, _datetime_text(self._clock())),
+        ).fetchone()[0]
+        if references != 0 or stages != 0:
             return None
         row = connection.execute(
             '''SELECT n.namespace_key, s.relative_path
@@ -1077,6 +2399,36 @@ class Outbox:
             (namespace_id, sha256),
         )
         return relative_path
+
+    def _discard_unowned_publication(self, namespace: Namespace, path: Path) -> None:
+        try:
+            relative_path = path.relative_to(self.root).as_posix()
+            sha256 = path.stem
+            with self._transaction() as connection:
+                namespace_id = self._namespace_id(connection, namespace, create=False)
+                if namespace_id is None:
+                    should_unlink = True
+                else:
+                    jobs = connection.execute(
+                        '''SELECT count(*) FROM jobs
+                           WHERE namespace_id = ? AND snapshot_sha256 = ?''',
+                        (namespace_id, sha256),
+                    ).fetchone()[0]
+                    stages = connection.execute(
+                        '''SELECT count(*) FROM snapshot_staging
+                           WHERE namespace_id = ? AND sha256 = ?''',
+                        (namespace_id, sha256),
+                    ).fetchone()[0]
+                    should_unlink = jobs == 0 and stages == 0
+                    if should_unlink:
+                        connection.execute(
+                            'DELETE FROM snapshots WHERE namespace_id = ? AND sha256 = ?',
+                            (namespace_id, sha256),
+                        )
+            if should_unlink:
+                self._unlink_generated_snapshot(relative_path)
+        except (OSError, OutboxError, sqlite3.Error):
+            pass
 
     def _unlink_generated_snapshot(self, relative_path: str) -> None:
         parts = PurePosixPath(relative_path).parts
@@ -1099,7 +2451,11 @@ class Outbox:
                 if _HAS_DIRECTORY_FDS:
                     path_stat = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
                 else:
-                    path_stat = os.lstat(path)
+                    descriptor = _open_path_readonly(path)
+                    try:
+                        path_stat = os.fstat(descriptor)
+                    finally:
+                        os.close(descriptor)
             except FileNotFoundError:
                 return
             if stat.S_ISLNK(path_stat.st_mode):
@@ -1109,8 +2465,8 @@ class Outbox:
             if _HAS_DIRECTORY_FDS:
                 os.unlink(path.name, dir_fd=directory_fd)
             else:
-                path.unlink()
-            _fsync_descriptor(directory_fd)
+                _secure_unlink(path)
+            _fsync_descriptor(directory_fd, directory=True)
         finally:
             os.close(directory_fd)
 
@@ -1119,6 +2475,12 @@ class Outbox:
             relative_parts = directory.relative_to(self.root).parts
         except ValueError as exc:
             raise OutboxError('generated directory escapes connector root') from exc
+        if _IS_WINDOWS:
+            native = _require_windows_native()
+            try:
+                return native.open_readonly(directory, directory=True)
+            except OSError:
+                raise OutboxError('generated directory contains a reparse point') from None
         flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
         flags |= getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
         if not _HAS_DIRECTORY_FDS:
@@ -1138,6 +2500,10 @@ class Outbox:
             raise
 
     def _require_directory_path(self, path: Path) -> None:
+        if _IS_WINDOWS:
+            descriptor = _require_windows_native().open_readonly(path, directory=True)
+            os.close(descriptor)
+            return
         path_stat = os.lstat(path)
         if stat.S_ISLNK(path_stat.st_mode):
             raise OutboxError('generated directory must not be a symlink')
@@ -1153,37 +2519,26 @@ class Outbox:
             path = Path(f'{self._database_path}{suffix}')
             if not os.path.lexists(path):
                 continue
-            try:
-                path_stat = os.lstat(path)
-            except FileNotFoundError:
-                continue
-            if stat.S_ISLNK(path_stat.st_mode):
-                raise OutboxError('SQLite files must not be symlinks')
-            if not stat.S_ISREG(path_stat.st_mode):
-                raise OutboxError('SQLite files must be regular files')
-            _set_private_permissions(path, 0o600)
+            self._ensure_private_database_file(path, create=False)
 
     @contextmanager
     def _filesystem_lock(self) -> Iterator[None]:
         with self._lock:
             lock_path = self.root / '.outbox.lock'
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_CLOEXEC', 0)
-            flags |= getattr(os, 'O_NOFOLLOW', 0)
             try:
-                descriptor = os.open(lock_path, flags, 0o600)
+                if _IS_WINDOWS:
+                    descriptor = _require_windows_native().open_lock(lock_path)
+                else:
+                    flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_CLOEXEC', 0)
+                    flags |= getattr(os, 'O_NOFOLLOW', 0)
+                    descriptor = os.open(lock_path, flags, 0o600)
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
-                    raise OutboxError('outbox lock must not be a symlink') from exc
-                raise OutboxError('outbox process lock is unavailable') from exc
+                    raise OutboxError('outbox lock must not be a symlink') from None
+                raise OutboxError('outbox process lock is unavailable') from None
             try:
                 descriptor_stat = os.fstat(descriptor)
-                path_stat = os.lstat(lock_path)
-                if (
-                    not stat.S_ISREG(descriptor_stat.st_mode)
-                    or stat.S_ISLNK(path_stat.st_mode)
-                    or (descriptor_stat.st_dev, descriptor_stat.st_ino)
-                    != (path_stat.st_dev, path_stat.st_ino)
-                ):
+                if not stat.S_ISREG(descriptor_stat.st_mode):
                     raise OutboxError('outbox lock must be a regular private file')
                 _set_private_permissions(lock_path, 0o600)
                 _acquire_file_lock(descriptor)
@@ -1214,8 +2569,20 @@ class Outbox:
         return self._connection
 
 
+def _schema_statement(statements: tuple[str, ...], kind: str, name: str) -> str:
+    prefix = f'CREATE {kind} {name}'
+    matches = [statement for statement in statements if statement.startswith(prefix)]
+    if len(matches) != 1:
+        raise OutboxError('outbox schema definition is invalid')
+    return matches[0]
+
+
+def _normalize_schema_sql(value: str) -> str:
+    return re.sub(r'\s+', ' ', value.strip()).casefold()
+
+
 def _namespace_key(namespace: Namespace) -> str:
-    if namespace.origin == '' or '\x00' in namespace.origin:
+    if namespace.origin == '' or _has_control_character(namespace.origin):
         raise ValueError('namespace origin is invalid')
     match = _NAMESPACE_KEY_RE.fullmatch(namespace.key)
     if match is None:
@@ -1244,10 +2611,15 @@ def _stored_snapshot_path(value: object, namespace_key: str, sha256: str) -> str
 
 def _open_path_readonly(path: Path) -> int:
     absolute = Path(os.path.abspath(os.fspath(path)))
+    if _IS_WINDOWS:
+        try:
+            return _require_windows_native().open_readonly(absolute)
+        except OSError:
+            raise OutboxError('saved profile path contains a reparse point or is unavailable') from None
     flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
     flags |= getattr(os, 'O_NONBLOCK', 0)
     directory_flags = flags | getattr(os, 'O_DIRECTORY', 0)
-    if os.name != 'nt' and os.open in os.supports_dir_fd:
+    if os.open in os.supports_dir_fd:
         components = absolute.parts[1:]
         if not components:
             raise OutboxError('saved profile path is invalid')
@@ -1262,8 +2634,8 @@ def _open_path_readonly(path: Path) -> int:
             return os.open(components[-1], flags, dir_fd=directory_fd)
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise OutboxError('saved profile path contains a symlink') from exc
-            raise OutboxError('saved profile is unavailable') from exc
+                raise OutboxError('saved profile path contains a symlink') from None
+            raise OutboxError('saved profile is unavailable') from None
         finally:
             os.close(directory_fd)
     _reject_symlink_components(absolute)
@@ -1271,8 +2643,8 @@ def _open_path_readonly(path: Path) -> int:
         descriptor = os.open(absolute, flags)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            raise OutboxError('saved profile path contains a symlink') from exc
-        raise OutboxError('saved profile is unavailable') from exc
+            raise OutboxError('saved profile path contains a symlink') from None
+        raise OutboxError('saved profile is unavailable') from None
     path_stat = os.lstat(absolute)
     descriptor_stat = os.fstat(descriptor)
     if (path_stat.st_dev, path_stat.st_ino) != (descriptor_stat.st_dev, descriptor_stat.st_ino):
@@ -1287,23 +2659,35 @@ def _reject_symlink_components(path: Path) -> None:
         current /= component
         try:
             current_stat = os.lstat(current)
-        except OSError as exc:
-            raise OutboxError('saved profile is unavailable') from exc
-        if stat.S_ISLNK(current_stat.st_mode):
-            raise OutboxError('saved profile path contains a symlink')
+        except OSError:
+            raise OutboxError('saved profile is unavailable') from None
+        if stat.S_ISLNK(current_stat.st_mode) or _path_is_junction(current):
+            raise OutboxError('saved profile path contains a symlink or reparse point')
 
 
-def _verify_regular_path(path: Path, label: str) -> None:
+def _verify_snapshot_content(
+    path: Path, sha256: str, byte_count: int, *, require_private: bool
+) -> None:
+    descriptor = _open_path_readonly(path)
+    digest = hashlib.sha256()
+    actual_count = 0
     try:
-        descriptor = _open_path_readonly(path)
-    except OutboxError as exc:
-        if os.path.lexists(path) and stat.S_ISLNK(os.lstat(path).st_mode):
-            raise OutboxError(f'{label} path must not be a symlink') from exc
-        raise
-    try:
-        _require_regular_file(os.fstat(descriptor), label)
+        descriptor_stat = os.fstat(descriptor)
+        _require_regular_file(descriptor_stat, 'snapshot')
+        if require_private:
+            _verify_private_permissions(path, 0o400)
+        while True:
+            chunk = os.read(descriptor, _COPY_CHUNK_BYTES)
+            if not chunk:
+                break
+            actual_count += len(chunk)
+            if actual_count > MAX_PROFILE_BYTES:
+                raise OutboxError('snapshot size is invalid')
+            digest.update(chunk)
     finally:
         os.close(descriptor)
+    if actual_count != byte_count or digest.hexdigest() != sha256:
+        raise OutboxError('snapshot content does not match its address')
 
 
 def _require_regular_file(value: os.stat_result, label: str) -> None:
@@ -1325,10 +2709,10 @@ def _write_all(descriptor: int, data: bytes) -> None:
 
 
 def _acquire_file_lock(descriptor: int) -> None:
-    if os.name == 'nt':
+    if _IS_WINDOWS:
         if os.fstat(descriptor).st_size == 0:
             os.write(descriptor, b'0')
-            os.fsync(descriptor)
+            _fsync_descriptor(descriptor)
         os.lseek(descriptor, 0, os.SEEK_SET)
         module = importlib.import_module('msvcrt')
         locking = cast(Callable[[int, int, int], None], module.__dict__['locking'])
@@ -1340,7 +2724,7 @@ def _acquire_file_lock(descriptor: int) -> None:
 
 
 def _release_file_lock(descriptor: int) -> None:
-    if os.name == 'nt':
+    if _IS_WINDOWS:
         os.lseek(descriptor, 0, os.SEEK_SET)
         module = importlib.import_module('msvcrt')
         locking = cast(Callable[[int, int, int], None], module.__dict__['locking'])
@@ -1351,45 +2735,118 @@ def _release_file_lock(descriptor: int) -> None:
         flock(descriptor, cast(int, module.__dict__['LOCK_UN']))
 
 
+def _require_windows_native() -> _WindowsNativeApi:
+    if _WINDOWS_NATIVE is None:
+        raise OutboxError('Windows secure filesystem APIs are unavailable')
+    return _WINDOWS_NATIVE
+
+
 def _set_private_permissions(path: Path, mode: int) -> None:
-    if os.name == 'nt':
+    if _IS_WINDOWS:
+        try:
+            _require_windows_native().set_private_permissions(path, mode)
+        except OSError:
+            raise OutboxError('private connector permissions could not be applied') from None
         return
     try:
         os.chmod(path, mode, follow_symlinks=False)
         actual_mode = stat.S_IMODE(os.lstat(path).st_mode)
-    except OSError as exc:
-        raise OutboxError('private connector permissions could not be applied') from exc
+    except OSError:
+        raise OutboxError('private connector permissions could not be applied') from None
     if actual_mode != mode:
         raise OutboxError('private connector permissions could not be applied')
 
 
-def _fsync_descriptor(descriptor: int) -> None:
+def _verify_private_permissions(path: Path, mode: int) -> None:
+    if _IS_WINDOWS:
+        try:
+            _require_windows_native().verify_private_permissions(path, mode)
+        except OSError:
+            raise OutboxError('private connector permissions are invalid') from None
+        return
+    try:
+        actual_mode = stat.S_IMODE(os.lstat(path).st_mode)
+    except OSError:
+        raise OutboxError('private connector permissions are invalid') from None
+    if actual_mode != mode:
+        raise OutboxError('snapshot private read-only permissions are invalid')
+
+
+def _fsync_descriptor(descriptor: int, *, directory: bool = False) -> None:
+    if _IS_WINDOWS:
+        try:
+            _require_windows_native().flush(descriptor, directory=directory)
+        except OSError:
+            raise
+        return
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        if directory and exc.errno in _UNSUPPORTED_DIRECTORY_SYNC_ERRNOS:
+            return
+        raise
 
 
 def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0)
-    flags |= getattr(os, 'O_NOFOLLOW', 0)
-    try:
+    if _IS_WINDOWS:
+        descriptor = _require_windows_native().open_readonly(path, directory=True)
+    else:
+        flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_DIRECTORY', 0)
+        flags |= getattr(os, 'O_NOFOLLOW', 0)
         descriptor = os.open(path, flags)
-    except OSError:
-        return
     try:
-        _fsync_descriptor(descriptor)
+        _fsync_descriptor(descriptor, directory=True)
     finally:
         os.close(descriptor)
+
+
+def _secure_unlink(path: Path) -> None:
+    if _IS_WINDOWS:
+        _require_windows_native().unlink(path)
+    else:
+        path.unlink()
 
 
 def _metadata_text(value: object, label: str) -> str:
     if not isinstance(value, bytes) or not value or len(value) > MAX_METADATA_BYTES:
         raise ValueError(f'{label} metadata has an invalid size')
     try:
-        return value.decode('utf-8')
-    except UnicodeDecodeError as exc:
-        raise ValueError(f'{label} metadata is not UTF-8') from exc
+        text = value.decode('utf-8')
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_object_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (RecursionError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f'{label} metadata is invalid JSON') from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f'{label} metadata must be a JSON object')
+    try:
+        canonical = json.dumps(
+            parsed,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError(f'{label} metadata is invalid JSON') from exc
+    if canonical != text:
+        raise ValueError(f'{label} metadata is not canonical')
+    return text
+
+
+def _reject_duplicate_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate JSON key')
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError('non-finite JSON number')
 
 
 def _datetime_text(value: object) -> str:
@@ -1426,6 +2883,12 @@ def _job_id(value: object) -> str:
     return value
 
 
+def _lease_token(value: object) -> str:
+    if not isinstance(value, str) or _UUID_HEX_RE.fullmatch(value) is None:
+        raise ValueError('lease token is invalid')
+    return value
+
+
 def _stored_job_id(value: object) -> str:
     if not isinstance(value, str) or _UUID_HEX_RE.fullmatch(value) is None:
         raise OutboxError('stored job id is invalid')
@@ -1451,13 +2914,38 @@ def _stored_sha256(value: object) -> str:
 
 
 def _stored_text(value: object, label: str) -> str:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or _has_control_character(value):
         raise OutboxError(f'stored {label} is invalid')
     return value
 
 
-def _optional_stored_text(value: object, label: str) -> str | None:
-    return None if value is None else _stored_text(value, label)
+def _stored_metadata_text(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise OutboxError(f'stored {label} metadata is invalid')
+    try:
+        return _metadata_text(value.encode('utf-8'), label)
+    except (UnicodeEncodeError, ValueError):
+        raise OutboxError(f'stored {label} metadata is invalid') from None
+
+
+def _stored_failure_code(value: object) -> str:
+    if not isinstance(value, str) or value not in _PUBLIC_FAILURE_CODES:
+        raise OutboxError('stored failure code is invalid')
+    return value
+
+
+def _optional_stored_failure_code(value: object) -> str | None:
+    return None if value is None else _stored_failure_code(value)
+
+
+def _stored_failure_message(value: object) -> str:
+    if not isinstance(value, str) or value not in FAILURE_MESSAGES.values():
+        raise OutboxError('stored failure message is invalid')
+    return value
+
+
+def _optional_stored_failure_message(value: object) -> str | None:
+    return None if value is None else _stored_failure_message(value)
 
 
 def _stored_nonnegative_int(value: object, label: str) -> int:
@@ -1476,24 +2964,75 @@ def _stored_positive_int(value: object, label: str, maximum: int) -> int:
 def _failure_fields(failure: PublicFailure) -> tuple[str, str]:
     if not isinstance(failure, PublicFailure):
         raise ValueError('failure is invalid')
+    if not isinstance(failure.kind, FailureKind):
+        raise ValueError('failure kind is invalid')
+    if type(failure.retryable) is not bool:
+        raise ValueError('failure retryable value is invalid')
     code = _bounded_text(failure.code, _FAILURE_CODE_CHARS, 'failure code')
-    message = _bounded_text(
-        failure.message, MAX_ERROR_MESSAGE_CODE_POINTS, 'failure message'
+    _bounded_text(
+        failure.message,
+        MAX_ERROR_MESSAGE_CODE_POINTS,
+        'failure message',
+        truncate=False,
     )
-    return code, message
+    if code not in _FAILURE_CODES_BY_KIND[failure.kind]:
+        raise ValueError('failure code is invalid')
+    return code, FAILURE_MESSAGES[failure.kind]
 
 
-def _bounded_text(value: object, maximum: int, label: str) -> str:
+def _stored_failure_pair_is_valid(code: str, message: str) -> bool:
+    return any(
+        message == FAILURE_MESSAGES[kind] and code in codes
+        for kind, codes in _FAILURE_CODES_BY_KIND.items()
+    )
+
+
+def _pause_code(value: object) -> str:
+    code = _bounded_text(value, _FAILURE_CODE_CHARS, 'pause code', truncate=False)
+    if code not in _PAUSE_CODES:
+        raise ValueError('pause code is invalid')
+    return code
+
+
+def _bounded_text(
+    value: object, maximum: int, label: str, *, truncate: bool = True
+) -> str:
     if not isinstance(value, str) or value == '':
         raise ValueError(f'{label} is invalid')
-    bounded = value[:maximum]
-    if '\x00' in bounded:
+    bounded = value[:maximum] if truncate else value
+    if len(bounded) > maximum or _has_control_character(bounded):
         raise ValueError(f'{label} is invalid')
     try:
         bounded.encode('utf-8')
     except UnicodeEncodeError as exc:
         raise ValueError(f'{label} is invalid') from exc
     return bounded
+
+
+def _has_control_character(value: str) -> bool:
+    return any(ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value)
+
+
+def _path_is_junction(path: Path) -> bool:
+    method = getattr(path, 'is_junction', None)
+    if not callable(method):
+        return False
+    try:
+        return bool(method())
+    except OSError:
+        return True
+
+
+def _directory_entry_is_reparse(entry: os.DirEntry[str]) -> bool:
+    if entry.is_symlink():
+        return True
+    method = getattr(entry, 'is_junction', None)
+    if callable(method):
+        try:
+            return bool(method())
+        except OSError:
+            return True
+    return _path_is_junction(Path(entry.path))
 
 
 __all__ = [
