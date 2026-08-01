@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 import re
 from uuid import UUID
@@ -91,14 +91,31 @@ def identity() -> ServerIdentity:
     )
 
 
+def _set_stored_identity(qsettings: QSettings, identity: ServerIdentity) -> None:
+    qsettings.setValue('RoastServer/identityUserID', str(identity.user.id))
+    qsettings.setValue('RoastServer/identityUserEmail', identity.user.email)
+    qsettings.setValue('RoastServer/identityUserNickname', identity.user.nickname)
+    qsettings.setValue('RoastServer/identityOrganizationID', str(identity.organization.id))
+    qsettings.setValue('RoastServer/identityOrganizationName', identity.organization.name)
+    qsettings.setValue('RoastServer/identityOrganizationSlug', identity.organization.slug)
+    qsettings.setValue('RoastServer/identityRole', identity.role)
+
+
+def _secret() -> str:
+    return ''.join(chr(value) for value in (115, 101, 99, 114, 101, 116))
+
+
 @pytest.mark.parametrize(
     ('raw', 'expected'),
     [
         (' HTTPS://Example.COM:443/ ', 'https://example.com'),
         ('https://example.com:8443', 'https://example.com:8443'),
+        ('http://localhost', 'http://localhost'),
+        ('http://LOCALHOST:8000/', 'http://localhost:8000'),
         ('http://127.0.0.1:8000/', 'http://127.0.0.1:8000'),
         ('http://[::1]:8000', 'http://[::1]:8000'),
         ('https://BÜCHER.example', 'https://xn--bcher-kva.example'),
+        ('https://LOCALHOST:443/', 'https://localhost'),
     ],
 )
 def test_canonical_origin(raw: str, expected: str) -> None:
@@ -109,13 +126,25 @@ def test_canonical_origin(raw: str, expected: str) -> None:
     'raw',
     [
         'http://example.com',
-        'http://localhost:8000',
         'https://user@example.com',
         'https://example.com/api',
         'https://example.com/?query=1',
         'https://example.com/#fragment',
         'https://exa mple.com',
         'https://example\n.com',
+        'https://example.com:',
+        'https://[::1]:',
+        'https://example.com:abc',
+        'https://_bad.example',
+        'https://example..com',
+        'https://example.com.',
+        'https://.example.com',
+        'https://example.com\\foo',
+        'https://example.com%2f.evil',
+        'https://127.1',
+        'https://[0:0:0:0:0:0:0:1]',
+        'https://[::1%25eth0]',
+        'http://[0:0:0:0:0:0:0:1]',
     ],
 )
 def test_origin_policy_rejects_unsafe_values(raw: str) -> None:
@@ -193,6 +222,48 @@ def test_settings_store_persists_only_roastserver_keys_and_stable_client_uuid(
     }
 
 
+@pytest.mark.parametrize(
+    ('stored', 'expected'),
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ('true', True),
+        ('false', False),
+    ],
+)
+def test_load_accepts_expected_enabled_representations(
+    qsettings: QSettings,
+    stored: bool | int | str,
+    expected: bool,
+) -> None:
+    qsettings.setValue('RoastServer/enabled', stored)
+
+    assert SettingsStore(qsettings).load().enabled is expected
+
+
+@pytest.mark.parametrize('stored', ['TRUE', '1', 'yes', 'on', 2, -1, 1.0, QByteArray(b'true')])
+def test_load_repairs_invalid_enabled_values(qsettings: QSettings, stored: object) -> None:
+    qsettings.setValue('RoastServer/enabled', stored)
+
+    loaded = SettingsStore(qsettings).load()
+
+    assert not loaded.enabled
+    assert qsettings.value('RoastServer/enabled') is False
+
+
+def test_load_repairs_invalid_automatic_upload_values(qsettings: QSettings, identity: ServerIdentity) -> None:
+    _set_stored_identity(qsettings, identity)
+    qsettings.setValue('RoastServer/automaticUpload', 'yes')
+
+    loaded = SettingsStore(qsettings).load()
+
+    assert loaded.identity == identity
+    assert not loaded.automatic_upload
+    assert qsettings.value('RoastServer/automaticUpload') is False
+
+
 def test_settings_store_requires_confirmed_identity_for_automatic_upload_and_bounds_cache(
     qsettings: QSettings,
     identity: ServerIdentity,
@@ -210,6 +281,53 @@ def test_settings_store_requires_confirmed_identity_for_automatic_upload_and_bou
     assert minimum.automatic_upload
     assert minimum.cache_limit_bytes == MIN_CACHE_LIMIT_BYTES
     assert maximum.cache_limit_bytes == MAX_CACHE_LIMIT_BYTES
+
+
+@pytest.mark.parametrize('stored_origin', [123, 'https://example.com:'])
+def test_invalid_origin_repair_clears_identity_and_disables_connection(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+    stored_origin: object,
+) -> None:
+    _set_stored_identity(qsettings, identity)
+    qsettings.setValue('RoastServer/origin', stored_origin)
+    qsettings.setValue('RoastServer/enabled', True)
+    qsettings.setValue('RoastServer/automaticUpload', True)
+
+    loaded = SettingsStore(qsettings).load()
+
+    assert loaded.origin == DEFAULT_ORIGIN
+    assert not loaded.enabled
+    assert not loaded.automatic_upload
+    assert loaded.identity is None
+    assert qsettings.value('RoastServer/origin') == DEFAULT_ORIGIN
+    assert qsettings.value('RoastServer/enabled') is False
+    assert qsettings.value('RoastServer/automaticUpload') is False
+    assert {key for key in qsettings.allKeys() if 'identity' in key} == set()
+
+
+def test_load_clears_partial_identity_and_invalid_automatic_upload(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+) -> None:
+    _set_stored_identity(qsettings, identity)
+    qsettings.remove('RoastServer/identityRole')
+    qsettings.setValue('RoastServer/automaticUpload', True)
+
+    loaded = SettingsStore(qsettings).load()
+
+    assert loaded.identity is None
+    assert not loaded.automatic_upload
+    assert qsettings.value('RoastServer/automaticUpload') is False
+    assert {key for key in qsettings.allKeys() if 'identity' in key} == set()
+
+
+def test_load_repairs_invalid_client_instance_uuid(qsettings: QSettings) -> None:
+    qsettings.setValue('RoastServer/clientInstanceUUID', 7)
+
+    loaded = SettingsStore(qsettings).load()
+
+    assert loaded.client_instance_uuid == UUID(str(qsettings.value('RoastServer/clientInstanceUUID')))
 
 
 def test_set_origin_clears_identity_and_disables_when_origin_changes(
@@ -246,9 +364,23 @@ def test_save_geometry_removes_absent_values(qsettings: QSettings) -> None:
     assert loaded.browser_geometry is None
 
 
+def test_loaded_geometry_is_copied_from_qsettings(qsettings: QSettings) -> None:
+    original = QByteArray(b'configuration')
+    qsettings.setValue('RoastServer/configurationGeometry', original)
+
+    loaded = SettingsStore(qsettings).load()
+    assert loaded.configuration_geometry == original
+    assert loaded.configuration_geometry is not None
+
+    loaded.configuration_geometry.append(b'!')
+
+    reloaded = SettingsStore(qsettings).load()
+    assert reloaded.configuration_geometry == original
+
+
 def test_keyring_get_set_delete_and_missing_delete_are_isolated(fake_keyring: FakeKeyring) -> None:
     store = SystemCredentialStore(fake_keyring)
-    secret = ''.join(chr(value) for value in (115, 101, 99, 114, 101, 116))
+    secret = _secret()
 
     store.set(' HTTPS://Example.COM:443/ ', secret)
 
@@ -263,13 +395,51 @@ def test_keyring_get_set_delete_and_missing_delete_are_isolated(fake_keyring: Fa
     assert store.get('https://example.com') is None
 
 
-def test_keyring_failure_has_fixed_message_and_no_secret(fake_keyring: FakeKeyring) -> None:
-    secret = ''.join(chr(value) for value in (115, 101, 99, 114, 101, 116))
-    fake_keyring.set_error = RuntimeError('backend echoed ' + secret)
+@pytest.mark.parametrize('operation', ['get', 'set', 'delete'])
+def test_keyring_failures_have_fixed_public_errors(
+    fake_keyring: FakeKeyring,
+    operation: str,
+) -> None:
+    store = SystemCredentialStore(fake_keyring)
+    secret = _secret()
+    backend_error = RuntimeError('backend echoed ' + secret)
+    action: Callable[[], object]
+
+    match operation:
+        case 'get':
+            fake_keyring.get_error = backend_error
+
+            def action() -> object:
+                return store.get('https://example.test')
+
+        case 'set':
+            fake_keyring.set_error = backend_error
+
+            def action() -> object:
+                store.set('https://example.test', secret)
+                return None
+
+        case 'delete':
+            fake_keyring.values[(KEYRING_SERVICE, credential_account('https://example.test'))] = secret
+            fake_keyring.delete_error = backend_error
+
+            def action() -> object:
+                store.delete('https://example.test')
+                return None
+
+        case _:
+            raise AssertionError('unexpected operation')
 
     with pytest.raises(CredentialStoreError) as raised:
-        SystemCredentialStore(fake_keyring).set('https://example.test', secret)
+        action()
 
     assert raised.value.args == (KEYRING_FAILURE_MESSAGE,)
     assert raised.value.__cause__ is None
     assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+
+
+def test_keyring_delete_tolerates_missing_entry_after_backend_delete_error(fake_keyring: FakeKeyring) -> None:
+    fake_keyring.delete_error = RuntimeError('delete failed')
+
+    SystemCredentialStore(fake_keyring).delete('https://missing.example')

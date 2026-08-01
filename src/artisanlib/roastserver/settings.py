@@ -29,10 +29,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from ipaddress import IPv6Address, ip_address
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Final, Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
+
+import idna
 
 from PyQt6.QtCore import QByteArray, QSettings
 
@@ -79,6 +81,8 @@ _IDENTITY_KEYS: Final[tuple[str, ...]] = (
 _IDENTITY_ROLE_VALUES: Final[frozenset[str]] = frozenset({'admin', 'member'})
 _DEFAULT_HTTPS_PORT: Final[int] = 443
 _DEFAULT_HTTP_PORT: Final[int] = 80
+_ALLOWED_HTTP_HOSTS: Final[frozenset[str]] = frozenset({'localhost', '127.0.0.1', '[::1]'})
+_VALID_BOOLEAN_STRINGS: Final[dict[str, bool]] = {'true': True, 'false': False}
 
 
 class SettingsError(ValueError):
@@ -156,8 +160,8 @@ class SettingsStore:
         client_instance_uuid = self._load_client_instance_uuid()
         loaded = ConnectorSettings(
             origin=origin,
-            enabled=_coerce_bool(self._value('enabled'), default=False),
-            automatic_upload=_coerce_bool(self._value('automaticUpload'), default=False),
+            enabled=self._load_security_bool('enabled'),
+            automatic_upload=self._load_security_bool('automaticUpload'),
             client_instance_uuid=client_instance_uuid,
             identity=self._load_identity(),
             cache_limit_bytes=_bounded_cache_limit(self._value('cacheLimitBytes')),
@@ -250,12 +254,12 @@ class SettingsStore:
         raw_origin = self._value('origin')
         if raw_origin is None:
             return DEFAULT_ORIGIN
+        if not isinstance(raw_origin, str):
+            return self._repair_origin(DEFAULT_ORIGIN)
         try:
-            canonical = canonical_origin(_coerce_text(raw_origin, default=DEFAULT_ORIGIN))
+            canonical = canonical_origin(raw_origin)
         except SettingsError:
-            self._set_value('origin', DEFAULT_ORIGIN)
-            self._sync()
-            return DEFAULT_ORIGIN
+            return self._repair_origin(DEFAULT_ORIGIN)
         if canonical != raw_origin:
             self._set_value('origin', canonical)
             self._sync()
@@ -273,6 +277,14 @@ class SettingsStore:
             self._set_value('clientInstanceUUID', str(client_instance_uuid))
             self._sync()
         return client_instance_uuid
+
+    def _load_security_bool(self, key: Literal['enabled', 'automaticUpload']) -> bool:
+        value, valid = _coerce_bool(self._value(key))
+        if valid:
+            return value
+        self._set_value(key, False)
+        self._sync()
+        return False
 
     def _load_identity(self) -> ServerIdentity | None:
         values = {key: self._value(key) for key in _IDENTITY_KEYS}
@@ -309,6 +321,14 @@ class SettingsStore:
         self._set_value('identityOrganizationSlug', identity.organization.slug)
         self._set_value('identityRole', identity.role)
 
+    def _repair_origin(self, origin: str) -> str:
+        self._set_value('origin', origin)
+        self._set_value('enabled', False)
+        self._set_value('automaticUpload', False)
+        self._clear_identity()
+        self._sync()
+        return origin
+
     def _clear_identity(self) -> None:
         for key in _IDENTITY_KEYS:
             self._remove(key)
@@ -328,24 +348,16 @@ class SettingsStore:
 
 def canonical_origin(value: str) -> str:
     raw_value = value.strip()
-    if raw_value == '' or _has_disallowed_inner_code_points(raw_value):
+    if raw_value == '' or _has_disallowed_inner_code_points(raw_value) or '\\' in raw_value:
         raise SettingsError('Enter a valid HTTPS origin.')
-    try:
-        parts = urlsplit(raw_value)
-        port = parts.port
-    except ValueError as exc:
-        raise SettingsError('Enter a valid HTTPS origin.') from exc
+    parts = urlsplit(raw_value)
     if parts.scheme not in {'https', 'http'}:
         raise SettingsError('Enter a valid HTTPS origin.')
-    if parts.netloc == '' or parts.username is not None or parts.password is not None:
+    if parts.netloc == '' or parts.query != '' or parts.fragment != '' or parts.path not in {'', '/'}:
         raise SettingsError('Enter a valid HTTPS origin.')
-    if parts.query != '' or parts.fragment != '' or parts.path not in {'', '/'}:
-        raise SettingsError('Enter a valid HTTPS origin.')
-    hostname = parts.hostname
-    if hostname is None:
-        raise SettingsError('Enter a valid HTTPS origin.')
-    normalized_host = _normalize_host(hostname)
-    if parts.scheme == 'http' and normalized_host not in {'127.0.0.1', '[::1]'}:
+    hostname, port, bracketed = _split_authority(parts.netloc)
+    normalized_host = _normalize_host(hostname, bracketed=bracketed)
+    if parts.scheme == 'http' and normalized_host not in _ALLOWED_HTTP_HOSTS:
         raise SettingsError('Enter a valid HTTPS origin.')
     if port is None or (
         (parts.scheme == 'https' and port == _DEFAULT_HTTPS_PORT)
@@ -378,18 +390,18 @@ def _bounded_cache_limit(value: object) -> int:
     return cache_limit
 
 
-def _coerce_bool(value: object, *, default: bool) -> bool:
+def _coerce_bool(value: object) -> tuple[bool, bool]:
+    if value is None:
+        return False, True
     if isinstance(value, bool):
-        return value
+        return value, True
     if isinstance(value, int):
-        return value != 0
-    if isinstance(value, str):
-        normalized = value.strip().casefold()
-        if normalized in {'1', 'true', 'yes', 'on'}:
-            return True
-        if normalized in {'0', 'false', 'no', 'off'}:
-            return False
-    return default
+        if value in {0, 1}:
+            return bool(value), True
+        return False, False
+    if isinstance(value, str) and value in _VALID_BOOLEAN_STRINGS:
+        return _VALID_BOOLEAN_STRINGS[value], True
+    return False, False
 
 
 def _coerce_int(value: object, *, default: int) -> int:
@@ -442,21 +454,70 @@ def _has_disallowed_inner_code_points(value: str) -> bool:
     return False
 
 
-def _normalize_host(hostname: str) -> str:
-    if hostname == '' or '%' in hostname:
+def _split_authority(netloc: str) -> tuple[str, int | None, bool]:
+    if netloc == '' or '@' in netloc:
+        raise SettingsError('Enter a valid HTTPS origin.')
+    if netloc.startswith('['):
+        closing_index = netloc.find(']')
+        if closing_index <= 1:
+            raise SettingsError('Enter a valid HTTPS origin.')
+        hostname = netloc[1:closing_index]
+        remainder = netloc[closing_index + 1 :]
+        if remainder == '':
+            return hostname, None, True
+        if not remainder.startswith(':') or remainder == ':':
+            raise SettingsError('Enter a valid HTTPS origin.')
+        return hostname, _parse_port(remainder[1:]), True
+    if '[' in netloc or ']' in netloc or netloc.count(':') > 1:
+        raise SettingsError('Enter a valid HTTPS origin.')
+    if ':' not in netloc:
+        return netloc, None, False
+    hostname, port_text = netloc.rsplit(':', 1)
+    if hostname == '' or port_text == '':
+        raise SettingsError('Enter a valid HTTPS origin.')
+    return hostname, _parse_port(port_text), False
+
+
+def _parse_port(value: str) -> int:
+    if not value.isascii() or not value.isdigit():
+        raise SettingsError('Enter a valid HTTPS origin.')
+    port = int(value)
+    if not 0 <= port <= 65535:
+        raise SettingsError('Enter a valid HTTPS origin.')
+    return port
+
+
+def _looks_like_ipv4_candidate(hostname: str) -> bool:
+    return '.' in hostname and all(char.isdigit() or char == '.' for char in hostname)
+
+
+def _normalize_host(hostname: str, *, bracketed: bool) -> str:
+    if hostname == '' or '%' in hostname or hostname.endswith('.'):
+        raise SettingsError('Enter a valid HTTPS origin.')
+    if bracketed:
+        try:
+            parsed_ip = ip_address(hostname)
+        except ValueError as exc:
+            raise SettingsError('Enter a valid HTTPS origin.') from exc
+        if not isinstance(parsed_ip, IPv6Address) or hostname != parsed_ip.compressed:
+            raise SettingsError('Enter a valid HTTPS origin.')
+        return f'[{parsed_ip.compressed}]'
+    if ':' in hostname:
         raise SettingsError('Enter a valid HTTPS origin.')
     try:
         parsed_ip = ip_address(hostname)
     except ValueError:
+        if _looks_like_ipv4_candidate(hostname):
+            raise SettingsError('Enter a valid HTTPS origin.') from None
         try:
-            ascii_hostname = hostname.encode('idna').decode('ascii').lower()
-        except UnicodeError as exc:
+            ascii_hostname = idna.encode(hostname, uts46=True, std3_rules=True).decode('ascii')
+        except (idna.IDNAError, UnicodeError) as exc:
             raise SettingsError('Enter a valid HTTPS origin.') from exc
         if ascii_hostname == '' or ascii_hostname.endswith('.'):
             raise SettingsError('Enter a valid HTTPS origin.') from None
-        return ascii_hostname
-    if isinstance(parsed_ip, IPv6Address):
-        return f'[{parsed_ip.compressed}]'
+        return ascii_hostname.lower()
+    if not isinstance(parsed_ip, IPv4Address) or hostname != str(parsed_ip):
+        raise SettingsError('Enter a valid HTTPS origin.')
     return str(parsed_ip)
 
 
