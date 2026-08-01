@@ -41,6 +41,9 @@ from typing import BinaryIO, Final, NoReturn, Protocol, TypeVar, cast, override,
 from uuid import UUID
 
 import requests
+from requests.adapters import BaseAdapter, HTTPAdapter
+from requests.cookies import RequestsCookieJar
+from requests.structures import CaseInsensitiveDict
 
 from artisanlib import __version__
 from artisanlib.roastserver.contract import (
@@ -148,8 +151,10 @@ class RoastServerClient:
             raise ValueError('credential must not be empty')
         self._origin = canonical_origin(origin)
         self._credential = credential
-        self._session = session if session is not None else requests.Session()
-        _sanitize_session(self._session)
+        if session is not None and type(session) is not requests.Session:
+            raise TypeError('session must be an exact requests.Session')
+        self._session = requests.Session() if session is None else session
+        _sanitize_session(self._session, replace_adapters=True)
 
     @override
     def __repr__(self) -> str:
@@ -320,6 +325,11 @@ class RoastServerClient:
         detail: RoastDetail,
         destination: BinaryIO,
     ) -> DownloadReceipt:
+        """Download into an empty connector-owned, seekable, writable destination.
+
+        The destination must support truncation. The caller must discard it whenever
+        the download fails. If a failed commit cannot be rolled back, it is closed.
+        """
         revision = detail.current_revision
         if revision is None:
             raise _fixed_api_failure(FailureKind.INVALID_RESPONSE, status_code=None)
@@ -575,17 +585,46 @@ class RoastServerClient:
 type ClientFactory = Callable[[str, str], RoastServerClient]
 
 
-def _sanitize_session(session: requests.Session) -> None:
+def _sanitize_session(
+    session: requests.Session,
+    *,
+    replace_adapters: bool = False,
+) -> None:
     failed = False
+    if replace_adapters:
+        inherited_adapters: tuple[BaseAdapter, ...] = ()
+        try:
+            inherited_adapters = tuple(session.adapters.values())
+        except Exception:
+            failed = True
+        try:
+            session.adapters = {}
+        except Exception:
+            failed = True
+        closed_adapter_ids: set[int] = set()
+        for adapter in inherited_adapters:
+            if id(adapter) in closed_adapter_ids:
+                continue
+            closed_adapter_ids.add(id(adapter))
+            try:
+                adapter.close()
+            except Exception:
+                failed = True
+        try:
+            session.adapters = {
+                'https://': HTTPAdapter(max_retries=0),
+                'http://': HTTPAdapter(max_retries=0),
+            }
+        except Exception:
+            failed = True
     try:
         session.trust_env = False
         session.proxies = {}
         session.auth = None
-        session.cookies.clear()
+        session.cookies = RequestsCookieJar()
         session.params = {}
         session.hooks = {'response': []}
-        session.headers.clear()
-        session.headers.update(_FIXED_SESSION_HEADERS)
+        session.headers = CaseInsensitiveDict(_FIXED_SESSION_HEADERS)
         session.cert = None
         session.verify = True
         session.stream = False
@@ -860,13 +899,19 @@ def _stage_profile(
 
 
 def _rollback_destination(destination: BinaryIO) -> None:
+    rollback_failed = False
     try:
         destination.seek(0)
         destination.truncate(0)
         destination.seek(0)
         destination.flush()
     except Exception:
-        pass
+        rollback_failed = True
+    if rollback_failed:
+        try:
+            destination.close()
+        except Exception:
+            pass
 
 
 def _commit_profile(destination: BinaryIO, profile_bytes: bytes) -> None:

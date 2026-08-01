@@ -18,7 +18,6 @@ import pytest
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter
-from requests.cookies import RequestsCookieJar
 from requests.structures import CaseInsensitiveDict
 from urllib3._collections import HTTPHeaderDict
 
@@ -213,87 +212,78 @@ def json_response(
 
 
 @dataclass(frozen=True, slots=True)
-class RecordedCall:
-    method: str
-    url: str
-    headers: dict[str, str] = field(repr=False)
-    params: Mapping[str, str | int] | None
-    data: Mapping[str, str | bytes] | bytes | None
-    files: Mapping[str, tuple[str, bytes, str]] | None = field(repr=False)
+class AdapterCall:
+    request: requests.PreparedRequest = field(repr=False)
     stream: bool
-    verify: object
-    allow_redirects: object
     timeout: object
+    verify: object
+    cert: object
+    proxies: Mapping[str, str] | None
+
+    @property
+    def method(self) -> str:
+        return self.request.method or ''
+
+    @property
+    def url(self) -> str:
+        return self.request.url or ''
+
+    @property
+    def headers(self) -> dict[str, str]:
+        headers = dict(self.request.headers)
+        if 'Authorization' in headers:
+            headers['Authorization'] = 'Bearer <redacted>'
+        return headers
+
+    @property
+    def data(self) -> object:
+        return self.request.body
 
 
-class RecordingSession:
+class RecordingAdapter(HTTPAdapter):
     def __init__(
         self,
         credential: str,
         outcomes: tuple[requests.Response | requests.RequestException, ...],
     ) -> None:
+        super().__init__(max_retries=0)
         self._expected_authorization = f'Bearer {credential}'
         self._outcomes = iter(outcomes)
-        self.calls: list[RecordedCall] = []
-        self.cookies = RequestsCookieJar()
-        self.headers: dict[str, str] = {}
-        self.auth: object = ('hostile', 'hostile')
-        self.proxies: dict[str, str] = {'https': 'https://proxy.invalid'}
-        self.hooks: dict[str, list[object]] = {'response': [object()]}
-        self.params: dict[str, str] = {'hostile': 'true'}
-        self.cert: object = '/private/client-certificate.pem'
-        self.stream = False
-        self.verify = False
-        self.trust_env = True
+        self.calls: list[AdapterCall] = []
+        self.session: requests.Session | None = None
 
     @override
-    def __repr__(self) -> str:
-        return '<RecordingSession redacted>'
-
-    def request(self, method: str | bytes, url: str | bytes, **kwargs: object) -> requests.Response:
-        headers_value = kwargs.get('headers')
-        if not isinstance(headers_value, Mapping):
-            raise AssertionError('missing or invalid authorization')
-        untyped_headers = cast(Mapping[object, object], headers_value)
-        if not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in untyped_headers.items()
-        ):
-            raise AssertionError('missing or invalid authorization')
-        headers = cast(Mapping[str, str], untyped_headers)
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        stream: bool = False,
+        timeout: object = None,
+        verify: object = True,
+        cert: object = None,
+        proxies: Mapping[str, str] | None = None,
+    ) -> requests.Response:
         if not secrets.compare_digest(
-            headers.get('Authorization', ''), self._expected_authorization
+            request.headers.get('Authorization', ''), self._expected_authorization
         ):
             raise AssertionError('missing or invalid authorization')
-        recorded_headers = dict(headers)
-        recorded_headers['Authorization'] = 'Bearer <redacted>'
-        stream_value = kwargs.get('stream', False)
         self.calls.append(
-            RecordedCall(
-                method=str(method),
-                url=str(url),
-                headers=recorded_headers,
-                params=cast(Mapping[str, str | int] | None, kwargs.get('params')),
-                data=cast(
-                    Mapping[str, str | bytes] | bytes | None,
-                    kwargs.get('data'),
-                ),
-                files=cast(
-                    Mapping[str, tuple[str, bytes, str]] | None,
-                    kwargs.get('files'),
-                ),
-                stream=stream_value if isinstance(stream_value, bool) else False,
-                verify=kwargs.get('verify'),
-                allow_redirects=kwargs.get('allow_redirects'),
-                timeout=kwargs.get('timeout'),
+            AdapterCall(
+                request=request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
             )
         )
         try:
             outcome = next(self._outcomes)
         except StopIteration:
-            raise AssertionError('unconfigured fake request') from None
+            raise AssertionError('unconfigured recording adapter request') from None
         if isinstance(outcome, requests.RequestException):
             raise outcome
+        outcome.request = request
+        outcome.url = request.url or ''
         return outcome
 
 
@@ -304,14 +294,25 @@ class RawOutcome:
     headers: tuple[tuple[str, str], ...]
 
 
-@dataclass(frozen=True, slots=True)
-class AdapterCall:
-    request: requests.PreparedRequest = field(repr=False)
-    stream: bool
-    timeout: object
-    verify: object
-    cert: object
-    proxies: Mapping[str, str] | None
+class HostileSession(requests.Session):
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_calls = 0
+        self.send_calls = 0
+
+    @override
+    def request(self, *args: object, **kwargs: object) -> requests.Response:
+        self.request_calls += 1
+        raise AssertionError('hostile Session.request called')
+
+    @override
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        **kwargs: object,
+    ) -> requests.Response:
+        self.send_calls += 1
+        raise AssertionError('hostile Session.send called')
 
 
 class NoNetworkAdapter(HTTPAdapter):
@@ -320,6 +321,7 @@ class NoNetworkAdapter(HTTPAdapter):
         self._outcomes = iter(outcomes)
         self.calls: list[AdapterCall] = []
         self.responses: list[requests.Response] = []
+        self.close_calls = 0
 
     @override
     def send(
@@ -361,6 +363,28 @@ class NoNetworkAdapter(HTTPAdapter):
         self.responses.append(response)
         return response
 
+    @override
+    def close(self) -> None:
+        self.close_calls += 1
+        super().close()
+
+
+def _install_test_adapter(
+    client: RoastServerClient,
+    adapter: HTTPAdapter,
+    *,
+    prefix: str = 'https://',
+) -> requests.Session:
+    """Install a trusted no-socket adapter through a test-only private seam."""
+    session = cast(requests.Session, vars(client)['_session'])
+    replaced = session.get_adapter(prefix)
+    session.mount(prefix, adapter)
+    if replaced is not adapter:
+        replaced.close()
+    if isinstance(adapter, RecordingAdapter):
+        adapter.session = session
+    return session
+
 
 def real_raw_outcome(
     status_code: int,
@@ -393,9 +417,10 @@ def real_client(
 ) -> tuple[RoastServerClient, requests.Session, NoNetworkAdapter, str]:
     credential = secrets.token_urlsafe(32)
     session = requests.Session() if hostile_session is None else hostile_session
+    client = RoastServerClient('https://example.test', credential, session)
     adapter = NoNetworkAdapter(tuple(outcomes))
-    session.mount('https://', adapter)
-    return RoastServerClient('https://example.test', credential, session), session, adapter, credential
+    _install_test_adapter(client, adapter)
+    return client, session, adapter, credential
 
 
 def multipart_profile(call: AdapterCall) -> bytes:
@@ -481,9 +506,34 @@ class PartialWriteFailure(io.BytesIO):
         raise OSError('/private/cache/archive.alog')
 
 
+class RollbackFailureDestination(PartialWriteFailure):
+    def __init__(self) -> None:
+        super().__init__()
+        self.truncate_calls = 0
+        self.close_calls = 0
+
+    @override
+    def truncate(self, size: int | None = None, /) -> int:
+        self.truncate_calls += 1
+        if self.truncate_calls > 1:
+            raise OSError('/private/cache/rollback-failed.alog')
+        return super().truncate(size)
+
+    @override
+    def close(self) -> None:
+        self.close_calls += 1
+        super().close()
+
+
+class NonTruncatableDestination(io.BytesIO):
+    @override
+    def truncate(self, size: int | None = None, /) -> int:
+        raise OSError('truncate unsupported')
+
+
 type ClientFactory = Callable[
     [requests.Response | requests.RequestException],
-    tuple[RoastServerClient, RecordingSession],
+    tuple[RoastServerClient, RecordingAdapter],
 ]
 
 
@@ -491,15 +541,13 @@ type ClientFactory = Callable[
 def client_factory() -> ClientFactory:
     def make_client(
         outcome: requests.Response | requests.RequestException,
-    ) -> tuple[RoastServerClient, RecordingSession]:
+    ) -> tuple[RoastServerClient, RecordingAdapter]:
         credential = secrets.token_urlsafe(32)
-        session = RecordingSession(credential, (outcome,))
-        client = RoastServerClient(
-            'https://example.test',
-            credential,
-            cast(requests.Session, session),
-        )
-        return client, session
+        session = requests.Session()
+        client = RoastServerClient('https://example.test', credential, session)
+        adapter = RecordingAdapter(credential, (outcome,))
+        _install_test_adapter(client, adapter)
+        return client, adapter
 
     return make_client
 
@@ -562,17 +610,17 @@ def test_session_disables_proxy_inheritance_tls_bypass_and_redirects(
 
     client.test_connection()
 
-    assert session.trust_env is False
+    assert session.session is not None
+    assert session.session.trust_env is False
     request = session.calls[0]
     assert request.verify is True
-    assert request.allow_redirects is False
     assert request.timeout == (4.0, 10.0)
     assert request.method == 'GET'
     assert request.url == 'https://example.test/api/v1/auth/me'
     assert request.headers['Cache-Control'] == 'no-store'
     assert request.headers['User-Agent'].startswith('Artisan/')
     assert request.headers['Authorization'] == 'Bearer <redacted>'
-    assert 'Authorization' not in session.headers
+    assert 'Authorization' not in session.session.headers
 
 
 def test_redirect_is_rejected_without_followup(client_factory: ClientFactory) -> None:
@@ -598,7 +646,6 @@ def test_exact_json_endpoints_and_same_origin_paths(client_factory: ClientFactor
     assert call.method == 'POST'
     assert call.url == 'https://example.test/api/v1/aroast'
     assert call.data == b'{"roast_id":"value"}'
-    assert call.files is None
     assert call.headers['Content-Type'] == 'application/json'
 
 
@@ -615,15 +662,11 @@ def test_list_serializes_only_bounded_filters(client_factory: ClientFactory) -> 
     page = client.list_roasts(filters, cursor='opaque-cursor', limit=25)
 
     assert page.items[0].roast_uuid == ROAST_UUID
-    assert session.calls[0].params == {
-        'limit': 25,
-        'cursor': 'opaque-cursor',
-        'search': 'sample',
-        'state': 'parsed',
-        'machine': 'Test Drum',
-        'roast_at_from': '2026-08-01T12:30:00+00:00',
-        'roast_at_to': '2026-08-02T12:30:00+00:00',
-    }
+    assert session.calls[0].url == (
+        'https://example.test/api/v1/roasts?limit=25&cursor=opaque-cursor&search=sample'
+        '&state=parsed&machine=Test+Drum&roast_at_from=2026-08-01T12%3A30%3A00%2B00%3A00'
+        '&roast_at_to=2026-08-02T12%3A30%3A00%2B00%3A00'
+    )
 
 
 @pytest.mark.parametrize(
@@ -688,23 +731,18 @@ def test_upload_multipart_has_exact_fields_and_validates_current_hash_success(
     call = session.calls[0]
     assert call.method == 'POST'
     assert call.url == f'https://example.test/api/v1/roasts/{ROAST_UUID.hex}/revisions'
-    assert isinstance(call.data, Mapping)
-    assert set(call.data) == {'sha256', 'idempotency_key', 'metadata'}
-    assert call.data == {
-        'sha256': SHA256,
-        'idempotency_key': IDEMPOTENCY_KEY,
-        'metadata': b'{"machine":"Test Drum"}',
-    }
-    assert isinstance(call.files, Mapping)
-    assert set(call.files) == {'profile'}
-    profile_part = call.files['profile']
-    assert isinstance(profile_part, tuple)
-    assert profile_part == (
-        f'{ROAST_UUID.hex}.alog',
-        PROFILE_BYTES,
-        'application/x-artisan-profile',
-    )
-    assert 'Content-Type' not in call.headers
+    assert isinstance(call.data, bytes)
+    assert call.data.count(b'Content-Disposition: form-data; name=') == 4
+    assert b'name="sha256"' in call.data
+    assert SHA256.encode() in call.data
+    assert b'name="idempotency_key"' in call.data
+    assert IDEMPOTENCY_KEY.encode() in call.data
+    assert b'name="metadata"' in call.data
+    assert b'{"machine":"Test Drum"}' in call.data
+    assert b'name="profile"' in call.data
+    assert f'filename="{ROAST_UUID.hex}.alog"'.encode() in call.data
+    assert multipart_profile(call) == PROFILE_BYTES
+    assert call.headers['Content-Type'].startswith('multipart/form-data; boundary=')
     assert snapshot.closed is False
 
 
@@ -1116,15 +1154,13 @@ def test_arbitrary_error_body_and_authorization_never_reach_logs_or_failure(
 ) -> None:
     credential = secrets.token_urlsafe(48)
     body = f'<html>{credential} infrastructure diagnostic</html>'.encode()
-    session = RecordingSession(
+    session = requests.Session()
+    client = RoastServerClient('https://example.test', credential, session)
+    adapter = RecordingAdapter(
         credential,
         (raw_response(502, body, {'Content-Length': str(len(body))}),),
     )
-    client = RoastServerClient(
-        'https://example.test',
-        credential,
-        cast(requests.Session, session),
-    )
+    _install_test_adapter(client, adapter)
 
     with pytest.raises(ApiFailure) as raised:
         client.test_connection()
@@ -1136,6 +1172,7 @@ def test_arbitrary_error_body_and_authorization_never_reach_logs_or_failure(
             repr(raised.value.failure),
             repr(client),
             repr(session),
+            repr(adapter),
             caplog.text,
         )
     )
@@ -1143,6 +1180,63 @@ def test_arbitrary_error_body_and_authorization_never_reach_logs_or_failure(
     assert 'infrastructure diagnostic' not in rendered
     assert raised.value.failure.kind is FailureKind.OFFLINE
     assert raised.value.failure.code == FailureKind.OFFLINE.value
+
+
+def test_session_subclasses_overriding_request_and_send_are_rejected() -> None:
+    session = HostileSession()
+
+    with pytest.raises(TypeError, match='exact requests.Session'):
+        RoastServerClient('https://example.test', secrets.token_urlsafe(32), session)
+
+    assert session.request_calls == 0
+    assert session.send_calls == 0
+
+
+def test_hostile_pre_mounted_adapter_is_closed_removed_and_never_called() -> None:
+    session = requests.Session()
+    inherited_adapters = tuple(session.adapters.values())
+    hostile_adapter = NoNetworkAdapter((real_json_outcome(200, valid_identity_payload()),))
+    session.mount('https://example.test/', hostile_adapter)
+    credential = secrets.token_urlsafe(32)
+
+    client = RoastServerClient('https://example.test', credential, session)
+
+    assert hostile_adapter.close_calls == 1
+    assert hostile_adapter.calls == []
+    assert set(session.adapters) == {'https://', 'http://'}
+    sanitized_adapters = tuple(session.adapters.values())
+    assert all(type(adapter) is HTTPAdapter for adapter in sanitized_adapters)
+    http_adapters = tuple(cast(HTTPAdapter, adapter) for adapter in sanitized_adapters)
+    assert all(adapter.max_retries.total == 0 for adapter in http_adapters)
+    assert all(adapter not in inherited_adapters for adapter in http_adapters)
+    assert hostile_adapter not in http_adapters
+
+    trusted_adapter = NoNetworkAdapter((real_json_outcome(200, valid_identity_payload()),))
+    _install_test_adapter(client, trusted_adapter)
+    client.test_connection()
+
+    assert hostile_adapter.calls == []
+    assert len(trusted_adapter.calls) == 1
+
+
+def test_loopback_http_uses_no_retry_default_without_environment_proxies() -> None:
+    session = requests.Session()
+    original_http_adapter = session.adapters['http://']
+    session.proxies = {'http': 'http://proxy.invalid'}
+    client = RoastServerClient('http://127.0.0.1:8000', secrets.token_urlsafe(32), session)
+
+    default_http_adapter = session.adapters['http://']
+    assert type(default_http_adapter) is HTTPAdapter
+    assert default_http_adapter is not original_http_adapter
+    assert default_http_adapter.max_retries.total == 0
+
+    trusted_adapter = NoNetworkAdapter((real_json_outcome(200, valid_identity_payload()),))
+    _install_test_adapter(client, trusted_adapter, prefix='http://')
+    identity = client.test_connection()
+
+    assert identity.user.id == ROAST_UUID
+    assert trusted_adapter.calls[0].request.url == 'http://127.0.0.1:8000/api/v1/auth/me'
+    assert trusted_adapter.calls[0].proxies == {}
 
 
 def test_real_session_is_fully_sanitized_and_prepared_request_is_pinned() -> None:
@@ -1599,11 +1693,32 @@ def test_download_commit_failure_rolls_back_partial_bytes_and_rewinds(
     assert raised.value.__context__ is None
 
 
+def test_download_rollback_failure_closes_destination_and_raises_fixed_failure(
+    client_factory: ClientFactory,
+) -> None:
+    client, _session = client_factory(raw_response(200, PROFILE_BYTES, download_headers()))
+    destination = RollbackFailureDestination()
+
+    with pytest.raises(ApiFailure) as raised:
+        client.download_revision(detail_for_download(), destination)
+
+    assert destination.closed is True
+    assert destination.close_calls == 1
+    assert raised.value.failure.kind is FailureKind.CACHE_CORRUPT
+    assert raised.value.failure.code == 'cache_corrupt'
+    assert raised.value.failure.message == 'Cached copy corrupt or unavailable.'
+    assert raised.value.status_code is None
+    assert raised.value.retry_after_seconds is None
+    assert '/private/' not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 @pytest.mark.parametrize(
     'destination',
-    (NonSeekableDestination(), NonWritableDestination()),
+    (NonSeekableDestination(), NonWritableDestination(), NonTruncatableDestination()),
 )
-def test_download_rejects_nonseekable_or_nonwritable_destination_without_request(
+def test_download_rejects_unusable_destination_without_request(
     client_factory: ClientFactory,
     destination: io.BytesIO,
 ) -> None:
