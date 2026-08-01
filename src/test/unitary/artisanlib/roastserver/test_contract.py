@@ -7,11 +7,14 @@ from uuid import UUID
 
 import pytest
 
+from artisanlib.roastserver import FrozenJsonArray as ExportedFrozenJsonArray
 from artisanlib.roastserver.contract import (
     ContractError,
+    FrozenJsonArray,
     JS_SAFE_INTEGER_MAX,
     MAX_CURSOR_CHARS,
     MAX_JSON_BYTES,
+    LabelColor,
     LabelSummary,
     RoastPage,
     ServerError,
@@ -28,7 +31,16 @@ ROAST_UUID = UUID('11111111-1111-4111-8111-111111111111')
 LABEL_UUID = UUID('33333333-3333-4333-8333-333333333333')
 PROFILE_BYTES = b"{'roastUUID':'11111111111141118111111111111111','mode':'C'}"
 SHA256 = hashlib.sha256(PROFILE_BYTES).hexdigest()
-PALETTE_VALUES = ('slate', 'red', 'orange', 'amber', 'green', 'teal', 'blue', 'violet')
+PALETTE_VALUES: tuple[LabelColor, ...] = (
+    'slate',
+    'red',
+    'orange',
+    'amber',
+    'green',
+    'teal',
+    'blue',
+    'violet',
+)
 ROAST_AT_TEXT = '2026-08-01T12:34:56Z'
 UPDATED_AT_TEXT = '2026-08-01T12:35:56+00:00'
 UPLOADED_AT_TEXT = '2026-08-01T12:36:56.123456+00:00'
@@ -90,6 +102,15 @@ def cyclic_metadata() -> dict[str, object]:
     root: dict[str, object] = {}
     root['self'] = root
     return root
+
+
+def ambiguous_container_metadata() -> dict[str, object]:
+    return {
+        'empty_array': [],
+        'empty_object': {},
+        'pair_array': [['key', 1]],
+        'nested': [[], {}, [['nested-key', 2]]],
+    }
 
 
 def labels_payload(color: str = 'green') -> list[dict[str, object]]:
@@ -276,7 +297,7 @@ def test_identity_requires_exact_hyphenated_uuids_and_role() -> None:
 
 
 @pytest.mark.parametrize('label_color', PALETTE_VALUES)
-def test_roast_page_accepts_exact_backend_palette_values(label_color: str) -> None:
+def test_roast_page_accepts_exact_backend_palette_values(label_color: LabelColor) -> None:
     page = parse_roast_page(valid_roast_page_payload(label_color=label_color, next_cursor='x' * MAX_CURSOR_CHARS))
 
     assert isinstance(page, RoastPage)
@@ -331,9 +352,7 @@ def test_roast_page_returns_detached_immutable_tuples() -> None:
 
 def test_roast_page_rejects_extra_key_bad_cursor_and_css_label_color() -> None:
     payload = valid_roast_page_payload()
-    items = payload['items']
-    assert isinstance(items, list)
-    item = deepcopy(items[0])
+    item = deepcopy(valid_roast_item_payload())
     item['internal_id'] = 'private'
     payload['items'] = [item]
     with pytest.raises(ContractError, match='invalid server response'):
@@ -403,6 +422,38 @@ def test_detail_accepts_state_matrix_canonicalizes_metadata_and_detaches_source(
     failed = parse_roast_detail(valid_roast_detail_payload(state='parse_failed', revision_count=1))
     assert failed.current_revision is not None
     assert failed.current_revision.parse_state == 'failed'
+
+
+def test_frozen_json_tags_arrays_without_changing_object_tuple_contract() -> None:
+    payload = valid_roast_detail_payload(
+        current_metadata=ambiguous_container_metadata(),
+        revision_metadata=ambiguous_container_metadata(),
+    )
+    detail = parse_roast_detail(payload)
+    metadata = dict(detail.current_metadata)
+
+    assert metadata['empty_object'] == ()
+    assert isinstance(metadata['empty_array'], FrozenJsonArray)
+    assert isinstance(metadata['empty_array'], ExportedFrozenJsonArray)
+    assert metadata['empty_array'] != metadata['empty_object']
+    assert isinstance(metadata['pair_array'], FrozenJsonArray)
+    assert isinstance(metadata['nested'], FrozenJsonArray)
+    assert detail.current_revision is not None
+    assert detail.current_revision.metadata == detail.current_metadata
+
+    error_body = json.dumps(
+        {
+            'error': {
+                'code': 'bad_request',
+                'message': 'Invalid.',
+                'details': [[], {}, [['key', 1]]],
+            }
+        },
+        separators=(',', ':'),
+    ).encode()
+    error = parse_error_envelope(error_body)
+    assert error is not None
+    assert isinstance(error.details, FrozenJsonArray)
 
 
 def test_detail_requires_state_revision_count_and_null_matrix() -> None:

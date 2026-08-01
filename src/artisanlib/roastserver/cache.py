@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
@@ -45,7 +45,7 @@ from typing import (
     Final,
     NoReturn,
     Protocol,
-    TypeGuard,
+    Self,
     cast,
     runtime_checkable,
 )
@@ -57,6 +57,7 @@ from artisanlib.roastserver.contract import (
     ContractError,
     FAILURE_MESSAGES,
     FailureKind,
+    FrozenJsonArray,
     FrozenJsonObject,
     JsonValue,
     LabelSummary,
@@ -70,6 +71,7 @@ from artisanlib.roastserver.contract import (
     ServerProfileSource,
     parse_revision_upload,
     parse_roast_page,
+    validate_archive_filters,
 )
 
 if TYPE_CHECKING:
@@ -77,7 +79,6 @@ if TYPE_CHECKING:
 
 _SCHEMA_VERSION: Final[int] = 1
 _COPY_CHUNK_BYTES: Final[int] = 1024 * 1024
-_STALE_TEMP_AGE: Final[timedelta] = timedelta(days=1)
 _LOCK_NAME: Final[str] = '.cache.lock'
 _NAMESPACE_KEY_RE: Final[re.Pattern[str]] = re.compile(r'^namespace-sha256:([0-9a-f]{64})$')
 _NAMESPACE_DIRECTORY_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{64}$')
@@ -87,6 +88,7 @@ _CACHE_FILE_RE: Final[re.Pattern[str]] = re.compile(
     r'^([1-9][0-9]*)-([0-9a-f]{64})\.(alog|json)$'
 )
 _TEMP_FILE_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}\.part$')
+_STAGE_FILE_RE: Final[re.Pattern[str]] = re.compile(r'^([0-9a-f]{32})\.(part|lock)$')
 _SIDECAR_KEYS: Final[frozenset[str]] = frozenset(
     {
         'schema_version',
@@ -148,6 +150,23 @@ class CachedPage:
     items: tuple[CachedRevision, ...]
 
 
+@dataclass(slots=True)
+class _OwnedStage:
+    path: Path
+    identity: tuple[int, int]
+    output: BinaryIO
+    lock_path: Path
+    lock_identity: tuple[int, int]
+    lock_descriptor: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProtectedPath:
+    path: Path
+    descriptor: int
+    identity: tuple[int, int]
+
+
 type _FileIdentity = tuple[int, int, int, int, int]
 
 
@@ -171,7 +190,8 @@ class CacheStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(os.path.abspath(os.fspath(root)))
         self._lock = threading.RLock()
-        self._staging: dict[Path, tuple[int, int]] = {}
+        self._staging: dict[Path, _OwnedStage] = {}
+        self._closed = False
         try:
             secure_filesystem.prepare_private_root(self.root)
             with self._filesystem_lock():
@@ -181,28 +201,137 @@ class CacheStore:
         except (OSError, ValueError, secure_filesystem.FilesystemError):
             raise CacheError from None
 
+    def __enter__(self) -> Self:
+        self._require_open()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
     def new_staging_file(self, namespace: Namespace) -> tuple[Path, BinaryIO]:
         try:
+            self._require_open()
             namespace_key = _namespace_key(namespace)
             with self._filesystem_lock():
-                temporary_directory = self._temporary_directory(namespace_key)
-                secure_filesystem.ensure_generated_directory(self.root, temporary_directory)
-                path = temporary_directory / f'{uuid4().hex}.part'
-                descriptor = secure_filesystem.create_generated_file(self.root, path, 0o600)
-                identity = os.fstat(descriptor)
-                self._staging[path] = (identity.st_dev, identity.st_ino)
-                try:
-                    output = os.fdopen(descriptor, 'w+b')
-                except BaseException:
-                    os.close(descriptor)
-                    self._discard_generated(path)
-                    self._staging.pop(path, None)
-                    raise
-                return path, cast(BinaryIO, output)
+                return self._new_staging_file_locked(namespace_key)
         except CacheError:
             raise
         except (OSError, ValueError, secure_filesystem.FilesystemError):
             raise CacheError from None
+
+    def _new_staging_file_locked(self, namespace_key: str) -> tuple[Path, BinaryIO]:
+        lock_descriptor: int | None = None
+        lock_identity: tuple[int, int] | None = None
+        lock_acquired = False
+        part_descriptor: int | None = None
+        part_identity: tuple[int, int] | None = None
+        output: BinaryIO | None = None
+        path: Path | None = None
+        lock_path: Path | None = None
+        try:
+            temporary_directory = self._temporary_directory(namespace_key)
+            secure_filesystem.ensure_generated_directory(self.root, temporary_directory)
+            token = uuid4().hex
+            path = temporary_directory / f'{token}.part'
+            lock_path = temporary_directory / f'{token}.lock'
+            lock_descriptor = secure_filesystem.create_generated_file(
+                self.root, lock_path, 0o600
+            )
+            lock_stat = os.fstat(lock_descriptor)
+            lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+            secure_filesystem.acquire_file_lock(lock_descriptor)
+            lock_acquired = True
+            part_descriptor = secure_filesystem.create_generated_file(
+                self.root, path, 0o600
+            )
+            part_stat = os.fstat(part_descriptor)
+            part_identity = (part_stat.st_dev, part_stat.st_ino)
+            _fsync_descriptor(part_descriptor)
+            secure_filesystem.fsync_directory(temporary_directory)
+            output = cast(BinaryIO, os.fdopen(part_descriptor, 'w+b'))
+            part_descriptor = None
+            stage = _OwnedStage(
+                path=path,
+                identity=part_identity,
+                output=output,
+                lock_path=lock_path,
+                lock_identity=lock_identity,
+                lock_descriptor=lock_descriptor,
+            )
+            self._staging[path] = stage
+            lock_descriptor = None
+            return path, output
+        except BaseException as error:
+            cleanup_failed = False
+            if output is not None:
+                try:
+                    output.close()
+                except BaseException:
+                    cleanup_failed = True
+            if part_descriptor is not None:
+                try:
+                    os.close(part_descriptor)
+                except OSError:
+                    cleanup_failed = True
+            if path is not None and part_identity is not None:
+                try:
+                    self._discard_owned_path(path, part_identity)
+                except BaseException:
+                    cleanup_failed = True
+            if lock_descriptor is not None and lock_acquired:
+                try:
+                    secure_filesystem.release_file_lock(lock_descriptor)
+                except BaseException:
+                    cleanup_failed = True
+            if lock_descriptor is not None:
+                try:
+                    os.close(lock_descriptor)
+                except OSError:
+                    cleanup_failed = True
+            if lock_path is not None and lock_identity is not None:
+                try:
+                    self._discard_owned_path(lock_path, lock_identity)
+                except BaseException:
+                    cleanup_failed = True
+            if cleanup_failed:
+                raise CacheError from None
+            if isinstance(error, CacheError):
+                raise
+            if isinstance(error, (OSError, ValueError, secure_filesystem.FilesystemError)):
+                raise CacheError from None
+            raise
+
+    def discard_staging(self, path: Path) -> None:
+        staged = Path(path)
+        try:
+            self._require_open()
+            with self._filesystem_lock():
+                stage = self._staging.get(staged)
+                if stage is None or self._cleanup_owned_stage(stage):
+                    raise CacheError
+        except CacheError:
+            raise
+        except (OSError, ValueError, secure_filesystem.FilesystemError):
+            raise CacheError from None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        failed = False
+        try:
+            with self._filesystem_lock():
+                for stage in tuple(self._staging.values()):
+                    if self._cleanup_owned_stage(stage):
+                        failed = True
+        except CacheError:
+            failed = True
+            for stage in tuple(self._staging.values()):
+                if self._cleanup_owned_stage(stage):
+                    failed = True
+        finally:
+            self._closed = True
+        if failed:
+            raise CacheError
 
     def publish(
         self,
@@ -214,10 +343,17 @@ class CacheStore:
     ) -> CachedRevision:
         staged = Path(staged_path)
         try:
+            self._require_open()
             with self._filesystem_lock():
-                return self._publish_locked(
-                    namespace, detail, receipt, staged, validated_at
-                )
+                try:
+                    return self._publish_locked(
+                        namespace, detail, receipt, staged, validated_at
+                    )
+                except BaseException:
+                    stage = self._staging.get(staged)
+                    if stage is not None and self._cleanup_owned_stage(stage):
+                        raise CacheError from None
+                    raise
         except CacheError:
             raise
         except (
@@ -229,14 +365,6 @@ class CacheStore:
             secure_filesystem.FilesystemError,
         ):
             raise CacheError from None
-        finally:
-            identity = self._staging.get(staged)
-            if identity is not None:
-                try:
-                    with self._filesystem_lock():
-                        self._discard_stage(staged, identity)
-                except CacheError:
-                    pass
 
     def find_current(
         self,
@@ -312,7 +440,7 @@ class CacheStore:
             raise CacheError from None
 
     def list_offline(self, namespace: Namespace, filters: ArchiveFilters) -> CachedPage:
-        normalized = _validate_filters(filters)
+        normalized = validate_archive_filters(filters)
         try:
             with self._filesystem_lock():
                 revisions = self._scan_namespace(namespace)
@@ -368,16 +496,18 @@ class CacheStore:
         if not isinstance(protected_paths, frozenset):
             raise ValueError('protected paths are invalid')
         try:
-            with self._filesystem_lock():
+            self._require_open()
+            with self._filesystem_lock(), self._protected_paths(protected_paths) as protected:
                 revisions = list(self._scan_namespace(namespace))
-                protected = self._protected_identities(protected_paths)
+                protected_identities = frozenset(item.identity for item in protected)
                 total = sum(item.revision.byte_size for item in revisions)
                 candidates = sorted(revisions, key=_lru_key)
                 for cached in candidates:
                     if total <= limit_bytes:
                         break
-                    if self._path_identity(cached.path) in protected:
+                    if self._path_identity(cached.path) in protected_identities:
                         continue
+                    self._verify_protected_paths(protected)
                     self._remove_pair(cached)
                     revisions.remove(cached)
                     total -= cached.revision.byte_size
@@ -419,12 +549,13 @@ class CacheStore:
             staged_path.relative_to(expected_staging_directory)
         except ValueError:
             raise CacheError from None
-        if staged_path.parent != expected_staging_directory:
+        if (
+            staged_path.parent != expected_staging_directory
+            or _TEMP_FILE_RE.fullmatch(staged_path.name) is None
+        ):
             raise CacheError
-        if _TEMP_FILE_RE.fullmatch(staged_path.name) is None:
-            raise CacheError
-        expected_staging_identity = self._staging.get(staged_path)
-        if expected_staging_identity is None:
+        stage = self._staging.get(staged_path)
+        if stage is None:
             raise CacheError
 
         destination = self._profile_path(
@@ -435,19 +566,34 @@ class CacheStore:
         )
         sidecar_path = destination.with_suffix('.json')
         secure_filesystem.ensure_generated_directory(self.root, destination.parent)
-
         copy_path = expected_staging_directory / f'{uuid4().hex}.part'
         sidecar_temporary_path = expected_staging_directory / f'{uuid4().hex}.part'
-        profile_publication_started = False
-        sidecar_publication_started = False
+        copy_identity: tuple[int, int] | None = None
+        sidecar_temporary_identity: tuple[int, int] | None = None
+        published_profile_identity: tuple[int, int] | None = None
+        published_sidecar_identity: tuple[int, int] | None = None
+        result: CachedRevision | None = None
+        operation_error: BaseException | None = None
         try:
-            self._copy_and_verify_staged(
-                staged_path,
-                expected_staging_identity,
-                copy_path,
-                revision.sha256,
-                revision.byte_size,
+            if not stage.output.closed:
+                stage.output.flush()
+                stage.output.close()
+            copy_descriptor = secure_filesystem.create_generated_file(
+                self.root, copy_path, 0o600
             )
+            copy_stat = os.fstat(copy_descriptor)
+            copy_identity = (copy_stat.st_dev, copy_stat.st_ino)
+            try:
+                self._copy_and_verify_staged(
+                    staged_path,
+                    stage.identity,
+                    copy_descriptor,
+                    copy_path,
+                    revision.sha256,
+                    revision.byte_size,
+                )
+            finally:
+                os.close(copy_descriptor)
             profile_exists = os.path.lexists(destination)
             sidecar_exists = os.path.lexists(sidecar_path)
             if profile_exists or sidecar_exists:
@@ -456,45 +602,102 @@ class CacheStore:
                 existing = self._load_pair(namespace, destination, sidecar_path)
                 if existing.roast != roast or existing.revision != revision:
                     raise CacheError
-                return existing
-            sidecar_bytes = _sidecar_bytes(namespace, roast, revision, downloaded_at)
-            self._write_temporary(sidecar_temporary_path, sidecar_bytes)
-            profile_publication_started = True
-            _replace_generated(self.root, copy_path, destination)
-            secure_filesystem.set_private_permissions(destination, 0o600)
-            sidecar_publication_started = True
-            _replace_generated(self.root, sidecar_temporary_path, sidecar_path)
-            secure_filesystem.set_private_permissions(sidecar_path, 0o600)
-            result = CachedRevision(
-                namespace=namespace,
-                roast=roast,
-                revision=revision,
-                path=destination,
-                sidecar_path=sidecar_path,
-                downloaded_at=downloaded_at,
+                result = existing
+            else:
+                sidecar_bytes = _sidecar_bytes(namespace, roast, revision, downloaded_at)
+                sidecar_descriptor = secure_filesystem.create_generated_file(
+                    self.root, sidecar_temporary_path, 0o600
+                )
+                sidecar_temporary_stat = os.fstat(sidecar_descriptor)
+                sidecar_temporary_identity = (
+                    sidecar_temporary_stat.st_dev,
+                    sidecar_temporary_stat.st_ino,
+                )
+                try:
+                    self._write_temporary(
+                        sidecar_temporary_path, sidecar_descriptor, sidecar_bytes
+                    )
+                finally:
+                    os.close(sidecar_descriptor)
+                published_profile_identity = copy_identity
+                _replace_generated(self.root, copy_path, destination)
+                secure_filesystem.set_private_permissions(destination, 0o600)
+                published_sidecar_identity = sidecar_temporary_identity
+                _replace_generated(self.root, sidecar_temporary_path, sidecar_path)
+                secure_filesystem.set_private_permissions(sidecar_path, 0o600)
+                expected = CachedRevision(
+                    namespace=namespace,
+                    roast=roast,
+                    revision=revision,
+                    path=destination,
+                    sidecar_path=sidecar_path,
+                    downloaded_at=downloaded_at,
+                )
+                result = self._load_pair(
+                    namespace, destination, sidecar_path, expected=expected
+                )
+        except BaseException as error:
+            operation_error = error
+
+        cleanup_failed = self._cleanup_owned_paths(
+            (
+                (copy_path, copy_identity),
+                (sidecar_temporary_path, sidecar_temporary_identity),
             )
-            return self._load_pair(namespace, destination, sidecar_path, expected=result)
-        except BaseException:
-            if sidecar_publication_started:
-                self._discard_generated(sidecar_path)
-            if profile_publication_started:
-                self._discard_generated(destination)
-            raise
-        finally:
-            self._discard_generated(copy_path)
-            self._discard_generated(sidecar_temporary_path)
-            self._discard_stage(staged_path, expected_staging_identity)
+        )
+        if self._cleanup_owned_stage_data(stage):
+            cleanup_failed = True
+        if (
+            operation_error is not None or cleanup_failed
+        ) and self._cleanup_owned_paths(
+            (
+                (sidecar_path, published_sidecar_identity),
+                (destination, published_profile_identity),
+            )
+        ):
+            cleanup_failed = True
+        release_failed = self._release_owned_stage(stage)
+        if (
+            release_failed
+            and operation_error is None
+            and not cleanup_failed
+            and self._cleanup_owned_paths(
+                (
+                    (sidecar_path, published_sidecar_identity),
+                    (destination, published_profile_identity),
+                )
+            )
+        ):
+            cleanup_failed = True
+        if operation_error is not None or cleanup_failed or release_failed:
+            if operation_error is not None and not isinstance(
+                operation_error,
+                (
+                    CacheError,
+                    ContractError,
+                    OSError,
+                    RecursionError,
+                    UnicodeError,
+                    ValueError,
+                    secure_filesystem.FilesystemError,
+                ),
+            ):
+                raise operation_error
+            raise CacheError from None
+        if result is None:
+            raise CacheError
+        return result
 
     def _copy_and_verify_staged(
         self,
         staged_path: Path,
         expected_identity: tuple[int, int],
+        destination: int,
         copy_path: Path,
         expected_sha256: str,
         expected_byte_count: int,
     ) -> None:
         source = secure_filesystem.open_generated_file(self.root, staged_path)
-        destination: int | None = None
         try:
             before = os.fstat(source)
             if not stat.S_ISREG(before.st_mode):
@@ -502,9 +705,6 @@ class CacheStore:
             if (before.st_dev, before.st_ino) != expected_identity:
                 raise CacheError
             secure_filesystem.verify_private_permissions(staged_path, 0o600)
-            destination = secure_filesystem.create_generated_file(
-                self.root, copy_path, 0o600
-            )
             digest = hashlib.sha256()
             byte_count = 0
             while True:
@@ -530,17 +730,12 @@ class CacheStore:
             secure_filesystem.set_private_permissions(copy_path, 0o600)
         finally:
             os.close(source)
-            if destination is not None:
-                os.close(destination)
 
-    def _write_temporary(self, path: Path, content: bytes) -> None:
-        descriptor = secure_filesystem.create_generated_file(self.root, path, 0o600)
-        try:
-            secure_filesystem.write_all(descriptor, content)
-            _fsync_descriptor(descriptor)
-            secure_filesystem.set_private_permissions(path, 0o600)
-        finally:
-            os.close(descriptor)
+    @staticmethod
+    def _write_temporary(path: Path, descriptor: int, content: bytes) -> None:
+        secure_filesystem.write_all(descriptor, content)
+        _fsync_descriptor(descriptor)
+        secure_filesystem.set_private_permissions(path, 0o600)
 
     def _load_pair(
         self,
@@ -613,7 +808,10 @@ class CacheStore:
             }
         )
         revision = revision_upload.revision
-        if roast.state == 'awaiting_profile' or revision.revision_number > roast.revision_count:
+        if (
+            roast.state == 'awaiting_profile'
+            or revision.revision_number != roast.revision_count
+        ):
             raise CacheError
         downloaded_at = _stored_datetime(value['downloaded_at'])
         cached = CachedRevision(
@@ -802,76 +1000,207 @@ class CacheStore:
         if not os.path.lexists(temporary_directory):
             return
         self._require_private_directory(temporary_directory)
-        cutoff = datetime.now(tz=UTC) - _STALE_TEMP_AGE
+        stages: dict[str, dict[str, Path]] = {}
         for entry in os.scandir(temporary_directory):
             if secure_filesystem.directory_entry_is_reparse(entry):
                 raise CacheError
-            if _TEMP_FILE_RE.fullmatch(entry.name) is None or not entry.is_file(
-                follow_symlinks=False
-            ):
+            match = _STAGE_FILE_RE.fullmatch(entry.name)
+            if match is None or not entry.is_file(follow_symlinks=False):
                 raise CacheError
-            path = Path(entry.path)
-            if path in self._staging:
+            stages.setdefault(match.group(1), {})[match.group(2)] = Path(entry.path)
+        for token in sorted(stages):
+            pair = stages[token]
+            part_path = pair.get('part')
+            lock_path = pair.get('lock')
+            if part_path is not None:
+                owned = self._staging.get(part_path)
+                if owned is not None:
+                    if lock_path != owned.lock_path:
+                        raise CacheError
+                    continue
+            if lock_path is None:
+                if part_path is None:
+                    raise CacheError
+                self._discard_generated(part_path)
                 continue
-            modified = datetime.fromtimestamp(entry.stat(follow_symlinks=False).st_mtime, tz=UTC)
-            if modified <= cutoff:
-                self._discard_generated(path)
+            lock_descriptor = secure_filesystem.open_generated_lock(
+                self.root, lock_path
+            )
+            lock_stat = os.fstat(lock_descriptor)
+            lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+            acquired = False
+            try:
+                acquired = secure_filesystem.try_acquire_file_lock(lock_descriptor)
+                if not acquired:
+                    if part_path is None:
+                        raise CacheError
+                    continue
+                cleanup_failed = False
+                if part_path is not None:
+                    try:
+                        part_identity = self._path_identity(part_path)
+                        self._discard_owned_path(part_path, part_identity)
+                    except BaseException:
+                        cleanup_failed = True
+                try:
+                    secure_filesystem.release_file_lock(lock_descriptor)
+                    acquired = False
+                except BaseException:
+                    cleanup_failed = True
+                try:
+                    os.close(lock_descriptor)
+                    lock_descriptor = -1
+                except OSError:
+                    cleanup_failed = True
+                try:
+                    self._discard_owned_path(lock_path, lock_identity)
+                except BaseException:
+                    cleanup_failed = True
+                if cleanup_failed:
+                    raise CacheError
+            finally:
+                if acquired:
+                    try:
+                        secure_filesystem.release_file_lock(lock_descriptor)
+                    except BaseException:
+                        pass
+                if lock_descriptor >= 0:
+                    os.close(lock_descriptor)
 
     def _require_private_directory(self, path: Path) -> None:
         secure_filesystem.require_directory_path(path)
         secure_filesystem.set_private_permissions(path, 0o700)
 
     def _remove_pair(self, cached: CachedRevision) -> None:
-        # The sidecar is the index. Removing it first makes a crash leave only an
-        # unindexed profile, which maintenance can safely collect.
-        secure_filesystem.unlink_generated_file(
-            self.root, cached.sidecar_path, missing_ok=False
-        )
-        secure_filesystem.unlink_generated_file(
-            self.root, cached.path, missing_ok=False
-        )
+        sidecar_identity = self._path_identity(cached.sidecar_path)
+        profile_identity = self._path_identity(cached.path)
+        # The sidecar is the index. Attempt it first, but a failure must not
+        # prevent cleanup of the profile path owned by this exact pair.
+        if self._cleanup_owned_paths(
+            (
+                (cached.sidecar_path, sidecar_identity),
+                (cached.path, profile_identity),
+            )
+        ):
+            raise CacheError
 
-    def _protected_identities(
+    @contextmanager
+    def _protected_paths(
         self, protected_paths: frozenset[Path]
-    ) -> frozenset[tuple[int, int]]:
-        identities: set[tuple[int, int]] = set()
+    ) -> Iterator[tuple[_ProtectedPath, ...]]:
+        opened: list[_ProtectedPath] = []
+        try:
+            absolute_paths = sorted(
+                (Path(os.path.abspath(os.fspath(path))) for path in protected_paths),
+                key=os.fspath,
+            )
+            for path in absolute_paths:
+                descriptor = secure_filesystem.open_path_readonly(path)
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    os.close(descriptor)
+                    raise CacheError
+                opened.append(
+                    _ProtectedPath(
+                        path,
+                        descriptor,
+                        (file_stat.st_dev, file_stat.st_ino),
+                    )
+                )
+            protected = tuple(opened)
+            self._verify_protected_paths(protected)
+            yield protected
+        except CacheError:
+            raise
+        except (OSError, ValueError, secure_filesystem.FilesystemError):
+            raise CacheError from None
+        finally:
+            for opened_path in opened:
+                try:
+                    os.close(opened_path.descriptor)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _verify_protected_paths(protected_paths: tuple[_ProtectedPath, ...]) -> None:
         for protected in protected_paths:
-            absolute = Path(os.path.abspath(os.fspath(protected)))
-            try:
-                descriptor = secure_filesystem.open_path_readonly(absolute)
-            except secure_filesystem.FilesystemError:
-                continue
+            descriptor = secure_filesystem.open_path_readonly(protected.path)
             try:
                 file_stat = os.fstat(descriptor)
-                if stat.S_ISREG(file_stat.st_mode):
-                    identities.add((file_stat.st_dev, file_stat.st_ino))
+                if (
+                    not stat.S_ISREG(file_stat.st_mode)
+                    or (file_stat.st_dev, file_stat.st_ino) != protected.identity
+                ):
+                    raise CacheError
             finally:
                 os.close(descriptor)
-        return frozenset(identities)
 
     def _path_identity(self, path: Path) -> tuple[int, int]:
         descriptor = secure_filesystem.open_generated_file(self.root, path)
         try:
             file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise CacheError
             return file_stat.st_dev, file_stat.st_ino
         finally:
             os.close(descriptor)
 
-    def _discard_stage(self, path: Path, identity: tuple[int, int]) -> None:
-        self._staging.pop(path, None)
-        candidates: list[Path] = []
-        if os.path.lexists(path):
-            candidates.append(path)
-        if os.path.lexists(path.parent):
-            for entry in os.scandir(path.parent):
-                try:
-                    entry_stat = entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if (entry_stat.st_dev, entry_stat.st_ino) == identity:
-                    candidates.append(Path(entry.path))
-        for candidate in dict.fromkeys(candidates):
-            self._discard_generated(candidate)
+    def _cleanup_owned_stage(self, stage: _OwnedStage) -> bool:
+        failed = self._cleanup_owned_stage_data(stage)
+        if self._release_owned_stage(stage):
+            failed = True
+        return failed
+
+    def _cleanup_owned_stage_data(self, stage: _OwnedStage) -> bool:
+        failed = False
+        if not stage.output.closed:
+            try:
+                stage.output.close()
+            except BaseException:
+                failed = True
+        try:
+            self._discard_owned_path(stage.path, stage.identity)
+        except BaseException:
+            failed = True
+        return failed
+
+    def _release_owned_stage(self, stage: _OwnedStage) -> bool:
+        self._staging.pop(stage.path, None)
+        failed = False
+        try:
+            secure_filesystem.release_file_lock(stage.lock_descriptor)
+        except BaseException:
+            failed = True
+        try:
+            os.close(stage.lock_descriptor)
+        except OSError:
+            failed = True
+        try:
+            self._discard_owned_path(stage.lock_path, stage.lock_identity)
+        except BaseException:
+            failed = True
+        return failed
+
+    def _cleanup_owned_paths(
+        self,
+        paths: tuple[tuple[Path, tuple[int, int] | None], ...],
+    ) -> bool:
+        failed = False
+        for path, identity in paths:
+            if identity is None:
+                continue
+            try:
+                self._discard_owned_path(path, identity)
+            except BaseException:
+                failed = True
+        return failed
+
+    def _discard_owned_path(self, path: Path, identity: tuple[int, int]) -> None:
+        if not os.path.lexists(path):
+            return
+        if self._path_identity(path) != identity:
+            raise CacheError
+        secure_filesystem.unlink_generated_file(self.root, path, missing_ok=False)
 
     def _discard_generated(self, path: Path) -> None:
         try:
@@ -879,6 +1208,10 @@ class CacheStore:
         except (OSError, secure_filesystem.FilesystemError):
             if os.path.lexists(path):
                 raise CacheError from None
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise CacheError
 
     @contextmanager
     def _filesystem_lock(self) -> Iterator[None]:
@@ -1064,18 +1397,11 @@ def _thaw_json_object(value: FrozenJsonObject) -> dict[str, object]:
 
 
 def _thaw_json(value: JsonValue) -> object:
-    if not isinstance(value, tuple):
-        return value
-    if _is_frozen_object(value):
+    if isinstance(value, FrozenJsonArray):
+        return [_thaw_json(item) for item in value.items]
+    if isinstance(value, tuple):
         return {key: _thaw_json(item) for key, item in value}
-    return [_thaw_json(item) for item in value]
-
-
-def _is_frozen_object(value: tuple[JsonValue, ...]) -> TypeGuard[FrozenJsonObject]:
-    return all(
-        isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
-        for item in value
-    )
+    return value
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1141,45 +1467,6 @@ def _file_identity(value: os.stat_result) -> _FileIdentity:
 
 def _read_chunk(descriptor: int) -> bytes:
     return os.read(descriptor, _COPY_CHUNK_BYTES)
-
-
-def _validate_filters(filters: object) -> ArchiveFilters:
-    if not isinstance(filters, ArchiveFilters):
-        raise ValueError('archive filters are invalid')
-    search = filters.search
-    if search is not None:
-        if not isinstance(search, str):
-            raise ValueError('archive search is invalid')
-        search = search.strip()
-        if len(search) > 200 or _has_control(search):
-            raise ValueError('archive search is invalid')
-        if search == '':
-            search = None
-    for value in (filters.roast_at_from, filters.roast_at_to):
-        if value is not None:
-            _validate_filter_datetime(value)
-    if (
-        filters.roast_at_from is not None
-        and filters.roast_at_to is not None
-        and filters.roast_at_from > filters.roast_at_to
-    ):
-        raise ValueError('archive date filter range is invalid')
-    return ArchiveFilters(
-        search=search,
-        state=filters.state,
-        machine=filters.machine,
-        roast_at_from=filters.roast_at_from,
-        roast_at_to=filters.roast_at_to,
-    )
-
-
-def _validate_filter_datetime(value: object) -> None:
-    if (
-        not isinstance(value, datetime)
-        or value.tzinfo is None
-        or value.utcoffset() is None
-    ):
-        raise ValueError('archive date filter is invalid')
 
 
 def _matches_filters(roast: RoastSummary, filters: ArchiveFilters) -> bool:

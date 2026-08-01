@@ -709,6 +709,28 @@ def test_list_rejects_invalid_cursor_and_limit_without_request(
     assert session.calls == []
 
 
+def test_list_preserves_filter_whitespace_and_rejects_exact_filter_bounds_without_request(
+    client_factory: ClientFactory,
+) -> None:
+    client, session = client_factory(json_response(200, valid_roast_page_payload()))
+    client.list_roasts(ArchiveFilters(search=' sample ', machine=' Test Drum '))
+    assert 'search=+sample+' in session.calls[0].url
+    assert 'machine=+Test+Drum+' in session.calls[0].url
+
+    invalid = (
+        ArchiveFilters(search=''),
+        ArchiveFilters(search='x' * 201),
+        ArchiveFilters(state='unknown'),  # type: ignore[arg-type]
+        ArchiveFilters(machine=''),
+        ArchiveFilters(machine='x' * 101),
+    )
+    for filters in invalid:
+        call_count = len(session.calls)
+        with pytest.raises(ValueError):
+            client.list_roasts(filters)
+        assert len(session.calls) == call_count
+
+
 def test_detail_requires_response_uuid_to_match_request(client_factory: ClientFactory) -> None:
     client, _session = client_factory(
         json_response(200, valid_roast_detail_payload(roast_uuid=OTHER_ROAST_UUID))

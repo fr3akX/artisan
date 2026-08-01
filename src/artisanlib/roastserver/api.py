@@ -68,6 +68,7 @@ from artisanlib.roastserver.contract import (
     parse_revision_upload,
     parse_roast_detail,
     parse_roast_page,
+    validate_archive_filters,
 )
 from artisanlib.roastserver.origin import canonical_origin
 
@@ -79,9 +80,6 @@ _RESPONSE_CHUNK_BYTES: Final[int] = 64 * 1024
 _JSON_CONTENT_TYPE: Final[str] = 'application/json'
 _PROFILE_CONTENT_TYPE: Final[str] = 'application/x-artisan-profile'
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{64}$')
-_ALLOWED_ROAST_STATES: Final[frozenset[str]] = frozenset(
-    {'awaiting_profile', 'parsed', 'parse_failed'}
-)
 _SESSION_TYPE: Final[type[requests.Session]] = requests.sessions.Session
 _FIXED_SESSION_HEADERS: Final[dict[str, str]] = {
     'Accept-Encoding': 'identity',
@@ -289,6 +287,7 @@ class RoastServerClient:
         self._require_open()
         if isinstance(limit, bool) or not 1 <= limit <= 100:
             raise ValueError('invalid archive page limit')
+        normalized_filters = validate_archive_filters(filters)
         params: dict[str, str | int] = {'limit': limit}
         if cursor is not None:
             params['cursor'] = _bounded_query_text(
@@ -296,35 +295,22 @@ class RoastServerClient:
                 maximum=MAX_CURSOR_CHARS,
                 name='cursor',
             )
-        if filters.search is not None:
-            params['search'] = _bounded_query_text(
-                filters.search,
-                maximum=200,
-                name='search',
-            )
-        if filters.state is not None:
-            if filters.state not in _ALLOWED_ROAST_STATES:
-                raise ValueError('invalid roast state')
-            params['state'] = filters.state
-        if filters.machine is not None:
-            params['machine'] = _bounded_query_text(
-                filters.machine,
-                maximum=100,
-                name='machine',
-            )
-        roast_at_from = _utc_query_datetime(filters.roast_at_from, name='roast_at_from')
-        roast_at_to = _utc_query_datetime(filters.roast_at_to, name='roast_at_to')
+        if normalized_filters.search is not None:
+            params['search'] = normalized_filters.search
+        if normalized_filters.state is not None:
+            params['state'] = normalized_filters.state
+        if normalized_filters.machine is not None:
+            params['machine'] = normalized_filters.machine
+        roast_at_from = _utc_query_datetime(
+            normalized_filters.roast_at_from, name='roast_at_from'
+        )
+        roast_at_to = _utc_query_datetime(
+            normalized_filters.roast_at_to, name='roast_at_to'
+        )
         if roast_at_from is not None:
             params['roast_at_from'] = roast_at_from
         if roast_at_to is not None:
             params['roast_at_to'] = roast_at_to
-        if (
-            filters.roast_at_from is not None
-            and filters.roast_at_to is not None
-            and filters.roast_at_from > filters.roast_at_to
-        ):
-            raise ValueError('invalid archive date range')
-
         response = self._request(
             'GET',
             '/api/v1/roasts',

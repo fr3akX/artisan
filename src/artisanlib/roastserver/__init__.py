@@ -31,8 +31,11 @@ from .contract import (
     ArchiveFilters,
     ContractError,
     FailureKind,
+    FrozenJsonArray,
+    FrozenJsonObject,
     IdentityOrganization,
     IdentityUser,
+    JsonValue,
     LabelSummary,
     Namespace,
     PublicFailure,
@@ -52,6 +55,7 @@ from .contract import (
     parse_revision_upload,
     parse_roast_detail,
     parse_roast_page,
+    validate_archive_filters,
 )
 
 __all__ = [
@@ -60,8 +64,11 @@ __all__ = [
     'ArchiveFilters',
     'ContractError',
     'FailureKind',
+    'FrozenJsonArray',
+    'FrozenJsonObject',
     'IdentityOrganization',
     'IdentityUser',
+    'JsonValue',
     'LabelSummary',
     'Namespace',
     'PublicFailure',
@@ -81,4 +88,5 @@ __all__ = [
     'parse_revision_upload',
     'parse_roast_detail',
     'parse_roast_page',
+    'validate_archive_filters',
 ]

@@ -44,6 +44,8 @@ JS_SAFE_INTEGER_MAX: Final[int] = 9_007_199_254_740_991
 POSTGRESQL_INTEGER_MAX: Final[int] = 2_147_483_647
 MAX_JSON_DEPTH: Final[int] = 64
 MAX_ERROR_MESSAGE_CODE_POINTS: Final[int] = 500
+MAX_ARCHIVE_SEARCH_CHARS: Final[int] = 200
+MAX_ARCHIVE_MACHINE_CHARS: Final[int] = 100
 
 _ROAST_STATE_VALUES: Final[frozenset[str]] = frozenset({'awaiting_profile', 'parsed', 'parse_failed'})
 _REVISION_PARSE_STATE_VALUES: Final[frozenset[str]] = frozenset({'parsed', 'failed'})
@@ -64,8 +66,15 @@ _TIMESTAMP_RE: Final[re.Pattern[str]] = re.compile(
 
 
 type FrozenJsonScalar = None | bool | int | float | str
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenJsonArray:
+    items: tuple[JsonValue, ...]
+
+
 type FrozenJsonObject = tuple[tuple[str, 'JsonValue'], ...]
-type JsonValue = FrozenJsonScalar | tuple['JsonValue', ...] | FrozenJsonObject
+type JsonValue = FrozenJsonScalar | FrozenJsonArray | FrozenJsonObject
 type RoastState = Literal['awaiting_profile', 'parsed', 'parse_failed']
 type RevisionParseState = Literal['parsed', 'failed']
 type UploadState = Literal['parsed', 'parse_failed']
@@ -281,9 +290,13 @@ def _fail() -> NoReturn:
 def _exact_object(value: object, keys: frozenset[str]) -> dict[str, object]:
     if not isinstance(value, dict):
         _fail()
-    if set(value) != keys:
+    mapping = cast(dict[object, object], value)
+    if len(mapping) != len(keys):
         _fail()
-    return value
+    for key in mapping:
+        if not isinstance(key, str) or key not in keys:
+            _fail()
+    return cast(dict[str, object], mapping)
 
 
 def _has_prohibited_string_code_point(text: str, *, reject_controls: bool) -> bool:
@@ -494,7 +507,12 @@ def _validate_json_graph(value: object, *, reject_string_controls: bool) -> None
     while stack:
         current, depth, exiting = stack.pop()
         if isinstance(current, list | dict):
-            container_id = id(current)
+            container: list[object] | dict[object, object]
+            if isinstance(current, list):
+                container = cast(list[object], current)
+            else:
+                container = cast(dict[object, object], current)
+            container_id = id(container)
             if exiting:
                 active_container_ids.remove(container_id)
                 continue
@@ -503,12 +521,12 @@ def _validate_json_graph(value: object, *, reject_string_controls: bool) -> None
             if container_id in active_container_ids:
                 _fail()
             active_container_ids.add(container_id)
-            stack.append((current, depth, True))
-            if isinstance(current, list):
-                for item in reversed(current):
+            stack.append((container, depth, True))
+            if isinstance(container, list):
+                for item in reversed(container):
                     stack.append((item, depth + 1, False))
             else:
-                items = list(current.items())
+                items = list(container.items())
                 for key, item in reversed(items):
                     if not isinstance(key, str):
                         _fail()
@@ -535,21 +553,26 @@ def _canonicalize_json_value(value: object, *, reject_string_controls: bool) -> 
             _fail()
         return value
     if isinstance(value, list):
+        sequence = cast(list[object], value)
         return [
             _canonicalize_json_value(item, reject_string_controls=reject_string_controls)
-            for item in value
+            for item in sequence
         ]
     if isinstance(value, dict):
-        canonical: dict[str, object] = {}
-        for key in sorted(value):
+        mapping = cast(dict[object, object], value)
+        items: list[tuple[str, object]] = []
+        for key, item in mapping.items():
             if not isinstance(key, str):
                 _fail()
             if _has_prohibited_string_code_point(key, reject_controls=reject_string_controls):
                 _fail()
-            canonical[key] = _canonicalize_json_value(
-                value[key], reject_string_controls=reject_string_controls
+            items.append((key, item))
+        return {
+            key: _canonicalize_json_value(
+                item, reject_string_controls=reject_string_controls
             )
-        return canonical
+            for key, item in sorted(items)
+        }
     _fail()
 
 
@@ -557,9 +580,13 @@ def _freeze_canonical_json(value: object) -> JsonValue:
     if value is None or isinstance(value, bool | int | float | str):
         return value
     if isinstance(value, list):
-        return tuple(_freeze_canonical_json(item) for item in value)
+        sequence = cast(list[object], value)
+        return FrozenJsonArray(tuple(_freeze_canonical_json(item) for item in sequence))
     if isinstance(value, dict):
-        return tuple((key, _freeze_canonical_json(item)) for key, item in value.items())
+        mapping = cast(dict[str, object], value)
+        return tuple(
+            (key, _freeze_canonical_json(item)) for key, item in mapping.items()
+        )
     _fail()
 
 
@@ -571,7 +598,8 @@ def _canonical_json(value: object, *, reject_string_controls: bool) -> object:
 def _metadata_object(value: object) -> FrozenJsonObject:
     if not isinstance(value, dict):
         _fail()
-    canonical = _canonical_json(value, reject_string_controls=False)
+    mapping = cast(dict[object, object], value)
+    canonical = _canonical_json(mapping, reject_string_controls=False)
     try:
         encoded = json.dumps(
             canonical,
@@ -586,11 +614,64 @@ def _metadata_object(value: object) -> FrozenJsonObject:
     frozen = _freeze_canonical_json(canonical)
     if not isinstance(frozen, tuple):
         _fail()
-    return cast(FrozenJsonObject, frozen)
+    return frozen
 
 
 def _safe_public_string(value: object, *, max_length: int) -> str:
     return _parse_required_string(value, max_length=max_length, reject_controls=True)
+
+
+def validate_archive_filters(value: object) -> ArchiveFilters:
+    if not isinstance(value, ArchiveFilters):
+        raise ValueError('invalid archive filters')
+    if value.search is not None:
+        try:
+            _parse_required_string(
+                value.search,
+                max_length=MAX_ARCHIVE_SEARCH_CHARS,
+                reject_controls=True,
+            )
+        except ContractError:
+            raise ValueError('invalid archive search') from None
+    if value.state is not None and value.state not in _ROAST_STATE_VALUES:
+        raise ValueError('invalid roast state')
+    if value.machine is not None:
+        try:
+            _parse_required_string(
+                value.machine,
+                max_length=MAX_ARCHIVE_MACHINE_CHARS,
+                reject_controls=True,
+            )
+        except ContractError:
+            raise ValueError('invalid archive machine') from None
+    for name, candidate in (
+        ('roast_at_from', value.roast_at_from),
+        ('roast_at_to', value.roast_at_to),
+    ):
+        candidate_object: object = candidate
+        if candidate_object is None:
+            continue
+        try:
+            aware = (
+                isinstance(candidate_object, datetime)
+                and candidate_object.tzinfo is not None
+                and candidate_object.utcoffset() is not None
+            )
+        except (OverflowError, ValueError):
+            aware = False
+        if not aware:
+            raise ValueError(f'invalid archive {name}')
+    try:
+        invalid_range = (
+            value.roast_at_from is not None
+            and value.roast_at_to is not None
+            and value.roast_at_from > value.roast_at_to
+        )
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError('invalid archive date range') from None
+    if invalid_range:
+        raise ValueError('invalid archive date range')
+    return value
 
 
 def _parse_label(value: object) -> LabelSummary:
@@ -660,9 +741,10 @@ def _parse_roast_summary(value: object) -> RoastSummary:
             }
         ),
     )
-    labels_raw = mapping['labels']
-    if not isinstance(labels_raw, list):
+    labels_value = mapping['labels']
+    if not isinstance(labels_value, list):
         _fail()
+    labels_raw = cast(list[object], labels_value)
     state = _parse_roast_state(mapping['state'])
     revision_count = _parse_safe_int(mapping['revision_count'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX)
     _validate_roast_state_count(state, revision_count)
@@ -722,9 +804,10 @@ def parse_identity(value: object) -> ServerIdentity:
 
 def parse_roast_page(value: object) -> RoastPage:
     mapping = _exact_object(value, frozenset({'items', 'next_cursor'}))
-    items_raw = mapping['items']
-    if not isinstance(items_raw, list):
+    items_value = mapping['items']
+    if not isinstance(items_value, list):
         _fail()
+    items_raw = cast(list[object], items_value)
     next_cursor_value = mapping['next_cursor']
     next_cursor: str | None
     if next_cursor_value is None:
@@ -905,12 +988,15 @@ __all__ = [
     'ContractError',
     'FAILURE_MESSAGES',
     'FailureKind',
+    'FrozenJsonArray',
     'FrozenJsonObject',
     'IdentityOrganization',
     'IdentityUser',
     'JS_SAFE_INTEGER_MAX',
     'JsonValue',
     'LabelSummary',
+    'MAX_ARCHIVE_MACHINE_CHARS',
+    'MAX_ARCHIVE_SEARCH_CHARS',
     'MAX_CURSOR_CHARS',
     'MAX_JSON_BYTES',
     'MAX_METADATA_BYTES',
@@ -934,4 +1020,5 @@ __all__ = [
     'parse_revision_upload',
     'parse_roast_detail',
     'parse_roast_page',
+    'validate_archive_filters',
 ]

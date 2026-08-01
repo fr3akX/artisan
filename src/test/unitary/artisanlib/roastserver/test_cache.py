@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import errno
 import hashlib
 import json
 import os
@@ -34,6 +35,55 @@ OTHER_ROAST_UUID = UUID('33333333-3333-4333-8333-333333333333')
 PROFILE_BYTES = b"{'roastUUID':'11111111111141118111111111111111','title':'cached'}"
 
 
+class PortableWindowsCacheNative:
+    def __init__(self) -> None:
+        self.permissions: list[tuple[Path, int]] = []
+        self.flushes: list[tuple[str, object]] = []
+        self.replacements: list[tuple[Path, Path]] = []
+        self.removals: list[Path] = []
+        self.reparse_path: Path | None = None
+
+    def open_readonly(self, path: Path, *, directory: bool = False) -> int:
+        if path == self.reparse_path:
+            raise OSError('injected reparse point')
+        flags = os.O_RDONLY
+        if directory:
+            flags |= getattr(os, 'O_DIRECTORY', 0)
+        return os.open(path, flags)
+
+    @staticmethod
+    def open_lock(path: Path) -> int:
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+    def set_private_permissions(self, path: Path, mode: int) -> None:
+        self.permissions.append((path, mode))
+        os.chmod(path, mode)
+
+    @staticmethod
+    def verify_private_permissions(path: Path, mode: int) -> None:
+        if stat.S_IMODE(path.stat().st_mode) != mode:
+            raise OSError('injected ACL mismatch')
+
+    def flush(self, descriptor: int, *, directory: bool) -> None:
+        self.flushes.append(('descriptor', directory))
+        os.fsync(descriptor)
+
+    def flush_directory(self, path: Path) -> None:
+        self.flushes.append(('directory', path))
+
+    @staticmethod
+    def publish(source: Path, destination: Path) -> None:
+        os.rename(source, destination)
+
+    def replace(self, source: Path, destination: Path) -> None:
+        self.replacements.append((source, destination))
+        os.replace(source, destination)
+
+    def unlink(self, path: Path) -> None:
+        self.removals.append(path)
+        path.unlink()
+
+
 def namespace_for_test(
     origin: str = 'https://archive.example',
     organization_uuid: UUID = ORGANIZATION_UUID,
@@ -59,6 +109,7 @@ def detail_payload(
     machine: str | None = 'Sample Roaster',
     state: str = 'parsed',
     labels: list[dict[str, object]] | None = None,
+    metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
     sha256 = hashlib.sha256(profile_bytes).hexdigest()
     roast_hex = roast_uuid.hex
@@ -90,7 +141,7 @@ def detail_payload(
                 'archived': False,
             }
         ],
-        'current_metadata': {'source': 'desktop'},
+        'current_metadata': {'source': 'desktop'} if metadata is None else metadata,
         'current_revision': {
             'revision_number': revision_number,
             'sha256': sha256,
@@ -100,7 +151,7 @@ def detail_payload(
             'parse_diagnostic_code': None,
             'parse_diagnostic_message': None,
             'uploaded_at': (roast_at + timedelta(minutes=11)).isoformat(),
-            'metadata': {'source': 'desktop'},
+            'metadata': {'source': 'desktop'} if metadata is None else metadata,
             'reparse_recommended': False,
         },
         'links': {
@@ -217,6 +268,7 @@ def three_cached_revisions(cache: CacheStore) -> tuple[CachedRevision, ...]:
 
 def assert_no_temporary_files(cache: CacheStore) -> None:
     assert not list(cache.root.rglob('*.part'))
+    assert not [path for path in cache.root.rglob('*.lock') if path.name != '.cache.lock']
 
 
 def test_publish_uses_generated_path_and_public_canonical_sidecar(
@@ -313,10 +365,18 @@ def test_publish_streams_exact_16_mib_boundary(cache: CacheStore) -> None:
     assert_no_temporary_files(cache)
 
 
-def test_publish_rejects_replaced_staging_inode_during_copy(
-    cache: CacheStore, monkeypatch: pytest.MonkeyPatch
+def test_publish_rejects_replaced_staging_inode_without_deleting_replacement_or_alias(
+    cache: CacheStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     staged = stage_bytes(cache, NAMESPACE, PROFILE_BYTES)
+    alias = tmp_path / 'owned-stage-alias.part'
+    try:
+        os.link(staged, alias)
+    except OSError:
+        pytest.skip('hard-link creation unavailable')
+    replacement_bytes = b'replacement-not-owned-by-cache'
+    replacement = tmp_path / 'replacement.part'
+    replacement.write_bytes(replacement_bytes)
     original = cache_module._read_chunk
     replaced = False
 
@@ -325,16 +385,16 @@ def test_publish_rejects_replaced_staging_inode_during_copy(
         chunk = original(descriptor)
         if chunk and not replaced:
             replaced = True
-            moved = staged.with_name('moved.part')
-            staged.replace(moved)
-            staged.write_bytes(PROFILE_BYTES)
+            os.replace(replacement, staged)
         return chunk
 
     monkeypatch.setattr(cache_module, '_read_chunk', replace_after_read)
     with pytest.raises(CacheError):
         cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
     assert not list(cache.root.rglob('*.alog'))
-    assert_no_temporary_files(cache)
+    assert staged.read_bytes() == replacement_bytes
+    assert alias.read_bytes() == PROFILE_BYTES
+    assert not staged.with_suffix('.lock').exists()
 
 
 def test_publish_rolls_back_profile_when_sidecar_replace_fails(
@@ -355,6 +415,52 @@ def test_publish_rolls_back_profile_when_sidecar_replace_fails(
     assert not list(cache.root.rglob('*.alog'))
     assert not list(cache.root.rglob('*.json'))
     assert_no_temporary_files(cache)
+
+
+def test_publication_cleanup_attempts_every_owned_artifact_after_first_failure(
+    cache: CacheStore, staged_download: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_replace = cache_module._replace_generated
+    original_discard = cache._discard_owned_path
+    attempts: list[Path] = []
+    failed_existing_path: Path | None = None
+
+    def fail_sidecar(root: Path, source: Path, destination: Path) -> None:
+        if destination.suffix == '.json':
+            raise OSError('injected sidecar publication failure')
+        original_replace(root, source, destination)
+
+    def fail_first_cleanup(path: Path, identity: tuple[int, int]) -> None:
+        nonlocal failed_existing_path
+        attempts.append(path)
+        if failed_existing_path is None and path.exists():
+            failed_existing_path = path
+            raise CacheError
+        original_discard(path, identity)
+
+    monkeypatch.setattr(cache_module, '_replace_generated', fail_sidecar)
+    monkeypatch.setattr(cache, '_discard_owned_path', fail_first_cleanup)
+
+    with pytest.raises(CacheError) as raised:
+        cache.publish(NAMESPACE, DETAIL, RECEIPT, staged_download, NOW)
+
+    assert raised.value.failure == cache_module.CACHE_FAILURE
+    assert any(path.suffix == '.json' for path in attempts)
+    assert any(path.suffix == '.alog' for path in attempts)
+    assert any(path.suffix == '.part' for path in attempts)
+    assert any(path.suffix == '.lock' for path in attempts)
+    lock_index = next(index for index, path in enumerate(attempts) if path.suffix == '.lock')
+    assert all(
+        index < lock_index
+        for index, path in enumerate(attempts)
+        if path.suffix in {'.alog', '.json'}
+    )
+    assert failed_existing_path is not None
+    assert failed_existing_path.exists()
+    assert not list(cache.root.rglob('*.alog'))
+    assert not list(cache.root.rglob('*.json'))
+    assert not staged_download.exists()
+    assert not staged_download.with_suffix('.lock').exists()
 
 
 def test_publication_fsync_failure_leaves_no_visible_or_temporary_artifact(
@@ -517,7 +623,8 @@ def test_offline_rows_are_latest_per_roast_newest_first_filtered_and_stale(
     assert latest.roast.labels[0].archived is True
     assert isinstance(latest.roast.labels, tuple)
     assert all(item.source.stale for item in page.items)
-    assert cache.list_offline(NAMESPACE, ArchiveFilters(search=' needle ')).items == (latest,)
+    assert cache.list_offline(NAMESPACE, ArchiveFilters(search='needle')).items == (latest,)
+    assert cache.list_offline(NAMESPACE, ArchiveFilters(search=' needle ')).items == ()
     assert cache.list_offline(
         NAMESPACE, ArchiveFilters(state='parse_failed', machine='Other Machine')
     ).items == (newest,)
@@ -615,6 +722,110 @@ def test_protected_paths_use_canonical_file_identity(
     assert cached_revision.sidecar_path.exists()
 
 
+def test_prune_holds_protected_identity_while_open_descriptor_remains_usable(
+    cache: CacheStore, cached_revision: CachedRevision
+) -> None:
+    with cached_revision.path.open('rb') as opened:
+        stats = cache.clear_unused(NAMESPACE, frozenset({cached_revision.path}))
+        assert stats.revision_count == 1
+        assert opened.read() == PROFILE_BYTES
+    assert cached_revision.path.exists()
+
+
+@pytest.mark.parametrize('kind', ('missing', 'symlink', 'directory'))
+def test_prune_aborts_before_deletion_when_any_protected_path_is_unverifiable(
+    cache: CacheStore,
+    three_cached_revisions: tuple[CachedRevision, ...],
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    protected = tmp_path / 'protected'
+    if kind == 'symlink':
+        try:
+            protected.symlink_to(three_cached_revisions[0].path)
+        except OSError:
+            pytest.skip('symlink creation unavailable')
+    elif kind == 'directory':
+        protected.mkdir()
+
+    with pytest.raises(CacheError) as raised:
+        cache.clear_unused(NAMESPACE, frozenset({protected}))
+
+    assert raised.value.failure == cache_module.CACHE_FAILURE
+    assert all(item.path.exists() and item.sidecar_path.exists() for item in three_cached_revisions)
+
+
+def test_prune_aborts_before_deletion_for_inaccessible_protected_path(
+    cache: CacheStore,
+    three_cached_revisions: tuple[CachedRevision, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protected = three_cached_revisions[0].path
+
+    def inaccessible(_path: Path) -> int:
+        raise filesystem_module.FilesystemError('injected access denial')
+
+    monkeypatch.setattr(filesystem_module, 'open_path_readonly', inaccessible)
+    with pytest.raises(CacheError):
+        cache.clear_unused(NAMESPACE, frozenset({protected}))
+    assert all(item.path.exists() and item.sidecar_path.exists() for item in three_cached_revisions)
+
+
+def test_prune_detects_protected_path_replacement_before_deleting_candidates(
+    cache: CacheStore,
+    three_cached_revisions: tuple[CachedRevision, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protected = three_cached_revisions[0].path
+    moved = tmp_path / 'original-open-profile.alog'
+    replacement = tmp_path / 'replacement.alog'
+    replacement.write_bytes(b'replacement')
+    os.chmod(replacement, 0o600)
+    original_open = filesystem_module.open_path_readonly
+    replaced = False
+
+    def replace_after_open(path: Path) -> int:
+        nonlocal replaced
+        descriptor = original_open(path)
+        if path == protected and not replaced:
+            replaced = True
+            os.replace(protected, moved)
+            os.replace(replacement, protected)
+        return descriptor
+
+    monkeypatch.setattr(filesystem_module, 'open_path_readonly', replace_after_open)
+    with pytest.raises(CacheError):
+        cache.clear_unused(NAMESPACE, frozenset({protected}))
+    assert three_cached_revisions[1].path.exists()
+    assert three_cached_revisions[2].path.exists()
+    assert protected.read_bytes() == b'replacement'
+    assert moved.read_bytes() == b'oldest'
+
+
+def test_pair_cleanup_attempts_profile_after_sidecar_removal_failure(
+    cache: CacheStore,
+    cached_revision: CachedRevision,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_discard = cache._discard_owned_path
+    attempted: list[Path] = []
+
+    def fail_sidecar(path: Path, identity: tuple[int, int]) -> None:
+        attempted.append(path)
+        if path == cached_revision.sidecar_path:
+            raise CacheError
+        original_discard(path, identity)
+
+    monkeypatch.setattr(cache, '_discard_owned_path', fail_sidecar)
+    with pytest.raises(CacheError) as raised:
+        cache.clear_unused(NAMESPACE, frozenset())
+    assert raised.value.failure == cache_module.CACHE_FAILURE
+    assert attempted[:2] == [cached_revision.sidecar_path, cached_revision.path]
+    assert cached_revision.sidecar_path.exists()
+    assert not cached_revision.path.exists()
+
+
 def test_prune_lru_tie_breaks_by_generated_path(
     cache: CacheStore,
 ) -> None:
@@ -649,6 +860,56 @@ def test_prune_rejects_bool_negative_and_noninteger_limits(cache: CacheStore) ->
             cache.prune(NAMESPACE, value, frozenset())  # type: ignore[arg-type]
 
 
+def test_staging_discard_and_close_remove_all_owned_lock_pairs(cache: CacheStore) -> None:
+    first_path, first_output = cache.new_staging_file(NAMESPACE)
+    second_path, second_output = cache.new_staging_file(NAMESPACE)
+    first_output.write(b'first')
+    second_output.write(b'second')
+    assert first_path.with_suffix('.lock').exists()
+    assert second_path.with_suffix('.lock').exists()
+
+    cache.discard_staging(first_path)
+    assert first_output.closed
+    assert not first_path.exists()
+    assert not first_path.with_suffix('.lock').exists()
+
+    cache.close()
+    assert second_output.closed
+    assert not second_path.exists()
+    assert not second_path.with_suffix('.lock').exists()
+    cache.close()
+    with pytest.raises(CacheError):
+        cache.new_staging_file(NAMESPACE)
+
+
+def test_close_attempts_every_stage_after_first_owned_removal_failure(
+    cache: CacheStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_path, first_output = cache.new_staging_file(NAMESPACE)
+    second_path, second_output = cache.new_staging_file(NAMESPACE)
+    first_output.write(b'first')
+    second_output.write(b'second')
+    original_discard = cache._discard_owned_path
+    failed = False
+
+    def fail_first(path: Path, identity: tuple[int, int]) -> None:
+        nonlocal failed
+        if not failed and path.suffix == '.part':
+            failed = True
+            raise CacheError
+        original_discard(path, identity)
+
+    monkeypatch.setattr(cache, '_discard_owned_path', fail_first)
+    with pytest.raises(CacheError) as raised:
+        cache.close()
+    assert raised.value.failure == cache_module.CACHE_FAILURE
+    assert first_output.closed and second_output.closed
+    assert first_path.exists()
+    assert not first_path.with_suffix('.lock').exists()
+    assert not second_path.exists()
+    assert not second_path.with_suffix('.lock').exists()
+
+
 def test_restart_collects_orphan_profile_and_temp(cache: CacheStore) -> None:
     namespace_directory = cache.root / NAMESPACE.key.removeprefix('namespace-sha256:')
     roast_directory = namespace_directory / 'roasts' / ROAST_UUID.hex
@@ -667,19 +928,131 @@ def test_restart_collects_orphan_profile_and_temp(cache: CacheStore) -> None:
     assert restarted.stats(NAMESPACE).revision_count == 0
 
 
-def test_two_processes_publish_without_partial_pairs(tmp_path: Path) -> None:
+def test_restart_cleanup_never_converts_untrusted_temporary_mtime(
+    cache: CacheStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    namespace_directory = cache.root / NAMESPACE.key.removeprefix('namespace-sha256:')
+    temporary_directory = namespace_directory / 'tmp'
+    temporary_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = temporary_directory / f'{UUID(int=8).hex}.part'
+    temporary.write_bytes(b'abandoned')
+    old = datetime(2000, 1, 1, tzinfo=UTC).timestamp()
+    os.utime(temporary, (old, old))
+
+    class RaisingDateTime(datetime):
+        @classmethod
+        def fromtimestamp(cls, *_args: object, **_kwargs: object) -> datetime:
+            raise OverflowError('injected untrusted timestamp')
+
+    monkeypatch.setattr(cache_module, 'datetime', RaisingDateTime)
+    restarted = CacheStore(cache.root)
+    assert not temporary.exists()
+    restarted.close()
+
+
+def test_active_old_stage_survives_other_process_maintenance_then_discard_and_crash_cleanup(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'cache'
+    script = r'''
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from uuid import UUID
+from artisanlib.roastserver.cache import CacheStore
+from artisanlib.roastserver.contract import Namespace
+root, namespace_json, ready, release = sys.argv[1:]
+namespace_data = json.loads(namespace_json)
+namespace = Namespace(namespace_data[0], UUID(namespace_data[1]), namespace_data[2])
+store = CacheStore(Path(root))
+path, output = store.new_staging_file(namespace)
+with output:
+    output.write(b'active-stage')
+Path(ready).write_text(str(path), encoding='utf-8')
+while not Path(release).exists():
+    time.sleep(0.01)
+if Path(release).read_text(encoding='utf-8') == 'discard':
+    store.discard_staging(path)
+    store.close()
+else:
+    os._exit(17)
+'''
+    namespace_json = json.dumps([NAMESPACE.origin, str(NAMESPACE.organization_id), NAMESPACE.key])
+
+    def start_owner(name: str) -> tuple[subprocess.Popen[bytes], Path, Path, Path]:
+        ready = tmp_path / f'{name}.ready'
+        release = tmp_path / f'{name}.release'
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                '-c',
+                script,
+                os.fspath(root),
+                namespace_json,
+                os.fspath(ready),
+                os.fspath(release),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _attempt in range(500):
+            if ready.exists():
+                break
+            if process.poll() is not None:
+                _stdout, stderr = process.communicate()
+                pytest.fail(stderr.decode('utf-8', errors='replace'))
+            import time
+            time.sleep(0.01)
+        else:
+            process.kill()
+            pytest.fail('stage owner did not reach barrier')
+        return process, Path(ready.read_text(encoding='utf-8')), ready, release
+
+    owner, active_path, _ready, release = start_owner('active')
+    old = datetime(2000, 1, 1, tzinfo=UTC).timestamp()
+    os.utime(active_path, (old, old))
+    os.utime(active_path.with_suffix('.lock'), (old, old))
+    observer = CacheStore(root)
+    assert active_path.exists()
+    assert active_path.with_suffix('.lock').exists()
+    observer.close()
+    release.write_text('discard', encoding='utf-8')
+    stdout, stderr = owner.communicate(timeout=20)
+    assert owner.returncode == 0, (stdout + stderr).decode('utf-8', errors='replace')
+    assert not active_path.exists()
+    assert not active_path.with_suffix('.lock').exists()
+
+    crashed, abandoned_path, _ready, release = start_owner('crashed')
+    release.write_text('crash', encoding='utf-8')
+    crashed.communicate(timeout=20)
+    assert crashed.returncode == 17
+    assert abandoned_path.exists()
+    recovered = CacheStore(root)
+    assert not abandoned_path.exists()
+    assert not abandoned_path.with_suffix('.lock').exists()
+    recovered.close()
+
+
+def test_two_processes_publish_same_destination_after_first_root_and_stage_barriers(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / 'cache'
     script = r'''
 import hashlib
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 from artisanlib.roastserver.api import DownloadReceipt
 from artisanlib.roastserver.cache import CacheStore
 from artisanlib.roastserver.contract import Namespace, parse_roast_detail
-root, namespace_json, payload_json, profile_hex, go = sys.argv[1:]
+root, namespace_json, payload_json, profile_hex, start, ready, go = sys.argv[1:]
+while not Path(start).exists():
+    time.sleep(0.01)
 namespace_data = json.loads(namespace_json)
 namespace = Namespace(namespace_data[0], UUID(namespace_data[1]), namespace_data[2])
 payload = json.loads(payload_json)
@@ -691,26 +1064,24 @@ store = CacheStore(Path(root))
 path, output = store.new_staging_file(namespace)
 with output:
     output.write(profile)
+Path(ready).touch()
 while not Path(go).exists():
-    pass
+    time.sleep(0.01)
 receipt = DownloadReceipt(detail.roast_uuid, revision.revision_number, revision.sha256,
                           revision.byte_size,
                           f'{detail.roast_uuid.hex}-r{revision.revision_number}.alog')
 store.publish(namespace, detail, receipt, path,
               datetime.fromisoformat('2026-08-01T12:34:56.123456+00:00'))
+store.close()
 '''
+    start = tmp_path / 'start'
     go = tmp_path / 'go'
     processes: list[subprocess.Popen[bytes]] = []
     namespace_json = json.dumps([NAMESPACE.origin, str(NAMESPACE.organization_id), NAMESPACE.key])
-    variants = (
-        (ROAST_UUID, b'process one'),
-        (OTHER_ROAST_UUID, b'process two'),
-    )
-    for roast_uuid, profile in variants:
-        payload_json = json.dumps(
-            detail_payload(roast_uuid=roast_uuid, profile_bytes=profile),
-            separators=(',', ':'),
-        )
+    profile = b'same destination bytes'
+    payload_json = json.dumps(detail_payload(profile_bytes=profile), separators=(',', ':'))
+    ready_paths = [tmp_path / f'ready-{index}' for index in range(2)]
+    for ready in ready_paths:
         processes.append(
             subprocess.Popen(
                 [
@@ -721,12 +1092,24 @@ store.publish(namespace, detail, receipt, path,
                     namespace_json,
                     payload_json,
                     profile.hex(),
+                    os.fspath(start),
+                    os.fspath(ready),
                     os.fspath(go),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
         )
+    start.touch()
+    for _attempt in range(500):
+        if all(path.exists() for path in ready_paths):
+            break
+        import time
+        time.sleep(0.01)
+    else:
+        for process in processes:
+            process.kill()
+        pytest.fail('publishers did not reach stage barrier')
     go.touch()
     failures: list[str] = []
     for process in processes:
@@ -735,9 +1118,84 @@ store.publish(namespace, detail, receipt, path,
             failures.append((stdout + stderr).decode('utf-8', errors='replace'))
     assert not failures
     reopened = CacheStore(root)
-    assert reopened.stats(NAMESPACE).revision_count == 2
-    for cached in reopened.list_offline(NAMESPACE, ArchiveFilters()).items:
-        assert reopened.validate(cached) == cached
+    assert reopened.stats(NAMESPACE).revision_count == 1
+    cached = reopened.list_offline(NAMESPACE, ArchiveFilters()).items[0]
+    assert reopened.validate(cached).path.read_bytes() == profile
+    reopened.close()
+
+
+def test_canonical_sidecar_requires_cached_revision_to_equal_roast_revision_count(
+    cache: CacheStore, cached_revision: CachedRevision
+) -> None:
+    sidecar = json.loads(cached_revision.sidecar_path.read_bytes())
+    sidecar['roast']['revision_count'] = 2
+    cached_revision.sidecar_path.write_bytes(
+        json.dumps(sidecar, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+    )
+    with pytest.raises(CacheError):
+        cache.stats(NAMESPACE)
+
+
+def test_cache_metadata_round_trip_distinguishes_objects_empty_and_pair_arrays(
+    cache: CacheStore,
+) -> None:
+    metadata: dict[str, object] = {
+        'empty_array': [],
+        'empty_object': {},
+        'pair_array': [['key', 1]],
+        'nested': [[], {}, [['nested-key', 2]]],
+    }
+    detail = make_detail(metadata=metadata)
+    staged = stage_bytes(cache, NAMESPACE, PROFILE_BYTES)
+    cached = cache.publish(NAMESPACE, detail, RECEIPT, staged, NOW)
+
+    sidecar = json.loads(cached.sidecar_path.read_bytes())
+    assert sidecar['revision']['metadata'] == metadata
+    assert cache.validate(cached).revision.metadata == detail.current_metadata
+
+
+def test_cache_and_api_share_exact_filter_validation_semantics(cache: CacheStore) -> None:
+    publish_revision(cache, title='Needle')
+    assert cache.list_offline(NAMESPACE, ArchiveFilters(search=' Needle ')).items == ()
+    invalid = (
+        ArchiveFilters(search=''),
+        ArchiveFilters(search='x' * 201),
+        ArchiveFilters(state='unknown'),  # type: ignore[arg-type]
+        ArchiveFilters(machine=''),
+        ArchiveFilters(machine='x' * 101),
+    )
+    for filters in invalid:
+        with pytest.raises(ValueError):
+            cache.list_offline(NAMESPACE, filters)
+
+
+def test_replace_generated_closes_source_descriptor_when_destination_open_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'root'
+    source_directory = root / 'source'
+    destination_directory = root / 'destination'
+    source_directory.mkdir(parents=True)
+    destination_directory.mkdir()
+    source = source_directory / 'source.part'
+    destination = destination_directory / 'destination.alog'
+    source.write_bytes(b'profile')
+    opened: list[int] = []
+    original_open = filesystem_module.open_generated_directory
+
+    def fail_destination(open_root: Path, directory: Path, **kwargs: Any) -> int:
+        if directory == destination_directory:
+            raise filesystem_module.FilesystemError('injected destination open failure')
+        descriptor = original_open(open_root, directory, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(filesystem_module, 'open_generated_directory', fail_destination)
+    with pytest.raises(filesystem_module.FilesystemError):
+        filesystem_module.replace_generated(root, source, destination)
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
 
 
 def test_cache_error_redacts_os_paths_controls_and_server_strings(
@@ -756,6 +1214,140 @@ def test_cache_error_redacts_os_paths_controls_and_server_strings(
     assert raised.value.__cause__ is None
     assert '/private' not in repr(raised.value)
     assert 'server-name' not in repr(raised.value)
+
+
+def test_portable_windows_seam_runs_complete_cache_publish_validate_and_remove_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native = PortableWindowsCacheNative()
+    monkeypatch.setattr(filesystem_module, '_IS_WINDOWS', True)
+    monkeypatch.setattr(filesystem_module, '_HAS_DIRECTORY_FDS', False)
+    monkeypatch.setattr(filesystem_module, '_WINDOWS_NATIVE', native)
+    def acquire(_descriptor: int) -> None:
+        return
+
+    def release(_descriptor: int) -> None:
+        return
+
+    def try_acquire(_descriptor: int) -> bool:
+        return True
+
+    monkeypatch.setattr(filesystem_module, 'acquire_file_lock', acquire)
+    monkeypatch.setattr(filesystem_module, 'release_file_lock', release)
+    monkeypatch.setattr(filesystem_module, 'try_acquire_file_lock', try_acquire)
+
+    store = CacheStore(tmp_path / 'cache')
+    cached = publish_revision(store)
+    assert store.validate(cached) == cached
+    stats = store.clear_unused(NAMESPACE, frozenset())
+    store.close()
+
+    assert stats.revision_count == 0
+    assert {destination.suffix for _source, destination in native.replacements} == {
+        '.alog',
+        '.json',
+    }
+    assert any(mode == 0o700 for _path, mode in native.permissions)
+    assert any(mode == 0o600 for _path, mode in native.permissions)
+    assert any(kind == 'descriptor' for kind, _value in native.flushes)
+    assert any(kind == 'directory' for kind, _value in native.flushes)
+    assert cached.path in native.removals
+    assert cached.sidecar_path in native.removals
+
+
+def test_portable_windows_full_store_rejects_native_reparse_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'cache'
+    namespace_directory = root / ('a' * 64)
+    namespace_directory.mkdir(parents=True)
+    native = PortableWindowsCacheNative()
+    native.reparse_path = namespace_directory
+    monkeypatch.setattr(filesystem_module, '_IS_WINDOWS', True)
+    monkeypatch.setattr(filesystem_module, '_HAS_DIRECTORY_FDS', False)
+    monkeypatch.setattr(filesystem_module, '_WINDOWS_NATIVE', native)
+
+    def acquire(_descriptor: int) -> None:
+        return
+
+    def release(_descriptor: int) -> None:
+        return
+
+    monkeypatch.setattr(filesystem_module, 'acquire_file_lock', acquire)
+    monkeypatch.setattr(filesystem_module, 'release_file_lock', release)
+
+    with pytest.raises(CacheError):
+        CacheStore(root)
+
+
+@pytest.mark.win32
+@pytest.mark.skipif(os.name != 'nt', reason='requires native Windows cache filesystem')
+def test_windows_runtime_cache_applies_acl_replaces_flushes_validates_and_deletes(
+    tmp_path: Path,
+) -> None:
+    store = CacheStore(tmp_path / 'cache')
+    cached = publish_revision(store)
+    filesystem_module.verify_private_permissions(store.root, 0o700)
+    filesystem_module.verify_private_permissions(cached.path, 0o600)
+    filesystem_module.verify_private_permissions(cached.sidecar_path, 0o600)
+    assert store.validate(cached) == cached
+    assert store.clear_unused(NAMESPACE, frozenset()).revision_count == 0
+    assert not cached.path.exists()
+    assert not cached.sidecar_path.exists()
+    store.close()
+
+
+@pytest.mark.win32
+@pytest.mark.skipif(os.name != 'nt', reason='requires native Windows reparse behavior')
+def test_windows_runtime_cache_rejects_reparse_namespace(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'cache'
+    outside = tmp_path / 'outside'
+    root.mkdir()
+    outside.mkdir()
+    namespace_directory = root / ('a' * 64)
+    try:
+        namespace_directory.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip('Windows symlink creation is unavailable')
+    with pytest.raises(CacheError):
+        CacheStore(root)
+    assert not list(outside.iterdir())
+
+
+def test_windows_nonblocking_stage_lock_uses_exact_contention_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / 'stage.lock'
+    lock_path.write_bytes(b'0')
+    descriptor = os.open(lock_path, os.O_RDWR)
+    calls: list[tuple[int, int, int]] = []
+    blocked = True
+
+    def locking(fd: int, mode: int, count: int) -> None:
+        calls.append((fd, mode, count))
+        if blocked:
+            raise OSError(errno.EACCES, 'lock is held')
+
+    fake_msvcrt = type(
+        'Msvcrt', (), {'locking': staticmethod(locking), 'LK_NBLCK': 7}
+    )
+    original_import = filesystem_module.importlib.import_module
+
+    def import_module(name: str) -> object:
+        if name == 'msvcrt':
+            return fake_msvcrt
+        return original_import(name)
+
+    monkeypatch.setattr(filesystem_module.importlib, 'import_module', import_module)
+    try:
+        assert not filesystem_module.try_acquire_file_lock(descriptor, is_windows=True)
+        blocked = False
+        assert filesystem_module.try_acquire_file_lock(descriptor, is_windows=True)
+    finally:
+        os.close(descriptor)
+    assert calls == [(descriptor, 7, 1), (descriptor, 7, 1)]
 
 
 def test_windows_replace_seam_is_write_through_and_replaces_atomically() -> None:

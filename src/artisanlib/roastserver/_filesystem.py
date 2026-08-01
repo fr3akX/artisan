@@ -1072,11 +1072,46 @@ def generated_entry_stat(root: Path, path: Path) -> os.stat_result:
         os.close(directory_fd)
 
 
+def open_generated_lock(root: Path, path: Path) -> int:
+    _relative_parts(root, path)
+    directory_fd = open_generated_directory(root, path.parent)
+    try:
+        if _IS_WINDOWS:
+            if not os.path.lexists(path):
+                _fail('generated lock is unavailable')
+            descriptor = require_windows_native().open_lock(path)
+        else:
+            flags = os.O_RDWR | getattr(os, 'O_CLOEXEC', 0)
+            flags |= getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+            if _HAS_DIRECTORY_FDS:
+                descriptor = os.open(path.name, flags, dir_fd=directory_fd)
+            else:
+                descriptor = os.open(path, flags)
+    except (FilesystemError, OSError):
+        _fail('generated lock contains a link or is unavailable')
+    finally:
+        os.close(directory_fd)
+    try:
+        lock_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(lock_stat.st_mode):
+            _fail('generated lock must be regular')
+        set_private_permissions(path, 0o600)
+        verify_private_permissions(path, 0o600)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def replace_generated(root: Path, source: Path, destination: Path) -> None:
     _relative_parts(root, source)
     _relative_parts(root, destination)
     source_directory_fd = open_generated_directory(root, source.parent)
-    destination_directory_fd = open_generated_directory(root, destination.parent)
+    try:
+        destination_directory_fd = open_generated_directory(root, destination.parent)
+    except BaseException:
+        os.close(source_directory_fd)
+        raise
     try:
         source_stat = (
             os.stat(source.name, dir_fd=source_directory_fd, follow_symlinks=False)
@@ -1249,6 +1284,40 @@ def acquire_file_lock(
         flock(descriptor, cast(int, module.__dict__['LOCK_EX']))
 
 
+def try_acquire_file_lock(
+    descriptor: int,
+    *,
+    is_windows: bool | None = None,
+) -> bool:
+    windows = _IS_WINDOWS if is_windows is None else is_windows
+    if windows:
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b'0')
+            fsync_descriptor(descriptor, is_windows=True)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        module = importlib.import_module('msvcrt')
+        locking = cast(Callable[[int, int, int], None], module.__dict__['locking'])
+        try:
+            locking(descriptor, cast(int, module.__dict__['LK_NBLCK']), 1)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        return True
+    module = importlib.import_module('fcntl')
+    flock = cast(Callable[[int, int], None], module.__dict__['flock'])
+    try:
+        flock(
+            descriptor,
+            cast(int, module.__dict__['LOCK_EX']) | cast(int, module.__dict__['LOCK_NB']),
+        )
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            return False
+        raise
+    return True
+
+
 def release_file_lock(
     descriptor: int,
     *,
@@ -1323,6 +1392,7 @@ __all__ = [
     'generated_entry_stat',
     'open_generated_directory',
     'open_generated_file',
+    'open_generated_lock',
     'open_path_readonly',
     'path_is_junction',
     'prepare_private_root',
@@ -1333,6 +1403,7 @@ __all__ = [
     'require_windows_native',
     'secure_unlink',
     'set_private_permissions',
+    'try_acquire_file_lock',
     'unlink_generated_file',
     'verify_private_permissions',
     'write_all',

@@ -179,15 +179,18 @@ Every lease creates a unique token. Complete, retry, and fail require `(job_id, 
 2. Strictly validate every item, label, timestamp, count, state, and next cursor.
 3. Fetch `/roasts/{uuid}` and require response identity/link consistency.
 4. Resolve the current revision and download `/revisions/{number}/download` with redirects disabled.
-5. Enforce the 16 MiB ceiling while hashing streamed bytes.
-6. Require exact content type, revision number, content-disposition name, byte count, and checksum headers.
-7. Compare computed SHA-256 to detail metadata and response headers.
-8. Validate the `.alog` through Artisan deserialization before making it visible as openable.
-9. Atomically publish the cache file and sidecar.
+5. Stream into a cache-generated `<token>.part` while the cache retains an exclusive OS lock on the paired `<token>.lock` for the complete stage lifecycle.
+6. Enforce the 16 MiB ceiling while hashing streamed bytes.
+7. Require exact content type, revision number, content-disposition name, byte count, and checksum headers.
+8. Compare computed SHA-256 to detail metadata and response headers.
+9. Validate the `.alog` through Artisan deserialization before making it visible as openable.
+10. Atomically publish the cache file and sidecar; successful or failed publication consumes the stage only after all cleanup attempts finish.
 
-A failure leaves the current Artisan profile untouched and removes temporary/corrupt data.
+A failure leaves the current Artisan profile untouched. Every profile, sidecar, publication temporary, and stage cleanup is attempted independently; the public result remains the fixed cache failure. Validation failure before publication calls `discard_staging()` explicitly. Worker shutdown calls `CacheStore.close()`, which discards every stage owned by that store and releases all lifecycle locks.
 
-Cache paths are namespaced by server and organization, then roast/revision/hash. Sidecars contain public metadata only. Cache pruning never deletes an open file or a file referenced by pending work.
+Cache paths are namespaced by server and organization, then roast/revision/hash. Sidecars contain public metadata only and require the cached revision number to equal the roast's current `revision_count`. Contract JSON uses immutable, explicitly tagged array values so empty arrays, empty objects, and pair-shaped arrays remain distinct and sidecar serialization is lossless. Cache pruning securely opens and retains every supplied protected regular-file identity before any deletion; missing, inaccessible, linked/reparse, non-regular, or changing protected paths abort the complete prune. Generated paths and hard-link aliases are protected by device/file identity. Pair and rollback cleanup removes only the exact owned pathname when its identity still matches, never a replacement pathname or every hard link.
+
+Stage creation and temporary-tree scans retain the global cache process lock. Maintenance never infers abandonment from timestamps: it attempts a nonblocking exclusive lock on each generated stage lock. Contended pairs survive regardless of mtime or wall-clock changes; an acquired lock proves the owner process exited, after which both generated pair paths are removed. A stage lock remains held across download, validation, publication or explicit discard, cleanup, and final release on POSIX and Windows.
 
 ## Read-only profile loading
 
@@ -215,11 +218,11 @@ The connector stores only the subset needed by `/aroast` and searchable revision
 - development time/ratio; and
 - selected non-sensitive roast descriptors supported by the compatible contract.
 
-Metadata is deterministic JSON, finite, safe-integer bounded, NUL-free, and capped below the server metadata limit. Unknown profile values are omitted rather than stringified. Exact `.alog` bytes remain authoritative.
+Metadata is deterministic JSON, finite, safe-integer bounded, NUL-free, and capped below the server metadata limit. Strict response contracts freeze JSON objects as sorted immutable key/value tuples and JSON arrays as immutable explicitly tagged array values; this preserves source shape for empty and pair-shaped containers. Unknown profile values are omitted rather than stringified. Exact `.alog` bytes remain authoritative.
 
 ## Qt lifecycle
 
-The controller is created after the main window and settings paths are ready. It owns one worker and one QThread. Startup opens/migrates the outbox, recovers leases, then starts processing only if enabled and credentialed. Shutdown requests interruption, wakes the worker, waits a bounded interval, closes SQLite, and never terminates a thread unsafely.
+The controller is created after the main window and settings paths are ready. It owns one worker and one QThread. Startup opens/migrates the outbox, recovers leases, then starts processing only if enabled and credentialed. Shutdown requests interruption, wakes the worker, waits a bounded interval, explicitly discards every cache stage, closes the cache and SQLite, and never terminates a thread unsafely.
 
 Dialogs call controller methods; they do not perform HTTP or direct queue writes. Worker signals carry immutable public result objects without credentials or response bodies.
 
@@ -262,7 +265,8 @@ Safe server validation messages may be retained when they match the versioned er
 - Retry classification and `Retry-After` bounds.
 - Strict v1 fingerprint/v2 migration, malformed schema/JSON/state rejection, multi-owner staging with real process barriers and abandoned expiry, duplicate enqueue, no-clobber/open-inode publication, tamper detection, fenced A/B leases, restart recovery, retry/failure/removal, fsync/permission failure, multiprocess cleanup, and snapshot job/stage reference tests.
 - Windows-marked runtime reparse/ACL/locking/publication/deletion tests plus platform-independent deterministic ctypes/native seams for exact ACL parsing, reparse rejection, write-capable flush success/failure, write-through no-replace publication, EEXIST reuse, and lock contention; non-Windows validation does not claim Windows runtime execution.
-- Cache publication, namespace isolation, corruption, checksum, pruning, and stale-open tests.
+- Cache publication, namespace isolation, corruption, checksum, pruning, stale-open, lossless tagged-JSON sidecar round trips, exact current-revision checks, fail-closed protected-path identity/race handling, and exhaustive identity-bound cleanup tests.
+- Real subprocess barriers for active old stages, owner discard, process-crash collection, first-root creation, and same-destination publication. Windows-marked runtime cache tests cover ACLs, reparse rejection, replacement, file/directory flush, locking, and deletion; portable full-flow native seams run on every platform, and Linux reports native Windows cases as skipped.
 - No-proxy and token-redaction tests.
 
 ### Qt
