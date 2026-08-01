@@ -42,16 +42,34 @@ MAX_JSON_BYTES: Final[int] = 2 * 1024 * 1024
 MAX_CURSOR_CHARS: Final[int] = 512
 JS_SAFE_INTEGER_MAX: Final[int] = 9_007_199_254_740_991
 POSTGRESQL_INTEGER_MAX: Final[int] = 2_147_483_647
+MAX_JSON_DEPTH: Final[int] = 64
+MAX_ERROR_MESSAGE_CODE_POINTS: Final[int] = 500
 
+_ROAST_STATE_VALUES: Final[frozenset[str]] = frozenset({'awaiting_profile', 'parsed', 'parse_failed'})
+_REVISION_PARSE_STATE_VALUES: Final[frozenset[str]] = frozenset({'parsed', 'failed'})
+_UPLOAD_STATE_VALUES: Final[frozenset[str]] = frozenset({'parsed', 'parse_failed'})
 _ROLE_VALUES: Final[frozenset[str]] = frozenset({'admin', 'member'})
-_STATE_VALUES: Final[frozenset[str]] = frozenset({'awaiting_profile', 'parsed', 'parse_failed'})
 _TEMPERATURE_UNIT_VALUES: Final[frozenset[str]] = frozenset({'C', 'F'})
+_LABEL_COLOR_VALUES: Final[frozenset[str]] = frozenset(
+    {'slate', 'red', 'orange', 'amber', 'green', 'teal', 'blue', 'violet'}
+)
 _HYPHENATED_UUID_RE: Final[re.Pattern[str]] = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 )
 _HEX_UUID_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{64}$')
-_LABEL_COLOR_RE: Final[re.Pattern[str]] = re.compile(r'^#[0-9a-fA-F]{6}$')
+_TIMESTAMP_RE: Final[re.Pattern[str]] = re.compile(
+    r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$'
+)
+
+
+type FrozenJsonScalar = None | bool | int | float | str
+type FrozenJsonObject = tuple[tuple[str, 'JsonValue'], ...]
+type JsonValue = FrozenJsonScalar | tuple['JsonValue', ...] | FrozenJsonObject
+type RoastState = Literal['awaiting_profile', 'parsed', 'parse_failed']
+type RevisionParseState = Literal['parsed', 'failed']
+type UploadState = Literal['parsed', 'parse_failed']
+type LabelColor = Literal['slate', 'red', 'orange', 'amber', 'green', 'teal', 'blue', 'violet']
 
 
 class ContractError(ValueError):
@@ -83,10 +101,6 @@ FAILURE_MESSAGES: Final[dict[FailureKind, str]] = {
     FailureKind.KEYRING: 'Operating-system keyring unavailable.',
 }
 
-type FrozenJsonScalar = None | bool | int | float | str
-type FrozenJsonObject = tuple[tuple[str, 'JsonValue'], ...]
-type JsonValue = FrozenJsonScalar | tuple['JsonValue', ...] | FrozenJsonObject
-
 
 @dataclass(frozen=True, slots=True)
 class PublicFailure:
@@ -106,7 +120,7 @@ class Namespace:
 @dataclass(frozen=True, slots=True)
 class ArchiveFilters:
     search: str | None = None
-    state: Literal['awaiting_profile', 'parsed', 'parse_failed'] | None = None
+    state: RoastState | None = None
     machine: str | None = None
     roast_at_from: datetime | None = None
     roast_at_to: datetime | None = None
@@ -146,7 +160,7 @@ class ServerIdentity:
 class LabelSummary:
     label_uuid: UUID
     name: str
-    color: str
+    color: LabelColor
     archived: bool
 
 
@@ -156,7 +170,7 @@ class Revision:
     sha256: str
     byte_size: int
     parser_version: str | None
-    parse_state: Literal['awaiting_profile', 'parsed', 'parse_failed']
+    parse_state: RevisionParseState
     parse_diagnostic_code: str | None
     parse_diagnostic_message: str | None
     uploaded_at: datetime
@@ -167,7 +181,7 @@ class Revision:
 @dataclass(frozen=True, slots=True)
 class RoastSummary:
     roast_uuid: UUID
-    state: Literal['awaiting_profile', 'parsed', 'parse_failed']
+    state: RoastState
     roast_at: datetime
     title: str | None
     batch_prefix: str | None
@@ -201,7 +215,7 @@ class RoastDetailLinks:
 @dataclass(frozen=True, slots=True)
 class RoastDetail:
     roast_uuid: UUID
-    state: Literal['awaiting_profile', 'parsed', 'parse_failed']
+    state: RoastState
     roast_at: datetime
     title: str | None
     batch_prefix: str | None
@@ -233,7 +247,7 @@ class RevisionUploadLinks:
 @dataclass(frozen=True, slots=True)
 class RevisionUpload:
     roast_uuid: UUID
-    state: Literal['awaiting_profile', 'parsed', 'parse_failed']
+    state: UploadState
     revision: Revision
     links: RevisionUploadLinks
 
@@ -272,28 +286,49 @@ def _exact_object(value: object, keys: frozenset[str]) -> dict[str, object]:
     return value
 
 
-def _parse_bool(value: object) -> bool:
-    if not isinstance(value, bool):
-        _fail()
-    return value
+def _has_prohibited_string_code_point(text: str, *, reject_controls: bool) -> bool:
+    for char in text:
+        code_point = ord(char)
+        if code_point == 0 or 0xD800 <= code_point <= 0xDFFF:
+            return True
+        if reject_controls and (code_point < 0x20 or 0x7F <= code_point <= 0x9F):
+            return True
+    return False
 
 
-def _parse_required_string(value: object, *, allow_empty: bool = False, max_length: int | None = None) -> str:
+def _parse_required_string(
+    value: object,
+    *,
+    allow_empty: bool = False,
+    max_length: int | None = None,
+    reject_controls: bool = False,
+) -> str:
     if not isinstance(value, str):
-        _fail()
-    if '\x00' in value:
         _fail()
     if not allow_empty and value == '':
         _fail()
     if max_length is not None and len(value) > max_length:
         _fail()
+    if _has_prohibited_string_code_point(value, reject_controls=reject_controls):
+        _fail()
     return value
 
 
-def _parse_optional_string(value: object, *, max_length: int | None = None) -> str | None:
+def _parse_optional_string(
+    value: object,
+    *,
+    max_length: int | None = None,
+    reject_controls: bool = False,
+) -> str | None:
     if value is None:
         return None
-    return _parse_required_string(value, max_length=max_length)
+    return _parse_required_string(value, max_length=max_length, reject_controls=reject_controls)
+
+
+def _parse_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        _fail()
+    return value
 
 
 def _parse_safe_int(value: object, *, minimum: int | None = None, maximum: int = JS_SAFE_INTEGER_MAX) -> int:
@@ -317,7 +352,15 @@ def _parse_optional_float(value: object) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int | float):
         _fail()
-    number = float(value)
+    if isinstance(value, int):
+        if abs(value) > JS_SAFE_INTEGER_MAX:
+            _fail()
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ContractError from exc
+    else:
+        number = value
     if not math.isfinite(number):
         _fail()
     return number
@@ -325,10 +368,11 @@ def _parse_optional_float(value: object) -> float | None:
 
 def _parse_aware_datetime(value: object) -> datetime:
     text = _parse_required_string(value)
-    if text.endswith('Z'):
-        text = text[:-1] + '+00:00'
+    if _TIMESTAMP_RE.fullmatch(text) is None:
+        _fail()
+    normalized = text[:-1] + '+00:00' if text.endswith('Z') else text
     try:
-        parsed = datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise ContractError from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
@@ -376,11 +420,25 @@ def _parse_role(value: object) -> Literal['admin', 'member']:
     return cast(Literal['admin', 'member'], text)
 
 
-def _parse_state(value: object) -> Literal['awaiting_profile', 'parsed', 'parse_failed']:
+def _parse_roast_state(value: object) -> RoastState:
     text = _parse_required_string(value)
-    if text not in _STATE_VALUES:
+    if text not in _ROAST_STATE_VALUES:
         _fail()
-    return cast(Literal['awaiting_profile', 'parsed', 'parse_failed'], text)
+    return cast(RoastState, text)
+
+
+def _parse_revision_parse_state(value: object) -> RevisionParseState:
+    text = _parse_required_string(value)
+    if text not in _REVISION_PARSE_STATE_VALUES:
+        _fail()
+    return cast(RevisionParseState, text)
+
+
+def _parse_upload_state(value: object) -> UploadState:
+    text = _parse_required_string(value)
+    if text not in _UPLOAD_STATE_VALUES:
+        _fail()
+    return cast(UploadState, text)
 
 
 def _parse_temperature_unit(value: object) -> Literal['C', 'F'] | None:
@@ -392,9 +450,76 @@ def _parse_temperature_unit(value: object) -> Literal['C', 'F'] | None:
     return cast(Literal['C', 'F'], text)
 
 
-def _freeze_json(value: object, *, depth: int = 1) -> JsonValue:
-    if depth > 64:
+def _parse_label_color(value: object) -> LabelColor:
+    text = _parse_required_string(value)
+    if text not in _LABEL_COLOR_VALUES:
         _fail()
+    return cast(LabelColor, text)
+
+
+def _expected_revision_parse_state(state: UploadState) -> RevisionParseState:
+    return 'parsed' if state == 'parsed' else 'failed'
+
+
+def _validate_roast_state_count(state: RoastState, revision_count: int) -> None:
+    if state == 'awaiting_profile':
+        if revision_count != 0:
+            _fail()
+        return
+    if revision_count < 1:
+        _fail()
+
+
+def _validate_json_scalar(value: object, *, reject_string_controls: bool) -> None:
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        if abs(value) > JS_SAFE_INTEGER_MAX:
+            _fail()
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            _fail()
+        return
+    if isinstance(value, str):
+        if _has_prohibited_string_code_point(value, reject_controls=reject_string_controls):
+            _fail()
+        return
+    _fail()
+
+
+def _validate_json_graph(value: object, *, reject_string_controls: bool) -> None:
+    stack: list[tuple[object, int, bool]] = [(value, 1, False)]
+    active_container_ids: set[int] = set()
+    while stack:
+        current, depth, exiting = stack.pop()
+        if isinstance(current, list | dict):
+            container_id = id(current)
+            if exiting:
+                active_container_ids.remove(container_id)
+                continue
+            if depth > MAX_JSON_DEPTH:
+                _fail()
+            if container_id in active_container_ids:
+                _fail()
+            active_container_ids.add(container_id)
+            stack.append((current, depth, True))
+            if isinstance(current, list):
+                for item in reversed(current):
+                    stack.append((item, depth + 1, False))
+            else:
+                items = list(current.items())
+                for key, item in reversed(items):
+                    if not isinstance(key, str):
+                        _fail()
+                    if _has_prohibited_string_code_point(key, reject_controls=reject_string_controls):
+                        _fail()
+                    stack.append((item, depth + 1, False))
+            continue
+        _validate_json_scalar(current, reject_string_controls=reject_string_controls)
+
+
+def _canonicalize_json_value(value: object, *, reject_string_controls: bool) -> object:
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -406,53 +531,74 @@ def _freeze_json(value: object, *, depth: int = 1) -> JsonValue:
             _fail()
         return value
     if isinstance(value, str):
-        if '\x00' in value:
+        if _has_prohibited_string_code_point(value, reject_controls=reject_string_controls):
             _fail()
         return value
     if isinstance(value, list):
-        return tuple(_freeze_json(item, depth=depth + 1) for item in value)
+        return [
+            _canonicalize_json_value(item, reject_string_controls=reject_string_controls)
+            for item in value
+        ]
     if isinstance(value, dict):
-        items: list[tuple[str, JsonValue]] = []
-        for key, item in value.items():
+        canonical: dict[str, object] = {}
+        for key in sorted(value):
             if not isinstance(key, str):
                 _fail()
-            items.append((key, _freeze_json(item, depth=depth + 1)))
-        return tuple(items)
+            if _has_prohibited_string_code_point(key, reject_controls=reject_string_controls):
+                _fail()
+            canonical[key] = _canonicalize_json_value(
+                value[key], reject_string_controls=reject_string_controls
+            )
+        return canonical
     _fail()
+
+
+def _freeze_canonical_json(value: object) -> JsonValue:
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, list):
+        return tuple(_freeze_canonical_json(item) for item in value)
+    if isinstance(value, dict):
+        return tuple((key, _freeze_canonical_json(item)) for key, item in value.items())
+    _fail()
+
+
+def _canonical_json(value: object, *, reject_string_controls: bool) -> object:
+    _validate_json_graph(value, reject_string_controls=reject_string_controls)
+    return _canonicalize_json_value(value, reject_string_controls=reject_string_controls)
 
 
 def _metadata_object(value: object) -> FrozenJsonObject:
     if not isinstance(value, dict):
         _fail()
+    canonical = _canonical_json(value, reject_string_controls=False)
     try:
-        encoded = json.dumps(value, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-    except (TypeError, ValueError) as exc:
+        encoded = json.dumps(
+            canonical,
+            separators=(',', ':'),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode('utf-8')
+    except (RecursionError, TypeError, ValueError, UnicodeEncodeError) as exc:
         raise ContractError from exc
     if len(encoded) > MAX_METADATA_BYTES:
         _fail()
-    frozen = _freeze_json(value)
+    frozen = _freeze_canonical_json(canonical)
     if not isinstance(frozen, tuple):
         _fail()
     return cast(FrozenJsonObject, frozen)
 
 
 def _safe_public_string(value: object, *, max_length: int) -> str:
-    text = _parse_required_string(value, max_length=max_length)
-    for char in text:
-        if ord(char) < 32 or ord(char) == 127:
-            _fail()
-    return text
+    return _parse_required_string(value, max_length=max_length, reject_controls=True)
 
 
 def _parse_label(value: object) -> LabelSummary:
     mapping = _exact_object(value, frozenset({'label_uuid', 'name', 'color', 'archived'}))
-    color = _parse_required_string(mapping['color'])
-    if _LABEL_COLOR_RE.fullmatch(color) is None:
-        _fail()
     return LabelSummary(
         label_uuid=_parse_hex_uuid(mapping['label_uuid']),
         name=_parse_required_string(mapping['name']),
-        color=color,
+        color=_parse_label_color(mapping['color']),
         archived=_parse_bool(mapping['archived']),
     )
 
@@ -480,7 +626,7 @@ def _parse_revision(value: object) -> Revision:
         sha256=_parse_sha256(mapping['sha256']),
         byte_size=_parse_safe_int(mapping['byte_size'], minimum=0, maximum=MAX_PROFILE_BYTES),
         parser_version=_parse_optional_string(mapping['parser_version']),
-        parse_state=_parse_state(mapping['parse_state']),
+        parse_state=_parse_revision_parse_state(mapping['parse_state']),
         parse_diagnostic_code=_parse_optional_string(mapping['parse_diagnostic_code']),
         parse_diagnostic_message=_parse_optional_string(mapping['parse_diagnostic_message']),
         uploaded_at=_parse_aware_datetime(mapping['uploaded_at']),
@@ -517,9 +663,12 @@ def _parse_roast_summary(value: object) -> RoastSummary:
     labels_raw = mapping['labels']
     if not isinstance(labels_raw, list):
         _fail()
+    state = _parse_roast_state(mapping['state'])
+    revision_count = _parse_safe_int(mapping['revision_count'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX)
+    _validate_roast_state_count(state, revision_count)
     return RoastSummary(
         roast_uuid=_parse_hex_uuid(mapping['roast_uuid']),
-        state=_parse_state(mapping['state']),
+        state=state,
         roast_at=_parse_aware_datetime(mapping['roast_at']),
         title=_parse_optional_string(mapping['title']),
         batch_prefix=_parse_optional_string(mapping['batch_prefix']),
@@ -532,10 +681,24 @@ def _parse_roast_summary(value: object) -> RoastSummary:
         duration_seconds=_parse_optional_int(mapping['duration_seconds'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
         green_weight_kg=_parse_optional_float(mapping['green_weight_kg']),
         roasted_weight_kg=_parse_optional_float(mapping['roasted_weight_kg']),
-        revision_count=_parse_safe_int(mapping['revision_count'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
+        revision_count=revision_count,
         updated_at=_parse_aware_datetime(mapping['updated_at']),
         labels=tuple(_parse_label(item) for item in labels_raw),
     )
+
+
+def _parse_error_details(value: object) -> JsonValue:
+    canonical = _canonical_json(value, reject_string_controls=True)
+    return _freeze_canonical_json(canonical)
+
+
+def _reject_duplicate_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('duplicate key')
+        value[key] = item
+    return value
 
 
 def parse_identity(value: object) -> ServerIdentity:
@@ -568,10 +731,7 @@ def parse_roast_page(value: object) -> RoastPage:
         next_cursor = None
     else:
         next_cursor = _parse_required_string(next_cursor_value, max_length=MAX_CURSOR_CHARS)
-    return RoastPage(
-        items=tuple(_parse_roast_summary(item) for item in items_raw),
-        next_cursor=next_cursor,
-    )
+    return RoastPage(items=tuple(_parse_roast_summary(item) for item in items_raw), next_cursor=next_cursor)
 
 
 def parse_roast_detail(value: object) -> RoastDetail:
@@ -634,14 +794,17 @@ def parse_roast_detail(value: object) -> RoastDetail:
     if self_path != expected_base or chart != f'{expected_base}/chart' or revisions != f'{expected_base}/revisions':
         _fail()
     if summary.state == 'awaiting_profile':
-        if summary.revision_count != 0 or current_revision is not None or current_metadata != ():
+        if current_revision is not None or current_metadata != ():
             _fail()
     else:
+        expected_revision_state: RevisionParseState = (
+            'parsed' if summary.state == 'parsed' else 'failed'
+        )
         if current_revision is None:
             _fail()
-        if summary.revision_count < 1 or current_revision.revision_number != summary.revision_count:
+        if current_revision.revision_number != summary.revision_count:
             _fail()
-        if current_revision.parse_state != summary.state:
+        if current_revision.parse_state != expected_revision_state:
             _fail()
         if current_revision.metadata != current_metadata:
             _fail()
@@ -672,9 +835,9 @@ def parse_roast_detail(value: object) -> RoastDetail:
 def parse_revision_upload(value: object) -> RevisionUpload:
     mapping = _exact_object(value, frozenset({'roast_uuid', 'state', 'revision', 'links'}))
     roast_uuid = _parse_hex_uuid(mapping['roast_uuid'])
-    state = _parse_state(mapping['state'])
+    state = _parse_upload_state(mapping['state'])
     revision = _parse_revision(mapping['revision'])
-    if revision.parse_state != state:
+    if revision.parse_state != _expected_revision_parse_state(state):
         _fail()
     links_mapping = _exact_object(mapping['links'], frozenset({'roast', 'chart', 'revisions', 'download'}))
     expected_base = f'/api/v1/roasts/{roast_uuid.hex}'
@@ -722,18 +885,15 @@ def parse_error_envelope(body: object) -> ServerError | None:
         return None
     try:
         text = body.decode('utf-8')
-    except UnicodeDecodeError:
-        return None
-    if '\x00' in text:
-        return None
-    try:
-        value = json.loads(text)
+        value = json.loads(text, object_pairs_hook=_reject_duplicate_object_pairs)
         mapping = _exact_object(value, frozenset({'error'}))
         error_mapping = _exact_object(mapping['error'], frozenset({'code', 'message', 'details'}))
         code = _safe_public_string(error_mapping['code'], max_length=100)
-        message = _safe_public_string(error_mapping['message'], max_length=500)
-        details = _freeze_json(error_mapping['details'])
-    except (ContractError, TypeError, ValueError, json.JSONDecodeError):
+        message = _safe_public_string(
+            error_mapping['message'], max_length=MAX_ERROR_MESSAGE_CODE_POINTS
+        )
+        details = _parse_error_details(error_mapping['details'])
+    except (ContractError, RecursionError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return ServerError(code=code, message=message, details=details)
 
