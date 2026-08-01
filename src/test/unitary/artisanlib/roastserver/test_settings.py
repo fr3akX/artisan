@@ -9,6 +9,7 @@ from PyQt6.QtCore import QByteArray, QCoreApplication, QSettings
 import pytest
 
 from artisanlib.roastserver.contract import IdentityOrganization, IdentityUser, ServerIdentity
+from artisanlib.roastserver.origin import canonical_origin as origin_canonical_origin
 from artisanlib.roastserver.settings import (
     DEFAULT_CACHE_LIMIT_BYTES,
     DEFAULT_ORIGIN,
@@ -120,6 +121,7 @@ def _secret() -> str:
     ],
 )
 def test_canonical_origin(raw: str, expected: str) -> None:
+    assert canonical_origin is origin_canonical_origin
     assert canonical_origin(raw) == expected
 
 

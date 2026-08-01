@@ -33,10 +33,11 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 import hashlib
 import hmac
+from io import SEEK_END
 import json
 import math
 import re
-from typing import BinaryIO, Final, NoReturn, TypeVar, cast, override
+from typing import BinaryIO, Final, NoReturn, Protocol, TypeVar, cast, override, runtime_checkable
 from uuid import UUID
 
 import requests
@@ -64,22 +65,49 @@ from artisanlib.roastserver.contract import (
     parse_roast_detail,
     parse_roast_page,
 )
-from artisanlib.roastserver.settings import canonical_origin
+from artisanlib.roastserver.origin import canonical_origin
 
 CONNECT_TIMEOUT_SECONDS: Final[float] = 4.0
 READ_TIMEOUT_SECONDS: Final[float] = 10.0
 MAX_RETRY_AFTER_SECONDS: Final[int] = 3600
 
 _RESPONSE_CHUNK_BYTES: Final[int] = 64 * 1024
-_UPLOAD_READ_BYTES: Final[int] = 64 * 1024
 _JSON_CONTENT_TYPE: Final[str] = 'application/json'
 _PROFILE_CONTENT_TYPE: Final[str] = 'application/x-artisan-profile'
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{64}$')
 _ALLOWED_ROAST_STATES: Final[frozenset[str]] = frozenset(
     {'awaiting_profile', 'parsed', 'parse_failed'}
 )
+_FIXED_SESSION_HEADERS: Final[dict[str, str]] = {
+    'Accept-Encoding': 'identity',
+    'Cache-Control': 'no-store',
+    'User-Agent': f'Artisan/{__version__}',
+}
+_SECURITY_RESPONSE_HEADERS: Final[tuple[str, ...]] = (
+    'Content-Encoding',
+    'Transfer-Encoding',
+    'Content-Length',
+    'Content-Type',
+    'Content-Disposition',
+    'X-Revision-Number',
+    'X-Content-SHA256',
+    'X-Checksum-SHA256',
+    'ETag',
+    'Retry-After',
+    'Location',
+)
 
 _ResultT = TypeVar('_ResultT')
+
+
+@runtime_checkable
+class _GetListHeaders(Protocol):
+    def getlist(self, name: str) -> object: ...
+
+
+@runtime_checkable
+class _GetAllHeaders(Protocol):
+    def get_all(self, name: str) -> object: ...
 
 
 class ApiFailure(RuntimeError):
@@ -121,8 +149,7 @@ class RoastServerClient:
         self._origin = canonical_origin(origin)
         self._credential = credential
         self._session = session if session is not None else requests.Session()
-        self._session.trust_env = False
-        self._session.cookies.clear()
+        _sanitize_session(self._session)
 
     @override
     def __repr__(self) -> str:
@@ -134,7 +161,7 @@ class RoastServerClient:
             self._require_status(response, frozenset({200}))
             return self._parse_json_response(response, parse_identity)
         finally:
-            response.close()
+            _close_response(response)
 
     def post_aroast(self, roast_uuid: UUID, aroast_json: bytes) -> None:
         _require_bounded_bytes(aroast_json, maximum=MAX_JSON_BYTES, name='aroast JSON')
@@ -150,7 +177,7 @@ class RoastServerClient:
             if acknowledgement.result.roast_id != roast_uuid:
                 raise _fixed_api_failure(FailureKind.INVALID_RESPONSE, status_code=200)
         finally:
-            response.close()
+            _close_response(response)
 
     def upload_revision(
         self,
@@ -173,7 +200,9 @@ class RoastServerClient:
             maximum=MAX_METADATA_BYTES,
             name='revision metadata',
         )
-        snapshot_size, snapshot_sha256 = _snapshot_size_and_sha256(snapshot)
+        snapshot_bytes = _freeze_snapshot(snapshot)
+        snapshot_size = len(snapshot_bytes)
+        snapshot_sha256 = hashlib.sha256(snapshot_bytes).hexdigest()
         if not hmac.compare_digest(snapshot_sha256, sha256):
             raise _fixed_api_failure(FailureKind.LOCAL_PROFILE, status_code=None)
 
@@ -182,10 +211,10 @@ class RoastServerClient:
             'idempotency_key': idempotency_key,
             'metadata': metadata_json,
         }
-        files: dict[str, tuple[str, BinaryIO, str]] = {
+        files: dict[str, tuple[str, bytes, str]] = {
             'profile': (
                 f'{roast_uuid.hex}.alog',
-                snapshot,
+                snapshot_bytes,
                 _PROFILE_CONTENT_TYPE,
             )
         }
@@ -210,7 +239,7 @@ class RoastServerClient:
                 )
             return result
         finally:
-            response.close()
+            _close_response(response)
 
     def list_roasts(
         self,
@@ -266,7 +295,7 @@ class RoastServerClient:
             self._require_status(response, frozenset({200}))
             return self._parse_json_response(response, parse_roast_page)
         finally:
-            response.close()
+            _close_response(response)
 
     def get_roast(self, roast_uuid: UUID) -> RoastDetail:
         response = self._request(
@@ -284,7 +313,7 @@ class RoastServerClient:
                 )
             return detail
         finally:
-            response.close()
+            _close_response(response)
 
     def download_revision(
         self,
@@ -294,6 +323,7 @@ class RoastServerClient:
         revision = detail.current_revision
         if revision is None:
             raise _fixed_api_failure(FailureKind.INVALID_RESPONSE, status_code=None)
+        _prepare_empty_destination(destination)
         filename = f'{detail.roast_uuid.hex}-r{revision.revision_number}.alog'
         path = (
             f'/api/v1/roasts/{detail.roast_uuid.hex}/revisions/'
@@ -309,9 +339,8 @@ class RoastServerClient:
                 expected_revision_number=revision.revision_number,
                 expected_filename=filename,
             )
-            byte_count, downloaded_sha256 = _stream_profile(
+            profile_bytes, downloaded_sha256 = _stage_profile(
                 response,
-                destination,
                 expected_byte_count=revision.byte_size,
             )
             if not hmac.compare_digest(downloaded_sha256, revision.sha256):
@@ -319,15 +348,16 @@ class RoastServerClient:
                     FailureKind.CHECKSUM_MISMATCH,
                     status_code=response.status_code,
                 )
+            _commit_profile(destination, profile_bytes)
             return DownloadReceipt(
                 roast_uuid=detail.roast_uuid,
                 revision_number=revision.revision_number,
                 sha256=downloaded_sha256,
-                byte_count=byte_count,
+                byte_count=len(profile_bytes),
                 filename=filename,
             )
         finally:
-            response.close()
+            _close_response(response)
 
     def _request(
         self,
@@ -336,17 +366,13 @@ class RoastServerClient:
         *,
         params: Mapping[str, str | int] | None = None,
         data: Mapping[str, str | bytes] | None = None,
-        files: Mapping[str, tuple[str, BinaryIO, str]] | None = None,
+        files: Mapping[str, tuple[str, bytes, str]] | None = None,
         json_bytes: bytes | None = None,
         stream: bool = False,
     ) -> requests.Response:
         url = self._same_origin_url(path)
-        headers = {
-            'Accept-Encoding': 'identity',
-            'Authorization': f'Bearer {self._credential}',
-            'Cache-Control': 'no-store',
-            'User-Agent': f'Artisan/{__version__}',
-        }
+        headers = dict(_FIXED_SESSION_HEADERS)
+        headers['Authorization'] = f'Bearer {self._credential}'
         request_data: Mapping[str, str | bytes] | bytes | None = data
         if json_bytes is not None:
             if data is not None or files is not None:
@@ -354,7 +380,7 @@ class RoastServerClient:
             headers['Content-Type'] = _JSON_CONTENT_TYPE
             request_data = json_bytes
 
-        self._session.cookies.clear()
+        _sanitize_session(self._session)
         request_failure: ApiFailure | None = None
         response: requests.Response | None = None
         try:
@@ -370,12 +396,26 @@ class RoastServerClient:
                 allow_redirects=False,
                 timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
             )
-        except requests.RequestException as error:
-            request_failure = _transport_api_failure(error)
+        except Exception as error:
+            request_failure = _request_api_failure(error)
         if request_failure is not None:
             raise request_failure
         if response is None:
             raise _fixed_api_failure(FailureKind.INVALID_RESPONSE, status_code=None)
+
+        sanitization_failure: ApiFailure | None = None
+        try:
+            _sanitize_session(self._session)
+        except ApiFailure as error:
+            sanitization_failure = error
+        if sanitization_failure is not None:
+            _close_response(response)
+            raise sanitization_failure
+
+        security_failure = _response_security_failure(response)
+        if security_failure is not None:
+            _close_response(response)
+            raise security_failure
         return response
 
     def _same_origin_url(self, path: str) -> str:
@@ -502,6 +542,7 @@ class RoastServerClient:
             or headers.get('Content-Disposition')
             != f'attachment; filename="{expected_filename}"'
             or headers.get('X-Revision-Number') != str(expected_revision_number)
+            or headers.get('Transfer-Encoding') is not None
         )
         try:
             content_length = _strict_content_length(
@@ -532,6 +573,85 @@ class RoastServerClient:
 
 
 type ClientFactory = Callable[[str, str], RoastServerClient]
+
+
+def _sanitize_session(session: requests.Session) -> None:
+    failed = False
+    try:
+        session.trust_env = False
+        session.proxies = {}
+        session.auth = None
+        session.cookies.clear()
+        session.params = {}
+        session.hooks = {'response': []}
+        session.headers.clear()
+        session.headers.update(_FIXED_SESSION_HEADERS)
+        session.cert = None
+        session.verify = True
+        session.stream = False
+    except Exception:
+        failed = True
+    if failed:
+        raise _fixed_api_failure(
+            FailureKind.INVALID_RESPONSE,
+            status_code=None,
+            code='request_error',
+        )
+
+
+def _request_api_failure(error: Exception) -> ApiFailure:
+    if isinstance(error, requests.RequestException):
+        return _transport_api_failure(error)
+    return _fixed_api_failure(
+        FailureKind.INVALID_RESPONSE,
+        status_code=None,
+        code='request_error',
+    )
+
+
+def _raw_header_values(response: requests.Response, name: str) -> tuple[str, ...] | None:
+    raw_headers = getattr(response.raw, 'headers', None)
+    if isinstance(raw_headers, _GetListHeaders):
+        values = raw_headers.getlist(name)
+    elif isinstance(raw_headers, _GetAllHeaders):
+        values = raw_headers.get_all(name)
+    else:
+        return None
+    if values is None:
+        return ()
+    if not isinstance(values, list | tuple) or not all(
+        isinstance(value, str) for value in values
+    ):
+        raise _ResponseBodyError
+    return tuple(cast(str, value) for value in values)
+
+
+def _response_security_failure(response: requests.Response) -> ApiFailure | None:
+    invalid = False
+    try:
+        for name in _SECURITY_RESPONSE_HEADERS:
+            values = _raw_header_values(response, name)
+            if values is not None and len(values) > 1:
+                invalid = True
+                break
+        content_encoding = response.headers.get('Content-Encoding')
+        if content_encoding is not None and content_encoding != 'identity':
+            invalid = True
+    except Exception:
+        invalid = True
+    if invalid:
+        return _fixed_api_failure(
+            FailureKind.INVALID_RESPONSE,
+            status_code=response.status_code,
+        )
+    return None
+
+
+def _close_response(response: requests.Response) -> None:
+    try:
+        response.close()
+    except Exception:
+        pass
 
 
 def _fixed_api_failure(
@@ -606,6 +726,7 @@ def _bounded_body(response: requests.Response, maximum: int) -> bytes:
     )
     body = bytearray()
     stream_failure: ApiFailure | None = None
+    body_error = False
     try:
         for chunk in response.iter_content(chunk_size=_RESPONSE_CHUNK_BYTES):
             if not isinstance(chunk, bytes):
@@ -615,8 +736,17 @@ def _bounded_body(response: requests.Response, maximum: int) -> bytes:
             if len(body) + len(chunk) > maximum:
                 raise _ResponseBodyError
             body.extend(chunk)
+    except _ResponseBodyError:
+        body_error = True
     except requests.RequestException as error:
         stream_failure = _transport_api_failure(error)
+    except Exception:
+        stream_failure = _fixed_api_failure(
+            FailureKind.INVALID_RESPONSE,
+            status_code=response.status_code,
+        )
+    if body_error:
+        raise _ResponseBodyError
     if stream_failure is not None:
         raise stream_failure
     if declared_length is not None and len(body) != declared_length:
@@ -654,58 +784,59 @@ def _parse_retry_after(value: str | None) -> int | None:
     return min(max(seconds, 0), MAX_RETRY_AFTER_SECONDS)
 
 
-def _snapshot_size_and_sha256(snapshot: BinaryIO) -> tuple[int, str]:
-    byte_count = 0
-    digest = hashlib.sha256()
-    failed = False
+def _freeze_snapshot(snapshot: BinaryIO) -> bytes:
+    snapshot_bytes: bytes | None = None
     try:
         snapshot.seek(0)
-        while True:
-            chunk = snapshot.read(_UPLOAD_READ_BYTES)
-            if not chunk:
-                break
-            byte_count += len(chunk)
-            if byte_count > MAX_PROFILE_BYTES:
-                failed = True
-                break
-            digest.update(chunk)
-        snapshot.seek(0)
-    except (OSError, ValueError):
-        failed = True
-    if failed:
+        value = snapshot.read(MAX_PROFILE_BYTES + 1)
+        if len(value) <= MAX_PROFILE_BYTES:
+            snapshot_bytes = bytes(value)
+    except Exception:
+        pass
+    if snapshot_bytes is None:
         raise _fixed_api_failure(FailureKind.LOCAL_PROFILE, status_code=None)
-    return byte_count, digest.hexdigest()
+    return snapshot_bytes
 
 
-def _stream_profile(
+def _prepare_empty_destination(destination: BinaryIO) -> None:
+    failed = False
+    nonempty = False
+    try:
+        if not destination.seekable() or not destination.writable():
+            raise _ResponseBodyError
+        original_position = destination.tell()
+        destination.seek(0, SEEK_END)
+        nonempty = destination.tell() != 0
+        if nonempty:
+            destination.seek(original_position)
+        else:
+            destination.truncate(0)
+            destination.seek(0)
+    except Exception:
+        failed = True
+    if failed or nonempty:
+        raise _fixed_api_failure(FailureKind.CACHE_CORRUPT, status_code=None)
+
+
+def _stage_profile(
     response: requests.Response,
-    destination: BinaryIO,
     *,
     expected_byte_count: int,
-) -> tuple[int, str]:
-    byte_count = 0
+) -> tuple[bytes, str]:
+    body = bytearray()
     digest = hashlib.sha256()
     stream_failure: ApiFailure | None = None
-    destination_failure = False
     try:
         for chunk in response.iter_content(chunk_size=_RESPONSE_CHUNK_BYTES):
             if not isinstance(chunk, bytes):
                 raise _ResponseBodyError
             if not chunk:
                 continue
-            next_byte_count = byte_count + len(chunk)
+            next_byte_count = len(body) + len(chunk)
             if next_byte_count > MAX_PROFILE_BYTES or next_byte_count > expected_byte_count:
                 raise _ResponseBodyError
-            try:
-                written = destination.write(chunk)
-            except OSError:
-                destination_failure = True
-                break
-            if written != len(chunk):
-                destination_failure = True
-                break
+            body.extend(chunk)
             digest.update(chunk)
-            byte_count = next_byte_count
     except requests.RequestException as error:
         stream_failure = _transport_api_failure(error)
     except _ResponseBodyError:
@@ -713,16 +844,44 @@ def _stream_profile(
             FailureKind.INVALID_RESPONSE,
             status_code=response.status_code,
         )
-    if destination_failure:
-        raise _fixed_api_failure(FailureKind.CACHE_CORRUPT, status_code=None)
+    except Exception:
+        stream_failure = _fixed_api_failure(
+            FailureKind.INVALID_RESPONSE,
+            status_code=response.status_code,
+        )
     if stream_failure is not None:
         raise stream_failure
-    if byte_count != expected_byte_count:
+    if len(body) != expected_byte_count:
         raise _fixed_api_failure(
             FailureKind.INVALID_RESPONSE,
             status_code=response.status_code,
         )
-    return byte_count, digest.hexdigest()
+    return bytes(body), digest.hexdigest()
+
+
+def _rollback_destination(destination: BinaryIO) -> None:
+    try:
+        destination.seek(0)
+        destination.truncate(0)
+        destination.seek(0)
+        destination.flush()
+    except Exception:
+        pass
+
+
+def _commit_profile(destination: BinaryIO, profile_bytes: bytes) -> None:
+    failed = False
+    try:
+        written = destination.write(profile_bytes)
+        if written != len(profile_bytes):
+            failed = True
+        else:
+            destination.flush()
+    except Exception:
+        failed = True
+    if failed:
+        _rollback_destination(destination)
+        raise _fixed_api_failure(FailureKind.CACHE_CORRUPT, status_code=None)
 
 
 def _require_bounded_bytes(value: object, *, maximum: int, name: str) -> None:
@@ -751,7 +910,12 @@ def _utc_query_datetime(value: datetime | None, *, name: str) -> str | None:
 def _has_prohibited_text_code_point(value: str) -> bool:
     for char in value:
         code_point = ord(char)
-        if code_point == 0 or code_point < 0x20 or 0x7F <= code_point <= 0x9F:
+        if (
+            code_point == 0
+            or code_point < 0x20
+            or 0x7F <= code_point <= 0x9F
+            or 0xD800 <= code_point <= 0xDFFF
+        ):
             return True
     return False
 

@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
 import secrets
-from collections.abc import Callable, Iterator, Mapping
+import subprocess
+import sys
+from collections.abc import Buffer, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from email.utils import format_datetime
-from typing import BinaryIO, cast, override
+from typing import cast, override
 from uuid import UUID
 
 import pytest
 import requests
+import urllib3
+from requests.adapters import HTTPAdapter
 from requests.cookies import RequestsCookieJar
 from requests.structures import CaseInsensitiveDict
+from urllib3._collections import HTTPHeaderDict
 
 from artisanlib.roastserver.api import ApiFailure, DownloadReceipt, RoastServerClient
 from artisanlib.roastserver.contract import (
@@ -154,7 +160,7 @@ class FakeResponse(requests.Response):
     def __init__(
         self,
         status_code: int,
-        chunks: list[bytes] | None = None,
+        chunks: list[bytes | requests.RequestException] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__()
@@ -172,7 +178,10 @@ class FakeResponse(requests.Response):
     ) -> Iterator[bytes]:
         assert decode_unicode is False
         self.requested_chunk_size = chunk_size
-        yield from self._chunks
+        for chunk in self._chunks:
+            if isinstance(chunk, requests.RequestException):
+                raise chunk
+            yield chunk
 
     @override
     def close(self) -> None:
@@ -184,7 +193,7 @@ def raw_response(
     body: bytes,
     headers: dict[str, str] | None = None,
     *,
-    chunks: list[bytes] | None = None,
+    chunks: list[bytes | requests.RequestException] | None = None,
 ) -> FakeResponse:
     return FakeResponse(status_code, [body] if chunks is None else chunks, headers)
 
@@ -194,7 +203,7 @@ def json_response(
     payload: object,
     headers: dict[str, str] | None = None,
     *,
-    chunks: list[bytes] | None = None,
+    chunks: list[bytes | requests.RequestException] | None = None,
 ) -> FakeResponse:
     body = json.dumps(payload, separators=(',', ':')).encode('utf-8')
     response_headers = {'Content-Type': 'application/json', 'Content-Length': str(len(body))}
@@ -210,7 +219,7 @@ class RecordedCall:
     headers: dict[str, str] = field(repr=False)
     params: Mapping[str, str | int] | None
     data: Mapping[str, str | bytes] | bytes | None
-    files: Mapping[str, tuple[str, BinaryIO, str]] | None = field(repr=False)
+    files: Mapping[str, tuple[str, bytes, str]] | None = field(repr=False)
     stream: bool
     verify: object
     allow_redirects: object
@@ -228,6 +237,13 @@ class RecordingSession:
         self.calls: list[RecordedCall] = []
         self.cookies = RequestsCookieJar()
         self.headers: dict[str, str] = {}
+        self.auth: object = ('hostile', 'hostile')
+        self.proxies: dict[str, str] = {'https': 'https://proxy.invalid'}
+        self.hooks: dict[str, list[object]] = {'response': [object()]}
+        self.params: dict[str, str] = {'hostile': 'true'}
+        self.cert: object = '/private/client-certificate.pem'
+        self.stream = False
+        self.verify = False
         self.trust_env = True
 
     @override
@@ -263,7 +279,7 @@ class RecordingSession:
                     kwargs.get('data'),
                 ),
                 files=cast(
-                    Mapping[str, tuple[str, BinaryIO, str]] | None,
+                    Mapping[str, tuple[str, bytes, str]] | None,
                     kwargs.get('files'),
                 ),
                 stream=stream_value if isinstance(stream_value, bool) else False,
@@ -279,6 +295,190 @@ class RecordingSession:
         if isinstance(outcome, requests.RequestException):
             raise outcome
         return outcome
+
+
+@dataclass(frozen=True, slots=True)
+class RawOutcome:
+    status_code: int
+    body: bytes
+    headers: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterCall:
+    request: requests.PreparedRequest = field(repr=False)
+    stream: bool
+    timeout: object
+    verify: object
+    cert: object
+    proxies: Mapping[str, str] | None
+
+
+class NoNetworkAdapter(HTTPAdapter):
+    def __init__(self, outcomes: tuple[RawOutcome | Exception, ...]) -> None:
+        super().__init__()
+        self._outcomes = iter(outcomes)
+        self.calls: list[AdapterCall] = []
+        self.responses: list[requests.Response] = []
+
+    @override
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        stream: bool = False,
+        timeout: object = None,
+        verify: object = True,
+        cert: object = None,
+        proxies: Mapping[str, str] | None = None,
+    ) -> requests.Response:
+        self.calls.append(
+            AdapterCall(
+                request=request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
+            )
+        )
+        try:
+            outcome = next(self._outcomes)
+        except StopIteration:
+            raise AssertionError('unconfigured no-network adapter request') from None
+        if isinstance(outcome, Exception):
+            raise outcome
+        headers = HTTPHeaderDict(outcome.headers)
+        raw = urllib3.response.HTTPResponse(
+            body=io.BytesIO(outcome.body),
+            headers=headers,
+            status=outcome.status_code,
+            preload_content=False,
+            decode_content=False,
+            request_method=request.method,
+            request_url=request.url,
+        )
+        response = self.build_response(request, raw)
+        self.responses.append(response)
+        return response
+
+
+def real_raw_outcome(
+    status_code: int,
+    body: bytes,
+    headers: tuple[tuple[str, str], ...] = (),
+) -> RawOutcome:
+    return RawOutcome(status_code=status_code, body=body, headers=headers)
+
+
+def real_json_outcome(
+    status_code: int,
+    payload: object,
+    headers: tuple[tuple[str, str], ...] = (),
+) -> RawOutcome:
+    body = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    return real_raw_outcome(
+        status_code,
+        body,
+        (
+            ('Content-Type', 'application/json'),
+            ('Content-Length', str(len(body))),
+            *headers,
+        ),
+    )
+
+
+def real_client(
+    *outcomes: RawOutcome | Exception,
+    hostile_session: requests.Session | None = None,
+) -> tuple[RoastServerClient, requests.Session, NoNetworkAdapter, str]:
+    credential = secrets.token_urlsafe(32)
+    session = requests.Session() if hostile_session is None else hostile_session
+    adapter = NoNetworkAdapter(tuple(outcomes))
+    session.mount('https://', adapter)
+    return RoastServerClient('https://example.test', credential, session), session, adapter, credential
+
+
+def multipart_profile(call: AdapterCall) -> bytes:
+    body = call.request.body
+    content_type = call.request.headers.get('Content-Type', '')
+    assert isinstance(body, bytes)
+    assert content_type.startswith('multipart/form-data; boundary=')
+    boundary = content_type.removeprefix('multipart/form-data; boundary=').encode('ascii')
+    for part in body.split(b'--' + boundary):
+        if b'name="profile"' not in part:
+            continue
+        _part_headers, separator, content = part.partition(b'\r\n\r\n')
+        assert separator == b'\r\n\r\n'
+        assert content.endswith(b'\r\n')
+        return content[:-2]
+    raise AssertionError('profile multipart field is absent')
+
+
+class MutatingSnapshot(io.BytesIO):
+    def __init__(self) -> None:
+        super().__init__(PROFILE_BYTES)
+        self.read_calls = 0
+
+    @override
+    def read(self, size: int | None = -1, /) -> bytes:
+        self.read_calls += 1
+        if self.read_calls == 1:
+            return PROFILE_BYTES
+        if self.read_calls == 2:
+            return b''
+        return b'changed-after-validation'
+
+
+class CountingSnapshot(io.BytesIO):
+    def __init__(self) -> None:
+        super().__init__(PROFILE_BYTES)
+        self.read_calls = 0
+
+    @override
+    def read(self, size: int | None = -1, /) -> bytes:
+        self.read_calls += 1
+        return super().read(size)
+
+
+class OversizedSnapshot(io.BytesIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested_sizes: list[int | None] = []
+
+    @override
+    def read(self, size: int | None = -1, /) -> bytes:
+        self.requested_sizes.append(size)
+        assert isinstance(size, int)
+        return b'x' * size
+
+
+class SnapshotReadFailure(io.BytesIO):
+    def __init__(self, failure: Exception) -> None:
+        super().__init__()
+        self._failure = failure
+
+    @override
+    def read(self, size: int | None = -1, /) -> bytes:
+        raise self._failure
+
+
+class NonSeekableDestination(io.BytesIO):
+    @override
+    def seekable(self) -> bool:
+        return False
+
+
+class NonWritableDestination(io.BytesIO):
+    @override
+    def writable(self) -> bool:
+        return False
+
+
+class PartialWriteFailure(io.BytesIO):
+    @override
+    def write(self, data: Buffer, /) -> int:
+        super().write(memoryview(data)[:7])
+        raise OSError('/private/cache/archive.alog')
 
 
 type ClientFactory = Callable[
@@ -501,7 +701,7 @@ def test_upload_multipart_has_exact_fields_and_validates_current_hash_success(
     assert isinstance(profile_part, tuple)
     assert profile_part == (
         f'{ROAST_UUID.hex}.alog',
-        snapshot,
+        PROFILE_BYTES,
         'application/x-artisan-profile',
     )
     assert 'Content-Type' not in call.headers
@@ -744,26 +944,34 @@ def test_download_requires_every_pinned_header(
 
 
 @pytest.mark.parametrize('body', (PROFILE_BYTES[:-1], PROFILE_BYTES + b'x'))
-def test_download_rejects_short_and_long_streams(
+def test_download_rejects_short_and_long_streams_without_touching_destination(
     client_factory: ClientFactory,
     body: bytes,
 ) -> None:
     client, _session = client_factory(raw_response(200, body, download_headers()))
+    destination = io.BytesIO()
 
     with pytest.raises(ApiFailure) as raised:
-        client.download_revision(detail_for_download(), io.BytesIO())
+        client.download_revision(detail_for_download(), destination)
 
     assert raised.value.failure.kind is FailureKind.INVALID_RESPONSE
+    assert destination.getvalue() == b''
+    assert destination.tell() == 0
 
 
-def test_download_rejects_streamed_sha256_mismatch(client_factory: ClientFactory) -> None:
+def test_download_rejects_streamed_sha256_mismatch_without_committing(
+    client_factory: ClientFactory,
+) -> None:
     changed = bytes([PROFILE_BYTES[0] ^ 1]) + PROFILE_BYTES[1:]
     client, _session = client_factory(raw_response(200, changed, download_headers()))
+    destination = io.BytesIO()
 
     with pytest.raises(ApiFailure) as raised:
-        client.download_revision(detail_for_download(), io.BytesIO())
+        client.download_revision(detail_for_download(), destination)
 
     assert raised.value.failure.kind is FailureKind.CHECKSUM_MISMATCH
+    assert destination.getvalue() == b''
+    assert destination.tell() == 0
 
 
 def test_download_stops_before_a_chunk_can_exceed_profile_ceiling(
@@ -935,3 +1143,509 @@ def test_arbitrary_error_body_and_authorization_never_reach_logs_or_failure(
     assert 'infrastructure diagnostic' not in rendered
     assert raised.value.failure.kind is FailureKind.OFFLINE
     assert raised.value.failure.code == FailureKind.OFFLINE.value
+
+
+def test_real_session_is_fully_sanitized_and_prepared_request_is_pinned() -> None:
+    hook_calls: list[str] = []
+
+    def hostile_hook(response: requests.Response, **_kwargs: object) -> requests.Response:
+        hook_calls.append('called')
+        return response
+
+    session = requests.Session()
+    session.trust_env = True
+    session.proxies = {'https': 'https://proxy.invalid'}
+    vars(session)['auth'] = ('hostile-user', 'hostile-password')
+    session.cookies.set('session', 'hostile-cookie')
+    session.params = {'injected': 'query'}
+    session.hooks = {'response': [hostile_hook]}
+    session.headers.update(
+        {
+            'Authorization': 'Basic hostile-default',
+            'Cookie': 'literal-hostile-cookie',
+            'X-Hostile-Default': 'present',
+        }
+    )
+    vars(session)['cert'] = '/private/client-certificate.pem'
+    client, sanitized, adapter, credential = real_client(
+        real_json_outcome(200, valid_identity_payload()),
+        hostile_session=session,
+    )
+
+    client.test_connection()
+
+    assert sanitized is session
+    assert session.trust_env is False
+    assert session.proxies == {}
+    assert session.auth is None
+    assert len(session.cookies) == 0
+    assert session.params == {}
+    assert session.hooks == {'response': []}
+    assert session.cert is None
+    assert session.verify is True
+    session_user_agent = session.headers.get('User-Agent')
+    assert isinstance(session_user_agent, str)
+    assert session.headers == {
+        'Accept-Encoding': 'identity',
+        'Cache-Control': 'no-store',
+        'User-Agent': session_user_agent,
+    }
+    assert session_user_agent.startswith('Artisan/')
+    assert hook_calls == []
+    assert len(adapter.calls) == 1
+    call = adapter.calls[0]
+    assert call.request.url == 'https://example.test/api/v1/auth/me'
+    prepared_user_agent = call.request.headers.get('User-Agent')
+    assert isinstance(prepared_user_agent, str)
+    assert call.request.headers == {
+        'Accept-Encoding': 'identity',
+        'Authorization': f'Bearer {credential}',
+        'Cache-Control': 'no-store',
+        'User-Agent': prepared_user_agent,
+    }
+    assert call.timeout == (4.0, 10.0)
+    assert call.verify is True
+    assert call.cert is None
+    assert call.proxies == {}
+    assert call.stream is True
+    assert adapter.responses[0].raw.closed
+
+
+def test_real_session_redirect_is_one_adapter_call_and_response_is_closed() -> None:
+    client, _session, adapter, _credential = real_client(
+        real_raw_outcome(
+            307,
+            b'',
+            (
+                ('Content-Length', '0'),
+                ('Location', 'https://other.test/stolen'),
+            ),
+        )
+    )
+
+    with pytest.raises(ApiFailure) as raised:
+        client.test_connection()
+
+    assert raised.value.failure.kind is FailureKind.INVALID_RESPONSE
+    assert len(adapter.calls) == 1
+    assert adapter.responses[0].raw.closed
+
+
+def test_upload_freezes_one_bounded_caller_read_before_real_multipart_preparation() -> None:
+    snapshot = MutatingSnapshot()
+    client, _session, adapter, _credential = real_client(
+        real_json_outcome(200, valid_upload_payload())
+    )
+
+    result = client.upload_revision(
+        ROAST_UUID,
+        SHA256,
+        IDEMPOTENCY_KEY,
+        b'{"machine":"Test Drum"}',
+        snapshot,
+    )
+
+    assert result.revision.sha256 == SHA256
+    assert snapshot.read_calls == 1
+    call = adapter.calls[0]
+    assert multipart_profile(call) == PROFILE_BYTES
+    assert isinstance(call.request.body, bytes)
+    assert len(call.request.body) <= MAX_PROFILE_BYTES + MAX_METADATA_BYTES + 4096
+    assert call.request.body.count(b'Content-Disposition: form-data; name=') == 4
+    assert b'name="sha256"' in call.request.body
+    assert b'name="idempotency_key"' in call.request.body
+    assert b'name="metadata"' in call.request.body
+    assert b'name="profile"' in call.request.body
+    assert call.timeout == (4.0, 10.0)
+    assert call.verify is True
+    assert call.stream is True
+    assert adapter.responses[0].raw.closed
+
+
+def test_upload_retry_after_prepared_failure_reads_once_per_call_and_sends_same_snapshot() -> None:
+    snapshot = CountingSnapshot()
+    client, _session, adapter, _credential = real_client(
+        requests.ConnectionError('failure after preparation'),
+        real_json_outcome(200, valid_upload_payload()),
+    )
+
+    with pytest.raises(ApiFailure):
+        client.upload_revision(
+            ROAST_UUID,
+            SHA256,
+            IDEMPOTENCY_KEY,
+            b'{}',
+            snapshot,
+        )
+    result = client.upload_revision(
+        ROAST_UUID,
+        SHA256,
+        IDEMPOTENCY_KEY,
+        b'{}',
+        snapshot,
+    )
+
+    assert result.revision.sha256 == SHA256
+    assert snapshot.read_calls == 2
+    assert len(adapter.calls) == 2
+    assert multipart_profile(adapter.calls[0]) == PROFILE_BYTES
+    assert multipart_profile(adapter.calls[1]) == PROFILE_BYTES
+
+
+def test_upload_oversize_probe_is_one_bounded_read_and_sends_nothing() -> None:
+    snapshot = OversizedSnapshot()
+    client, _session, adapter, _credential = real_client(
+        real_json_outcome(200, valid_upload_payload())
+    )
+
+    with pytest.raises(ApiFailure) as raised:
+        client.upload_revision(
+            ROAST_UUID,
+            'a' * 64,
+            IDEMPOTENCY_KEY,
+            b'{}',
+            snapshot,
+        )
+
+    assert raised.value.failure.kind is FailureKind.LOCAL_PROFILE
+    assert snapshot.requested_sizes == [MAX_PROFILE_BYTES + 1]
+    assert adapter.calls == []
+
+
+@pytest.mark.parametrize(
+    'failure',
+    (
+        OSError('/private/customer/profile.alog'),
+        UnicodeEncodeError('utf-8', '/private/customer/profile.alog', 0, 1, 'invalid'),
+        RuntimeError('/private/customer/profile.alog'),
+    ),
+)
+def test_upload_read_failures_are_fixed_unchained_and_redacted(failure: Exception) -> None:
+    client, _session, adapter, credential = real_client(
+        real_json_outcome(200, valid_upload_payload())
+    )
+
+    with pytest.raises(ApiFailure) as raised:
+        client.upload_revision(
+            ROAST_UUID,
+            SHA256,
+            IDEMPOTENCY_KEY,
+            b'{}',
+            SnapshotReadFailure(failure),
+        )
+
+    rendered = f'{raised.value!s}\n{raised.value!r}'
+    assert '/private/' not in rendered
+    assert credential not in rendered
+    assert raised.value.failure.kind is FailureKind.LOCAL_PROFILE
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert adapter.calls == []
+
+
+def test_upload_preparation_oserror_is_fixed_unchained_and_redacted() -> None:
+    local_path = '/private/cache/customer-name.alog'
+    client, _session, adapter, credential = real_client(OSError(local_path))
+
+    with pytest.raises(ApiFailure) as raised:
+        client.upload_revision(
+            ROAST_UUID,
+            SHA256,
+            IDEMPOTENCY_KEY,
+            b'{}',
+            io.BytesIO(PROFILE_BYTES),
+        )
+
+    rendered = f'{raised.value!s}\n{raised.value!r}'
+    assert local_path not in rendered
+    assert credential not in rendered
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert len(adapter.calls) == 1
+
+
+def test_real_prepared_query_preserves_reserved_plus_unicode_and_utc_offsets() -> None:
+    filters = ArchiveFilters(
+        search='a b+café/?&=',
+        state='parsed',
+        machine='Drum +/雪',
+        roast_at_from=datetime(
+            2026,
+            8,
+            1,
+            12,
+            30,
+            tzinfo=timezone(timedelta(hours=5, minutes=30)),
+        ),
+        roast_at_to=datetime(
+            2026,
+            8,
+            2,
+            12,
+            30,
+            tzinfo=timezone(-timedelta(hours=4)),
+        ),
+    )
+    client, _session, adapter, _credential = real_client(
+        real_json_outcome(200, valid_roast_page_payload())
+    )
+
+    client.list_roasts(filters, cursor='c +/?&=✓', limit=25)
+
+    assert adapter.calls[0].request.url == (
+        'https://example.test/api/v1/roasts?limit=25&'
+        'cursor=c+%2B%2F%3F%26%3D%E2%9C%93&'
+        'search=a+b%2Bcaf%C3%A9%2F%3F%26%3D&state=parsed&'
+        'machine=Drum+%2B%2F%E9%9B%AA&'
+        'roast_at_from=2026-08-01T07%3A00%3A00%2B00%3A00&'
+        'roast_at_to=2026-08-02T16%3A30%3A00%2B00%3A00'
+    )
+
+
+@pytest.mark.parametrize(('field', 'expected_message'), (
+    ('cursor', 'invalid archive cursor'),
+    ('search', 'invalid archive search'),
+    ('machine', 'invalid archive machine'),
+    ('idempotency', 'invalid idempotency key'),
+))
+def test_query_and_idempotency_reject_surrogates_before_preparation(
+    field: str,
+    expected_message: str,
+) -> None:
+    client, _session, adapter, _credential = real_client(
+        real_json_outcome(200, valid_roast_page_payload())
+    )
+    surrogate = '\ud800'
+
+    with pytest.raises(ValueError) as raised:
+        if field == 'idempotency':
+            client.upload_revision(
+                ROAST_UUID,
+                SHA256,
+                surrogate,
+                b'{}',
+                io.BytesIO(PROFILE_BYTES),
+            )
+        else:
+            client.list_roasts(
+                ArchiveFilters(
+                    search=surrogate if field == 'search' else None,
+                    machine=surrogate if field == 'machine' else None,
+                ),
+                cursor=surrogate if field == 'cursor' else None,
+            )
+
+    assert raised.value.args == (expected_message,)
+    assert raised.value.__cause__ is None
+    assert adapter.calls == []
+
+
+@pytest.mark.parametrize(
+    ('encoding', 'body'),
+    (
+        (
+            'gzip',
+            gzip.compress(
+                json.dumps(valid_identity_payload(), separators=(',', ':')).encode('utf-8')
+            ),
+        ),
+        ('br', b'unsolicited brotli representation'),
+    ),
+)
+def test_real_response_rejects_unsolicited_content_encoding_before_reading(
+    encoding: str,
+    body: bytes,
+) -> None:
+    client, _session, adapter, _credential = real_client(
+        real_raw_outcome(
+            200,
+            body,
+            (
+                ('Content-Type', 'application/json'),
+                ('Content-Encoding', encoding),
+            ),
+        )
+    )
+
+    with pytest.raises(ApiFailure) as raised:
+        client.test_connection()
+
+    assert raised.value.failure.kind is FailureKind.INVALID_RESPONSE
+    assert len(adapter.calls) == 1
+    assert adapter.responses[0].raw.closed
+
+
+def test_real_response_accepts_exact_identity_content_encoding() -> None:
+    payload = json.dumps(valid_identity_payload(), separators=(',', ':')).encode('utf-8')
+    client, _session, adapter, _credential = real_client(
+        real_raw_outcome(
+            200,
+            payload,
+            (
+                ('Content-Type', 'application/json'),
+                ('Content-Length', str(len(payload))),
+                ('Content-Encoding', 'identity'),
+            ),
+        )
+    )
+
+    identity = client.test_connection()
+
+    assert identity.user.id == ROAST_UUID
+    assert adapter.responses[0].raw.closed
+
+
+@pytest.mark.parametrize(
+    'encodings',
+    (
+        ('identity', 'identity'),
+        ('identity', 'gzip'),
+    ),
+)
+def test_real_response_rejects_repeated_or_conflicting_security_headers(
+    encodings: tuple[str, str],
+) -> None:
+    payload = json.dumps(valid_identity_payload(), separators=(',', ':')).encode('utf-8')
+    client, _session, adapter, _credential = real_client(
+        real_raw_outcome(
+            200,
+            payload,
+            (
+                ('Content-Type', 'application/json'),
+                ('Content-Length', str(len(payload))),
+                ('Content-Encoding', encodings[0]),
+                ('Content-Encoding', encodings[1]),
+            ),
+        )
+    )
+
+    with pytest.raises(ApiFailure) as raised:
+        client.test_connection()
+
+    assert raised.value.failure.kind is FailureKind.INVALID_RESPONSE
+    assert adapter.responses[0].raw.headers.getlist('Content-Encoding') == list(encodings)
+    assert adapter.responses[0].raw.closed
+
+
+@pytest.mark.parametrize('transfer_encoding', ('chunked', 'identity'))
+def test_real_download_rejects_transfer_encoding_with_content_length_before_commit(
+    transfer_encoding: str,
+) -> None:
+    headers = tuple(download_headers().items()) + (('Transfer-Encoding', transfer_encoding),)
+    client, _session, adapter, _credential = real_client(
+        real_raw_outcome(200, PROFILE_BYTES, headers)
+    )
+    destination = io.BytesIO()
+
+    with pytest.raises(ApiFailure) as raised:
+        client.download_revision(detail_for_download(), destination)
+
+    assert raised.value.failure.kind is FailureKind.INVALID_RESPONSE
+    assert destination.getvalue() == b''
+    assert adapter.responses[0].raw.closed
+
+
+def test_real_download_rejects_duplicate_checksum_header_as_invalid_framing() -> None:
+    headers = tuple(download_headers().items()) + (('X-Content-SHA256', SHA256),)
+    client, _session, adapter, _credential = real_client(
+        real_raw_outcome(200, PROFILE_BYTES, headers)
+    )
+    destination = io.BytesIO()
+
+    with pytest.raises(ApiFailure) as raised:
+        client.download_revision(detail_for_download(), destination)
+
+    assert raised.value.failure.kind is FailureKind.INVALID_RESPONSE
+    assert adapter.responses[0].raw.headers.getlist('X-Content-SHA256') == [SHA256, SHA256]
+    assert destination.getvalue() == b''
+    assert adapter.responses[0].raw.closed
+
+
+def test_download_midstream_transport_failure_leaves_empty_rewound_destination(
+    client_factory: ClientFactory,
+) -> None:
+    response = raw_response(
+        200,
+        b'',
+        download_headers(),
+        chunks=[PROFILE_BYTES[:9], requests.ConnectionError('midstream diagnostic')],
+    )
+    client, _session = client_factory(response)
+    destination = io.BytesIO()
+
+    with pytest.raises(ApiFailure) as raised:
+        client.download_revision(detail_for_download(), destination)
+
+    assert raised.value.failure.kind is FailureKind.OFFLINE
+    assert destination.getvalue() == b''
+    assert destination.tell() == 0
+    assert response.closed_by_client is True
+
+
+def test_download_commit_failure_rolls_back_partial_bytes_and_rewinds(
+    client_factory: ClientFactory,
+) -> None:
+    client, _session = client_factory(raw_response(200, PROFILE_BYTES, download_headers()))
+    destination = PartialWriteFailure()
+
+    with pytest.raises(ApiFailure) as raised:
+        client.download_revision(detail_for_download(), destination)
+
+    assert raised.value.failure.kind is FailureKind.CACHE_CORRUPT
+    assert destination.getvalue() == b''
+    assert destination.tell() == 0
+    assert '/private/' not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    'destination',
+    (NonSeekableDestination(), NonWritableDestination()),
+)
+def test_download_rejects_nonseekable_or_nonwritable_destination_without_request(
+    client_factory: ClientFactory,
+    destination: io.BytesIO,
+) -> None:
+    client, session = client_factory(raw_response(200, PROFILE_BYTES, download_headers()))
+
+    with pytest.raises(ApiFailure) as raised:
+        client.download_revision(detail_for_download(), destination)
+
+    assert raised.value.failure.kind is FailureKind.CACHE_CORRUPT
+    assert destination.getvalue() == b''
+    assert session.calls == []
+
+
+def test_download_rejects_nonempty_destination_without_request(
+    client_factory: ClientFactory,
+) -> None:
+    client, session = client_factory(raw_response(200, PROFILE_BYTES, download_headers()))
+    destination = io.BytesIO(b'existing cache data')
+
+    with pytest.raises(ApiFailure) as raised:
+        client.download_revision(detail_for_download(), destination)
+
+    assert raised.value.failure.kind is FailureKind.CACHE_CORRUPT
+    assert destination.getvalue() == b'existing cache data'
+    assert session.calls == []
+
+
+def test_importing_api_has_no_settings_or_qt_transitive_import() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            (
+                'import sys; import artisanlib.roastserver.api; '
+                "assert 'artisanlib.roastserver.settings' not in sys.modules; "
+                "assert not any(name == 'PyQt6' or name.startswith('PyQt6.') "
+                'for name in sys.modules)'
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
