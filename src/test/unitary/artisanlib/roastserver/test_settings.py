@@ -114,6 +114,7 @@ def _secret() -> str:
         ('http://LOCALHOST:8000/', 'http://localhost:8000'),
         ('http://127.0.0.1:8000/', 'http://127.0.0.1:8000'),
         ('http://[::1]:8000', 'http://[::1]:8000'),
+        ('https://[::1]', 'https://[::1]'),
         ('https://BÜCHER.example', 'https://xn--bcher-kva.example'),
         ('https://LOCALHOST:443/', 'https://localhost'),
     ],
@@ -150,6 +151,26 @@ def test_canonical_origin(raw: str, expected: str) -> None:
 def test_origin_policy_rejects_unsafe_values(raw: str) -> None:
     with pytest.raises(SettingsError, match='valid HTTPS origin'):
         canonical_origin(raw)
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [
+        'https://[::1',
+        'https://::1]',
+        'https://[::1]extra',
+        'https://[::1]:80]',
+        'https://[::1]:abc',
+    ],
+)
+def test_origin_policy_rejects_malformed_bracketed_authorities(raw: str) -> None:
+    with pytest.raises(SettingsError) as raised:
+        canonical_origin(raw)
+
+    assert raised.value.args == ('Enter a valid HTTPS origin.',)
+    assert raised.value.__cause__ is None
+    assert raw not in str(raised.value)
+    assert raw not in repr(raised.value)
 
 
 def test_namespace_and_account_hashes_are_scoped() -> None:

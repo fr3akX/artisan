@@ -350,7 +350,10 @@ def canonical_origin(value: str) -> str:
     raw_value = value.strip()
     if raw_value == '' or _has_disallowed_inner_code_points(raw_value) or '\\' in raw_value:
         raise SettingsError('Enter a valid HTTPS origin.')
-    parts = urlsplit(raw_value)
+    try:
+        parts = urlsplit(raw_value)
+    except (ValueError, UnicodeError):
+        raise SettingsError('Enter a valid HTTPS origin.') from None
     if parts.scheme not in {'https', 'http'}:
         raise SettingsError('Enter a valid HTTPS origin.')
     if parts.netloc == '' or parts.query != '' or parts.fragment != '' or parts.path not in {'', '/'}:
