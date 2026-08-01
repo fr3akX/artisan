@@ -141,6 +141,11 @@ class SavedProfileRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoveCredentialRequest:
+    origin: str
+
+
+@dataclass(frozen=True, slots=True)
 class BrowseRequest:
     namespace: Namespace
     filters: ArchiveFilters
@@ -190,6 +195,7 @@ type ProfileLoader = Callable[[Path], ProfileData]
 
 class RoastServerWorker(QObject):
     connectionTested = pyqtSignal(str, object)
+    credentialRemoved = pyqtSignal(str)
     operationFailed = pyqtSignal(str, object)
     queueChanged = pyqtSignal(object)
     failedJobsChanged = pyqtSignal(object)
@@ -407,6 +413,51 @@ class RoastServerWorker(QObject):
             credential = ''
         if not self._cancelled():
             self.connectionTested.emit(request_id, identity)
+
+    @pyqtSlot(str)
+    def remove_credential(self, opaque_id: str) -> None:
+        request_id = _public_request_id(opaque_id)
+        try:
+            value = self._command_vault.take(opaque_id)
+        except KeyError:
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        if self._cancelled():
+            return
+        if not isinstance(value, RemoveCredentialRequest):
+            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        configuration = self._configuration
+        try:
+            origin = canonical_origin(value.origin)
+        except SettingsError:
+            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        if (
+            configuration is None
+            or origin != value.origin
+            or configuration.origin != origin
+        ):
+            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        try:
+            self._credentials.delete(origin)
+        except CredentialStoreError:
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        if self._cancelled():
+            return
+        namespace = configuration.namespace
+        self._credential = None
+        if namespace is not None:
+            self._discard_namespace_stages(namespace)
+            self._pause_namespace(namespace, 'credential_removed')
+        self._stop_timer()
+        self.onlineChanged.emit(False)
+        self._emit_aggregates(namespace)
+        self.credentialRemoved.emit(request_id)
 
     @pyqtSlot(str)
     def enqueue_saved(self, opaque_id: str) -> None:
@@ -681,6 +732,11 @@ class RoastServerWorker(QObject):
         if str(error) != 'lease_lost':
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
         return False
+
+    @pyqtSlot()
+    def refresh(self) -> None:
+        if not self._cancelled():
+            self._emit_aggregates(self._current_namespace())
 
     @pyqtSlot(str)
     def retry_job(self, job_id: str) -> None:
@@ -1395,6 +1451,7 @@ __all__ = [
     'OnlineOpenRequest',
     'OpaqueVault',
     'PublishRequest',
+    'RemoveCredentialRequest',
     'RoastServerWorker',
     'SavedProfileRequest',
     'WorkerConfiguration',
