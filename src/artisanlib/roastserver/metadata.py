@@ -40,17 +40,22 @@ from artisanlib.util import convertWeight, fromFtoCstrict
 
 _WEIGHT_UNIT_TO_INDEX: Final[dict[str, int]] = {
     'g': 0,
+    'Kg': 1,
     'kg': 1,
     'lb': 2,
     'oz': 3,
 }
+_MAX_WEIGHT_KG: Final[float] = 65_534.0
+_MAX_TIME_SECONDS: Final[float] = 86_400.0
+_MAX_TEMPERATURE: Final[float] = 1_000.0
+_MAX_ENERGY_OR_EMISSIONS: Final[float] = 1_000_000_000.0
 _STRING_LIMITS: Final[dict[str, int]] = {
     'label': 255,
     'title': 255,
-    'operator': 255,
-    'machine': 100,
-    'machine_setup': 255,
-    'setup': 255,
+    'operator': 100,
+    'machine': 50,
+    'machine_setup': 50,
+    'setup': 50,
     'batch_prefix': 50,
     'beans': 2048,
     'color_system': 25,
@@ -116,7 +121,7 @@ _REVISION_REMOVABLE_KEYS: Final[tuple[str, ...]] = (
     'batch_prefix',
     'batch_position',
     'batch_number',
-    'defects_weight_kg',
+    'defect_weight_kg',
     'roasted_weight_estimate_flag',
     'roasted_weight_kg',
     'green_weight_kg',
@@ -173,7 +178,7 @@ class ProjectedMetadata:
 def project_profile(profile: ProfileData, modified: datetime) -> ProjectedMetadata:
     modified_text = _aware_datetime_text(modified)
     roast_id = _uuid_hex(profile.get('roastUUID'))
-    roast_at_utc, roast_tz_offset_seconds = _roast_datetime_parts(profile)
+    roast_at, roast_timezone_offset_seconds = _roast_datetime_parts(profile)
     mode = _temperature_unit(profile.get('mode'))
     computed = _computed_profile(profile)
 
@@ -185,11 +190,11 @@ def project_profile(profile: ProfileData, modified: datetime) -> ProjectedMetada
         revision['roast_id'] = roast_id
     aroast['modified_at'] = modified_text
 
-    if roast_at_utc is not None:
-        aroast['date'] = roast_at_utc
-        revision['roast_at_utc'] = roast_at_utc
-    if roast_tz_offset_seconds is not None:
-        revision['roast_tz_offset_seconds'] = roast_tz_offset_seconds
+    if roast_at is not None:
+        aroast['date'] = roast_at
+        revision['roast_at'] = roast_at
+    if roast_timezone_offset_seconds is not None:
+        revision['roast_timezone_offset_seconds'] = roast_timezone_offset_seconds
     if mode is not None:
         revision['temperature_unit'] = mode
 
@@ -207,12 +212,12 @@ def project_profile(profile: ProfileData, modified: datetime) -> ProjectedMetada
         aroast['batch_prefix'] = batch_prefix
         revision['batch_prefix'] = batch_prefix
 
-    batch_number = _safe_int(profile.get('roastbatchnr'), minimum=0)
+    batch_number = _safe_int(profile.get('roastbatchnr'), minimum=0, maximum=65_534)
     if batch_number is not None:
         aroast['batch_number'] = batch_number
         revision['batch_number'] = batch_number
 
-    batch_position = _safe_int(profile.get('roastbatchpos'), minimum=0)
+    batch_position = _safe_int(profile.get('roastbatchpos'), minimum=0, maximum=255)
     if batch_position is not None:
         aroast['batch_pos'] = batch_position
         revision['batch_position'] = batch_position
@@ -225,15 +230,15 @@ def project_profile(profile: ProfileData, modified: datetime) -> ProjectedMetada
         aroast['end_weight'] = roasted_weight_kg
         revision['roasted_weight_kg'] = roasted_weight_kg
 
-    end_weight_est = _safe_int(profile.get('end_weight_est'), minimum=0)
+    end_weight_est = _profile_bool(profile.get('end_weight_est'))
     if end_weight_est is not None:
         aroast['end_weight_est'] = end_weight_est
         revision['roasted_weight_estimate_flag'] = end_weight_est
 
-    defects_weight_kg = _weight_to_kg(profile.get('defects_weight'), weight_unit_index)
-    if defects_weight_kg is not None:
-        aroast['defects_weight'] = defects_weight_kg
-        revision['defects_weight_kg'] = defects_weight_kg
+    defect_weight_kg = _weight_to_kg(profile.get('defects_weight'), weight_unit_index)
+    if defect_weight_kg is not None:
+        aroast['defects_weight'] = defect_weight_kg
+        revision['defect_weight_kg'] = defect_weight_kg
 
     moisture_roasted = _bounded_float(profile.get('moisture_roasted'), minimum=0.0, maximum=100.0, digits=3)
     if moisture_roasted is not None:
@@ -278,7 +283,9 @@ def project_profile(profile: ProfileData, modified: datetime) -> ProjectedMetada
         aroast['humidity'] = ambient_humidity
         revision['ambient_humidity_percent'] = ambient_humidity
 
-    ambient_pressure = _bounded_float(profile.get('ambient_pressure'), minimum=0.0, maximum=2000.0, digits=3)
+    ambient_pressure = _bounded_float(
+        profile.get('ambient_pressure'), minimum=800.0, maximum=1_200.0, digits=3
+    )
     if ambient_pressure is not None:
         aroast['pressure'] = ambient_pressure
         revision['ambient_pressure_hpa'] = ambient_pressure
@@ -293,7 +300,7 @@ def project_profile(profile: ProfileData, modified: datetime) -> ProjectedMetada
     development_time = _bounded_float(
         computed.get('finishphasetime'),
         minimum=0.0,
-        maximum=float(JS_SAFE_INTEGER_MAX),
+        maximum=_MAX_TIME_SECONDS,
         digits=3,
     )
     if development_time is not None:
@@ -358,14 +365,17 @@ def _roast_datetime_parts(profile: ProfileData) -> tuple[str | None, int | None]
     epoch = _safe_int(profile.get('roastepoch'))
     if epoch is None:
         return None, None
-    roast_at = datetime.fromtimestamp(epoch, tz=UTC).isoformat()
+    try:
+        roast_at = datetime.fromtimestamp(epoch, tz=UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None, None
     offset = _safe_int(profile.get('roasttzoffset'), minimum=-18 * 3600, maximum=18 * 3600)
     return roast_at, offset
 
 
 def _weight_pair_kg(profile: ProfileData) -> tuple[float | None, float | None, int | None]:
     weight = profile.get('weight')
-    if not isinstance(weight, list) or len(weight) < 3:
+    if not isinstance(weight, list | tuple) or len(weight) < 3:
         return None, None, None
     unit_index = _weight_unit_index(weight[2])
     if unit_index is None:
@@ -378,38 +388,48 @@ def _weight_pair_kg(profile: ProfileData) -> tuple[float | None, float | None, i
 def _weight_unit_index(value: object) -> int | None:
     if not isinstance(value, str):
         return None
-    return _WEIGHT_UNIT_TO_INDEX.get(value.lower())
+    return _WEIGHT_UNIT_TO_INDEX.get(value)
 
 
 def _weight_to_kg(value: object, unit_index: int | None) -> float | None:
     raw = _finite_float(value)
     if raw is None or unit_index is None:
         return None
-    return _bounded_float(convertWeight(raw, unit_index, 1), minimum=0.0, maximum=float(JS_SAFE_INTEGER_MAX), digits=6)
+    return _bounded_float(
+        convertWeight(raw, unit_index, 1), minimum=0.0, maximum=_MAX_WEIGHT_KG, digits=6
+    )
 
 
 def _density_value(value: object) -> float | None:
-    if not isinstance(value, list) or not value:
+    if not isinstance(value, list | tuple) or not value:
         return None
     return _bounded_float(cast(object, value[0]), minimum=0.0, maximum=1000.0, digits=6)
 
 
 def _temperature_c(value: object, mode: str | None) -> float | None:
+    if mode not in {'C', 'F'}:
+        return None
     numeric = _finite_float(value)
     if numeric is None or numeric == -1:
         return None
     if mode == 'F':
         numeric = fromFtoCstrict(numeric)
-    return _bounded_float(numeric, minimum=-100.0, maximum=1000.0, digits=6)
+    return _bounded_float(
+        numeric, minimum=-_MAX_TEMPERATURE, maximum=_MAX_TEMPERATURE, digits=6
+    )
 
 
 def _ror_c(value: object, mode: str | None) -> float | None:
+    if mode not in {'C', 'F'}:
+        return None
     numeric = _finite_float(value)
     if numeric is None or numeric == -1:
         return None
     if mode == 'F':
         numeric = numeric * (5.0 / 9.0)
-    return _bounded_float(numeric, minimum=-1000.0, maximum=1000.0, digits=6)
+    return _bounded_float(
+        numeric, minimum=-_MAX_TEMPERATURE, maximum=_MAX_TEMPERATURE, digits=6
+    )
 
 
 def _bounded_float(
@@ -426,12 +446,25 @@ def _bounded_float(
 
 
 def _finite_float(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    numeric = float(value)
+    if isinstance(value, int) and abs(value) > JS_SAFE_INTEGER_MAX:
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     if not math.isfinite(numeric) or abs(numeric) > JS_SAFE_INTEGER_MAX:
         return None
     return numeric
+
+
+def _profile_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    return None
 
 
 def _safe_int(value: object, minimum: int | None = None, maximum: int | None = None) -> int | None:
@@ -483,7 +516,7 @@ def _project_events(
         time_seconds = _bounded_float(
             computed.get(time_key),
             minimum=0.0,
-            maximum=float(JS_SAFE_INTEGER_MAX),
+            maximum=_MAX_TIME_SECONDS,
             digits=6,
         )
         if time_seconds is not None:
@@ -517,7 +550,9 @@ def _project_events(
 def _energy_projection(computed: ComputedProfileInformation) -> dict[str, object]:
     projected: dict[str, object] = {}
     for key in _BTU_KEYS:
-        value = _bounded_float(computed.get(key), minimum=0.0, maximum=float(JS_SAFE_INTEGER_MAX), digits=3)
+        value = _bounded_float(
+            computed.get(key), minimum=0.0, maximum=_MAX_ENERGY_OR_EMISSIONS, digits=3
+        )
         if value is not None:
             projected[key] = value
     return projected
@@ -529,7 +564,12 @@ def _co2_projection(computed: ComputedProfileInformation) -> dict[str, object]:
         raw_value = _finite_float(computed.get(key))
         if raw_value is None:
             continue
-        value = _bounded_float(raw_value / 1000.0, minimum=0.0, maximum=float(JS_SAFE_INTEGER_MAX), digits=6)
+        value = _bounded_float(
+            raw_value / 1000.0,
+            minimum=0.0,
+            maximum=_MAX_ENERGY_OR_EMISSIONS,
+            digits=6,
+        )
         if value is not None:
             projected[key] = value
     return projected
