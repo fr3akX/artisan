@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import threading
+import time
 from uuid import UUID
 
 from artisanlib.roastserver.contract import Namespace
@@ -76,3 +77,82 @@ def test_registry_release_is_identity_checked_and_thread_safe(tmp_path: Path) ->
     assert set(observations) <= {frozenset({path.absolute()}), frozenset()}
     assert not registry.release(token)
     assert 'secret' not in repr(registry).lower()
+
+
+def test_registry_read_guard_linearizes_prune_with_protect_and_release(
+    tmp_path: Path,
+) -> None:
+    registry = ProtectionRegistry()
+    first_path = tmp_path / 'first.alog'
+    second_path = tmp_path / 'second.alog'
+    first = registry.protect(NAMESPACE, first_path)
+    guard_entered = threading.Event()
+    allow_guard_exit = threading.Event()
+    transitions_finished = threading.Event()
+    guarded_paths: list[frozenset[Path]] = []
+
+    def guarded_prune() -> None:
+        with registry.read_guard(NAMESPACE) as paths:
+            guarded_paths.append(paths)
+            guard_entered.set()
+            assert allow_guard_exit.wait(2)
+
+    def transition() -> None:
+        second = registry.protect(
+            NAMESPACE, second_path, expected=first)
+        assert registry.release(second)
+        transitions_finished.set()
+
+    prune_thread = threading.Thread(target=guarded_prune)
+    transition_thread = threading.Thread(target=transition)
+    prune_thread.start()
+    assert guard_entered.wait(2)
+    transition_thread.start()
+    time.sleep(0.02)
+    assert not transitions_finished.is_set()
+    allow_guard_exit.set()
+    prune_thread.join(2)
+    transition_thread.join(2)
+
+    assert guarded_paths == [frozenset({first_path.absolute()})]
+    assert transitions_finished.is_set()
+    assert registry.current() is None
+
+
+def test_registry_transaction_guard_blocks_prune_until_rollback_is_complete(
+    tmp_path: Path,
+) -> None:
+    registry = ProtectionRegistry()
+    path = tmp_path / 'protected.alog'
+    token = registry.protect(NAMESPACE, path)
+    prune_entered = threading.Event()
+
+    def guarded_prune() -> None:
+        with registry.read_guard(NAMESPACE) as paths:
+            assert paths == frozenset({path.absolute()})
+            prune_entered.set()
+
+    with registry.transaction_guard(token):
+        prune_thread = threading.Thread(target=guarded_prune)
+        prune_thread.start()
+        assert not prune_entered.wait(0.02)
+        assert registry.release(token)
+        assert registry.restore(token, expected=None)
+        assert not prune_entered.is_set()
+
+    prune_thread.join(2)
+    assert prune_entered.is_set()
+    assert registry.current() is token
+
+
+def test_registry_reentrant_cas_never_releases_or_restores_wrong_token(
+    tmp_path: Path,
+) -> None:
+    registry = ProtectionRegistry()
+    first = registry.protect(NAMESPACE, tmp_path / 'first.alog')
+    second = registry.protect(
+        NAMESPACE, tmp_path / 'second.alog', expected=first)
+
+    assert not registry.release(first)
+    assert not registry.restore(first, expected=None)
+    assert registry.current() is second

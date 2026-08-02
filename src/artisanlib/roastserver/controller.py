@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 import copy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -856,74 +857,93 @@ class RoastServerController(QObject):
         self._require_command_state()
         return self._protection_registry.current()
 
+    def protection_guard(
+        self, expected: ProtectionToken | None
+    ) -> AbstractContextManager[None]:
+        self._require_command_state()
+        return self._protection_registry.transaction_guard(expected)
+
     def record_open_source(
-        self, path: Path, source: ServerProfileSource
+        self,
+        path: Path,
+        source: ServerProfileSource,
+        *,
+        expected: ProtectionToken | None,
     ) -> ProtectionToken | None:
         if not self.is_expected_open_source(path, source):
             return None
         canonical_path = _absolute_path(path)
-        previous = self._protection_registry.current()
         try:
-            token = self._protection_registry.protect(
-                source.namespace,
-                canonical_path,
-                source,
-                expected=previous,
-            )
+            with self._protection_registry.transaction_guard(expected):
+                token = self._protection_registry.protect(
+                    source.namespace,
+                    canonical_path,
+                    source,
+                    expected=expected,
+                )
+                if self._protection_registry.current() is not token:
+                    return None
+                previous_path = self._current_open_cache_path
+                previous_source = self._current_open_cache_source
+                try:
+                    if previous_path is not None:
+                        self._open_cache_paths.discard(previous_path)
+                    self._current_open_cache_path = canonical_path
+                    self._current_open_cache_source = source
+                    self._open_cache_paths.add(canonical_path)
+                    self._ready_cache_paths.move_to_end(canonical_path)
+                    self._prune_ready_cache_paths()
+                    self._queue_current_protected_paths()
+                    return token
+                except Exception:  # pylint: disable=broad-exception-caught
+                    self._protection_registry.restore(expected, expected=token)
+                    self._open_cache_paths.discard(canonical_path)
+                    self._current_open_cache_path = previous_path
+                    self._current_open_cache_source = previous_source
+                    if previous_path is not None and previous_source is not None:
+                        self._open_cache_paths.add(previous_path)
+                        self._ready_cache_paths[previous_path] = previous_source
+                    return None
         except (OSError, RuntimeError, TypeError, ValueError):
             return None
-        if self._protection_registry.current() is not token:
-            return None
-        previous_path = self._current_open_cache_path
-        previous_source = self._current_open_cache_source
-        try:
-            if previous_path is not None:
-                self._open_cache_paths.discard(previous_path)
-            self._current_open_cache_path = canonical_path
-            self._current_open_cache_source = source
-            self._open_cache_paths.add(canonical_path)
-            self._ready_cache_paths.move_to_end(canonical_path)
-            self._prune_ready_cache_paths()
-            self._queue_current_protected_paths()
-            return token
-        except Exception:  # pylint: disable=broad-exception-caught
-            self._protection_registry.restore(previous, expected=token)
-            self._open_cache_paths.discard(canonical_path)
-            self._current_open_cache_path = previous_path
-            self._current_open_cache_source = previous_source
-            if previous_path is not None and previous_source is not None:
-                self._open_cache_paths.add(previous_path)
-                self._ready_cache_paths[previous_path] = previous_source
-            return None
 
-    def record_local_save(self, path: Path) -> ProtectionToken | bool:
+    def record_local_save(
+        self,
+        path: Path,
+        *,
+        expected: ProtectionToken | None,
+    ) -> ProtectionToken | bool:
         self._require_command_state()
         try:
             _absolute_path(path)
         except (OSError, TypeError, ValueError):
             return False
-        token = self._protection_registry.current()
-        if token is None:
-            return self._current_open_cache_path is None
-        if not self._protection_registry.release(token):
-            return False
-        if self._protection_registry.current() is not None:
-            self._protection_registry.restore(token, expected=None)
-            return False
         try:
-            self._open_cache_paths.discard(token.path)
-            self._ready_cache_paths.pop(token.path, None)
-            self._current_open_cache_path = None
-            self._current_open_cache_source = None
-            self._queue_current_protected_paths()
-            return token
-        except Exception:  # pylint: disable=broad-exception-caught
-            self._protection_registry.restore(token, expected=None)
-            self._current_open_cache_path = token.path
-            self._current_open_cache_source = token.source
-            self._open_cache_paths.add(token.path)
-            if token.source is not None:
-                self._ready_cache_paths[token.path] = token.source
+            with self._protection_registry.transaction_guard(expected):
+                token = self._protection_registry.current()
+                if token is None:
+                    return self._current_open_cache_path is None
+                if not self._protection_registry.release(token):
+                    return False
+                if self._protection_registry.current() is not None:
+                    self._protection_registry.restore(token, expected=None)
+                    return False
+                try:
+                    self._open_cache_paths.discard(token.path)
+                    self._ready_cache_paths.pop(token.path, None)
+                    self._current_open_cache_path = None
+                    self._current_open_cache_source = None
+                    self._queue_current_protected_paths()
+                    return token
+                except Exception:  # pylint: disable=broad-exception-caught
+                    self._protection_registry.restore(token, expected=None)
+                    self._current_open_cache_path = token.path
+                    self._current_open_cache_source = token.source
+                    self._open_cache_paths.add(token.path)
+                    if token.source is not None:
+                        self._ready_cache_paths[token.path] = token.source
+                    return False
+        except RuntimeError:
             return False
 
     def restore_protection(

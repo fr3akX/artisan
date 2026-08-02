@@ -8084,7 +8084,8 @@ class tgraphcanvas(QObject):
             self.plus_sync_record_hash = None
             self.plus_file_last_modified = None
             # clear also the cached sync record and sync record hash used to detect changes in the loaded profile
-            clearSyncRecordHash()
+            if not server_read_only:
+                clearSyncRecordHash()
 
             # initialize recording version to be stored to new profiles recorded
             self.aw.recording_version = str(__version__)
@@ -8341,7 +8342,8 @@ class tgraphcanvas(QObject):
 
         self.aw.qmc.timealign(redraw=False)
 
-        self.aw.updatePlusStatus()
+        if not server_read_only:
+            self.aw.updatePlusStatus()
 
         self.aw.announce_current_ui_mode()
 

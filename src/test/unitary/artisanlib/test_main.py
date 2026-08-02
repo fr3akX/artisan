@@ -109,14 +109,16 @@ modules that require real Qt components while preventing cross-file contaminatio
 # Store original import function before any mocking occurs
 import builtins
 import copy
+from contextlib import nullcontext
 from datetime import UTC, datetime
 import inspect
 import os
+import stat
 import tempfile
 from pathlib import Path
 from collections.abc import Generator
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 from uuid import UUID
 
 import numpy as np
@@ -191,7 +193,7 @@ from artisanlib import util as util_module
 from artisanlib.atypes import ProfileData, RecentRoast
 from artisanlib.main import ApplicationWindow, UI_MODE
 from artisanlib.roastserver import dialogs as roastserver_dialogs
-from artisanlib.roastserver.contract import Namespace, ServerProfileSource
+from artisanlib.roastserver.contract import MAX_PROFILE_BYTES, Namespace, ServerProfileSource
 from artisanlib.util import deserialize as util_deserialize
 from artisanlib.util import serialize_with_timestamp as util_serialize_with_timestamp
 from artisanlib.widgets import MyQLCDNumber, SliderUnclickable
@@ -3909,6 +3911,13 @@ def roastserver_save_window() -> tuple[ApplicationWindow, Mock, dict[str, Any]]:
     window = ApplicationWindow.__new__(ApplicationWindow)
     profile = copy.deepcopy(ROASTSERVER_PROFILE)
     controller = Mock()
+
+    def protection_guard(expected: object) -> object:
+        if controller.current_protection_token() is not expected:
+            raise RuntimeError('cache protection ownership changed')
+        return nullcontext()
+
+    controller.protection_guard.side_effect = protection_guard
     window.roastserver_controller = controller
     window.qmc = Mock()
     window.qmc.autosaveimage = False
@@ -4631,6 +4640,189 @@ class TestRoastServerMainIntegration:
         plus_sync.assert_not_called()
         settings.assert_not_called()
 
+    def test_get_profile_read_only_snapshot_is_observationally_pure(self) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.qmc = MagicMock()
+        window.app = MagicMock(artisanviewerMode=False)
+        window.pidcontrol = MagicMock()
+        window.ser = MagicMock(externalprogram='', externaloutprogram='')
+        window.get_os = Mock(return_value=('Linux', 'test', 'x86_64'))
+        window.locale_str = 'en'
+        window.nLCDS = 4
+        window.recording_version = 'recording-version'
+        window.recording_revision = 'recording-revision'
+        window.recording_build = 'recording-build'
+        window.eventsliderunits = ['%', 'rpm']
+        window.extraLCDvisibility1 = [True]
+        window.extraLCDvisibility2 = [False, True]
+        window.extraCurveVisibility1 = [True]
+        window.extraCurveVisibility2 = [False]
+        window.extraDelta1 = [False]
+        window.extraDelta2 = [True]
+        window.extraFill1 = [0]
+        window.extraFill2 = [1]
+        window.percent_decimals = 1
+        window.bbp_begin = 'sentinel begin'
+        window.bbp_time_added_from_prev = 12.5
+        window.bbp_endroast_epoch_msec = 123
+        window.bbp_endevents = ['end']
+        window.bbp_dropevents = ['drop']
+        window.bbp_dropbt = 201.5
+        window.bbp_dropet = 199.5
+        window.bbp_drop_to_end = 8.0
+        window.bbp_total_time = 90.0
+        window.bbp_bottom_temp = 80.0
+        window.bbp_begin_to_bottom_time = 40.0
+        window.bbp_bottom_to_charge_time = 50.0
+        window.bbp_begin_to_bottom_ror = -5.0
+        window.bbp_bottom_to_charge_ror = 7.0
+        qmc = window.qmc
+        qmc.mode = 'C'
+        qmc.timeindex = [-1, 0, 0, 0, 0, 0, 0, 0]
+        qmc.flavors = []
+        qmc.flavorlabels = []
+        qmc.title = 'Pure snapshot'
+        qmc.plus_store = None
+        qmc.plus_coffee = None
+        qmc.plus_blend_spec = None
+        qmc.beans = ''
+        qmc.weight = (0.0, 0.0, 'g')
+        qmc.volume = (0.0, 0.0, 'l')
+        qmc.density = (0.0, 'g', 1.0, 'l')
+        qmc.density_roasted = (0.0, 'g', 1.0, 'l')
+        qmc.color_systems = ['Agtron']
+        qmc.color_system_idx = 0
+        qmc.roastUUID = None
+        qmc.scheduleID = None
+        qmc.scheduleDate = None
+        qmc.specialevents = [1.0, 2.0]
+        qmc.specialeventstype = [3]
+        qmc.specialeventsvalue = [4.0]
+        qmc.specialeventsStrings = ['one']
+        qmc.etypes = ['Air', 'Drum', 'Damper', 'Burner', '--']
+        qmc.etypesdefault = qmc.etypes[:]
+        qmc.timex = []
+        qmc.temp1 = []
+        qmc.temp2 = []
+        qmc.extradevices = [25, 25]
+        qmc.device = 0
+        qmc.devices = ['Virtual'] * 26
+        qmc.extraname1 = ['only one']
+        qmc.extraname2 = []
+        qmc.extratimex = [[]]
+        qmc.extratemp1 = [[]]
+        qmc.extratemp2 = [[]]
+        qmc.extramathexpression1 = []
+        qmc.extramathexpression2 = []
+        qmc.extradevicecolor1 = []
+        qmc.extradevicecolor2 = []
+        qmc.extramarkersizes1 = []
+        qmc.extramarkersizes2 = []
+        qmc.extramarkers1 = []
+        qmc.extramarkers2 = []
+        qmc.extralinewidths1 = []
+        qmc.extralinewidths2 = []
+        qmc.extralinestyles1 = []
+        qmc.extralinestyles2 = []
+        qmc.extradrawstyles1 = []
+        qmc.extradrawstyles2 = []
+        qmc.extraNoneTempHint1 = []
+        qmc.extraNoneTempHint2 = []
+        qmc.legend = None
+        qmc.backgroundpath = ''
+        qmc.backgroundUUID = None
+        qmc.profile_sampling_interval = None
+        qmc.bbpPrevRoast = {'sentinel': ['unchanged']}
+        qmc.getAnnoPositions.return_value = []
+        qmc.getFlagPositions.return_value = []
+        window.consolidateSpecialEvents = Mock(
+            side_effect=AssertionError('snapshot consolidated events'))
+        window.ensureCorrectExtraDeviceListLength = Mock(
+            side_effect=AssertionError('snapshot resized extra devices'))
+        window.computedProfileInformation = Mock(
+            return_value={'bbp_total_time': window.bbp_total_time})
+        qmc_names = (
+            'roastUUID', 'specialevents', 'specialeventstype',
+            'specialeventsvalue', 'specialeventsStrings', 'extradevices',
+            'extraname1', 'extraname2', 'extratimex', 'extratemp1',
+            'extratemp2', 'extramathexpression1', 'extramathexpression2',
+            'extradevicecolor1', 'extradevicecolor2', 'extramarkersizes1',
+            'extramarkersizes2', 'extramarkers1', 'extramarkers2',
+            'extralinewidths1', 'extralinewidths2', 'extralinestyles1',
+            'extralinestyles2', 'extradrawstyles1', 'extradrawstyles2',
+            'extraNoneTempHint1', 'extraNoneTempHint2', 'bbpPrevRoast',
+        )
+        window_names = (
+            'extraLCDvisibility1', 'extraLCDvisibility2',
+            'extraCurveVisibility1', 'extraCurveVisibility2', 'extraDelta1',
+            'extraDelta2', 'extraFill1', 'extraFill2', 'bbp_begin',
+            'bbp_time_added_from_prev', 'bbp_endroast_epoch_msec',
+            'bbp_endevents', 'bbp_dropevents', 'bbp_dropbt', 'bbp_dropet',
+            'bbp_drop_to_end', 'bbp_total_time', 'bbp_bottom_temp',
+            'bbp_begin_to_bottom_time', 'bbp_bottom_to_charge_time',
+            'bbp_begin_to_bottom_ror', 'bbp_bottom_to_charge_ror',
+        )
+
+        def observed_state() -> tuple[dict[str, Any], dict[str, Any]]:
+            return (
+                {name: getattr(qmc, name) for name in qmc_names},
+                {name: getattr(window, name) for name in window_names},
+            )
+
+        before = copy.deepcopy(observed_state())
+
+        profile = window.getProfile(server_read_only=True)
+
+        assert profile
+        assert 'roastUUID' not in profile
+        assert copy.deepcopy(observed_state()) == before
+        window.consolidateSpecialEvents.assert_not_called()
+        window.ensureCorrectExtraDeviceListLength.assert_not_called()
+        window.computedProfileInformation.assert_called_once_with(update_bbp=False)
+        qmc.adderror.assert_not_called()
+
+    def test_computed_profile_read_only_mode_does_not_update_bbp(self) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.qmc = Mock()
+        window.qmc.timeindex = [-1, 0, 0, 0, 0, 0, 0, 0]
+        window.qmc.timex = []
+        window.qmc.temp1 = []
+        window.qmc.temp2 = []
+        window.qmc.delta2 = []
+        window.qmc.calcStatistics.return_value = (0, [0, 0, 0, 0, 0])
+        window.qmc.volume = (0.0, 0.0, 'l')
+        window.qmc.weight = (0.0, 0.0, 'g')
+        window.qmc.roasted_defects_weight = 0.0
+        window.qmc.moisture_greens = 0.0
+        window.qmc.moisture_roasted = 0.0
+        window.qmc.density = (0.0, 'g', 1.0, 'l')
+        window.qmc.ambient_humidity = 0.0
+        window.qmc.ambient_pressure = 0.0
+        window.qmc.ambientTemp = 0.0
+        window.qmc.AUCbase = 0.0
+        window.qmc.AUCbaseFlag = False
+        window.qmc.AUCbegin = 0
+        window.qmc.calcEnergyuse.return_value = ({}, [])
+        window.percent_decimals = 1
+        window.bbp_total_time = 91.0
+        window.bbp_bottom_temp = 81.0
+        window.bbp_begin_to_bottom_time = 40.0
+        window.bbp_bottom_to_charge_time = 51.0
+        window.bbp_begin_to_bottom_ror = -4.0
+        window.bbp_bottom_to_charge_ror = 6.0
+        window.calcBBPMetrics = Mock(
+            side_effect=AssertionError('read-only computation updated BBP'))
+        window.ts = Mock(return_value=(0, 0, 0, 0))
+        window.curveSimilarity = Mock(return_value=(None, None))
+        window.weight_loss = Mock(return_value=0.0)
+        window.volume_increase = Mock(return_value=0.0)
+
+        computed = window.computedProfileInformation(update_bbp=False)
+
+        assert computed['bbp_total_time'] == 91.0
+        window.calcBBPMetrics.assert_not_called()
+        window.qmc.adderror.assert_not_called()
+
     def test_roastserver_open_slot_delegates_to_read_only_load(
         self, tmp_path: Path
     ) -> None:
@@ -4657,6 +4849,19 @@ class TestRoastServerReadOnlyLoad:
         window.roastserver_open_source = None
         window.roastserver_controller = Mock()
         window.roastserver_controller.is_expected_open_source.return_value = True
+
+        def protection_guard(expected: object) -> object:
+            if window.roastserver_controller.current_protection_token() is not expected:
+                raise RuntimeError('cache protection ownership changed')
+            return nullcontext()
+
+        window.roastserver_controller.protection_guard.side_effect = protection_guard
+        protection_token = object()
+        window.roastserver_controller.current_protection_token.return_value = (
+            protection_token)
+        window.roastserver_controller.record_open_source.return_value = object()
+        window.roastserver_controller.record_local_save.return_value = protection_token
+        window.roastserver_controller.restore_protection.return_value = True
         window.qmc = Mock()
         window.qmc.designerflag = False
         window.qmc.wheelflag = False
@@ -4683,6 +4888,8 @@ class TestRoastServerReadOnlyLoad:
         window.getProfile = Mock(return_value=copy.deepcopy(previous))
         window.profile_data_type_adapter = _PROFILE_DATA_ADAPTER
         window.official_build = False
+        window.pidcontrol = Mock(pidActive=False)
+        window.fujipid = Mock(sv=None)
         window.setProfile = Mock(return_value=True)
         window.setProfileDict = Mock(return_value=True)
         window.orderEvents = Mock()
@@ -4703,7 +4910,189 @@ class TestRoastServerReadOnlyLoad:
         window.autoAdjustAxis = Mock()
         window.updatePlusStatus = Mock()
         window.summarystats_startup = True
+        exact_window_defaults:dict[str, Any] = {
+            'extraser': [],
+            'extracomport': [],
+            'extrabaudrate': [],
+            'extrabytesize': [],
+            'extraparity': [],
+            'extrastopbits': [],
+            'extratimeout': [],
+            'extraLCDvisibility1': [],
+            'extraLCDvisibility2': [],
+            'extraCurveVisibility1': [],
+            'extraCurveVisibility2': [],
+            'extraDelta1': [],
+            'extraDelta2': [],
+            'extraFill1': [],
+            'extraFill2': [],
+            'eventsliderunits': [],
+            'recording_version': 'previous-version',
+            'recording_revision': 'previous-revision',
+            'recording_build': 'previous-build',
+            'block_quantification_sampling_ticks': [0, 0, 0, 0],
+            'keyboardmoveindex': 0,
+            'seriallog': [],
+            'lastbuttonpressed': -1,
+            'extraMODBUStx': 0.0,
+            'extraS7tx': 0.0,
+            'bbp_dropbt': 0.0,
+            'bbp_dropet': 0.0,
+            'bbp_total_time': -1.0,
+            'bbp_bottom_temp': -1.0,
+            'bbp_begin_to_bottom_time': -1.0,
+            'bbp_bottom_to_charge_time': -1.0,
+            'bbp_begin_to_bottom_ror': -1.0,
+            'bbp_bottom_to_charge_ror': -1.0,
+            'bbp_time_added_from_prev': 0.0,
+            'bbp_begin': 'Start',
+            'bbp_endroast_epoch_msec': 0,
+            'bbp_endevents': [],
+            'bbp_dropevents': [],
+            'bbp_drop_to_end': 0.0,
+        }
+        for name, value in exact_window_defaults.items():
+            setattr(window, name, value)
+        exact_qmc_defaults:dict[str, Any] = {
+            'bbpPrevRoast': {},
+            'extrastemp1': [],
+            'extrastemp2': [],
+            'extractemp1': [],
+            'extractemp2': [],
+            'extractimex1': [],
+            'extractimex2': [],
+            'alarmstate': [],
+            'statisticstimes': [],
+            'AUCvalue': 0.0,
+            'AUCsinceFCs': 0.0,
+            'AUCguideTime': 0.0,
+            'roastepoch': 0,
+            'roasttzoffset': 0,
+            'zoom_follow': False,
+            'ystep_down': 0,
+            'ystep_up': 0,
+            'analysisresultsstr': '',
+            'autoChargeIdx': 0,
+            'autoDropIdx': 0,
+            'l_annotations_dict': {},
+            'l_event_flags_dict': {},
+            'l_event_flags_pos_dict': {},
+            'l_timeline': None,
+            'TPalarmtimeindex': None,
+            'profile_sampling_interval': None,
+            'BTprojection_temp': [],
+            'BTprojection_tx': [],
+            'DeltaBTprojection_temp': [],
+            'DeltaBTprojection_tx': [],
+            'DeltaETprojection_temp': [],
+            'DeltaETprojection_tx': [],
+            'ETprojection_temp': [],
+            'ETprojection_tx': [],
+            'E1timex': [],
+            'E1values': [],
+            'E2timex': [],
+            'E2values': [],
+            'E3timex': [],
+            'E3values': [],
+            'E4timex': [],
+            'E4values': [],
+            'autoCHARGEenabled': True,
+            'autoDROPenabled': True,
+            'autoDRYenabled': True,
+            'autoFCsenabled': True,
+            'beansize': 0.0,
+            'beepedBackgroundEvents': [],
+            'ctemp1': [],
+            'ctemp2': [],
+            'ctimex1': [],
+            'ctimex2': [],
+            'currentpidsv': 0.0,
+            'currentx': 0.0,
+            'currenty': 0.0,
+            'delta1': [],
+            'delta2': [],
+            'designerflag': False,
+            'designertemp1init': [],
+            'designertemp2init': [],
+            'dutycycle': -1,
+            'dutycycleTX': 0.0,
+            'errorlog': [],
+            'indexpoint': 0,
+            'l_annotations': [],
+            'program_t3': -1,
+            'program_t4': -1,
+            'program_t5': -1,
+            'program_t6': -1,
+            'program_t7': -1,
+            'program_t8': -1,
+            'program_t9': -1,
+            'program_t10': -1,
+            'rateofchange1': [],
+            'rateofchange2': [],
+            'replayedBackgroundEvents': [],
+            'stemp1': [],
+            'stemp2': [],
+            'tstemp1': [],
+            'tstemp2': [],
+            'unfiltereddelta1': [],
+            'unfiltereddelta1_pure': [],
+            'unfiltereddelta2': [],
+            'unfiltereddelta2_pure': [],
+            'wheelflag': False,
+            'workingline': 2,
+        }
+        for name, value in exact_qmc_defaults.items():
+            setattr(window.qmc, name, value)
         return window, previous
+
+    def test_server_load_protects_exact_expected_token_before_deserialize(
+        self, tmp_path: Path
+    ) -> None:
+        window, _previous = self.load_window()
+        cache_file = tmp_path / 'cache.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        expected_token = object()
+        opened_token = object()
+        window.roastserver_controller.current_protection_token.return_value = (
+            expected_token)
+        ordering: list[str] = []
+
+        def protect(*_args: Any, **_kwargs: Any) -> object:
+            ordering.append('protect')
+            return opened_token
+
+        def read_profile(path: str) -> dict[str, Any]:
+            ordering.append('deserialize')
+            return util_deserialize(path)
+
+        window.roastserver_controller.record_open_source.side_effect = protect
+        with patch('artisanlib.main.deserialize', side_effect=read_profile):
+            assert window.loadFile(str(cache_file), server_source=SERVER_SOURCE)
+
+        assert ordering[:2] == ['protect', 'deserialize']
+        window.roastserver_controller.record_open_source.assert_called_once_with(
+            cache_file, SERVER_SOURCE, expected=expected_token)
+
+    def test_snapshot_copy_failure_aborts_before_protection_or_deserialize(
+        self, tmp_path: Path
+    ) -> None:
+        class Uncopyable:
+            def __deepcopy__(self, _memo: dict[int, object]) -> object:
+                raise RuntimeError('injected copy failure')
+
+        window, _previous = self.load_window()
+        cache_file = tmp_path / 'cache.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        window.qmc.backgroundprofile = Uncopyable()
+
+        with patch('artisanlib.main.deserialize') as deserialize_mock:
+            assert not window.loadFile(
+                str(cache_file), server_source=SERVER_SOURCE)
+
+        deserialize_mock.assert_not_called()
+        window.roastserver_controller.record_open_source.assert_not_called()
+        window.qmc.reset.assert_not_called()
+        window.setProfile.assert_not_called()
 
     @pytest.mark.parametrize('plus_connected', [False, True])
     def test_server_load_prevalidates_real_file_and_skips_all_plus_recent_hooks(
@@ -4757,7 +5146,10 @@ class TestRoastServerReadOnlyLoad:
         assert not window.qmc.safesaveflag
         window.qmc.fileCleanSignal.emit.assert_called_once_with()
         window.roastserver_controller.record_open_source.assert_called_once_with(
-            cache_file, SERVER_SOURCE)
+            cache_file,
+            SERVER_SOURCE,
+            expected=window.roastserver_controller.current_protection_token.return_value,
+        )
         assert window.roastserver_open_source == (cache_file, SERVER_SOURCE)
         assert window.sendmessage.call_args.args == (
             QApplication.translate(
@@ -4784,10 +5176,29 @@ class TestRoastServerReadOnlyLoad:
         window.roastserver_open_source = (old_source_path, old_source)
         previous_modified = window.qmc.plus_file_last_modified
         previous_hash = window.qmc.plus_sync_record_hash
+        window.extracomport = ['sentinel-a', 'sentinel-b']
+        window.extrabaudrate = [9600, 19200]
+        window.qmc.bbpPrevRoast = {'sentinel': [failure]}
+        exact_sentinels = copy.deepcopy((
+            window.extracomport,
+            window.extrabaudrate,
+            window.qmc.bbpPrevRoast,
+        ))
         window.setProfile.side_effect = [True, True]
-        if failure == 'reset':
-            window.qmc.reset.side_effect = [False, True]
-        elif failure == 'apply':
+        reset_calls = 0
+
+        def reset_profile(*_args: Any, **_kwargs: Any) -> bool:
+            nonlocal reset_calls
+            reset_calls += 1
+            if reset_calls == 1:
+                window.extracomport = ['mutated']
+                window.extrabaudrate = [1]
+                window.qmc.bbpPrevRoast = {'mutated': True}
+                return failure != 'reset'
+            return True
+
+        window.qmc.reset.side_effect = reset_profile
+        if failure == 'apply':
             window.setProfile.side_effect = [False, True]
         elif failure == 'order':
             window.orderEvents.side_effect = [RuntimeError('order failed'), None]
@@ -4811,12 +5222,124 @@ class TestRoastServerReadOnlyLoad:
         assert window.qmc.plus_file_last_modified == previous_modified
         assert window.qmc.plus_sync_record_hash == previous_hash
         assert window.roastserver_open_source == (old_source_path, old_source)
+        assert (
+            window.extracomport,
+            window.extrabaudrate,
+            window.qmc.bbpPrevRoast,
+        ) == exact_sentinels
         window.qmc.fileDirtySignal.emit.assert_called_once_with()
-        window.roastserver_controller.record_open_source.assert_not_called()
+        window.roastserver_controller.record_open_source.assert_called_once()
+        window.roastserver_controller.restore_protection.assert_called_once_with(
+            window.roastserver_controller.current_protection_token.return_value,
+            window.roastserver_controller.record_open_source.return_value,
+        )
+
+    def test_failed_apply_restores_exact_non_profile_device_and_bbp_state(
+        self, tmp_path: Path
+    ) -> None:
+        window, _previous = self.load_window()
+        cache_file = tmp_path / 'verified.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        serial_a = object()
+        serial_b = object()
+        window.extraser = [serial_a, serial_b]
+        window.extracomport = ['A', 'B']
+        window.extrabaudrate = [9600, 19200]
+        window.extrabytesize = [7, 8]
+        window.extraparity = ['E', 'N']
+        window.extrastopbits = [1, 2]
+        window.extratimeout = [0.5, 1.5]
+        window.extraLCDvisibility1 = [True, False, True]
+        window.extraLCDvisibility2 = [False, True]
+        window.extraCurveVisibility1 = [False, True]
+        window.extraCurveVisibility2 = [True, False]
+        window.extraDelta1 = [True]
+        window.extraDelta2 = [False, True]
+        window.extraFill1 = [1, 2]
+        window.extraFill2 = [3]
+        window.bbp_total_time = 123.5
+        window.bbp_bottom_temp = 77.25
+        window.qmc.bbpPrevRoast = {'nested': ['previous']}
+        window.qmc.extrastemp1 = [[1.0, 2.0]]
+        window.qmc.extrastemp2 = [[3.0, 4.0]]
+        window.qmc.extractemp1 = [[5.0]]
+        window.qmc.extractemp2 = [[6.0]]
+        window.qmc.extractimex1 = [[7.0]]
+        window.qmc.extractimex2 = [[8.0]]
+        window.qmc.profile_sampling_interval = 3.5
+        expected_qmc = copy.deepcopy({
+            name: getattr(window.qmc, name)
+            for name in (
+                'bbpPrevRoast', 'extrastemp1', 'extrastemp2', 'extractemp1',
+                'extractemp2', 'extractimex1', 'extractimex2',
+                'profile_sampling_interval',
+            )
+        })
+        expected = {
+            name: (list(getattr(window, name)) if isinstance(getattr(window, name), list)
+                   else getattr(window, name))
+            for name in (
+                'extraser', 'extracomport', 'extrabaudrate', 'extrabytesize',
+                'extraparity', 'extrastopbits', 'extratimeout',
+                'extraLCDvisibility1', 'extraLCDvisibility2',
+                'extraCurveVisibility1', 'extraCurveVisibility2',
+                'extraDelta1', 'extraDelta2', 'extraFill1', 'extraFill2',
+                'bbp_total_time', 'bbp_bottom_temp',
+            )
+        }
+        apply_calls = 0
+
+        def apply_profile(*_args: Any, **_kwargs: Any) -> bool:
+            nonlocal apply_calls
+            apply_calls += 1
+            if apply_calls == 1:
+                window.extraser = [object()]
+                window.extracomport = ['mutated']
+                window.extrabaudrate = [1]
+                window.extrabytesize = [5]
+                window.extraparity = ['O']
+                window.extrastopbits = [3]
+                window.extratimeout = [99.0]
+                window.extraLCDvisibility1 = []
+                window.extraLCDvisibility2 = []
+                window.extraCurveVisibility1 = []
+                window.extraCurveVisibility2 = []
+                window.extraDelta1 = []
+                window.extraDelta2 = []
+                window.extraFill1 = []
+                window.extraFill2 = []
+                window.bbp_total_time = -1
+                window.bbp_bottom_temp = -1
+                window.qmc.bbpPrevRoast = {'nested': ['mutated']}
+                window.qmc.extrastemp1 = []
+                window.qmc.extrastemp2 = []
+                window.qmc.extractemp1 = []
+                window.qmc.extractemp2 = []
+                window.qmc.extractimex1 = []
+                window.qmc.extractimex2 = []
+                window.qmc.profile_sampling_interval = 99.0
+                return False
+            return True
+
+        window.setProfile.side_effect = apply_profile
+
+        assert not window.loadFile(
+            str(cache_file), server_source=SERVER_SOURCE)
+
+        for name, value in expected.items():
+            actual = getattr(window, name)
+            if name == 'extraser':
+                assert actual[0] is serial_a and actual[1] is serial_b
+            else:
+                assert actual == value
+        assert {
+            name: getattr(window.qmc, name)
+            for name in expected_qmc
+        } == expected_qmc
 
     @pytest.mark.parametrize(
         'failure',
-        ['delete', 'combo', 'timealign', 'axis', 'clean', 'title', 'protection', 'message'],
+        ['delete', 'combo', 'timealign', 'axis', 'clean', 'title', 'message'],
     )
     def test_every_late_server_load_failure_restores_transaction_components(
         self, tmp_path: Path, failure: str
@@ -4853,8 +5376,6 @@ class TestRoastServerReadOnlyLoad:
             window.qmc.fileCleanSignal.emit.side_effect = RuntimeError('clean failed')
         elif failure == 'title':
             window.updateWindowTitle.side_effect = [RuntimeError('title failed'), None]
-        elif failure == 'protection':
-            window.roastserver_controller.record_open_source.return_value = None
         else:
             window.sendmessage.side_effect = RuntimeError('message failed')
 
@@ -4876,9 +5397,24 @@ class TestRoastServerReadOnlyLoad:
         window.etypeComboBox.addItems.assert_any_call(
             ['Previous event A', 'Previous event B'])
         window.etypeComboBox.setCurrentIndex.assert_called_with(1)
-        if failure == 'message':
-            window.roastserver_controller.restore_protection.assert_called_once_with(
-                previous_token, opened_token)
+        window.roastserver_controller.restore_protection.assert_called_once_with(
+            previous_token, opened_token)
+
+    def test_protection_refusal_precedes_deserialize_and_active_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        window, _previous = self.load_window()
+        cache_file = tmp_path / 'verified.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        window.roastserver_controller.record_open_source.return_value = None
+
+        with patch('artisanlib.main.deserialize') as deserialize_mock:
+            assert not window.loadFile(
+                str(cache_file), server_source=SERVER_SOURCE)
+
+        deserialize_mock.assert_not_called()
+        window.qmc.reset.assert_not_called()
+        window.setProfile.assert_not_called()
 
     def test_hide_background_failure_restores_visibility_and_axis(
         self, tmp_path: Path
@@ -4989,9 +5525,10 @@ class TestRoastServerReadOnlyLoad:
         invalid = tmp_path / 'invalid.alog'
         invalid.write_text("{'not': object()}", encoding='utf-8')
         assert not window.loadFile(str(invalid), server_source=SERVER_SOURCE)
-        window.getProfile.assert_not_called()
+        window.getProfile.assert_called_once_with(server_read_only=True)
         window.qmc.reset.assert_not_called()
         window.setProfile.assert_not_called()
+        window.roastserver_controller.restore_protection.assert_called_once()
 
     def test_local_load_release_refusal_rolls_back_profile_and_source(
         self, tmp_path: Path
@@ -5009,7 +5546,7 @@ class TestRoastServerReadOnlyLoad:
         ):
             assert not window.loadFile(str(local_file))
 
-        window.setProfile.assert_not_called()
+        window.setProfile.assert_called()
         assert window.getProfile.return_value == previous
         assert window.roastserver_open_source == source
         assert window.curFile == 'previous.alog'
@@ -5031,8 +5568,7 @@ class TestRoastServerReadOnlyLoad:
 
         assert not window.loadFile(str(local_file))
 
-        window.roastserver_controller.restore_protection.assert_called_once_with(
-            previous_token, None)
+        window.roastserver_controller.restore_protection.assert_not_called()
         assert window.roastserver_open_source == source
         assert window.curFile == 'previous.alog'
 
@@ -5052,7 +5588,9 @@ class TestRoastServerReadOnlyLoad:
             assert window.loadFile(str(local_file))
 
         window.roastserver_controller.record_local_save.assert_called_once_with(
-            local_file)
+            local_file,
+            expected=window.roastserver_controller.current_protection_token.return_value,
+        )
         assert window.roastserver_open_source is None
         assert window.curFile == str(local_file)
 
@@ -5063,6 +5601,9 @@ class TestRoastServerReadOnlySaveTransition:
         tmp_path: Path,
     ) -> tuple[ApplicationWindow, Mock, Path, Path]:
         window, controller, _profile = roastserver_save_window()
+        protection_token = object()
+        controller.current_protection_token.return_value = protection_token
+        controller.record_local_save.return_value = protection_token
         cache_file = tmp_path / 'cache.alog'
         cache_file.write_bytes(b'protected cache bytes')
         destination = tmp_path / 'saved-as.alog'
@@ -5071,6 +5612,7 @@ class TestRoastServerReadOnlySaveTransition:
         window.qmc.safesaveflag = False
         window.qmc.plus_sync_record_hash = None
         window.updateWindowTitle = Mock()
+        window.refreshRoastServerActions = Mock()
         window.roastServerRecentFiles = Mock(return_value=['previous.alog'])
         window.roastServerWriteRecentFiles = Mock()
         window.roastServerPlusPath = Mock(return_value='previous-plus.alog')
@@ -5090,7 +5632,10 @@ class TestRoastServerReadOnlySaveTransition:
         window.ArtisanSaveFileDialog.assert_called_once()
         window.roastServerSetPlusPath.assert_called_once_with(
             ROASTSERVER_PROFILE['roastUUID'], str(destination))
-        controller.record_local_save.assert_called_once_with(destination)
+        controller.record_local_save.assert_called_once_with(
+            destination,
+            expected=controller.current_protection_token.return_value,
+        )
         controller.saved_profile.assert_called_once()
         serialized, detached, modified_at = controller.saved_profile.call_args.args
         assert serialized == destination.read_bytes()
@@ -5101,6 +5646,23 @@ class TestRoastServerReadOnlySaveTransition:
         assert window.roastserver_open_source is None
         assert window.curFile == str(destination)
         assert (cache_file.read_bytes(), cache_file.stat().st_mtime_ns) == before
+
+    def test_save_snapshot_copy_failure_aborts_before_dialog_or_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        class Uncopyable:
+            def __deepcopy__(self, _memo: dict[int, object]) -> object:
+                raise RuntimeError('injected copy failure')
+
+        window, controller, _cache_file, destination = self.source_window(tmp_path)
+        window.qmc.plus_store = Uncopyable()
+
+        assert not window.fileSave(None)
+
+        window.ArtisanSaveFileDialog.assert_not_called()
+        controller.record_local_save.assert_not_called()
+        assert not destination.exists()
+        assert window.roastserver_open_source is not None
 
     def test_cancel_or_failed_save_retains_read_only_source_and_cache(
         self, tmp_path: Path
@@ -5130,6 +5692,155 @@ class TestRoastServerReadOnlySaveTransition:
         controller.saved_profile.assert_not_called()
         assert (cache_file.read_bytes(), cache_file.stat().st_mtime_ns) == before
 
+    @pytest.mark.parametrize(
+        'failure', [
+            'timestamp', 'autosave', 'clean', 'title', 'qsettings', 'register',
+            'refresh', 'release',
+        ])
+    @pytest.mark.parametrize('destination_exists', [False, True])
+    def test_every_post_write_failure_restores_exact_destination_transaction(
+        self,
+        tmp_path: Path,
+        failure: str,
+        destination_exists: bool,
+    ) -> None:
+        window, controller, _cache_file, destination = self.source_window(tmp_path)
+        token = object()
+        controller.current_protection_token.return_value = token
+        controller.record_local_save.return_value = token
+        original_bytes = b'exact prior destination bytes'
+        original_mode = 0o640
+        original_times = (1_700_000_001_234_567_890, 1_700_000_009_876_543_210)
+        if destination_exists:
+            destination.write_bytes(original_bytes)
+            if os.name != 'nt':
+                destination.chmod(original_mode)
+            os.utime(destination, ns=original_times)
+
+        if failure == 'timestamp':
+            timestamp_context = patch(
+                'artisanlib.main.plus.util.getModificationDate',
+                side_effect=OSError('timestamp failed'),
+            )
+        else:
+            timestamp_context = patch(
+                'artisanlib.main.plus.util.getModificationDate',
+                return_value=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        if failure == 'autosave':
+            window.qmc.autosaveimage = True
+            window.qmc.flagon = False
+            window.qmc.autosavealsopath = ''
+            window.autosave.side_effect = OSError('autosave failed')
+        elif failure == 'clean':
+            window.qmc.fileCleanSignal.emit.side_effect = OSError('clean failed')
+        elif failure == 'title':
+            window.updateWindowTitle.side_effect = OSError('title failed')
+        elif failure == 'qsettings':
+            window.roastServerWriteRecentFiles.side_effect = OSError('settings failed')
+        elif failure == 'register':
+            window.roastServerSetPlusPath.return_value = False
+        elif failure == 'refresh':
+            window.refreshRoastServerActions.side_effect = OSError('refresh failed')
+        elif failure == 'release':
+            controller.record_local_save.return_value = False
+
+        with timestamp_context:
+            assert not window.fileSave(None)
+
+        if destination_exists:
+            after_stat = destination.stat()
+            assert destination.read_bytes() == original_bytes
+            if os.name != 'nt':
+                assert stat.S_IMODE(after_stat.st_mode) == original_mode
+            assert (after_stat.st_atime_ns, after_stat.st_mtime_ns) == original_times
+        else:
+            assert not destination.exists()
+        assert window.roastserver_open_source is not None
+        assert controller.current_protection_token.return_value is token
+        controller.saved_profile.assert_not_called()
+
+    @pytest.mark.parametrize('destination_exists', [False, True])
+    def test_serializer_postpublication_failure_restores_prior_destination(
+        self, tmp_path: Path, destination_exists: bool
+    ) -> None:
+        window, _controller, _cache_file, destination = self.source_window(tmp_path)
+        original_bytes = b'prior destination'
+        original_stat:os.stat_result|None = None
+        if destination_exists:
+            destination.write_bytes(original_bytes)
+            original_stat = destination.stat()
+
+        def publish_then_fail(filename: str, profile: dict[str, Any]) -> object:
+            util_serialize_with_timestamp(filename, profile)
+            raise OSError('injected postpublication failure')
+
+        with patch(
+            'artisanlib.main.serialize_with_timestamp',
+            side_effect=publish_then_fail,
+        ):
+            assert not window.fileSave(None)
+
+        if original_stat is None:
+            assert not destination.exists()
+        else:
+            restored_stat = destination.stat()
+            assert destination.read_bytes() == original_bytes
+            assert restored_stat.st_mtime_ns == original_stat.st_mtime_ns
+
+    def test_server_save_as_refuses_oversize_destination_before_write(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, _cache_file, destination = self.source_window(tmp_path)
+        with destination.open('wb') as destination_file:
+            destination_file.truncate(MAX_PROFILE_BYTES + 1)
+        before = destination.stat()
+
+        assert not window.fileSave(None)
+
+        after = destination.stat()
+        assert after.st_size == before.st_size
+        assert after.st_mtime_ns == before.st_mtime_ns
+        controller.record_local_save.assert_not_called()
+        controller.saved_profile.assert_not_called()
+
+    def test_server_save_as_releases_expected_token_as_final_fallible_commit(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, _cache_file, destination = self.source_window(tmp_path)
+        token = object()
+        controller.current_protection_token.return_value = token
+        controller.record_local_save.return_value = token
+        ordered = Mock()
+        ordered.attach_mock(window.updateWindowTitle, 'title')
+        ordered.attach_mock(window.roastServerWriteRecentFiles, 'settings')
+        ordered.attach_mock(window.roastServerSetPlusPath, 'register')
+        ordered.attach_mock(window.refreshRoastServerActions, 'refresh')
+        ordered.attach_mock(controller.record_local_save, 'release')
+
+        assert window.fileSave(None)
+
+        names = [call[0] for call in ordered.mock_calls]
+        assert names[-1] == 'release'
+        controller.record_local_save.assert_called_once_with(
+            destination, expected=token)
+
+    def test_reentrant_save_as_transition_never_releases_wrong_token(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, _cache_file, destination = self.source_window(tmp_path)
+        expected_token = object()
+        reentrant_token = object()
+        controller.current_protection_token.side_effect = [
+            expected_token, reentrant_token]
+
+        assert not window.fileSave(None)
+
+        controller.record_local_save.assert_not_called()
+        controller.restore_protection.assert_not_called()
+        assert not destination.exists()
+        assert window.roastserver_open_source is not None
+
     @pytest.mark.parametrize('failure', ['post-save', 'cache-release'])
     def test_post_write_failure_restores_read_only_transition_state(
         self, tmp_path: Path, failure: str
@@ -5145,7 +5856,7 @@ class TestRoastServerReadOnlySaveTransition:
 
         assert not window.fileSave(None)
 
-        assert destination.exists()
+        assert not destination.exists()
         assert window.roastserver_open_source == source
         assert window.curFile is None
         assert not window.qmc.safesaveflag
@@ -5226,14 +5937,14 @@ class TestRoastServerReadOnlySaveTransition:
         assert register_state == {uuid_value: 'previous-plus.alog'}
         assert window.roastserver_open_source == source
         assert window.curFile is None
-        controller.restore_protection.assert_called_once_with(protection_token, None)
+        controller.restore_protection.assert_not_called()
         controller.saved_profile.assert_not_called()
         plus_sync.assert_not_called()
-        assert destination.exists()
+        assert not destination.exists()
 
     @pytest.mark.skipif(os.name == 'nt', reason='POSIX link semantics')
     @pytest.mark.parametrize('alias_kind', ['symlink', 'hardlink'])
-    def test_save_as_replaces_cache_alias_without_overwriting_cache(
+    def test_save_as_rejects_every_existing_cache_alias(
         self, tmp_path: Path, alias_kind: str
     ) -> None:
         window, controller, cache_file, _destination = self.source_window(tmp_path)
@@ -5245,12 +5956,28 @@ class TestRoastServerReadOnlySaveTransition:
         window.ArtisanSaveFileDialog.return_value = str(alias)
         before = (cache_file.read_bytes(), cache_file.stat().st_ino)
 
-        assert window.fileSave(None)
+        assert not window.fileSave(None)
 
-        assert not alias.is_symlink()
-        assert alias.stat().st_ino != cache_file.stat().st_ino
+        if alias_kind == 'symlink':
+            assert alias.is_symlink()
+        assert alias.stat().st_ino == cache_file.stat().st_ino
         assert (cache_file.read_bytes(), cache_file.stat().st_ino) == before
-        controller.record_local_save.assert_called_once_with(alias)
+        controller.record_local_save.assert_not_called()
+
+    @pytest.mark.skipif(os.name == 'nt', reason='POSIX symlink semantics')
+    def test_save_as_rejects_parent_alias_to_protected_cache_directory(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, cache_file, _destination = self.source_window(tmp_path)
+        aliased_parent = tmp_path / 'cache-parent-alias'
+        aliased_parent.symlink_to(cache_file.parent, target_is_directory=True)
+        candidate = aliased_parent / cache_file.name
+        window.ArtisanSaveFileDialog.return_value = str(candidate)
+
+        assert not window.fileSave(None)
+
+        assert cache_file.read_bytes() == b'protected cache bytes'
+        controller.record_local_save.assert_not_called()
 
     def test_cache_path_resolution_uncertainty_fails_closed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

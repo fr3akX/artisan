@@ -2406,18 +2406,97 @@ class TestSerialize:
         assert destination.read_bytes() == b'racer entry'
         assert not list(tmp_path.glob('.artisan-*.tmp'))
 
-    def test_directory_sync_is_an_explicit_windows_noop(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.skipif(os.name == 'nt', reason='POSIX symlink semantics')
+    def test_serialize_rejects_every_linked_destination_parent(
+        self, tmp_path: Path
+    ) -> None:
+        real_parent = tmp_path / 'real-parent'
+        real_parent.mkdir()
+        linked_parent = tmp_path / 'linked-parent'
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        destination = linked_parent / 'profile.alog'
+
+        with pytest.raises(OSError, match='profile serialization failed'):
+            serialize(str(destination), {'value': 'must not traverse'})
+
+        assert not destination.exists()
+        assert not list(real_parent.glob('.artisan-*.tmp'))
+
+    def test_serialize_rejects_destination_parent_junction_seam(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parent = tmp_path / 'junction-parent'
+        parent.mkdir()
+        destination = parent / 'profile.alog'
+        original = getattr(Path, 'is_junction', None)
+
+        def is_junction(path: Path) -> bool:
+            if path == parent:
+                return True
+            return bool(original(path)) if callable(original) else False
+
+        monkeypatch.setattr(Path, 'is_junction', is_junction, raising=False)
+
+        with pytest.raises(OSError, match='profile serialization failed'):
+            serialize(str(destination), {'value': 'must reject junction'})
+
+        assert not destination.exists()
+
+    def test_serialize_final_prepublish_hook_cannot_hide_destination_swap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from artisanlib import util as util_module
 
-        open_mock = Mock(side_effect=AssertionError('Windows opened a directory'))
-        monkeypatch.setattr(util_module.os, 'name', 'nt')
-        monkeypatch.setattr(util_module.os, 'open', open_mock)
+        destination = tmp_path / 'final-gap.alog'
+        replacement = tmp_path / 'attacker.alog'
+        destination.write_bytes(b'original entry')
+        replacement.write_bytes(b'attacker entry')
 
-        util_module._sync_directory('not-a-raw-path')
+        def swap_at_final_gap(_destination: Path) -> None:
+            os.replace(replacement, destination)
 
-        open_mock.assert_not_called()
+        monkeypatch.setattr(
+            util_module, '_serialization_prepublish_hook', swap_at_final_gap)
+
+        with pytest.raises(OSError, match='profile serialization failed'):
+            serialize(str(destination), {'value': 'must not publish'})
+
+        assert destination.read_bytes() == b'attacker entry'
+        assert not list(tmp_path.glob('.artisan-*.tmp'))
+
+    def test_windows_overwrite_uses_write_through_native_replace_and_flush(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'windows-overwrite.alog'
+        destination.write_bytes(b'old bytes')
+        events: list[str] = []
+
+        class Native:
+            @staticmethod
+            def replace(source: Path, target: Path) -> None:
+                events.append('replace-write-through')
+                os.replace(source, target)
+
+            @staticmethod
+            def flush_directory(directory: Path) -> None:
+                assert directory == tmp_path
+                events.append('flush-directory')
+
+        monkeypatch.setattr(
+            util_module, '_serialization_is_windows', lambda: True)
+        monkeypatch.setattr(
+            util_module, '_serialization_windows_native', Native)
+        monkeypatch.setattr(
+            util_module.os, 'fchmod',
+            Mock(side_effect=AssertionError('Windows called fchmod')),
+        )
+
+        serialized = serialize(str(destination), {'value': 'windows'})
+
+        assert destination.read_bytes() == serialized
+        assert events == ['replace-write-through', 'flush-directory']
 
     def test_serialize_basic(self) -> None:
         """Test serialize writes object to file."""

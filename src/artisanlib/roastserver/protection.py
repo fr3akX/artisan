@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -52,7 +54,7 @@ class ProtectionRegistry:
     """Linearizable ownership shared by the UI controller and cache worker."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._serial = 0
         self._current: ProtectionToken | None = None
 
@@ -65,11 +67,28 @@ class ProtectionRegistry:
             return self._current
 
     def paths(self, namespace: Namespace) -> frozenset[Path]:
+        with self.read_guard(namespace) as paths:
+            return paths
+
+    @contextmanager
+    def read_guard(self, namespace: Namespace) -> Iterator[frozenset[Path]]:
+        """Hold ownership stable while a cache operation uses its paths."""
         with self._lock:
             current = self._current
             if current is None or current.namespace != namespace:
-                return frozenset()
-            return frozenset({current.path})
+                yield frozenset()
+            else:
+                yield frozenset({current.path})
+
+    @contextmanager
+    def transaction_guard(
+        self, expected: ProtectionToken | None
+    ) -> Iterator[None]:
+        """Prevent pruning while an exact-owner transaction is in flight."""
+        with self._lock:
+            if self._current is not expected:
+                raise RuntimeError('cache protection ownership changed')
+            yield
 
     def protect(
         self,

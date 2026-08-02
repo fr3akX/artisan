@@ -1998,14 +1998,15 @@ class RoastServerWorker(QObject):
             self._emit_failure(request_id, CACHE_FAILURE)
             return
         try:
-            protected = (
-                self._open_cache_paths
-                | self._protection_registry.paths(request.namespace)
-                | self._outbox.protected_paths(request.namespace)
-            )
-            if self._cancelled():
-                return
-            stats = self._cache.clear_unused(request.namespace, protected)
+            outbox_paths = self._outbox.protected_paths(request.namespace)
+            with self._protection_registry.read_guard(
+                request.namespace
+            ) as registry_paths:
+                protected = (
+                    self._open_cache_paths | registry_paths | outbox_paths)
+                if self._cancelled():
+                    return
+                stats = self._cache.clear_unused(request.namespace, protected)
         except (CacheError, OutboxError, OSError, ValueError):
             if not self._cancelled():
                 self._emit_failure(request_id, CACHE_FAILURE)
@@ -2020,16 +2021,15 @@ class RoastServerWorker(QObject):
         if configuration is None or configuration.namespace != namespace:
             return
         try:
-            protected = (
-                self._open_cache_paths
-                | self._protection_registry.paths(namespace)
-                | self._outbox.protected_paths(namespace)
-            )
-            if self._cancelled():
-                return
-            stats = self._cache.prune(
-                namespace, configuration.cache_limit_bytes, protected
-            )
+            outbox_paths = self._outbox.protected_paths(namespace)
+            with self._protection_registry.read_guard(namespace) as registry_paths:
+                protected = (
+                    self._open_cache_paths | registry_paths | outbox_paths)
+                if self._cancelled():
+                    return
+                stats = self._cache.prune(
+                    namespace, configuration.cache_limit_bytes, protected
+                )
         except (CacheError, OutboxError, OSError, ValueError):
             if not self._cancelled():
                 self._emit_failure(operation, CACHE_FAILURE)

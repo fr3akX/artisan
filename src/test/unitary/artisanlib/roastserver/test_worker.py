@@ -536,6 +536,8 @@ class RecordingCache(CacheStore):
         self.timer_stopped: Callable[[], bool] = lambda: False
         self.timer_was_stopped_on_close: list[bool] = []
         self.fail_next_discard = False
+        self.prune_entered:threading.Event|None = None
+        self.allow_prune:threading.Event|None = None
 
     @override
     def open(self) -> None:
@@ -572,6 +574,10 @@ class RecordingCache(CacheStore):
         self.prune_calls.append(
             (namespace, protected_paths, int(QThread.currentThreadId()))
         )
+        if self.prune_entered is not None:
+            self.prune_entered.set()
+        if self.allow_prune is not None:
+            assert self.allow_prune.wait(2)
         return super().prune(namespace, limit_bytes, protected_paths)
 
     @override
@@ -2909,6 +2915,45 @@ def test_publication_prune_always_unions_synchronous_registry_snapshot(
 
     _namespace, protected, _thread_id = worker_harness.cache.prune_calls[-1]
     assert protected == frozenset({open_path})
+
+
+def test_worker_holds_registry_guard_through_prune_against_token_transition(
+    worker_harness: WorkerHarness,
+) -> None:
+    first_path = worker_harness.tmp_path / 'first-protected.alog'
+    second_path = worker_harness.tmp_path / 'second-protected.alog'
+    first_path.write_bytes(b'first')
+    second_path.write_bytes(b'second')
+    registry = worker_harness.worker._protection_registry
+    first = registry.protect(NAMESPACE, first_path)
+    prune_entered = threading.Event()
+    allow_prune = threading.Event()
+    transition_finished = threading.Event()
+    _online_id, request = worker_harness.open_online()
+    worker_harness.cache.prune_entered = prune_entered
+    worker_harness.cache.allow_prune = allow_prune
+    publish_id = worker_harness.command_vault.put(request)
+
+    worker_harness.bus.publish_worker.emit(publish_id)
+    assert prune_entered.wait(2)
+
+    def transition() -> None:
+        second = registry.protect(NAMESPACE, second_path, expected=first)
+        assert registry.release(second)
+        transition_finished.set()
+
+    transition_thread = threading.Thread(target=transition)
+    transition_thread.start()
+    try:
+        time.sleep(0.02)
+        assert not transition_finished.is_set()
+    finally:
+        allow_prune.set()
+        transition_thread.join(2)
+    worker_harness.wait_until(transition_finished.is_set)
+
+    assert worker_harness.cache.prune_calls[-1][1] == frozenset({first_path})
+    assert registry.current() is None
 
 
 def test_clear_unused_unions_open_and_outbox_protected_paths(

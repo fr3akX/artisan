@@ -40,6 +40,7 @@ from uuid import uuid4
 import numpy
 import functools
 import datetime
+import errno
 from dataclasses import dataclass
 from bisect import bisect_right
 from pathlib import Path
@@ -1375,57 +1376,250 @@ def _same_entry(first:os.stat_result, second:os.stat_result) -> bool:
     )
 
 
-def _sync_directory(directory:str) -> None:
-    if os.name == 'nt':
-        return
-    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
-    descriptor = os.open(directory, flags)
+def _serialization_is_windows() -> bool:
+    return os.name == 'nt'
+
+
+def _serialization_windows_native() -> Any:
+    from artisanlib.roastserver._filesystem import require_windows_native
+    return require_windows_native()
+
+
+def _stat_is_reparse_point(entry_stat:os.stat_result) -> bool:
+    attributes = getattr(entry_stat, 'st_file_attributes', 0)
+    reparse_flag = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0)
+    return bool(attributes & reparse_flag)
+
+
+def _path_is_junction(path:Path) -> bool:
+    method = getattr(path, 'is_junction', None)
+    if not callable(method):
+        return False
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        return bool(method())
+    except OSError:
+        return True
 
 
-def _open_serialization_temp(directory:str) -> tuple[int, str]:
+def _reject_linked_parent(directory:Path) -> None:
+    absolute = Path(os.path.abspath(os.fspath(directory)))
+    if absolute.anchor == '':
+        raise OSError('profile serialization parent is invalid')
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        if component in {'', '.', '..'}:
+            raise OSError('profile serialization parent is invalid')
+        current /= component
+        current_stat = os.lstat(current)
+        if (
+            stat.S_ISLNK(current_stat.st_mode)
+            or _stat_is_reparse_point(current_stat)
+            or _path_is_junction(current)
+        ):
+            raise OSError('profile serialization parent contains a link')
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise OSError('profile serialization parent is invalid')
+
+
+def _serialization_uses_dir_fd() -> bool:
+    return (
+        os.name != 'nt'
+        and os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.replace in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
+
+
+def _open_serialization_parent(directory:Path) -> int:
+    _reject_linked_parent(directory)
+    if os.name == 'nt':
+        return cast(
+            int,
+            _serialization_windows_native().open_readonly(
+                directory, directory=True),
+        )
+    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
+    flags |= getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    if _serialization_uses_dir_fd():
+        absolute = Path(os.path.abspath(os.fspath(directory)))
+        descriptor = os.open(absolute.anchor, flags)
+        try:
+            for component in absolute.parts[1:]:
+                next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    return os.open(directory, flags)
+
+
+def _serialization_entry_stat(
+    directory_descriptor:int,
+    directory:Path,
+    name:str,
+) -> os.stat_result|None:
+    try:
+        if _serialization_uses_dir_fd():
+            return os.stat(
+                name, dir_fd=directory_descriptor, follow_symlinks=False)
+        return os.lstat(directory / name)
+    except FileNotFoundError:
+        return None
+
+
+def _open_serialization_temp(
+    directory_descriptor:int,
+    directory:Path,
+) -> tuple[int, str, Path]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, 'O_BINARY', 0)
+    flags |= getattr(os, 'O_BINARY', 0) | getattr(os, 'O_CLOEXEC', 0)
     flags |= getattr(os, 'O_NOFOLLOW', 0)
     for _ in range(10):
-        candidate = os.path.join(directory, f'.artisan-{uuid4().hex}.tmp')
+        name = f'.artisan-{uuid4().hex}.tmp'
+        path = directory / name
         try:
-            return os.open(candidate, flags, 0o666), candidate
+            descriptor = (
+                os.open(name, flags, 0o666, dir_fd=directory_descriptor)
+                if _serialization_uses_dir_fd()
+                else os.open(path, flags, 0o666)
+            )
+            return descriptor, name, path
         except FileExistsError:
             continue
     raise OSError('profile serialization temporary file could not be created')
 
 
-def serialize_with_timestamp(filename:str, obj:dict[str, Any]) -> SerializationResult:
-    serialized = serialize_bytes(obj)
+def _serialization_prepublish_hook(_destination:Path) -> None:
+    """Test seam immediately before the descriptor-bound identity check.
+
+    Parent identity is held across publication. A same-user process that can
+    modify entries in that already verified directory can still race the final
+    check and atomic replacement; that local malicious race is out of scope.
+    """
+
+
+def _same_optional_entry(
+    before:os.stat_result|None,
+    after:os.stat_result|None,
+) -> bool:
+    return (
+        (before is None and after is None)
+        or (
+            before is not None
+            and after is not None
+            and _same_entry(before, after)
+        )
+    )
+
+
+def _replace_serialization_entry(
+    directory_descriptor:int,
+    directory:Path,
+    temporary_name:str,
+    destination_name:str,
+) -> None:
+    if _serialization_is_windows():
+        _serialization_windows_native().replace(
+            directory / temporary_name, directory / destination_name)
+    elif _serialization_uses_dir_fd():
+        os.replace(
+            temporary_name,
+            destination_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+    else:
+        os.replace(directory / temporary_name, directory / destination_name)
+
+
+def _sync_serialization_directory(
+    directory_descriptor:int,
+    directory:Path,
+) -> None:
+    if _serialization_is_windows():
+        _serialization_windows_native().flush_directory(directory)
+        return
+    try:
+        os.fsync(directory_descriptor)
+    except OSError as error:
+        unsupported = {errno.EINVAL}
+        unsupported.update(
+            value
+            for value in (
+                getattr(errno, 'ENOTSUP', None),
+                getattr(errno, 'EOPNOTSUPP', None),
+            )
+            if isinstance(value, int)
+        )
+        if error.errno not in unsupported:
+            raise
+
+
+def _unlink_serialization_entry(
+    directory_descriptor:int,
+    directory:Path,
+    name:str,
+) -> None:
+    if _serialization_uses_dir_fd():
+        os.unlink(name, dir_fd=directory_descriptor)
+    else:
+        os.unlink(directory / name)
+
+
+def _write_serialization_bytes(descriptor:int, serialized:bytes) -> None:
+    offset = 0
+    while offset < len(serialized):
+        written = os.write(descriptor, serialized[offset:])
+        if written <= 0:
+            raise OSError('profile serialization write was incomplete')
+        offset += written
+
+
+def _atomic_write_bytes(
+    destination:Path,
+    serialized:bytes,
+    *,
+    restored_mode:int|None = None,
+    restored_times:tuple[int, int]|None = None,
+) -> SerializationResult:
+    directory = destination.parent
+    directory_descriptor:int|None = None
     descriptor:int|None = None
-    temporary_path:str|None = None
+    temporary_name:str|None = None
+    temporary_path:Path|None = None
     replaced = False
     try:
-        destination = os.path.abspath(os.fspath(filename))
-        directory = os.path.dirname(destination)
-        try:
-            destination_before:os.stat_result|None = os.lstat(destination)
-        except FileNotFoundError:
-            destination_before = None
+        directory_descriptor = _open_serialization_parent(directory)
+        destination_before = _serialization_entry_stat(
+            directory_descriptor, directory, destination.name)
         if destination_before is not None and not (
             stat.S_ISREG(destination_before.st_mode)
             or stat.S_ISLNK(destination_before.st_mode)
         ):
             raise OSError('profile serialization destination is invalid')
 
-        descriptor, temporary_path = _open_serialization_temp(directory)
-        if destination_before is not None and stat.S_ISREG(destination_before.st_mode):
-            os.fchmod(descriptor, stat.S_IMODE(destination_before.st_mode))
-        offset = 0
-        while offset < len(serialized):
-            written = os.write(descriptor, serialized[offset:])
-            if written <= 0:
-                raise OSError('profile serialization write was incomplete')
-            offset += written
+        descriptor, temporary_name, temporary_path = _open_serialization_temp(
+            directory_descriptor, directory)
+        selected_mode = restored_mode
+        if (
+            selected_mode is None
+            and destination_before is not None
+            and stat.S_ISREG(destination_before.st_mode)
+        ):
+            selected_mode = stat.S_IMODE(destination_before.st_mode)
+        if selected_mode is not None and not _serialization_is_windows():
+            os.fchmod(descriptor, selected_mode)
+        _write_serialization_bytes(descriptor, serialized)
+        if selected_mode is not None and _serialization_is_windows():
+            os.chmod(temporary_path, selected_mode)
+        if restored_times is not None:
+            if _serialization_is_windows():
+                os.utime(temporary_path, ns=restored_times)
+            else:
+                os.utime(descriptor, ns=restored_times)
         os.fsync(descriptor)
         temporary_stat = os.fstat(descriptor)
         if not stat.S_ISREG(temporary_stat.st_mode) or temporary_stat.st_nlink != 1:
@@ -1435,43 +1629,238 @@ def serialize_with_timestamp(filename:str, obj:dict[str, Any]) -> SerializationR
         os.close(descriptor)
         descriptor = None
 
-        temporary_path_stat = os.lstat(temporary_path)
-        if not _same_entry(temporary_stat, temporary_path_stat):
-            raise OSError('profile serialization temporary identity changed')
-        try:
-            destination_now:os.stat_result|None = os.lstat(destination)
-        except FileNotFoundError:
-            destination_now = None
+        temporary_path_stat = _serialization_entry_stat(
+            directory_descriptor, directory, temporary_name)
         if (
-            (destination_before is None) != (destination_now is None)
-            or (
-                destination_before is not None
-                and destination_now is not None
-                and not _same_entry(destination_before, destination_now)
-            )
+            temporary_path_stat is None
+            or not _same_entry(temporary_stat, temporary_path_stat)
         ):
+            raise OSError('profile serialization temporary identity changed')
+
+        _serialization_prepublish_hook(destination)
+        destination_now = _serialization_entry_stat(
+            directory_descriptor, directory, destination.name)
+        if not _same_optional_entry(destination_before, destination_now):
             raise OSError('profile serialization destination identity changed')
 
-        os.replace(temporary_path, destination)
+        _replace_serialization_entry(
+            directory_descriptor, directory, temporary_name, destination.name)
         replaced = True
-        published_stat = os.lstat(destination)
-        if not _same_entry(temporary_stat, published_stat):
+        published_stat = _serialization_entry_stat(
+            directory_descriptor, directory, destination.name)
+        if published_stat is None or not _same_entry(temporary_stat, published_stat):
             raise OSError('profile serialization publication identity is uncertain')
-        _sync_directory(directory)
+        _sync_serialization_directory(directory_descriptor, directory)
         return SerializationResult(serialized, modified_at)
-    except Exception:
-        raise OSError('profile serialization failed') from None
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
-        if temporary_path is not None and not replaced:
+        if (
+            directory_descriptor is not None
+            and temporary_name is not None
+            and not replaced
+        ):
             try:
-                os.unlink(temporary_path)
+                _unlink_serialization_entry(
+                    directory_descriptor, directory, temporary_name)
             except OSError:
                 pass
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+
+
+def serialize_with_timestamp(filename:str, obj:dict[str, Any]) -> SerializationResult:
+    serialized = serialize_bytes(obj)
+    try:
+        destination = Path(os.path.abspath(os.fspath(filename)))
+        return _atomic_write_bytes(destination, serialized)
+    except Exception:
+        raise OSError('profile serialization failed') from None
+
+
+@dataclass(slots=True)
+class FileDestinationTransaction:
+    destination:Path
+    existed:bool
+    content:bytes|None
+    mode:int|None
+    atime_ns:int|None
+    mtime_ns:int|None
+    symlink_target:str|None = None
+    _active:bool = True
+
+    def commit(self) -> None:
+        self.content = None
+        self.symlink_target = None
+        self._active = False
+
+    def rollback(self) -> None:
+        if not self._active:
+            return
+        if not self.existed:
+            _remove_destination_entry(self.destination)
+        elif self.symlink_target is not None:
+            _restore_destination_symlink(self)
+        else:
+            if (
+                self.content is None
+                or self.mode is None
+                or self.atime_ns is None
+                or self.mtime_ns is None
+            ):
+                raise OSError('profile destination rollback state is invalid')
+            _atomic_write_bytes(
+                self.destination,
+                self.content,
+                restored_mode=self.mode,
+                restored_times=(self.atime_ns, self.mtime_ns),
+            )
+        self.commit()
+
+
+def snapshot_file_destination(
+    filename:str,
+    *,
+    max_bytes:int,
+) -> FileDestinationTransaction:
+    destination = Path(os.path.abspath(os.fspath(filename)))
+    directory = destination.parent
+    directory_descriptor:int|None = None
+    descriptor:int|None = None
+    try:
+        directory_descriptor = _open_serialization_parent(directory)
+        entry_stat = _serialization_entry_stat(
+            directory_descriptor, directory, destination.name)
+        if entry_stat is None:
+            return FileDestinationTransaction(
+                destination, False, None, None, None, None)
+        mode = stat.S_IMODE(entry_stat.st_mode)
+        if stat.S_ISLNK(entry_stat.st_mode):
+            target = (
+                os.readlink(destination.name, dir_fd=directory_descriptor)
+                if _serialization_uses_dir_fd()
+                else os.readlink(destination)
+            )
+            return FileDestinationTransaction(
+                destination,
+                True,
+                None,
+                mode,
+                entry_stat.st_atime_ns,
+                entry_stat.st_mtime_ns,
+                target,
+            )
+        if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_size > max_bytes:
+            raise OSError('profile destination snapshot is invalid')
+        flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
+        flags |= getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        if os.name == 'nt':
+            from artisanlib.roastserver._filesystem import open_path_readonly
+            descriptor = open_path_readonly(destination)
+        else:
+            descriptor = (
+                os.open(destination.name, flags, dir_fd=directory_descriptor)
+                if _serialization_uses_dir_fd()
+                else os.open(destination, flags)
+            )
+        descriptor_before = os.fstat(descriptor)
+        if not _same_entry(entry_stat, descriptor_before):
+            raise OSError('profile destination identity changed')
+        chunks:list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b''.join(chunks)
+        descriptor_after = os.fstat(descriptor)
+        if (
+            len(content) > max_bytes
+            or len(content) != descriptor_before.st_size
+            or not _same_entry(descriptor_before, descriptor_after)
+            or descriptor_before.st_size != descriptor_after.st_size
+            or descriptor_before.st_mtime_ns != descriptor_after.st_mtime_ns
+            or descriptor_before.st_ctime_ns != descriptor_after.st_ctime_ns
+        ):
+            raise OSError('profile destination changed while snapshotted')
+        return FileDestinationTransaction(
+            destination,
+            True,
+            content,
+            stat.S_IMODE(descriptor_before.st_mode),
+            descriptor_before.st_atime_ns,
+            descriptor_before.st_mtime_ns,
+        )
+    except Exception:
+        raise OSError('profile destination snapshot failed') from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+
+
+def _remove_destination_entry(destination:Path) -> None:
+    directory_descriptor = _open_serialization_parent(destination.parent)
+    try:
+        if _serialization_entry_stat(
+            directory_descriptor, destination.parent, destination.name
+        ) is not None:
+            _unlink_serialization_entry(
+                directory_descriptor, destination.parent, destination.name)
+            _sync_serialization_directory(
+                directory_descriptor, destination.parent)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _restore_destination_symlink(state:FileDestinationTransaction) -> None:
+    if (
+        state.symlink_target is None
+        or state.atime_ns is None
+        or state.mtime_ns is None
+    ):
+        raise OSError('profile destination rollback state is invalid')
+    directory = state.destination.parent
+    directory_descriptor = _open_serialization_parent(directory)
+    temporary_name = f'.artisan-{uuid4().hex}.tmp'
+    temporary_path = directory / temporary_name
+    replaced = False
+    try:
+        if _serialization_uses_dir_fd():
+            os.symlink(
+                state.symlink_target,
+                temporary_name,
+                dir_fd=directory_descriptor,
+            )
+        else:
+            os.symlink(state.symlink_target, temporary_path)
+        _replace_serialization_entry(
+            directory_descriptor,
+            directory,
+            temporary_name,
+            state.destination.name,
+        )
+        replaced = True
+        os.utime(
+            state.destination,
+            ns=(state.atime_ns, state.mtime_ns),
+            follow_symlinks=False,
+        )
+        _sync_serialization_directory(directory_descriptor, directory)
+    finally:
+        if not replaced:
+            try:
+                _unlink_serialization_entry(
+                    directory_descriptor, directory, temporary_name)
+            except OSError:
+                pass
+        os.close(directory_descriptor)
 
 
 #Write object to file

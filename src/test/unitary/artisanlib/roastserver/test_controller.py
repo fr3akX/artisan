@@ -2082,7 +2082,8 @@ def test_ready_cache_paths_keep_current_and_only_a_small_pending_set(
         lambda: current.path.absolute()
         in controller_harness.controller._ready_cache_paths
     )
-    controller_harness.controller.record_open_source(current.path, current.source)
+    controller_harness.controller.record_open_source(
+        current.path, current.source, expected=None)
 
     for index in range(20):
         pending = replace(
@@ -2359,7 +2360,9 @@ def test_cached_open_is_stale_and_only_successful_open_paths_are_protected(
     assert first_clear.namespace == cached.namespace
 
     before_protect = len(controller_harness.fake_worker.protect_ids)
-    controller_harness.controller.record_open_source(cached.path, source)
+    token = controller_harness.controller.record_open_source(
+        cached.path, source, expected=None)
+    assert token is not None
     controller_harness.wait_until(
         lambda: len(controller_harness.fake_worker.protect_ids) > before_protect
     )
@@ -2383,7 +2386,7 @@ def test_cached_open_is_stale_and_only_successful_open_paths_are_protected(
 
     before_protect = len(controller_harness.fake_worker.protect_ids)
     controller_harness.controller.record_local_save(
-        controller_harness.tmp_path / 'local.alog'
+        controller_harness.tmp_path / 'local.alog', expected=token
     )
     controller_harness.wait_until(
         lambda: len(controller_harness.fake_worker.protect_ids) > before_protect
@@ -2419,16 +2422,17 @@ def test_protection_updates_are_synchronous_and_restore_exact_previous_token(
     controller_harness.relay.cached.emit(open_id, cached)
     source = cast(ServerProfileSource, controller_harness.wait_for_spy(ready)[1])
 
-    token = controller_harness.controller.record_open_source(cached.path, source)
+    token = controller_harness.controller.record_open_source(
+        cached.path, source, expected=None)
 
     assert token is not None
     assert controller_harness.controller.current_protection_token() is token
     assert controller_harness.controller.record_open_source(
-        cached.path, replace(source, stale=False)) is None
+        cached.path, replace(source, stale=False), expected=token) is None
     assert controller_harness.controller.current_protection_token() is token
 
     released = controller_harness.controller.record_local_save(
-        controller_harness.tmp_path / 'local.alog')
+        controller_harness.tmp_path / 'local.alog', expected=token)
     assert released is token
     assert controller_harness.controller.current_protection_token() is None
     assert controller_harness.controller.restore_protection(token, None)
@@ -2451,7 +2455,8 @@ def test_namespace_transition_releases_then_restores_current_open_protection(
         ServerProfileSource,
         controller_harness.wait_for_spy(ready)[1],
     )
-    controller_harness.controller.record_open_source(cached.path, source)
+    controller_harness.controller.record_open_source(
+        cached.path, source, expected=None)
     controller_harness.wait_until(
         lambda: bool(controller_harness.fake_worker.protect_ids)
     )
@@ -2514,7 +2519,8 @@ def test_stale_or_forged_open_results_never_publish_or_protect_paths(
     time.sleep(0.01)
     controller_harness.app.processEvents()
     assert len(ready) == 0
-    controller_harness.controller.record_open_source(forged.path, forged.source)
+    controller_harness.controller.record_open_source(
+        forged.path, forged.source, expected=None)
     controller_harness.controller.clear_unused_cache()
     controller_harness.wait_until(
         lambda: bool(controller_harness.fake_worker.clear_ids)
