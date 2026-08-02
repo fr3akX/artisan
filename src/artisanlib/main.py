@@ -169,6 +169,10 @@ import matplotlib.backends.qt_editor._formlayout as formlayout # type:ignore[unt
 if TYPE_CHECKING:
     from types import TracebackType
     from artisanlib.atypes import ExtraDeviceSettings, Palette # pylint: disable=unused-import
+    from artisanlib.roastserver.contract import ServerProfileSource
+    from artisanlib.roastserver.controller import RoastServerController
+    from artisanlib.roastserver.dialogs import RoastServerBrowserDialog, RoastServerConfigDialog
+    from artisanlib.roastserver.settings import ConnectorSettings
     from artisanlib.scale import ScaleSpec
     from artisanlib.roast_properties import editGraphDlg # pylint: disable=unused-import
     from artisanlib.comparator import roastCompareDlg # pylint: disable=unused-import
@@ -216,7 +220,7 @@ from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, en
         application_organization_domain, application_desktop_file_name, getDataDirectory, getDocumentsDirectory, getAppPath, getResourcePath, debugLogLevelToggle,
         debugLogLevelActive, setDebugLogLevel, createGradient, natsort, setDeviceDebugLogLevel,
         comma2dot, is_proper_temp, weight_units, weight_units_lower, volume_units, float2float, float2str,
-        convertWeight, convertVolume, rgba_colorname2argb_colorname, render_weight, serialize, deserialize, csv_load, exportProfile2CSV, findTPint,
+        convertWeight, convertVolume, rgba_colorname2argb_colorname, render_weight, serialize_bytes, serialize, deserialize, csv_load, exportProfile2CSV, findTPint,
         eventtime2string, toDim, signature_message, rec_int_to_float, smooth_list)
 
 from artisanlib.qtsingleapplication import QtSingleApplication
@@ -1536,7 +1540,10 @@ class ApplicationWindow(QMainWindow):
         'schedule_visible_filter', 'scheduler_tasks_visible', 'scheduler_completed_details_visible', 'scheduler_filters_visible', 'scheduler_auto_open',
         'main_menu_actions_with_shortcuts', 'ui_mode', 'UIModeMenu',  'productionModeAction', 'defaultModeAction', 'expertModeAction', 'calculatorAction',
         'helpAboutAction', 'checkUpdateAction', 'errorAction', 'messageAction', 'serialAction', 'platformAction', 'aboutQtAction',
-        'helpDocumentationAction', 'KshortCAction', 'profile_data_type_adapter', 'official_build', 'roasthubs_org_id', 'roasthubs_machine_id', 'roasthubs_token' ]
+        'helpDocumentationAction', 'KshortCAction', 'profile_data_type_adapter', 'official_build',
+        'roastserver_controller', 'roastserver_settings', 'roastserver_config_dialog', 'roastserver_browser_dialog',
+        'roastServerUploadAction', 'roastServerRoastsAction', 'roastServerConfigAction',
+        'roasthubs_org_id', 'roasthubs_machine_id', 'roasthubs_token' ]
 
     nLCDS: Final[int] = 10 # maximum number of LCDs and extra devices (2x10 => 20 in total!)
 
@@ -1617,6 +1624,10 @@ class ApplicationWindow(QMainWindow):
 
         super().__init__(parent)
         self.helpdialog:HelpDlg|None = None
+        self.roastserver_controller:'RoastServerController|None' = None # noqa: UP037
+        self.roastserver_settings:'ConnectorSettings|None' = None # noqa: UP037
+        self.roastserver_config_dialog:'RoastServerConfigDialog|None' = None # noqa: UP037
+        self.roastserver_browser_dialog:'RoastServerBrowserDialog|None' = None # noqa: UP037
 
         self.setAcceptDrops(True) # enable drag-and-drop
 
@@ -2252,6 +2263,13 @@ class ApplicationWindow(QMainWindow):
         self.fileSaveCopyAsAction = QAction(QApplication.translate('Menu', 'Save a Copy As...'), self)
         self.fileSaveCopyAsAction.triggered.connect(self.fileSave_copy_action)
 
+        self.roastServerRoastsAction = QAction(
+            QApplication.translate('Menu', 'Server Roasts...'), self)
+        self.roastServerRoastsAction.triggered.connect(self.showServerRoasts)
+        self.roastServerUploadAction = QAction(
+            QApplication.translate('Menu', 'Upload to Roast Server'), self)
+        self.roastServerUploadAction.triggered.connect(self.uploadToRoastServer)
+
         self.exportMenu:QMenu = QMenu(QApplication.translate('Menu', 'Export'))
         if QIcon.hasThemeIcon('document-export'):
             self.exportMenu.setIcon(QIcon.fromTheme('document-export'))
@@ -2523,6 +2541,10 @@ class ApplicationWindow(QMainWindow):
 
         self.batchAction:QAction = QAction(QApplication.translate('Menu', 'Batch...'), self)
         self.batchAction.triggered.connect(self.batchconf)
+
+        self.roastServerConfigAction = QAction(
+            QApplication.translate('Menu', 'Roast Server...'), self)
+        self.roastServerConfigAction.triggered.connect(self.showRoastServerConfig)
 
         self.temperatureConfMenu:QMenu = QMenu(QApplication.translate('Menu', 'Temperature'))
 
@@ -4367,6 +4389,8 @@ class ApplicationWindow(QMainWindow):
         file_menu.addAction(self.fileSaveAsAction)     # SaveAs
         if ui_mode is UI_MODE.EXPERT:
             file_menu.addAction(self.fileSaveCopyAsAction) # SaveAs Copy
+        file_menu.addAction(self.roastServerRoastsAction)
+        file_menu.addAction(self.roastServerUploadAction)
         file_menu.addSeparator()
         if ui_mode in {UI_MODE.EXPERT, UI_MODE.DEFAULT}:
             file_menu.addMenu(self.exportMenu)         # Export
@@ -4434,6 +4458,7 @@ class ApplicationWindow(QMainWindow):
             config_menu.addMenu(self.temperatureConfMenu)
         if ui_mode is not UI_MODE.PRODUCTION:
             config_menu.addMenu(self.languageMenu)
+        config_menu.addAction(self.roastServerConfigAction)
         # the UI mode selector should always be present
         config_menu.addSeparator()
         config_menu.addMenu(self.UIModeMenu)
@@ -4516,6 +4541,106 @@ class ApplicationWindow(QMainWindow):
             help_menu.addSeparator()
             help_menu.addAction(self.resetAction)
         return help_menu
+
+    @pyqtSlot(object)
+    def setRoastServerSettings(self, settings:object) -> None:
+        self.roastserver_settings = cast('ConnectorSettings', settings)
+
+    @pyqtSlot()
+    @pyqtSlot(bool)
+    def showRoastServerConfig(self, _:bool = False) -> None:
+        controller = self.roastserver_controller
+        settings = self.roastserver_settings
+        if controller is None or settings is None:
+            self.sendmessage(QApplication.translate(
+                'Message', 'Roast Server is not available.'))
+            return
+        if self.roastserver_config_dialog is None:
+            from artisanlib.roastserver.dialogs import RoastServerConfigDialog
+            self.roastserver_config_dialog = RoastServerConfigDialog(
+                controller, settings, self)
+        self.roastserver_config_dialog.show()
+        self.roastserver_config_dialog.raise_()
+        self.roastserver_config_dialog.activateWindow()
+
+    @pyqtSlot()
+    @pyqtSlot(bool)
+    def showServerRoasts(self, _:bool = False) -> None:
+        controller = self.roastserver_controller
+        if controller is None:
+            self.sendmessage(QApplication.translate(
+                'Message', 'Roast Server is not available.'))
+            return
+        if self.roastserver_browser_dialog is None:
+            from artisanlib.roastserver.dialogs import RoastServerBrowserDialog
+            self.roastserver_browser_dialog = RoastServerBrowserDialog(
+                controller, self.roastserver_settings, self)
+        self.roastserver_browser_dialog.show()
+        self.roastserver_browser_dialog.raise_()
+        self.roastserver_browser_dialog.activateWindow()
+
+    @staticmethod
+    def roastServerProfileModifiedAt(filename:str) -> datetime.datetime|None:
+        try:
+            return datetime.datetime.fromtimestamp(
+                Path(filename).stat().st_mtime, tz=datetime.UTC)
+        except (OSError, OverflowError, ValueError) as error:
+            _log.error('could not determine saved profile timestamp: %s', error)
+            return None
+
+    @pyqtSlot()
+    @pyqtSlot(bool)
+    def uploadToRoastServer(self, _:bool = False) -> None:
+        controller = self.roastserver_controller
+        filename = self.curFile
+        if (
+            controller is None
+            or self.app.artisanviewerMode
+            or self.qmc.safesaveflag
+            or filename is None
+            or Path(filename).suffix.lower() != '.alog'
+            or not Path(filename).is_file()
+        ):
+            self.sendmessage(QApplication.translate(
+                'Message',
+                'Save the current profile as a clean Artisan .alog file before uploading it to Roast Server.'))
+            return
+        modified_at = self.roastServerProfileModifiedAt(filename)
+        if modified_at is None:
+            self.sendmessage(QApplication.translate(
+                'Message', 'Roast Server upload could not be queued.'))
+            return
+        try:
+            pf = copyd.deepcopy(self.getProfile(copy=False, generate_hash=False))
+            if not pf:
+                raise ValueError('invalid Roast Server profile')
+            serialized_profile = serialize_bytes(cast(dict[str,Any], pf))
+            controller.manual_upload(serialized_profile, pf, modified_at)
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+            self.sendmessage(QApplication.translate(
+                'Message', 'Roast Server upload could not be queued.'))
+
+    def startRoastServer(self, data_directory:Path) -> None:
+        if self.roastserver_controller is not None:
+            return
+        import keyring
+        from artisanlib.roastserver.api import RoastServerClient
+        from artisanlib.roastserver.controller import RoastServerController
+        from artisanlib.roastserver.settings import SettingsStore, SystemCredentialStore
+
+        controller = RoastServerController(
+            settings=SettingsStore(QSettings()),
+            credentials=SystemCredentialStore(cast(Any, keyring)),
+            data_root=data_directory / 'roastserver',
+            client_factory=RoastServerClient,
+            profile_validator=self.validateRoastServerProfile,
+            parent=self,
+        )
+        self.roastserver_controller = controller
+        controller.settingsChanged.connect(self.setRoastServerSettings)
+        controller.profileReady.connect(self.openRoastServerProfile)
+        controller.start()
 
     #
 
@@ -13316,6 +13441,8 @@ class ApplicationWindow(QMainWindow):
     # returns filename on success, None otherwise
     def automaticsave(self, interactive:bool = True) -> str|None:
         filename:str|None = None
+        pf:ProfileData|None = None
+        serialized_profile:bytes|None = None
         try:
             if self.qmc.autosaveflag:
                 if self.qmc.autosavepath == '':
@@ -13332,26 +13459,27 @@ class ApplicationWindow(QMainWindow):
                     prefix += self.qmc.batchprefix
                 filename = self.generateFilename(prefix=prefix)
                 filename_path = os.path.join(self.qmc.autosavepath,filename)
-                oldDir = str(QDir.current())
+                oldDir = QDir.currentPath()
                 res = QDir.setCurrent(self.qmc.autosavepath)
                 if res:
                     #write
                     pf = self.getProfile(generate_hash=True)
                     # pf should not be modified before saving anymore this would break its hash
                     self.plusAddPath(cast(dict[str, Any], pf), filename_path)
-                    serialize(filename_path, cast(dict[str, Any], pf))
+                    serialized_profile = serialize(filename_path, cast(dict[str, Any], pf))
                     self.sendmessage(QApplication.translate('Message','Profile {0} saved in: {1}').format(filename,self.qmc.autosavepath))
                     self.setCurrentFile(filename_path,self.qmc.autosaveaddtorecentfilesflag)
                     self.qmc.fileCleanSignal.emit()
                 else:
                     self.sendmessage(QApplication.translate('Message','Autosave path does not exist. Autosave failed.'))
                 #restore dirs
-                QDir.setCurrent(oldDir)
+                post_save_succeeded = QDir.setCurrent(oldDir)
                 # file might be autosaved but not uploaded to plus yet (no DROP registered). This needs to be indicated by a red plus icon
                 try:
                     self.updatePlusStatus()
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
+                    post_save_succeeded = False
                 # autosave "other" (eg. PDF) even if autosavepath is empty
                 if self.qmc.autosaveimage and not self.qmc.flagon:
                     if self.qmc.autosavealsopath != '':
@@ -13363,6 +13491,9 @@ class ApplicationWindow(QMainWindow):
                     if other_filename_path.endswith('.alog'):
                         other_filename_path = other_filename_path[0:-5]
                     self.autosave(other_filename_path)
+                if res and post_save_succeeded and pf is not None and serialized_profile is not None:
+                    self.notifyRoastServerSavedProfile(
+                        serialized_profile, pf, filename_path)
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
             _, _, exc_tb = sys.exc_info()
@@ -13702,6 +13833,36 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot(str)
     def loadFileSlot(self, filename:str) -> None:
         self.loadFile(filename)
+
+    def validateRoastServerProfile(self, path:Path) -> None:
+        profile = deserialize(str(path))
+        if not profile:
+            raise ValueError('invalid Roast Server profile')
+        if 'samplinginterval' in profile and profile['samplinginterval'] is None:
+            del profile['samplinginterval']
+        if 'extramarkers1' in profile:
+            profile['extramarkers1'] = [
+                'None' if marker is None else marker
+                for marker in profile['extramarkers1']
+            ]
+        if 'extramarkers2' in profile:
+            profile['extramarkers2'] = [
+                'None' if marker is None else marker
+                for marker in profile['extramarkers2']
+            ]
+        self.validateProfileDict(profile, quiet=True, validate_signature=True)
+
+    @pyqtSlot(str, object)
+    def openRoastServerProfile(
+        self, filename:str, source:'ServerProfileSource'
+    ) -> bool:
+        self.loadFile(filename)
+        if self.curFile != filename:
+            return False
+        controller = self.roastserver_controller
+        if controller is not None:
+            controller.record_open_source(Path(filename), source)
+        return True
 
     #loads stored profiles. Called from file menu (NOTE: background profile is not loaded if quiet=True!)
     def loadFile(self, filename:str, quiet:bool = False) -> None:
@@ -17369,6 +17530,25 @@ class ApplicationWindow(QMainWindow):
             self.qmc.adderror((QApplication.translate('Error Message', 'Exception:') + ' getProfile(): {0}').format(str(ex)),getattr(exc_tb, 'tb_lineno', '?'))
             return ProfileData()
 
+    def notifyRoastServerSavedProfile(
+        self,
+        serialized_profile:bytes,
+        profile:'ProfileData',
+        filename:str,
+    ) -> None:
+        controller = self.roastserver_controller
+        if controller is None:
+            return
+        modified_at = self.roastServerProfileModifiedAt(filename)
+        if modified_at is None:
+            return
+        try:
+            detached_profile = copyd.deepcopy(profile)
+            controller.saved_profile(
+                serialized_profile, detached_profile, modified_at)
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+
     @pyqtSlot()
     @pyqtSlot(bool)
     def fileSave_current_action(self, _:bool = False) -> None:
@@ -17411,7 +17591,7 @@ class ApplicationWindow(QMainWindow):
                 if pf:
                     # we save the file and set the filename
                     self.plusAddPath(cast(dict[str,Any], pf), filename)
-                    serialize(filename, cast(dict[str,Any], pf))
+                    serialized_profile = serialize(filename, cast(dict[str,Any], pf))
                     self.sendmessage(QApplication.translate('Message','Profile saved'))
                     _log.info('profile saved: %s', filename)
                     if not copy:
@@ -17437,6 +17617,9 @@ class ApplicationWindow(QMainWindow):
 
                         self.autosave(filename_also)
 
+                    if not copy and self.qmc.plus_file_last_modified is not None:
+                        self.notifyRoastServerSavedProfile(
+                            serialized_profile, pf, filename)
                     return True
                 self.sendmessage(QApplication.translate('Message','Cancelled'))
                 return False
@@ -21579,6 +21762,17 @@ class ApplicationWindow(QMainWindow):
                 flagKeepON = self.qmc.flagKeepON
                 self.qmc.flagKeepON = False # temporarily turn keepOn off
 
+                controller = self.roastserver_controller
+                if controller is not None:
+                    shutdown_timeout_message = QApplication.translate(
+                        'Message',
+                        'Roast Server worker did not stop within the shutdown timeout.')
+                    try:
+                        if not controller.shutdown(15_000):
+                            self.sendmessage(shutdown_timeout_message)
+                    except Exception as error: # pylint: disable=broad-except
+                        _log.exception(error)
+                        self.sendmessage(shutdown_timeout_message)
 
                 self.stopActivities() # also disconnect from connected scales and stops BLE scanning
                 # if BLE was used we need to terminate its singular thread/asyncloop running the bleak scan and connect:
@@ -28376,6 +28570,12 @@ def main() -> None:
     # now load the app settings
     appWindow.settingsLoad(redraw=False) # redraw is triggered later in the startup process again
     appWindow.restoreExtraDeviceSettingsBackup() # load settings backup if it exists (like on RESET)
+    data_directory = getDataDirectory()
+    if data_directory is not None:
+        try:
+            appWindow.startRoastServer(Path(data_directory))
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
     _log.info('loaded %s settings in %.2fs', len(QSettings().allKeys()), libtime.process_time() - start_time)
 #    _log.debug("PRINT mpl.get_cachedir(): %s",mpl.get_cachedir())
 

@@ -175,6 +175,7 @@ from artisanlib.util import (
     medfilt,
     polyRoR,
     arrayRoR,
+    deserialize,
     serialize,
     roast_message,
     max_blocks,
@@ -2193,12 +2194,45 @@ class TestSerialize:
         test_data: dict[str, Any] = {}
 
         # Act
-        serialize(str(test_file), test_data)
+        serialized = serialize(str(test_file), test_data)
 
         # Assert
+        assert serialized == b'{}'
         assert test_file.exists()
-        content = test_file.read_text(encoding='utf-8')
-        assert content.strip() == '{}'
+        assert test_file.read_bytes() == serialized
+
+    def test_serialize_returns_exact_utf8_repr_bytes(self, tmp_path: Path) -> None:
+        """The returned immutable snapshot is exactly what is written."""
+        test_file = tmp_path / 'unicode.alog'
+        test_data: dict[str, Any] = {
+            'coffee': 'Café',
+            'notes': ['甘い', '☕'],
+        }
+        expected = repr(test_data).encode('utf-8')
+
+        serialized = serialize(str(test_file), test_data)
+
+        assert serialized == expected
+        assert test_file.read_bytes() == expected
+        assert deserialize(str(test_file)) == test_data
+
+    def test_serialize_computes_repr_once(self, tmp_path: Path) -> None:
+        """A mutable object's representation is captured only once."""
+
+        class CountingDict(dict[str, Any]):
+            calls = 0
+
+            def __repr__(self) -> str:
+                self.calls += 1
+                return super().__repr__()
+
+        test_file = tmp_path / 'single-repr.alog'
+        test_data = CountingDict(value='snapshot')
+
+        serialized = serialize(str(test_file), test_data)
+
+        assert test_data.calls == 1
+        assert test_file.read_bytes() == serialized
 
     def test_serialize_basic(self) -> None:
         """Test serialize writes object to file."""

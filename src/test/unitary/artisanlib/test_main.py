@@ -108,6 +108,9 @@ modules that require real Qt components while preventing cross-file contaminatio
 
 # Store original import function before any mocking occurs
 import builtins
+import copy
+from datetime import UTC, datetime
+import inspect
 import os
 import tempfile
 from pathlib import Path
@@ -160,7 +163,7 @@ def ensure_main_qt_isolation() -> Generator[None, None, None]:
 # Use PyQt6 only as requested (ignore PyQt5)
 try:
     from PyQt6.QtCore import QLocale, QSettings, Qt, QTime
-    from PyQt6.QtGui import QColor
+    from PyQt6.QtGui import QAction, QColor
     from PyQt6.QtWidgets import (
         QApplication,
         QFrame,
@@ -168,6 +171,7 @@ try:
         QLayout,
         QLCDNumber,
         QLineEdit,
+        QMenu,
         QSlider,
         QTableWidget,
         QWidget,
@@ -180,8 +184,10 @@ except ImportError as exc:
 if not QApplication.instance():
     app = QApplication(sys.argv)
 
+from artisanlib import main as main_module
 from artisanlib.atypes import RecentRoast
-from artisanlib.main import ApplicationWindow
+from artisanlib.main import ApplicationWindow, UI_MODE
+from artisanlib.util import serialize as util_serialize
 from artisanlib.widgets import MyQLCDNumber, SliderUnclickable
 
 
@@ -3822,3 +3828,361 @@ class TestFileUtilities:
 
         # Assert
         assert result == 'clean_filename.txt'
+
+
+ROASTSERVER_PROFILE: dict[str, Any] = {
+    'roastUUID': '0123456789abcdef0123456789abcdef',
+    'title': 'Connector test',
+    'beans': 'Café',
+}
+
+
+def roastserver_save_window() -> tuple[ApplicationWindow, Mock, dict[str, Any]]:
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    profile = copy.deepcopy(ROASTSERVER_PROFILE)
+    controller = Mock()
+    window.roastserver_controller = controller
+    window.qmc = Mock()
+    window.qmc.autosaveimage = False
+    window.qmc.flagon = False
+    window.qmc.roastbatchnr = 0
+    window.qmc.roastbatchprefix = ''
+    window.qmc.batchcounter = -1
+    window.qmc.batchprefix = ''
+    window.qmc.autosaveprefix = ''
+    window.qmc.plus_file_last_modified = None
+    window.getProfile = Mock(return_value=profile)
+    window.plusAddPath = Mock()
+    window.sendmessage = Mock()
+    window.setCurrentFile = Mock()
+    window.updatePlusStatus = Mock()
+    window.autosave = Mock()
+    window.getDefaultPath = Mock(return_value='.')
+    window.generateFilename = Mock(return_value='chosen.alog')
+    window.ArtisanSaveFileDialog = Mock()
+    return window, controller, profile
+
+
+def roastserver_menu_window() -> ApplicationWindow:
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    action_names = (
+        'fileLoadAction', 'fileSaveAction', 'fileSaveAsAction',
+        'fileSaveCopyAsAction', 'roastServerRoastsAction',
+        'roastServerUploadAction', 'printAction', 'quitAction', 'deviceAction',
+        'commportAction', 'calibrateDelayAction', 'curvesAction', 'eventsAction',
+        'alarmAction', 'phasesGraphAction', 'StatisticsAction',
+        'WindowconfigAction', 'colorsAction', 'autosaveAction', 'batchAction',
+        'roastServerConfigAction',
+    )
+    for name in action_names:
+        label = {
+            'roastServerRoastsAction': 'Server Roasts...',
+            'roastServerUploadAction': 'Upload to Roast Server',
+            'roastServerConfigAction': 'Roast Server...',
+        }.get(name, name)
+        setattr(window, name, QAction(label))
+    menu_names = (
+        'newRoastMenu', 'openRecentMenu', 'importMenu', 'convFromMenu',
+        'exportMenu', 'convMenu', 'saveGraphMenu', 'reportMenu',
+        'saveStatisticsMenu', 'machineMenu', 'themeMenu',
+        'temperatureConfMenu', 'languageMenu', 'UIModeMenu',
+    )
+    for name in menu_names:
+        label = 'Mode' if name == 'UIModeMenu' else name
+        setattr(window, name, QMenu(label))
+    return window
+
+
+class TestRoastServerMainIntegration:
+    def test_roastserver_successful_save_uses_exact_detached_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        destination = tmp_path / 'saved.alog'
+        ordered = Mock()
+        with patch('artisanlib.main.serialize', wraps=util_serialize) as serialize_mock:
+            ordered.attach_mock(serialize_mock, 'serialize')
+            ordered.attach_mock(controller.saved_profile, 'saved_profile')
+            assert window.fileSave(str(destination))
+
+        assert [call[0] for call in ordered.mock_calls] == [
+            'serialize', 'saved_profile']
+        serialized, detached, modified_at = controller.saved_profile.call_args.args
+        assert serialized == destination.read_bytes() == repr(profile).encode('utf-8')
+        assert detached == profile
+        assert detached is not profile
+        assert modified_at == datetime.fromtimestamp(destination.stat().st_mtime, UTC)
+        assert modified_at.tzinfo is UTC
+
+    def test_roastserver_failed_copy_or_post_save_failure_does_not_enqueue(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, _profile = roastserver_save_window()
+        with patch('artisanlib.main.serialize', side_effect=OSError('write failed')):
+            assert not window.fileSave(str(tmp_path / 'failed.alog'))
+        controller.saved_profile.assert_not_called()
+
+        with patch('artisanlib.main.serialize', return_value=b'copy snapshot'):
+            assert window.fileSave(str(tmp_path / 'copy.alog'), copy=True)
+        controller.saved_profile.assert_not_called()
+
+        window.setCurrentFile.side_effect = RuntimeError('post-save failed')
+        with patch('artisanlib.main.serialize', wraps=util_serialize):
+            assert not window.fileSave(str(tmp_path / 'post-save.alog'))
+        controller.saved_profile.assert_not_called()
+
+    def test_roastserver_save_as_uses_chosen_path(self, tmp_path: Path) -> None:
+        window, controller, profile = roastserver_save_window()
+        chosen = tmp_path / 'chosen.alog'
+        window.ArtisanSaveFileDialog.return_value = str(chosen)
+
+        assert window.fileSave(None)
+
+        window.ArtisanSaveFileDialog.assert_called_once()
+        assert chosen.read_bytes() == repr(profile).encode('utf-8')
+        controller.saved_profile.assert_called_once()
+
+    def test_roastserver_autosave_notifies_only_after_exact_write(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        window.qmc.autosaveflag = True
+        window.qmc.autosavepath = str(tmp_path)
+        window.qmc.autosaveaddtorecentfilesflag = True
+        window.qmc.autosaveimage = False
+        window.generateFilename.return_value = 'automatic.alog'
+        ordered = Mock()
+        with patch('artisanlib.main.serialize', wraps=util_serialize) as serialize_mock:
+            ordered.attach_mock(serialize_mock, 'serialize')
+            ordered.attach_mock(controller.saved_profile, 'saved_profile')
+            assert window.automaticsave() == 'automatic.alog'
+
+        destination = tmp_path / 'automatic.alog'
+        assert destination.read_bytes() == repr(profile).encode('utf-8')
+        assert [call[0] for call in ordered.mock_calls] == [
+            'serialize', 'saved_profile']
+
+    @pytest.mark.parametrize(
+        ('viewer', 'dirty', 'filename'),
+        [
+            (False, False, None),
+            (False, True, 'saved.alog'),
+            (True, False, 'saved.alog'),
+            (False, False, 'saved.txt'),
+            (False, False, 'missing.alog'),
+        ],
+    )
+    def test_roast_server_manual_upload_requires_clean_existing_alog(
+        self, tmp_path: Path, viewer: bool, dirty: bool, filename: str | None
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        window.app = Mock(artisanviewerMode=viewer)
+        window.qmc.safesaveflag = dirty
+        if filename not in {None, 'missing.alog'}:
+            (tmp_path / filename).write_bytes(b'original saved bytes')
+        window.curFile = None if filename is None else str(tmp_path / filename)
+        before = (
+            Path(window.curFile).read_bytes()
+            if window.curFile is not None and Path(window.curFile).is_file()
+            else None
+        )
+        with patch('artisanlib.main.deserialize') as deserialize_mock, patch(
+            'artisanlib.main.plus.controller.updateSyncRecordHashAndSync'
+        ) as plus_sync_mock:
+            window.uploadToRoastServer()
+
+        controller.manual_upload.assert_not_called()
+        deserialize_mock.assert_not_called()
+        plus_sync_mock.assert_not_called()
+        if before is not None and window.curFile is not None:
+            assert Path(window.curFile).read_bytes() == before
+        assert profile == ROASTSERVER_PROFILE
+
+    def test_roast_server_manual_upload_uses_in_memory_serializer_bytes(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        window.app = Mock(artisanviewerMode=False)
+        window.qmc.safesaveflag = False
+        destination = tmp_path / 'saved.alog'
+        destination.write_bytes(b'original saved bytes')
+        window.curFile = str(destination)
+        before_bytes = destination.read_bytes()
+        before_mtime = destination.stat().st_mtime
+        with patch('artisanlib.main.deserialize') as deserialize_mock, patch(
+            'artisanlib.main.plus.controller.updateSyncRecordHashAndSync'
+        ) as plus_sync_mock:
+            window.uploadToRoastServer()
+
+        deserialize_mock.assert_not_called()
+        plus_sync_mock.assert_not_called()
+        serialized, detached, modified_at = controller.manual_upload.call_args.args
+        assert serialized == repr(profile).encode('utf-8')
+        assert detached == profile
+        assert detached is not profile
+        assert modified_at == datetime.fromtimestamp(before_mtime, UTC)
+        assert destination.read_bytes() == before_bytes
+        assert destination.stat().st_mtime == before_mtime
+
+    def test_roastserver_file_menu_action_order_in_all_modes(self) -> None:
+        window = roastserver_menu_window()
+        for mode in UI_MODE:
+            menu = window.create_file_menu(mode)
+            labels = [action.text() for action in menu.actions()]
+            save_as = labels.index('fileSaveAsAction')
+            roasts = labels.index('Server Roasts...')
+            upload = labels.index('Upload to Roast Server')
+            export = labels.index('exportMenu') if mode is not UI_MODE.PRODUCTION else len(labels)
+            assert save_as < roasts < upload < export
+
+    def test_roastserver_config_menu_action_precedes_mode_in_all_modes(self) -> None:
+        window = roastserver_menu_window()
+        for mode in UI_MODE:
+            menu = window.create_config_menu(mode)
+            labels = [action.text() for action in menu.actions()]
+            assert labels.index('Roast Server...') < labels.index('Mode')
+
+    @pytest.mark.parametrize(
+        ('method_name', 'dialog_name', 'attribute_name'),
+        [
+            ('showRoastServerConfig', 'RoastServerConfigDialog',
+             'roastserver_config_dialog'),
+            ('showServerRoasts', 'RoastServerBrowserDialog',
+             'roastserver_browser_dialog'),
+        ],
+    )
+    def test_roastserver_modeless_dialogs_are_reused_and_raised(
+        self, method_name: str, dialog_name: str, attribute_name: str
+    ) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.roastserver_controller = Mock()
+        window.roastserver_settings = Mock()
+        setattr(window, attribute_name, None)
+        dialog = Mock()
+        with patch(
+            f'artisanlib.roastserver.dialogs.{dialog_name}', return_value=dialog
+        ) as dialog_class:
+            getattr(window, method_name)()
+            getattr(window, method_name)()
+
+        dialog_class.assert_called_once()
+        assert getattr(window, attribute_name) is dialog
+        assert dialog.show.call_count == 2
+        assert dialog.raise_.call_count == 2
+        assert dialog.activateWindow.call_count == 2
+
+    def test_roastserver_startup_builds_controller_after_settings_path_ready(
+        self, tmp_path: Path
+    ) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.roastserver_controller = None
+        window.roastserver_settings = None
+        controller = Mock()
+        with patch.dict(sys.modules, {'keyring': Mock()}), patch(
+            'artisanlib.roastserver.settings.SettingsStore'
+        ) as settings_store, patch(
+            'artisanlib.roastserver.settings.SystemCredentialStore'
+        ) as credential_store, patch(
+            'artisanlib.roastserver.controller.RoastServerController',
+            return_value=controller,
+        ) as controller_class, patch(
+            'artisanlib.roastserver.api.RoastServerClient'
+        ) as client_class:
+            window.startRoastServer(tmp_path)
+
+        controller_class.assert_called_once_with(
+            settings=settings_store.return_value,
+            credentials=credential_store.return_value,
+            data_root=tmp_path / 'roastserver',
+            client_factory=client_class,
+            profile_validator=window.validateRoastServerProfile,
+            parent=window,
+        )
+        controller.profileReady.connect.assert_called_once_with(
+            window.openRoastServerProfile)
+        controller.start.assert_called_once_with()
+        assert window.roastserver_controller is controller
+        source = inspect.getsource(main_module.main)
+        settings_loaded = source.index('settingsLoad(redraw=False)')
+        data_path_ready = source.index('getDataDirectory()')
+        controller_started = source.index('startRoastServer')
+        assert settings_loaded < data_path_ready < controller_started
+
+    @pytest.mark.parametrize('stopped', [True, False])
+    def test_roastserver_shutdown_is_bounded_and_precedes_device_teardown(
+        self, stopped: bool
+    ) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock()
+        window.qmc.safesaveflag = False
+        window.qmc.checkSaved.return_value = True
+        window.qmc.flagKeepON = True
+        window.roastserver_controller = Mock()
+        window.roastserver_controller.shutdown.return_value = stopped
+        window.stopActivities = Mock()
+        window.closeEventSettings = Mock()
+        window.sendmessage = Mock()
+        ordered = Mock()
+        ordered.attach_mock(window.roastserver_controller.shutdown, 'shutdown')
+        ordered.attach_mock(window.stopActivities, 'stopActivities')
+        ordered.attach_mock(window.closeEventSettings, 'closeEventSettings')
+        with patch.object(
+            QApplication, 'queryKeyboardModifiers',
+            return_value=Qt.KeyboardModifier.NoModifier,
+        ), patch.object(QApplication, 'exit') as exit_mock:
+            ordered.attach_mock(exit_mock, 'exit')
+            assert window.closeApp()
+
+        assert [call[0] for call in ordered.mock_calls] == [
+            'shutdown', 'stopActivities', 'closeEventSettings', 'exit']
+        window.roastserver_controller.shutdown.assert_called_once_with(15_000)
+        if stopped:
+            window.sendmessage.assert_not_called()
+        else:
+            assert 'shutdown timeout' in window.sendmessage.call_args.args[0]
+        assert '.terminate(' not in inspect.getsource(ApplicationWindow.closeApp)
+
+    def test_roastserver_validator_normalizes_without_opening_profile(
+        self, tmp_path: Path
+    ) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.validateProfileDict = Mock(return_value=ROASTSERVER_PROFILE)
+        profile_path = tmp_path / 'staged.part'
+        profile_path.write_text(
+            repr({
+                **ROASTSERVER_PROFILE,
+                'samplinginterval': None,
+                'extramarkers1': [None, 'o'],
+                'extramarkers2': [None],
+            }),
+            encoding='utf-8',
+        )
+
+        window.validateRoastServerProfile(profile_path)
+
+        normalized = window.validateProfileDict.call_args.args[0]
+        assert 'samplinginterval' not in normalized
+        assert normalized['extramarkers1'] == ['None', 'o']
+        assert normalized['extramarkers2'] == ['None']
+        window.validateProfileDict.assert_called_once_with(
+            normalized, quiet=True, validate_signature=True)
+
+    def test_roastserver_open_slot_delegates_until_read_only_integration(
+        self, tmp_path: Path
+    ) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        profile_path = tmp_path / 'verified.alog'
+        source = Mock()
+        controller = Mock()
+        window.roastserver_controller = controller
+        window.curFile = None
+
+        def load(filename: str) -> None:
+            window.curFile = filename
+
+        window.loadFile = Mock(side_effect=load)
+
+        assert window.openRoastServerProfile(str(profile_path), source)
+        window.loadFile.assert_called_once_with(str(profile_path))
+        controller.record_open_source.assert_called_once_with(profile_path, source)

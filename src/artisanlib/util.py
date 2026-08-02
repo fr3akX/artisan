@@ -1353,11 +1353,17 @@ def computeDeltas(
 ### serialize/deserialize
 
 
+def serialize_bytes(obj:dict[str, Any]) -> bytes:
+    return repr(obj).encode('utf-8')
+
+
 #Write object to file
-def serialize(filename:str, obj:dict[str, Any]) -> None:
+def serialize(filename:str, obj:dict[str, Any]) -> bytes:
+    serialized = serialize_bytes(obj)
     fn = str(filename)
-    with open(fn, 'w+', encoding='utf-8') as f:
-        f.write(repr(obj))
+    with open(fn, 'wb') as f:
+        f.write(serialized)
+    return serialized
 
 
 #Read object from file
