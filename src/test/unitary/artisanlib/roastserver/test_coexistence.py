@@ -32,15 +32,33 @@ import pytest
 
 
 _CONTROLLER_ISOLATION_SCRIPT = r'''
+import importlib
+import json
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import UUID
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QObject, pyqtSignal
+
+app = QCoreApplication.instance() or QCoreApplication([])
+app.setApplicationName('ArtisanCoexistenceTest')
+app.setOrganizationName('artisan-scope')
+app.artisanviewerMode = False
+order = sys.argv[3]
+module_names = (
+    'plus.config', 'plus.controller', 'plus.register', 'plus.sync',
+    'artisanlib.roastserver.controller',
+)
+if order == 'connector-first':
+    module_names = tuple(reversed(module_names))
+for module_name in module_names:
+    importlib.import_module(module_name)
 
 import plus.config
+import plus.controller
+import plus.register
+import plus.sync
 from artisanlib.roastserver.controller import RoastServerController
 from artisanlib.roastserver.settings import (
     DEFAULT_CACHE_LIMIT_BYTES,
@@ -108,21 +126,24 @@ class SentinelSettingsStore:
 
 tmp_path = Path(sys.argv[1])
 connected = sys.argv[2] == 'connected'
-plus_runtime = SimpleNamespace(
-    settings=object(),
-    token=object(),
-    outbox=object(),
-    cache=object(),
-    worker=object(),
-    status_action=Mock(),
-    uuid_register=Mock(),
-    sync=Mock(),
-)
-plus_before = vars(plus_runtime).copy()
+plus_status_action = Mock()
+plus_uuid_register = Mock()
+plus_uuid_remove = Mock()
+plus_uuid_lookup = Mock(return_value='existing-plus.alog')
+plus_sync = Mock()
+plus_sync_hash = Mock(return_value='existing-sync-hash')
 plus_connected_before = connected
 plus_token_before = 'existing-plus-session-token' if connected else None
+plus_app_window_before = object()
 plus.config.connected = plus_connected_before
 plus.config.token = plus_token_before
+plus.config.app_window = plus_app_window_before
+plus.config.status_action = plus_status_action
+plus.register.addPath = plus_uuid_register
+plus.register.removePath = plus_uuid_remove
+plus.register.getPath = plus_uuid_lookup
+plus.sync.sync = plus_sync
+plus.controller.updateSyncRecordHashAndSync = plus_sync_hash
 plus_modules_before = {
     name: module for name, module in sys.modules.items()
     if name == 'plus' or name.startswith('plus.')
@@ -181,13 +202,17 @@ assert observed['outbox'] is connector_outbox
 assert observed['cache'] is connector_cache
 assert observed['credentials'] is connector_credentials
 assert observed['worker'] is connector_worker
-assert vars(plus_runtime) == plus_before
-plus_runtime.status_action.setEnabled.assert_not_called()
-plus_runtime.status_action.setIcon.assert_not_called()
-plus_runtime.uuid_register.assert_not_called()
-plus_runtime.sync.assert_not_called()
+plus_status_action.setEnabled.assert_not_called()
+plus_status_action.setIcon.assert_not_called()
+plus_uuid_register.assert_not_called()
+plus_uuid_remove.assert_not_called()
+plus_uuid_lookup.assert_not_called()
+plus_sync.assert_not_called()
+plus_sync_hash.assert_not_called()
 assert plus.config.connected is plus_connected_before
 assert plus.config.token == plus_token_before
+assert plus.config.app_window is plus_app_window_before
+assert plus.config.status_action is plus_status_action
 assert all(sys.modules.get(name) is module for name, module in plus_modules_before.items())
 
 plus_root = tmp_path / 'artisan-plus'
@@ -202,13 +227,22 @@ assert connector_root not in plus_paths
 assert observed['outbox_root'] not in plus_paths
 assert observed['cache_root'] not in plus_paths
 assert controller.shutdown()
+print(json.dumps({
+    'connected': plus.config.connected,
+    'token': plus.config.token,
+    'plus_modules': sorted(plus_modules_before),
+    'outbox_root': str(observed['outbox_root'].relative_to(tmp_path)),
+    'cache_root': str(observed['cache_root'].relative_to(tmp_path)),
+    'register_calls': plus_uuid_register.call_count,
+    'sync_calls': plus_sync.call_count,
+}, sort_keys=True))
 '''
 
 
 def test_connector_production_package_has_no_plus_imports() -> None:
     package_root = Path('artisanlib/roastserver')
     violations: list[str] = []
-    for source_path in sorted(package_root.glob('*.py')):
+    for source_path in sorted(package_root.rglob('*.py')):
         tree = ast.parse(source_path.read_text(encoding='utf-8'), source_path.as_posix())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import) and any(
@@ -226,25 +260,51 @@ def test_connector_production_package_has_no_plus_imports() -> None:
 
 
 @pytest.mark.parametrize('connected', [False, True])
-def test_controller_construction_preserves_plus_sentinels_and_storage_roots(
+def test_controller_construction_preserves_actual_plus_sentinels_in_both_orders(
     tmp_path: Path,
     connected: bool,
 ) -> None:
     environment = os.environ.copy()
     environment['QT_QPA_PLATFORM'] = 'offscreen'
-    result = subprocess.run(
-        [
-            sys.executable,
-            '-c',
-            textwrap.dedent(_CONTROLLER_ISOLATION_SCRIPT),
-            str(tmp_path),
-            'connected' if connected else 'disconnected',
-        ],
-        cwd=Path.cwd(),
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    fingerprints: list[str] = []
+    for order in ('connector-first', 'plus-first'):
+        result = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                textwrap.dedent(_CONTROLLER_ISOLATION_SCRIPT),
+                str(tmp_path / order),
+                'connected' if connected else 'disconnected',
+                order,
+            ],
+            cwd=Path.cwd(),
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        fingerprints.append(result.stdout.strip().splitlines()[-1])
+    assert fingerprints[0] == fingerprints[1]
+
+
+def test_known_plus_node_and_connector_nodes_pass_in_fresh_subprocess_both_orders() -> None:
+    environment = os.environ.copy()
+    environment['QT_QPA_PLATFORM'] = 'offscreen'
+    plus_node = 'test/unitary/plus/test_sync.py::TestAddSync::test_add_sync_successful'
+    connector_node = 'test/unitary/artisanlib/roastserver/test_protection.py'
+    summaries: list[str] = []
+    for nodes in ((plus_node, connector_node), (connector_node, plus_node)):
+        result = subprocess.run(
+            [sys.executable, '-m', 'pytest', '-q', *nodes],
+            cwd=Path.cwd(),
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        summaries.append(result.stdout.strip().splitlines()[-1])
+    assert summaries[0].split(' in ')[0] == summaries[1].split(' in ')[0]

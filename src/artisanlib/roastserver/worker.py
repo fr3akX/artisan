@@ -71,6 +71,7 @@ from artisanlib.roastserver.outbox import (
     OutboxError,
     Snapshot,
 )
+from artisanlib.roastserver.protection import ProtectionRegistry
 from artisanlib.roastserver.settings import (
     MAX_CACHE_LIMIT_BYTES,
     MIN_CACHE_LIMIT_BYTES,
@@ -429,6 +430,7 @@ class RoastServerWorker(QObject):
         profile_vault: OpaqueVault[SavedProfileRequest],
         command_vault: OpaqueVault[object],
         configuration_fence: ConfigurationFence | None = None,
+        protection_registry: ProtectionRegistry | None = None,
         timer_factory: TimerFactory | None = None,
         operation_hook: OperationHook | None = None,
     ) -> None:
@@ -442,6 +444,7 @@ class RoastServerWorker(QObject):
         self._profile_vault = profile_vault
         self._command_vault = command_vault
         self._configuration_fence = configuration_fence or ConfigurationFence()
+        self._protection_registry = protection_registry or ProtectionRegistry()
         self._timer_factory = timer_factory or QTimer
         self._operation_hook = operation_hook
         self._timer: QTimer | None = None
@@ -1995,8 +1998,10 @@ class RoastServerWorker(QObject):
             self._emit_failure(request_id, CACHE_FAILURE)
             return
         try:
-            protected = self._open_cache_paths | self._outbox.protected_paths(
-                request.namespace
+            protected = (
+                self._open_cache_paths
+                | self._protection_registry.paths(request.namespace)
+                | self._outbox.protected_paths(request.namespace)
             )
             if self._cancelled():
                 return
@@ -2015,7 +2020,11 @@ class RoastServerWorker(QObject):
         if configuration is None or configuration.namespace != namespace:
             return
         try:
-            protected = self._open_cache_paths | self._outbox.protected_paths(namespace)
+            protected = (
+                self._open_cache_paths
+                | self._protection_registry.paths(namespace)
+                | self._outbox.protected_paths(namespace)
+            )
             if self._cancelled():
                 return
             stats = self._cache.prune(

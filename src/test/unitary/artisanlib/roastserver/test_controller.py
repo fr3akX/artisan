@@ -850,6 +850,7 @@ class ControllerHarness:
         self.validator_failure: Exception | None = None
         self.validator_callback: Callable[[Path], None] | None = None
         self.worker = cast(FakeWorker, None)
+        self.worker_protection_registry:object|None = None
         self.relay = WorkerRelay()
 
         def validate(path: Path) -> None:
@@ -864,6 +865,7 @@ class ControllerHarness:
             assert repr(kwargs['configuration_fence']) == '<ConfigurationFence>'
             assert kwargs['profile_vault'] is self.profile_vault
             assert kwargs['command_vault'] is self.command_vault
+            self.worker_protection_registry = kwargs['protection_registry']
             self.worker = FakeWorker(**kwargs)
             self.relay.connection.connect(self.worker.relay_connection)
             self.relay.committed.connect(self.worker.relay_committed)
@@ -897,6 +899,7 @@ class ControllerHarness:
             worker_factory=worker_factory,
             clock=lambda: NOW,
         )
+        assert self.worker_protection_registry is self.controller._protection_registry
         self.controller.start()
         self.wait_until(lambda: self.worker.start_count == 1)
         self.wait_until(lambda: bool(self.worker.configure_values))
@@ -2402,6 +2405,36 @@ def test_cached_open_is_stale_and_only_successful_open_paths_are_protected(
         ClearUnusedRequest, controller_harness.command_vault.take(third_clear_id)
     )
     assert third_clear.namespace == cached.namespace
+
+
+def test_protection_updates_are_synchronous_and_restore_exact_previous_token(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    ready = QSignalSpy(controller_harness.controller.profileReady)
+    cached = cached_revision(controller_harness.tmp_path / 'transactional-open.alog')
+    open_id = controller_harness.controller.open_cached(cached)
+    controller_harness.command_vault.take(open_id)
+    controller_harness.relay.cached.emit(open_id, cached)
+    source = cast(ServerProfileSource, controller_harness.wait_for_spy(ready)[1])
+
+    token = controller_harness.controller.record_open_source(cached.path, source)
+
+    assert token is not None
+    assert controller_harness.controller.current_protection_token() is token
+    assert controller_harness.controller.record_open_source(
+        cached.path, replace(source, stale=False)) is None
+    assert controller_harness.controller.current_protection_token() is token
+
+    released = controller_harness.controller.record_local_save(
+        controller_harness.tmp_path / 'local.alog')
+    assert released is token
+    assert controller_harness.controller.current_protection_token() is None
+    assert controller_harness.controller.restore_protection(token, None)
+    assert controller_harness.controller.current_protection_token() is token
+    assert controller_harness.controller._current_open_cache_path == cached.path.absolute()
+    assert controller_harness.controller._current_open_cache_source == source
 
 
 def test_namespace_transition_releases_then_restores_current_open_protection(

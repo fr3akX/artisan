@@ -35,6 +35,8 @@ import os
 import io
 import re
 import ast
+import stat
+from uuid import uuid4
 import numpy
 import functools
 import datetime
@@ -1364,17 +1366,112 @@ def serialize_bytes(obj:dict[str, Any]) -> bytes:
     return repr(obj).encode('utf-8')
 
 
+def _same_entry(first:os.stat_result, second:os.stat_result) -> bool:
+    return (
+        first.st_dev == second.st_dev
+        and first.st_ino != 0
+        and first.st_ino == second.st_ino
+        and stat.S_IFMT(first.st_mode) == stat.S_IFMT(second.st_mode)
+    )
+
+
+def _sync_directory(directory:str) -> None:
+    if os.name == 'nt':
+        return
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _open_serialization_temp(directory:str) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, 'O_BINARY', 0)
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+    for _ in range(10):
+        candidate = os.path.join(directory, f'.artisan-{uuid4().hex}.tmp')
+        try:
+            return os.open(candidate, flags, 0o666), candidate
+        except FileExistsError:
+            continue
+    raise OSError('profile serialization temporary file could not be created')
+
+
 def serialize_with_timestamp(filename:str, obj:dict[str, Any]) -> SerializationResult:
     serialized = serialize_bytes(obj)
-    fn = str(filename)
-    with open(fn, 'wb') as f:
-        written = f.write(serialized)
-        if written != len(serialized):
-            raise OSError('profile serialization write was incomplete')
-        f.flush()
+    descriptor:int|None = None
+    temporary_path:str|None = None
+    replaced = False
+    try:
+        destination = os.path.abspath(os.fspath(filename))
+        directory = os.path.dirname(destination)
+        try:
+            destination_before:os.stat_result|None = os.lstat(destination)
+        except FileNotFoundError:
+            destination_before = None
+        if destination_before is not None and not (
+            stat.S_ISREG(destination_before.st_mode)
+            or stat.S_ISLNK(destination_before.st_mode)
+        ):
+            raise OSError('profile serialization destination is invalid')
+
+        descriptor, temporary_path = _open_serialization_temp(directory)
+        if destination_before is not None and stat.S_ISREG(destination_before.st_mode):
+            os.fchmod(descriptor, stat.S_IMODE(destination_before.st_mode))
+        offset = 0
+        while offset < len(serialized):
+            written = os.write(descriptor, serialized[offset:])
+            if written <= 0:
+                raise OSError('profile serialization write was incomplete')
+            offset += written
+        os.fsync(descriptor)
+        temporary_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(temporary_stat.st_mode) or temporary_stat.st_nlink != 1:
+            raise OSError('profile serialization temporary identity is invalid')
         modified_at = datetime.datetime.fromtimestamp(
-            os.fstat(f.fileno()).st_mtime, tz=datetime.UTC)
-    return SerializationResult(serialized, modified_at)
+            temporary_stat.st_mtime, tz=datetime.UTC)
+        os.close(descriptor)
+        descriptor = None
+
+        temporary_path_stat = os.lstat(temporary_path)
+        if not _same_entry(temporary_stat, temporary_path_stat):
+            raise OSError('profile serialization temporary identity changed')
+        try:
+            destination_now:os.stat_result|None = os.lstat(destination)
+        except FileNotFoundError:
+            destination_now = None
+        if (
+            (destination_before is None) != (destination_now is None)
+            or (
+                destination_before is not None
+                and destination_now is not None
+                and not _same_entry(destination_before, destination_now)
+            )
+        ):
+            raise OSError('profile serialization destination identity changed')
+
+        os.replace(temporary_path, destination)
+        replaced = True
+        published_stat = os.lstat(destination)
+        if not _same_entry(temporary_stat, published_stat):
+            raise OSError('profile serialization publication identity is uncertain')
+        _sync_directory(directory)
+        return SerializationResult(serialized, modified_at)
+    except Exception:
+        raise OSError('profile serialization failed') from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None and not replaced:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
 
 #Write object to file

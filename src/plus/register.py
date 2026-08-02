@@ -123,6 +123,26 @@ def addPath(uuid: str, path: str) -> None:
             register_semaphore.release(1)
 
 
+# remove the registered path for the given UUID
+def removePath(uuid: str) -> None:
+    _log.debug('removePath(%s)', uuid)
+    import portalocker
+    import shelve
+    fh:IO[str]
+    try:
+        register_semaphore.acquire(1)
+        with portalocker.Lock(uuid_cache_path_lock, timeout=0.5) as fh:
+            with shelve.open(uuid_cache_path) as db:
+                db.pop(uuid, None)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception as error:  # pylint: disable=broad-except
+        _log.exception(error)
+    finally:
+        if register_semaphore.available() < 1:
+            register_semaphore.release(1)
+
+
 # returns None if given UUID is not registered, otherwise the registered path
 def getPath(uuid: str) -> str|None:
     _log.debug('getPath(%s)', uuid)

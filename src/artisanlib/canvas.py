@@ -7976,7 +7976,16 @@ class tgraphcanvas(QObject):
     # returns False if action was canceled, True otherwise
     # if keepProperties=True (a call from OnMonitor()), we keep all the pre-set roast properties
     # onMonitor is set if called from onMonitor
-    def reset(self,redraw:bool = True, soundOn:bool = True, keepProperties:bool = False, fireResetAction:bool = True, onMonitor:bool = False) -> bool:
+    def reset(
+        self,
+        redraw:bool = True,
+        soundOn:bool = True,
+        keepProperties:bool = False,
+        fireResetAction:bool = True,
+        onMonitor:bool = False,
+        *,
+        server_read_only:bool = False,
+    ) -> bool:
 #        _log.debug('PRINT reset(keepProperties=%s,onMonitor=%s)',keepProperties,onMonitor)
         try:
             focused_widget = QApplication.focusWidget()
@@ -7989,7 +7998,8 @@ class tgraphcanvas(QObject):
             return False
 
         # restore and clear extra device settings which might have been created on loading a profile with different extra devices settings configuration
-        self.aw.restoreExtraDeviceSettingsBackup()
+        if not server_read_only:
+            self.aw.restoreExtraDeviceSettingsBackup()
 
         if onMonitor and self.flagOpenCompleted and self.aw.curFile is not None:
             # always if ON is pressed while a profile is loaded, the profile is send to the Viewer

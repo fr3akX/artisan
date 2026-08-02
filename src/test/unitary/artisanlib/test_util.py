@@ -15,11 +15,9 @@ Key Features:
 - Python 3.8+ compatibility with type annotations
 """
 
-import builtins
 from datetime import UTC, datetime
 import os
 import stat
-from types import SimpleNamespace
 import warnings
 import math
 import pytest
@@ -2257,106 +2255,89 @@ class TestSerialize:
 
         assert result.serialized_profile == repr(test_data).encode('utf-8')
         assert test_file.read_bytes() == result.serialized_profile
-        assert len(descriptors) == 1
+        assert descriptors
+        assert len(set(descriptors)) == 1
         assert result.modified_at == datetime.fromtimestamp(
             test_file.stat().st_mtime, UTC)
         assert result.modified_at.tzinfo is UTC
 
-    def test_serialize_with_timestamp_orders_write_flush_fstat_and_close(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_serialize_with_timestamp_orders_write_sync_replace_and_directory_sync(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        destination = tmp_path / 'ordered.alog'
         events: list[str] = []
+        real_write = os.write
+        real_fsync = os.fsync
+        real_replace = os.replace
 
-        class OrderedFile:
-            def __enter__(self) -> 'OrderedFile':
-                return self
+        def recording_write(descriptor: int, value: bytes) -> int:
+            events.append('write')
+            return real_write(descriptor, value)
 
-            def __exit__(
-                self,
-                _exc_type: type[BaseException] | None,
-                _exc_value: BaseException | None,
-                _traceback: object,
-            ) -> bool:
-                events.append('close')
-                return False
+        def recording_fsync(descriptor: int) -> None:
+            events.append('fsync')
+            real_fsync(descriptor)
 
-            @staticmethod
-            def write(value: bytes) -> int:
-                events.append('write')
-                return len(value)
+        def recording_replace(source: str, target: str) -> None:
+            events.append('replace')
+            real_replace(source, target)
 
-            @staticmethod
-            def flush() -> None:
-                events.append('flush')
+        monkeypatch.setattr('artisanlib.util.os.write', recording_write)
+        monkeypatch.setattr('artisanlib.util.os.fsync', recording_fsync)
+        monkeypatch.setattr('artisanlib.util.os.replace', recording_replace)
 
-            @staticmethod
-            def fileno() -> int:
-                events.append('fileno')
-                return 42
+        serialize_with_timestamp(str(destination), {'value': 'ordered'})
 
-        def fstat(_descriptor: int) -> object:
-            events.append('fstat')
-            return SimpleNamespace(st_mtime=1_775_203_200.0)
+        assert events[0] == 'write'
+        assert events.count('fsync') == (1 if os.name == 'nt' else 2)
+        assert events.index('write') < events.index('replace')
+        assert events[-1] == ('replace' if os.name == 'nt' else 'fsync')
 
-        monkeypatch.setattr(builtins, 'open', lambda *_args, **_kwargs: OrderedFile())
-        monkeypatch.setattr('artisanlib.util.os.fstat', fstat)
-
-        serialize_with_timestamp('ignored.alog', {'value': 'ordered'})
-
-        assert events == ['write', 'flush', 'fileno', 'fstat', 'close']
-
-    @pytest.mark.parametrize('failure', ['write', 'flush', 'close'])
-    def test_serialize_with_timestamp_observes_file_errors(
-        self, failure: str, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize('failure', ['write', 'file-sync', 'replace'])
+    def test_serialize_with_timestamp_fails_closed_without_raw_paths(
+        self, tmp_path: Path, failure: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        class FailingFile:
-            def __enter__(self) -> 'FailingFile':
-                return self
+        destination = tmp_path / 'private-profile-name.alog'
+        destination.write_bytes(b'old bytes')
+        before = destination.read_bytes()
+        if failure == 'write':
+            monkeypatch.setattr(
+                'artisanlib.util.os.write', Mock(side_effect=OSError(str(destination))))
+        elif failure == 'replace':
+            monkeypatch.setattr(
+                'artisanlib.util.os.replace', Mock(side_effect=OSError(str(destination))))
+        else:
+            real_fsync = os.fsync
+            calls = 0
 
-            def __exit__(
-                self,
-                _exc_type: type[BaseException] | None,
-                _exc_value: BaseException | None,
-                _traceback: object,
-            ) -> bool:
-                if failure == 'close':
-                    raise OSError('close failed')
-                return False
+            def fail_first_sync(descriptor: int) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError(str(destination))
+                real_fsync(descriptor)
 
-            def write(self, value: bytes) -> int:
-                if failure == 'write':
-                    raise OSError('write failed')
-                return len(value)
+            monkeypatch.setattr('artisanlib.util.os.fsync', fail_first_sync)
 
-            def flush(self) -> None:
-                if failure == 'flush':
-                    raise OSError('flush failed')
+        with pytest.raises(OSError) as raised:
+            serialize_with_timestamp(str(destination), {'value': failure})
 
-            @staticmethod
-            def fileno() -> int:
-                return 42
+        assert str(destination) not in str(raised.value)
+        assert destination.read_bytes() == before
+        assert not list(tmp_path.glob('.artisan-*.tmp'))
 
-        monkeypatch.setattr(builtins, 'open', lambda *_args, **_kwargs: FailingFile())
-        monkeypatch.setattr(
-            'artisanlib.util.os.fstat',
-            lambda _descriptor: SimpleNamespace(st_mtime=1_775_203_200.0),
-        )
-
-        with pytest.raises(OSError, match=f'{failure} failed'):
-            serialize_with_timestamp('ignored.alog', {'value': failure})
-
-    def test_serialize_with_timestamp_observes_fstat_failure(
+    def test_serialize_with_timestamp_fstat_failure_leaves_destination_unchanged(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         test_file = tmp_path / 'fstat-failure.alog'
-        expected = repr({'value': 'written'}).encode('utf-8')
+        test_file.write_bytes(b'old bytes')
         monkeypatch.setattr(
-            'artisanlib.util.os.fstat', Mock(side_effect=OSError('fstat failed')))
+            'artisanlib.util.os.fstat', Mock(side_effect=OSError('descriptor detail')))
 
-        with pytest.raises(OSError, match='fstat failed'):
+        with pytest.raises(OSError, match='profile serialization failed'):
             serialize_with_timestamp(str(test_file), {'value': 'written'})
 
-        assert test_file.read_bytes() == expected
+        assert test_file.read_bytes() == b'old bytes'
 
     @pytest.mark.skipif(os.name == 'nt', reason='POSIX permission semantics')
     def test_serialize_preserves_existing_permissions_and_honors_umask(
@@ -2377,6 +2358,66 @@ class TestSerialize:
         finally:
             os.umask(previous_umask)
         assert stat.S_IMODE(created.stat().st_mode) == 0o640
+
+    @pytest.mark.skipif(os.name == 'nt', reason='POSIX link semantics')
+    @pytest.mark.parametrize('alias_kind', ['symlink', 'hardlink'])
+    def test_serialize_replaces_alias_entry_without_touching_target_inode(
+        self, tmp_path: Path, alias_kind: str
+    ) -> None:
+        protected = tmp_path / 'protected-cache.alog'
+        protected.write_bytes(b'protected cache bytes')
+        before = (protected.read_bytes(), protected.stat().st_ino)
+        alias = tmp_path / f'{alias_kind}.alog'
+        if alias_kind == 'symlink':
+            alias.symlink_to(protected)
+        else:
+            os.link(protected, alias)
+
+        serialized = serialize(str(alias), {'value': alias_kind})
+
+        assert alias.read_bytes() == serialized
+        assert not alias.is_symlink()
+        assert alias.stat().st_ino != protected.stat().st_ino
+        assert (protected.read_bytes(), protected.stat().st_ino) == before
+
+    def test_serialize_detects_destination_replacement_race(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        destination = tmp_path / 'raced.alog'
+        destination.write_bytes(b'first entry')
+        replacement = tmp_path / 'racer.alog'
+        replacement.write_bytes(b'racer entry')
+        real_lstat = os.lstat
+        destination_stats = 0
+
+        def racing_lstat(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> os.stat_result:
+            nonlocal destination_stats
+            if os.fspath(path) == str(destination):
+                destination_stats += 1
+                if destination_stats == 2:
+                    os.replace(replacement, destination)
+            return real_lstat(path)
+
+        monkeypatch.setattr('artisanlib.util.os.lstat', racing_lstat)
+
+        with pytest.raises(OSError, match='profile serialization failed'):
+            serialize(str(destination), {'value': 'must not win race'})
+
+        assert destination.read_bytes() == b'racer entry'
+        assert not list(tmp_path.glob('.artisan-*.tmp'))
+
+    def test_directory_sync_is_an_explicit_windows_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        open_mock = Mock(side_effect=AssertionError('Windows opened a directory'))
+        monkeypatch.setattr(util_module.os, 'name', 'nt')
+        monkeypatch.setattr(util_module.os, 'open', open_mock)
+
+        util_module._sync_directory('not-a-raw-path')
+
+        open_mock.assert_not_called()
 
     def test_serialize_basic(self) -> None:
         """Test serialize writes object to file."""

@@ -2895,6 +2895,22 @@ def test_publication_prune_always_uses_latest_queued_protected_paths(
     assert thread_id == worker_harness.worker_thread_id
 
 
+def test_publication_prune_always_unions_synchronous_registry_snapshot(
+    worker_harness: WorkerHarness,
+) -> None:
+    open_path = worker_harness.tmp_path / 'registry-open.alog'
+    open_path.write_bytes(b'open')
+    worker_harness.worker._protection_registry.protect(NAMESPACE, open_path)
+    _online_id, request = worker_harness.open_online()
+    publish_id = worker_harness.command_vault.put(request)
+
+    worker_harness.bus.publish_worker.emit(publish_id)
+    worker_harness.wait_until(lambda: bool(worker_harness.cache.prune_calls))
+
+    _namespace, protected, _thread_id = worker_harness.cache.prune_calls[-1]
+    assert protected == frozenset({open_path})
+
+
 def test_clear_unused_unions_open_and_outbox_protected_paths(
     worker_harness: WorkerHarness,
 ) -> None:
