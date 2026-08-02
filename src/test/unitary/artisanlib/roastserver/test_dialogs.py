@@ -27,6 +27,7 @@ from uuid import UUID
 
 import pytest
 from PyQt6.QtCore import QByteArray, QDate, QObject, QSettings, Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QWidget
 
@@ -990,6 +991,12 @@ BROWSER_LABEL = LabelSummary(
     color='green',
     archived=False,
 )
+BROWSER_ARCHIVED_LABEL = LabelSummary(
+    label_uuid=UUID('88888888-8888-4888-8888-888888888888'),
+    name='Former label',
+    color='violet',
+    archived=True,
+)
 
 
 def browser_summary(
@@ -1064,6 +1071,7 @@ class FakeBrowserController(QObject):
         self.open_roast_calls: list[tuple[str, UUID]] = []
         self.open_cached_calls: list[tuple[str, CachedRevision]] = []
         self.cancel_open_calls: list[str] = []
+        self.resolved_cached: dict[tuple[UUID, int, str], CachedRevision] = {}
         self.saved_geometries: list[bytes] = []
         self._counter = 0
 
@@ -1093,6 +1101,16 @@ class FakeBrowserController(QObject):
 
     def cancel_open(self, request_id: str) -> None:
         self.cancel_open_calls.append(request_id)
+
+    def close_browser(self) -> None:
+        return
+
+    def cached_revision_for(
+        self, source: ServerProfileSource
+    ) -> CachedRevision | None:
+        return self.resolved_cached.get(
+            (source.roast_uuid, source.revision_number, source.sha256)
+        )
 
     def save_browser_geometry(self, geometry: QByteArray) -> None:
         self.saved_geometries.append(bytes(geometry.data()))
@@ -1177,7 +1195,7 @@ def test_browser_model_is_read_only_plain_accessible_newest_first_and_bounded() 
         for column in range(model.columnCount())
     ] == ['Roast date', 'Title', 'Batch', 'Machine', 'Labels', 'Parse state', 'Revisions', 'Cache']
     label_index = model.index(1, 4)
-    assert model.data(label_index) == BROWSER_LABEL.name
+    assert model.data(label_index) == '<b>Plain & curated</b> (Green)'
     assert model.data(label_index, Qt.ItemDataRole.EditRole) is None
     assert model.flags(label_index) == (
         Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
@@ -1188,9 +1206,27 @@ def test_browser_model_is_read_only_plain_accessible_newest_first_and_bounded() 
     assert model.data(
         model.index(1, 0), RoastTableModel.CachedRevisionRole
     ) == BROWSER_CACHED
-    assert '<b>Plain & curated</b>' in cast(
+    assert '<b>Plain & curated</b> (Green)' in cast(
         str,
         model.data(model.index(1, 0), Qt.ItemDataRole.AccessibleTextRole),
+    )
+    decoration = model.data(label_index, Qt.ItemDataRole.DecorationRole)
+    assert isinstance(decoration, QColor)
+    assert decoration.name() == '#16a34a'
+
+    archived = replace(
+        BROWSER_SUMMARY_ONE,
+        labels=(BROWSER_ARCHIVED_LABEL,),
+    )
+    model.set_page(
+        ArchivePageView((ArchiveRow(archived, None, None, False),), None, True, None),
+        append=False,
+    )
+    archived_index = model.index(0, 4)
+    assert model.data(archived_index) == 'Former label (Violet, archived)'
+    assert 'archived' in cast(
+        str,
+        model.data(archived_index, Qt.ItemDataRole.AccessibleTextRole),
     )
 
     many = tuple(
@@ -1308,6 +1344,41 @@ def test_browser_load_more_deduplicates_and_visible_fallback_matches_scroll_pagi
     assert len(browser_controller.load_more_calls) == before + 1
 
 
+def test_browser_retained_offline_page_merges_verified_cache_and_keeps_server_description(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+) -> None:
+    server_summary = replace(BROWSER_SUMMARY_ONE, title='Authoritative server title')
+    emit_current_page(
+        browser_controller,
+        online_browser_page(server_summary, BROWSER_SUMMARY_TWO, next_cursor='next'),
+    )
+    offline_summary = replace(BROWSER_SUMMARY_ONE, title=None, machine=None, labels=())
+    verified = replace(BROWSER_CACHED, roast=offline_summary)
+
+    browser.refresh_button.click()
+    refresh_id = browser_controller.browse_calls[-1][0]
+    browser_controller.archivePageReady.emit(refresh_id, cached_browser_page(verified))
+
+    retained = browser.roast_model.row(
+        browser.roast_model.roast_uuids().index(BROWSER_ROAST_ONE)
+    )
+    assert retained is not None
+    assert retained.roast.title == 'Authoritative server title'
+    assert retained.roast.machine == BROWSER_SUMMARY_ONE.machine
+    assert retained.cached == verified
+    assert retained.stale
+    assert not browser.roast_model.has_more()
+    browser.select_roast(BROWSER_ROAST_ONE)
+    assert browser.open_button.isEnabled()
+    browser.open_button.click()
+    assert browser_controller.open_cached_calls[-1][1] == verified
+
+    browser._finish_open()
+    browser.select_roast(BROWSER_ROAST_TWO)
+    assert not browser.open_button.isEnabled()
+
+
 def test_browser_offline_open_revalidates_cached_and_tracks_only_matching_profile(
     browser: RoastServerBrowserDialog,
     browser_controller: FakeBrowserController,
@@ -1332,6 +1403,50 @@ def test_browser_offline_open_revalidates_cached_and_tracks_only_matching_profil
     assert browser.status_label.text() == 'Opened verified cached revision 2 (stale).'
     assert BROWSER_SOURCE.stale
     assert open_id not in browser_controller.cancel_open_calls
+
+
+def test_browser_refresh_during_open_accepts_detail_revision_advance_and_updates_row(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+) -> None:
+    emit_current_page(browser_controller, online_browser_page(BROWSER_SUMMARY_ONE))
+    browser.select_roast(BROWSER_ROAST_ONE)
+    browser.open_button.click()
+    assert browser.progress_bar.isVisible()
+
+    browser.refresh_button.click()
+    emit_current_page(browser_controller, online_browser_page(BROWSER_SUMMARY_ONE))
+    advanced = replace(
+        BROWSER_SOURCE,
+        revision_number=3,
+        sha256='c' * 64,
+        stale=False,
+    )
+    advanced_cached = replace(
+        BROWSER_CACHED,
+        roast=replace(BROWSER_SUMMARY_ONE, revision_count=3),
+        revision=replace(BROWSER_REVISION, revision_number=3, sha256='c' * 64),
+        path=Path('/tmp/advanced.alog'),
+    )
+    browser_controller.resolved_cached[
+        (advanced.roast_uuid, advanced.revision_number, advanced.sha256)
+    ] = advanced_cached
+    browser_controller.profileReady.emit('/tmp/advanced.alog', advanced)
+
+    assert not browser.progress_bar.isVisible()
+    assert browser.status_label.text() == 'Opened verified server revision 3.'
+    row = browser.roast_model.row(0)
+    assert row is not None
+    assert row.roast.revision_count == 3
+    assert row.cached_revision == 3
+    assert row.cached_sha256 == 'c' * 64
+    assert row.cached == advanced_cached
+
+    browser_controller.onlineChanged.emit(False)
+    browser.select_roast(BROWSER_ROAST_ONE)
+    assert browser.open_button.isEnabled()
+    browser.open_button.click()
+    assert browser_controller.open_cached_calls[-1][1] == advanced_cached
 
 
 def test_browser_awaiting_profile_disabled_fallback_is_confirmed_and_close_cancels(
@@ -1405,6 +1520,16 @@ def test_browser_is_modeless_plain_accessible_keyboard_reachable_and_onscreen(
     assert browser.roast_view.accessibleName() == 'Server roast archive'
     assert browser.open_button.accessibleName() == 'Open selected server roast'
     assert browser.load_more_button.accessibleName() == 'Load more server roasts'
+    assert '&' in browser.cancel_open_button.text()
+    browser.cancel_open_button.show()
+    browser.load_more_button.setEnabled(True)
+    browser.open_button.setEnabled(True)
+    browser.load_more_button.setFocus(Qt.FocusReason.OtherFocusReason)
+    QTest.keyClick(browser.load_more_button, Qt.Key.Key_Tab)  # type: ignore[call-overload]
+    assert QApplication.focusWidget() is browser.cancel_open_button
+    QTest.keyClick(browser.cancel_open_button, Qt.Key.Key_Tab)  # type: ignore[call-overload]
+    assert QApplication.focusWidget() is browser.open_button
+    browser.cancel_open_button.hide()
     assert not hasattr(browser, 'comments_edit')
     assert not browser.roast_view.editTriggers()
     screen = browser.screen()

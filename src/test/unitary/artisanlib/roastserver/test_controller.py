@@ -22,7 +22,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
+from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 import hashlib
 import json
 import os
@@ -122,9 +124,9 @@ def assert_secret_absent(secret: str, value: object) -> None:
         pytest.fail('runtime secret exposed by controller value', pytrace=False)
 
 
-def revision_for(content: bytes = PROFILE_BYTES) -> Revision:
+def revision_for(content: bytes = PROFILE_BYTES, *, number: int = 1) -> Revision:
     return Revision(
-        revision_number=1,
+        revision_number=number,
         sha256=hashlib.sha256(content).hexdigest(),
         byte_size=len(content),
         parser_version='controller-test',
@@ -137,8 +139,8 @@ def revision_for(content: bytes = PROFILE_BYTES) -> Revision:
     )
 
 
-def summary_for(content: bytes = PROFILE_BYTES) -> RoastSummary:
-    revision = revision_for(content)
+def summary_for(content: bytes = PROFILE_BYTES, *, number: int = 1) -> RoastSummary:
+    revision = revision_for(content, number=number)
     return RoastSummary(
         roast_uuid=ROAST_UUID,
         state='parsed',
@@ -160,9 +162,9 @@ def summary_for(content: bytes = PROFILE_BYTES) -> RoastSummary:
     )
 
 
-def detail_for(content: bytes = PROFILE_BYTES) -> RoastDetail:
-    summary = summary_for(content)
-    revision = revision_for(content)
+def detail_for(content: bytes = PROFILE_BYTES, *, number: int = 1) -> RoastDetail:
+    summary = summary_for(content, number=number)
+    revision = revision_for(content, number=number)
     return RoastDetail(
         roast_uuid=summary.roast_uuid,
         state=summary.state,
@@ -202,8 +204,13 @@ def cached_revision(path: Path, *, organization_id: UUID = ORGANIZATION_ID) -> C
     )
 
 
-def publish_request(path: Path) -> PublishRequest:
-    detail = detail_for()
+def publish_request(
+    path: Path,
+    *,
+    content: bytes = PROFILE_BYTES,
+    number: int = 1,
+) -> PublishRequest:
+    detail = detail_for(content, number=number)
     revision = cast(Revision, detail.current_revision)
     return PublishRequest(
         detail=detail,
@@ -550,6 +557,7 @@ class FakeWorker(QObject):
     failedJobsChanged = pyqtSignal(object)
     cacheStatsChanged = pyqtSignal(object)
     archivePageReady = pyqtSignal(str, object)
+    browseFinished = pyqtSignal(str)
     downloadStaged = pyqtSignal(str, object)
     cachedReady = pyqtSignal(str, object)
     cachedFallbackReady = pyqtSignal(str, object)
@@ -570,6 +578,7 @@ class FakeWorker(QObject):
         self.rollback_succeeds = True
         self.auto_finish_rollback = True
         self.enqueue_ids: list[str] = []
+        self.browse_ids: list[str] = []
         self.publish_ids: list[str] = []
         self.protect_ids: list[str] = []
         self.discard_paths: list[str] = []
@@ -661,6 +670,7 @@ class FakeWorker(QObject):
 
     @pyqtSlot(str)
     def browse(self, request_id: str) -> None:
+        self.browse_ids.append(request_id)
         self._record('browse', request_id)
 
     @pyqtSlot(str)
@@ -749,6 +759,11 @@ class FakeWorker(QObject):
     @pyqtSlot(str, object)
     def relay_archive(self, request_id: str, value: object) -> None:
         self.archivePageReady.emit(request_id, value)
+        self.browseFinished.emit(request_id)
+
+    @pyqtSlot(str)
+    def relay_browse_finished(self, request_id: str) -> None:
+        self.browseFinished.emit(request_id)
 
     @pyqtSlot(str, object)
     def relay_staged(self, request_id: str, value: object) -> None:
@@ -801,6 +816,7 @@ class WorkerRelay(QObject):
     failed_jobs = pyqtSignal(object)
     cache_stats = pyqtSignal(object)
     archive = pyqtSignal(str, object)
+    browse_finished = pyqtSignal(str)
     staged = pyqtSignal(str, object)
     cached = pyqtSignal(str, object)
     cached_fallback = pyqtSignal(str, object)
@@ -832,11 +848,14 @@ class ControllerHarness:
         self.command_vault: OpaqueVault[object] = OpaqueVault()
         self.validator_calls: list[tuple[Path, int]] = []
         self.validator_failure: Exception | None = None
+        self.validator_callback: Callable[[Path], None] | None = None
         self.worker = cast(FakeWorker, None)
         self.relay = WorkerRelay()
 
         def validate(path: Path) -> None:
             self.validator_calls.append((path, int(QThread.currentThreadId())))
+            if self.validator_callback is not None:
+                self.validator_callback(path)
             if self.validator_failure is not None:
                 raise self.validator_failure
 
@@ -858,6 +877,7 @@ class ControllerHarness:
             self.relay.failed_jobs.connect(self.worker.relay_failed_jobs)
             self.relay.cache_stats.connect(self.worker.relay_cache_stats)
             self.relay.archive.connect(self.worker.relay_archive)
+            self.relay.browse_finished.connect(self.worker.relay_browse_finished)
             self.relay.staged.connect(self.worker.relay_staged)
             self.relay.cached.connect(self.worker.relay_cached)
             self.relay.cached_fallback.connect(self.worker.relay_cached_fallback)
@@ -1842,6 +1862,34 @@ def test_browse_tracks_cursor_and_ignores_stale_pages(
     assert len(page_spy) == 1
 
 
+def test_blocked_browse_coalesces_one_active_and_only_latest_pending_filters(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    vault_before = controller_harness.command_vault.size()
+    first_id = controller_harness.controller.browse(ArchiveFilters(search='first'))
+    latest_id = first_id
+    for number in range(100):
+        latest_id = controller_harness.controller.browse(
+            ArchiveFilters(search=f'latest-{number}')
+        )
+
+    controller_harness.wait_until(
+        lambda: first_id in controller_harness.fake_worker.browse_ids
+    )
+    assert controller_harness.fake_worker.browse_ids == [first_id]
+    assert controller_harness.command_vault.size() <= vault_before + 2
+
+    controller_harness.relay.browse_finished.emit(first_id)
+    controller_harness.wait_until(
+        lambda: len(controller_harness.fake_worker.browse_ids) == 2
+    )
+    assert controller_harness.fake_worker.browse_ids == [first_id, latest_id]
+    latest = cast(BrowseRequest, controller_harness.command_vault.take(latest_id))
+    assert latest.filters.search == 'latest-99'
+
+
 def test_browse_emits_immutable_page_views_and_failed_next_cursor_can_retry(
     controller_harness: ControllerHarness,
 ) -> None:
@@ -1870,11 +1918,85 @@ def test_browse_emits_immutable_page_views_and_failed_next_cursor_can_retry(
     failure = public_failure(FailureKind.OFFLINE)
     controller_harness.relay.failure.emit(more_id, failure)
     assert controller_harness.wait_for_spy(failed) == [more_id, failure]
+    controller_harness.relay.browse_finished.emit(more_id)
+    controller_harness.wait_until(
+        lambda: controller_harness.controller._browse_active_id is None
+    )
 
     retry_id = controller_harness.controller.load_more()
     assert retry_id is not None
     retry = cast(BrowseRequest, controller_harness.command_vault.take(retry_id))
     assert retry.cursor == 'next-cursor'
+
+
+@pytest.mark.parametrize(
+    'returned_cursors',
+    [('A', 'A'), ('A', 'B', 'A')],
+    ids=['A-A', 'A-B-A'],
+)
+def test_browse_rejects_successful_cursor_cycles_and_stops_paging(
+    controller_harness: ControllerHarness,
+    returned_cursors: tuple[str, ...],
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    failed = QSignalSpy(controller_harness.controller.operationFailed)
+    first_id = controller_harness.controller.browse(ArchiveFilters())
+    controller_harness.command_vault.take(first_id)
+    controller_harness.relay.archive.emit(
+        first_id, RoastPage((summary_for(),), returned_cursors[0])
+    )
+    controller_harness.wait_until(
+        lambda: controller_harness.controller._browse_active_id is None
+    )
+
+    for next_cursor in returned_cursors[1:]:
+        more_id = controller_harness.controller.load_more()
+        assert more_id is not None
+        request = cast(BrowseRequest, controller_harness.command_vault.take(more_id))
+        assert request.cursor is not None
+        controller_harness.relay.archive.emit(
+            more_id, RoastPage((), next_cursor)
+        )
+        controller_harness.wait_until(
+            lambda: controller_harness.controller._browse_active_id is None
+        )
+        if next_cursor == returned_cursors[0]:
+            assert list(failed[-1]) == [
+                more_id,
+                public_failure(FailureKind.INVALID_RESPONSE),
+            ]
+
+    assert controller_harness.controller._next_cursor is None
+    assert controller_harness.controller.load_more() is None
+
+
+def test_failed_cursor_is_not_consumed_and_can_retry(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    first_id = controller_harness.controller.browse(ArchiveFilters())
+    controller_harness.command_vault.take(first_id)
+    controller_harness.relay.archive.emit(first_id, RoastPage((), 'A'))
+    controller_harness.wait_until(
+        lambda: controller_harness.controller._browse_active_id is None
+    )
+    failed_id = controller_harness.controller.load_more()
+    assert failed_id is not None
+    controller_harness.command_vault.take(failed_id)
+    controller_harness.relay.failure.emit(
+        failed_id, public_failure(FailureKind.OFFLINE)
+    )
+    controller_harness.relay.browse_finished.emit(failed_id)
+    controller_harness.wait_until(
+        lambda: controller_harness.controller._browse_active_id is None
+    )
+
+    retry_id = controller_harness.controller.load_more()
+    assert retry_id is not None
+    retry = cast(BrowseRequest, controller_harness.command_vault.take(retry_id))
+    assert retry.cursor == 'A'
 
 
 def test_cached_page_view_carries_verified_revision_and_retained_failure(
@@ -1915,6 +2037,72 @@ def test_cached_page_view_carries_verified_revision_and_retained_failure(
     assert open_request.cached_fallback == cached
 
 
+def test_controller_bounds_cached_revision_lru_to_visible_model_capacity(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    first_id = controller_harness.controller.browse(ArchiveFilters())
+    controller_harness.command_vault.take(first_id)
+    cached_items = tuple(
+        CachedRevision(
+            namespace=namespace_for(ORIGIN, ORGANIZATION_ID),
+            roast=replace(summary_for(), roast_uuid=UUID(int=index + 1)),
+            revision=revision_for(),
+            path=controller_harness.tmp_path / f'{index}.alog',
+            sidecar_path=controller_harness.tmp_path / f'{index}.json',
+            downloaded_at=NOW,
+        )
+        for index in range(5_025)
+    )
+
+    controller_harness.relay.archive.emit(first_id, CachedPage(cached_items))
+    controller_harness.wait_until(
+        lambda: controller_harness.controller._browse_active_id is None
+    )
+
+    known = controller_harness.controller._known_cached_revisions
+    assert len(known) <= 5_000
+    assert cached_items[-1].roast.roast_uuid in known
+
+
+def test_ready_cache_paths_keep_current_and_only_a_small_pending_set(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    current = cached_revision(controller_harness.tmp_path / 'current.alog')
+    first_id = controller_harness.controller.open_cached(current)
+    controller_harness.command_vault.take(first_id)
+    controller_harness.relay.cached.emit(first_id, current)
+    controller_harness.wait_until(
+        lambda: current.path.absolute()
+        in controller_harness.controller._ready_cache_paths
+    )
+    controller_harness.controller.record_open_source(current.path, current.source)
+
+    for index in range(20):
+        pending = replace(
+            current,
+            path=controller_harness.tmp_path / f'pending-{index}.alog',
+            sidecar_path=controller_harness.tmp_path / f'pending-{index}.json',
+        )
+        request_id = controller_harness.controller.open_cached(pending)
+        controller_harness.command_vault.take(request_id)
+        controller_harness.relay.cached.emit(request_id, pending)
+        pending_path = pending.path.absolute()
+        controller_harness.wait_until(
+            partial(
+                controller_harness.controller._ready_cache_paths.__contains__,
+                pending_path,
+            )
+        )
+
+    ready_paths = controller_harness.controller._ready_cache_paths
+    assert len(ready_paths) <= 8
+    assert current.path.absolute() in ready_paths
+
+
 def test_online_cached_fallback_and_cancel_are_exact_request_generation(
     controller_harness: ControllerHarness,
 ) -> None:
@@ -1924,7 +2112,9 @@ def test_online_cached_fallback_and_cancel_are_exact_request_generation(
     ready = QSignalSpy(controller_harness.controller.profileReady)
     cached = cached_revision(controller_harness.tmp_path / 'fallback.alog')
     first_id = controller_harness.controller.open_roast(ROAST_UUID)
-    controller_harness.command_vault.take(first_id)
+    first_online = cast(
+        OnlineOpenRequest, controller_harness.command_vault.take(first_id)
+    )
 
     controller_harness.relay.cached_fallback.emit(first_id, cached)
 
@@ -1932,7 +2122,10 @@ def test_online_cached_fallback_and_cancel_are_exact_request_generation(
     controller_harness.controller.cancel_open(first_id)
     controller_harness.relay.staged.emit(
         first_id,
-        publish_request(controller_harness.tmp_path / 'cancelled.part'),
+        replace(
+            publish_request(controller_harness.tmp_path / 'cancelled.part'),
+            token=first_online.token,
+        ),
     )
     time.sleep(0.01)
     controller_harness.app.processEvents()
@@ -1943,9 +2136,109 @@ def test_online_cached_fallback_and_cancel_are_exact_request_generation(
     controller_harness.command_vault.take(second_id)
     controller_harness.controller.browse(ArchiveFilters(search='new revision'))
     controller_harness.relay.cached_fallback.emit(second_id, cached)
+    assert controller_harness.wait_for_spy(fallback_spy, 1) == [second_id, cached]
+
+
+def test_refresh_during_open_does_not_cancel_detail_authoritative_revision(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    ready = QSignalSpy(controller_harness.controller.profileReady)
+    open_id = controller_harness.controller.open_roast(ROAST_UUID)
+    online = cast(OnlineOpenRequest, controller_harness.command_vault.take(open_id))
+    refresh_id = controller_harness.controller.browse(
+        ArchiveFilters(search='newer list')
+    )
+    staged = replace(
+        publish_request(
+            controller_harness.tmp_path / 'advanced.part',
+            content=b'advanced-profile',
+            number=2,
+        ),
+        token=online.token,
+    )
+
+    controller_harness.relay.staged.emit(open_id, staged)
+    controller_harness.wait_until(
+        lambda: bool(controller_harness.fake_worker.publish_ids)
+    )
+    publish_id = controller_harness.fake_worker.publish_ids[-1]
+    controller_harness.command_vault.take(publish_id)
+    advanced = CachedRevision(
+        namespace=namespace_for(ORIGIN, ORGANIZATION_ID),
+        roast=summary_for(b'advanced-profile', number=2),
+        revision=revision_for(b'advanced-profile', number=2),
+        path=controller_harness.tmp_path / 'advanced.alog',
+        sidecar_path=controller_harness.tmp_path / 'advanced.json',
+        downloaded_at=NOW,
+    )
+    controller_harness.relay.published.emit(publish_id, advanced)
+
+    payload = controller_harness.wait_for_spy(ready)
+    source = cast(ServerProfileSource, payload[1])
+    assert source.revision_number == 2
+    assert not source.stale
+    assert controller_harness.controller._known_cached_revisions[ROAST_UUID] == advanced
+    assert refresh_id != open_id
+
+
+def test_cancel_during_validation_discards_exact_stage_before_publication(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    open_id = controller_harness.controller.open_roast(ROAST_UUID)
+    online = cast(OnlineOpenRequest, controller_harness.command_vault.take(open_id))
+    staged = replace(
+        publish_request(controller_harness.tmp_path / 'cancel-after-validation.part'),
+        token=online.token,
+    )
+    controller_harness.validator_callback = (
+        lambda _path: controller_harness.controller.cancel_open(open_id)
+    )
+
+    controller_harness.relay.staged.emit(open_id, staged)
+    controller_harness.wait_until(
+        lambda: str(staged.staged_path) in controller_harness.fake_worker.discard_paths
+    )
+
+    assert online.token.is_cancelled()
+    assert controller_harness.fake_worker.publish_ids == []
+    assert staged.staged_path not in (
+        tracked.request.staged_path
+        for tracked in controller_harness.controller._publish_requests.values()
+    )
+
+
+def test_cancel_after_publication_handoff_suppresses_open_completion(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    ready = QSignalSpy(controller_harness.controller.profileReady)
+    open_id = controller_harness.controller.open_roast(ROAST_UUID)
+    online = cast(OnlineOpenRequest, controller_harness.command_vault.take(open_id))
+    staged = replace(
+        publish_request(controller_harness.tmp_path / 'linearized.part'),
+        token=online.token,
+    )
+    controller_harness.relay.staged.emit(open_id, staged)
+    controller_harness.wait_until(
+        lambda: bool(controller_harness.fake_worker.publish_ids)
+    )
+    publish_id = controller_harness.fake_worker.publish_ids[-1]
+    controller_harness.command_vault.take(publish_id)
+
+    controller_harness.controller.cancel_open(open_id)
+    valid_cached = cached_revision(controller_harness.tmp_path / 'linearized.alog')
+    controller_harness.relay.published.emit(publish_id, valid_cached)
     time.sleep(0.01)
     controller_harness.app.processEvents()
-    assert len(fallback_spy) == 1
+
+    assert online.token.is_cancelled()
+    assert len(ready) == 0
+    assert valid_cached.path not in controller_harness.controller._ready_cache_paths
 
 
 def test_validation_precedes_publication_and_profile_ready(
@@ -1955,9 +2248,9 @@ def test_validation_precedes_publication_and_profile_ready(
     controller_harness.enable(automatic_upload=False)
     ready = QSignalSpy(controller_harness.controller.profileReady)
     open_id = controller_harness.controller.open_roast(ROAST_UUID)
-    controller_harness.command_vault.take(open_id)
+    online = cast(OnlineOpenRequest, controller_harness.command_vault.take(open_id))
     staged_path = controller_harness.tmp_path / 'hidden.part'
-    request = publish_request(staged_path)
+    request = replace(publish_request(staged_path), token=online.token)
 
     controller_harness.relay.staged.emit(open_id, request)
     controller_harness.wait_until(
@@ -1987,8 +2280,11 @@ def test_validator_and_publish_vault_failures_explicitly_discard_stage(
     controller_harness.enable(automatic_upload=False)
     failed = QSignalSpy(controller_harness.controller.operationFailed)
     open_id = controller_harness.controller.open_roast(ROAST_UUID)
-    controller_harness.command_vault.take(open_id)
-    request = publish_request(controller_harness.tmp_path / 'invalid.part')
+    online = cast(OnlineOpenRequest, controller_harness.command_vault.take(open_id))
+    request = replace(
+        publish_request(controller_harness.tmp_path / 'invalid.part'),
+        token=online.token,
+    )
     controller_harness.validator_failure = ValueError('profile parser detail')
 
     controller_harness.relay.staged.emit(open_id, request)
@@ -2001,8 +2297,13 @@ def test_validator_and_publish_vault_failures_explicitly_discard_stage(
 
     controller_harness.validator_failure = None
     second_id = controller_harness.controller.open_roast(ROAST_UUID)
-    controller_harness.command_vault.take(second_id)
-    second = publish_request(controller_harness.tmp_path / 'vault-loss.part')
+    second_online = cast(
+        OnlineOpenRequest, controller_harness.command_vault.take(second_id)
+    )
+    second = replace(
+        publish_request(controller_harness.tmp_path / 'vault-loss.part'),
+        token=second_online.token,
+    )
     original_put = controller_harness.command_vault.put
 
     def fail_put(_value: object) -> str:

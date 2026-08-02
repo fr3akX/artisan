@@ -175,6 +175,31 @@ class ConfigurationFence:
                 self._active[generation] = active - 1
 
 
+class OpenCancellationToken:
+    """Secret-free synchronous cancellation fence for one open request chain."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+
+    @override
+    def __repr__(self) -> str:
+        return '<OpenCancellationToken>'
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def begin_publication(self) -> bool:
+        """Linearize publication before a concurrent cancellation."""
+        with self._lock:
+            return not self._cancelled
+
+
 class OpaqueVault[T]:
     """Thread-safe one-shot transfer that never represents stored values."""
 
@@ -307,11 +332,13 @@ class OnlineOpenRequest:
     namespace: Namespace
     roast_uuid: UUID
     cached_fallback: CachedRevision | None = None
+    token: OpenCancellationToken = field(default_factory=OpenCancellationToken)
 
 
 @dataclass(frozen=True, slots=True)
 class CachedOpenRequest:
     cached: CachedRevision
+    token: OpenCancellationToken = field(default_factory=OpenCancellationToken)
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +346,7 @@ class PublishRequest:
     detail: RoastDetail
     receipt: DownloadReceipt
     staged_path: Path
+    token: OpenCancellationToken = field(default_factory=OpenCancellationToken)
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +409,7 @@ class RoastServerWorker(QObject):
     failedJobsChanged = pyqtSignal(object)
     cacheStatsChanged = pyqtSignal(object)
     archivePageReady = pyqtSignal(str, object)
+    browseFinished = pyqtSignal(str)
     downloadStaged = pyqtSignal(str, object)
     cachedReady = pyqtSignal(str, object)
     cachedFallbackReady = pyqtSignal(str, object)
@@ -1521,6 +1550,12 @@ class RoastServerWorker(QObject):
         ):
             return
         try:
+            self._browse(opaque_id, request_id)
+        finally:
+            self.browseFinished.emit(request_id)
+
+    def _browse(self, opaque_id: str, request_id: str) -> None:
+        try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
             if not self._cancelled():
@@ -1627,12 +1662,19 @@ class RoastServerWorker(QObject):
             return
         if self._cancelled():
             return
-        if not isinstance(value, OnlineOpenRequest) or not self._namespace_is_current(
-            value.namespace
+        token_value: object = (
+            value.token if isinstance(value, OnlineOpenRequest) else None
+        )
+        if (
+            not isinstance(value, OnlineOpenRequest)
+            or not isinstance(token_value, OpenCancellationToken)
+            or not self._namespace_is_current(value.namespace)
         ):
             self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
             return
         request = value
+        if request.token.is_cancelled():
+            return
         configuration = self._configuration
         credential = self._credential
         if (
@@ -1641,6 +1683,8 @@ class RoastServerWorker(QObject):
             or not configuration.enabled
             or not self._configuration_is_authorized(configuration)
         ):
+            if self._open_cancelled(request.token):
+                return
             self._emit_failure(request_id, _failure(FailureKind.OFFLINE))
             self.onlineChanged.emit(False)
             self._offer_request_fallback(request_id, request)
@@ -1650,14 +1694,14 @@ class RoastServerWorker(QObject):
         detail: RoastDetail | None = None
         try:
             with self._client_factory(configuration.origin, credential) as client:
-                if self._cancelled():
+                if self._open_cancelled(request.token):
                     return
                 permit = self._operation_permit(configuration, 'get_roast')
                 if permit is None:
                     raise _StaleConfiguration
                 with permit:
                     detail_value: object = client.get_roast(request.roast_uuid)
-                if self._cancelled():
+                if self._open_cancelled(request.token):
                     return
                 if (
                     not isinstance(detail_value, RoastDetail)
@@ -1667,7 +1711,7 @@ class RoastServerWorker(QObject):
                     raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
                 detail = detail_value
                 staged_path, output = self._cache.new_staging_file(request.namespace)
-                if self._cancelled():
+                if self._open_cancelled(request.token):
                     self._discard_stage(staged_path)
                     return
                 permit = self._operation_permit(configuration, 'download_revision')
@@ -1675,13 +1719,13 @@ class RoastServerWorker(QObject):
                     raise _StaleConfiguration
                 with permit:
                     receipt = client.download_revision(detail, output)
-                if self._cancelled():
+                if self._open_cancelled(request.token):
                     self._discard_stage(staged_path)
                     return
-            publish_request = PublishRequest(detail, receipt, staged_path)
+            publish_request = PublishRequest(detail, receipt, staged_path, request.token)
             if not _valid_publish_request(publish_request):
                 raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
-            if self._cancelled():
+            if self._open_cancelled(request.token):
                 self._discard_stage(staged_path)
                 return
             self._pending_stages[staged_path] = _PendingStage(
@@ -1690,40 +1734,42 @@ class RoastServerWorker(QObject):
         except _StaleConfiguration:
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            if not self._cancelled():
+            if not self._open_cancelled(request.token):
                 self._emit_failure(request_id, _failure(FailureKind.OFFLINE))
                 self.onlineChanged.emit(False)
             return
         except ApiFailure as error:
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            if not self._cancelled():
+            if not self._open_cancelled(request.token):
                 self._handle_nonqueue_api_failure(request_id, request.namespace, error)
                 if error.failure.retryable:
                     if detail is None:
                         self._offer_request_fallback(request_id, request)
                     else:
-                        self._offer_cached_fallback(request_id, request.namespace, detail)
+                        self._offer_cached_fallback(
+                            request_id, request.namespace, detail, request.token
+                        )
             return
         except CacheError as error:
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            if not self._cancelled():
+            if not self._open_cancelled(request.token):
                 self._emit_failure(request_id, error.failure)
             return
         except _DeliveryFailure as error:
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            if not self._cancelled():
+            if not self._open_cancelled(request.token):
                 self._emit_failure(request_id, error.failure)
             return
         except Exception:  # pylint: disable=broad-exception-caught
             if staged_path is not None:
                 self._discard_stage(staged_path)
-            if not self._cancelled():
+            if not self._open_cancelled(request.token):
                 self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
             return
-        if self._cancelled():
+        if self._open_cancelled(request.token):
             self._discard_stage(staged_path)
             return
         self.downloadStaged.emit(request_id, publish_request)
@@ -1735,7 +1781,7 @@ class RoastServerWorker(QObject):
         request: OnlineOpenRequest,
     ) -> None:
         expected = request.cached_fallback
-        if expected is None or self._cancelled():
+        if expected is None or self._open_cancelled(request.token):
             return
         try:
             cached = self._cache.validate(expected)
@@ -1746,6 +1792,7 @@ class RoastServerWorker(QObject):
             and cached.roast.roast_uuid == request.roast_uuid
             and cached.revision.revision_number == cached.roast.revision_count
             and not self._cancelled()
+            and not request.token.is_cancelled()
         ):
             self.cachedFallbackReady.emit(request_id, cached)
 
@@ -1754,9 +1801,10 @@ class RoastServerWorker(QObject):
         request_id: str,
         namespace: Namespace,
         detail: RoastDetail,
+        token: OpenCancellationToken,
     ) -> None:
         revision = detail.current_revision
-        if revision is None or self._cancelled():
+        if revision is None or self._open_cancelled(token):
             return
         try:
             cached = self._cache.find_current(
@@ -1767,8 +1815,11 @@ class RoastServerWorker(QObject):
             )
         except CacheError:
             return
-        if cached is not None and not self._cancelled():
+        if cached is not None and not self._open_cancelled(token):
             self.cachedFallbackReady.emit(request_id, cached)
+
+    def _open_cancelled(self, token: OpenCancellationToken) -> bool:
+        return self._cancelled() or token.is_cancelled()
 
     @pyqtSlot(str)
     def open_cached(self, opaque_id: str) -> None:
@@ -1787,10 +1838,17 @@ class RoastServerWorker(QObject):
             return
         if self._cancelled():
             return
-        if not isinstance(value, CachedOpenRequest) or not self._namespace_is_current(
-            value.cached.namespace
+        token_value: object = (
+            value.token if isinstance(value, CachedOpenRequest) else None
+        )
+        if (
+            not isinstance(value, CachedOpenRequest)
+            or not isinstance(token_value, OpenCancellationToken)
+            or not self._namespace_is_current(value.cached.namespace)
         ):
             self._emit_failure(request_id, CACHE_FAILURE)
+            return
+        if value.token.is_cancelled():
             return
         try:
             cached = self._cache.validate(value.cached)
@@ -1798,7 +1856,7 @@ class RoastServerWorker(QObject):
             if not self._cancelled():
                 self._emit_failure(request_id, error.failure)
             return
-        if not self._cancelled():
+        if not self._cancelled() and not value.token.is_cancelled():
             self.cachedReady.emit(request_id, cached)
 
     @pyqtSlot(str)
@@ -1838,6 +1896,12 @@ class RoastServerWorker(QObject):
             self._discard_stage(request.staged_path)
             self._emit_failure(request_id, CACHE_FAILURE)
             return
+        hook = self._operation_hook
+        if hook is not None:
+            hook('publish_staged')
+        if not request.token.begin_publication():
+            self._discard_stage(request.staged_path)
+            return
         self._pending_stages.pop(request.staged_path, None)
         try:
             cached = self._cache.publish(
@@ -1858,7 +1922,8 @@ class RoastServerWorker(QObject):
         if self._cancelled():
             return
         self.cachePublished.emit(request_id, cached)
-        self._prune_to_limit(request_id, pending.namespace)
+        if not request.token.is_cancelled():
+            self._prune_to_limit(request_id, pending.namespace)
 
     @pyqtSlot(str)
     def discard_staged(self, staged_path_text: str) -> None:
@@ -2403,6 +2468,7 @@ def _valid_publish_request(value: object) -> TypeGuard[PublishRequest]:
         not isinstance(detail, RoastDetail)
         or not isinstance(receipt, DownloadReceipt)
         or not isinstance(staged_path, Path)
+        or not isinstance(value.token, OpenCancellationToken)
     ):
         return False
     revision = detail.current_revision
@@ -2470,6 +2536,7 @@ __all__ = [
     'ConfigurationPermit',
     'ConnectionTestRequest',
     'OnlineOpenRequest',
+    'OpenCancellationToken',
     'OpaqueVault',
     'PendingConnectionRecovery',
     'ProtectedPathsRequest',

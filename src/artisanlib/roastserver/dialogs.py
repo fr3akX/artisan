@@ -48,7 +48,7 @@ from PyQt6.QtCore import (
     QTimer,
     pyqtSlot,
 )
-from PyQt6.QtGui import QCloseEvent, QShowEvent
+from PyQt6.QtGui import QCloseEvent, QColor, QShowEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -77,6 +77,7 @@ from artisanlib.roastserver.contract import (
     MAX_ARCHIVE_SEARCH_CHARS,
     ArchiveFilters,
     FailureKind,
+    LabelColor,
     PublicFailure,
     RoastState,
     ServerIdentity,
@@ -101,6 +102,16 @@ _NOT_CONNECTED: Final[str] = 'Not connected'
 _ROOT_INDEX: Final[QModelIndex] = QModelIndex()
 _MAX_BROWSER_ROWS: Final[int] = 5_000
 _SEARCH_DEBOUNCE_MS: Final[int] = 300
+_LABEL_PALETTE: Final[dict[LabelColor, str]] = {
+    'slate': '#64748b',
+    'red': '#dc2626',
+    'orange': '#ea580c',
+    'amber': '#d97706',
+    'green': '#16a34a',
+    'teal': '#0d9488',
+    'blue': '#2563eb',
+    'violet': '#7c3aed',
+}
 
 
 class _FailedJob(Protocol):
@@ -141,6 +152,10 @@ class RoastServerBrowserController(Protocol):
     def open_roast(self, roast_uuid: UUID) -> str: ...
     def open_cached(self, cached: CachedRevision) -> str: ...
     def cancel_open(self, request_id: str) -> None: ...
+    def close_browser(self) -> None: ...
+    def cached_revision_for(
+        self, source: ServerProfileSource
+    ) -> CachedRevision | None: ...
     def save_browser_geometry(self, geometry: QByteArray) -> None: ...
 
 
@@ -243,6 +258,12 @@ class RoastTableModel(QAbstractTableModel):
             return row.stale
         if role == Qt.ItemDataRole.AccessibleTextRole:
             return ', '.join(self._display_values(row))
+        if (
+            role == Qt.ItemDataRole.DecorationRole
+            and index.column() == 4
+            and row.roast.labels
+        ):
+            return QColor(_LABEL_PALETTE[row.roast.labels[0].color])
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         values = self._display_values(row)
@@ -276,6 +297,74 @@ class RoastTableModel(QAbstractTableModel):
         )
         self.endResetModel()
 
+    def merge_retained_offline(self, page: ArchivePageView) -> None:
+        verified = {row.roast.roast_uuid: row for row in page.rows}
+        merged: list[ArchiveRow] = []
+        for retained in self._rows:
+            cached = verified.pop(retained.roast.roast_uuid, None)
+            if cached is None:
+                merged.append(ArchiveRow(retained.roast, None, None, False))
+            else:
+                merged.append(
+                    ArchiveRow(
+                        retained.roast,
+                        cached.cached_revision,
+                        cached.cached_sha256,
+                        True,
+                        cached.cached,
+                    )
+                )
+        merged.extend(verified.values())
+        self.set_page(
+            replace(page, rows=tuple(merged), next_cursor=None),
+            append=False,
+        )
+
+    def mark_profile_ready(
+        self,
+        source: ServerProfileSource,
+        verified_cached: CachedRevision | None = None,
+    ) -> None:
+        if (
+            verified_cached is not None
+            and (
+                verified_cached.roast.roast_uuid != source.roast_uuid
+                or verified_cached.revision.revision_number != source.revision_number
+                or verified_cached.revision.sha256 != source.sha256
+            )
+        ):
+            verified_cached = None
+        changed = False
+        rows: list[ArchiveRow] = []
+        for row in self._rows:
+            if row.roast.roast_uuid != source.roast_uuid:
+                rows.append(row)
+                continue
+            cached = verified_cached or (
+                row.cached
+                if row.cached is not None
+                and row.cached.revision.revision_number == source.revision_number
+                and row.cached.revision.sha256 == source.sha256
+                else None
+            )
+            rows.append(
+                ArchiveRow(
+                    replace(row.roast, revision_count=source.revision_number),
+                    source.revision_number,
+                    source.sha256,
+                    source.stale,
+                    cached,
+                )
+            )
+            changed = True
+        if changed:
+            self.beginResetModel()
+            self._rows = tuple(rows)
+            self.endResetModel()
+
+    def clear_cursor(self) -> None:
+        self._next_cursor = None
+
     def clear(self) -> None:
         self.beginResetModel()
         self._rows = ()
@@ -296,7 +385,10 @@ class RoastTableModel(QAbstractTableModel):
     @staticmethod
     def _display_values(row: ArchiveRow) -> tuple[str, ...]:
         roast = row.roast
-        labels = ', '.join(label.name for label in roast.labels)
+        labels = ', '.join(
+            _format_label(label.name, label.color, label.archived)
+            for label in roast.labels
+        )
         states: dict[RoastState, str] = {
             'awaiting_profile': _tr('Awaiting profile'),
             'parsed': _tr('Parsed'),
@@ -1023,7 +1115,7 @@ class RoastServerBrowserDialog(QDialog):
         self._refresh_request: str | None = None
         self._more_request: str | None = None
         self._open_request: str | None = None
-        self._open_expected: tuple[UUID, int, str | None] | None = None
+        self._open_expected: tuple[UUID, int | None, str | None] | None = None
         self._online = False
         self._shown_once = False
         self._view_generation = 0
@@ -1152,7 +1244,7 @@ class RoastServerBrowserDialog(QDialog):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setAccessibleName(_tr('Opening server roast'))
         self.progress_bar.hide()
-        self.cancel_open_button = QPushButton(_tr('Cancel open'), self)
+        self.cancel_open_button = QPushButton(_tr('&Cancel open'), self)
         self.cancel_open_button.setAccessibleName(_tr('Cancel opening server roast'))
         self.cancel_open_button.hide()
         progress_row.addWidget(self.progress_bar, 1)
@@ -1193,7 +1285,8 @@ class RoastServerBrowserDialog(QDialog):
         QWidget.setTabOrder(self.end_date_edit, self.refresh_button)
         QWidget.setTabOrder(self.refresh_button, self.roast_view)
         QWidget.setTabOrder(self.roast_view, self.load_more_button)
-        QWidget.setTabOrder(self.load_more_button, self.open_button)
+        QWidget.setTabOrder(self.load_more_button, self.cancel_open_button)
+        QWidget.setTabOrder(self.cancel_open_button, self.open_button)
         QWidget.setTabOrder(self.open_button, close_button)
 
         self._search_timer.timeout.connect(self._refresh)
@@ -1314,13 +1407,13 @@ class RoastServerBrowserDialog(QDialog):
         if not append and not refresh:
             return
         self._online = value.online
-        if value.retained_error is not None and self.roast_model.rowCount() > 0:
-            self._set_error(value.retained_error.message)
+        if not value.online and self.roast_model.rowCount() > 0:
+            self.roast_model.merge_retained_offline(value)
         else:
-            self.roast_model.set_page(value, append=append)
-            self._set_error(
-                '' if value.retained_error is None else value.retained_error.message
-            )
+            self.roast_model.set_page(value, append=append and value.online)
+        self._set_error(
+            '' if value.retained_error is None else value.retained_error.message
+        )
         if append:
             self._more_request = None
         else:
@@ -1344,11 +1437,14 @@ class RoastServerBrowserDialog(QDialog):
         )
         if operation in {self._refresh_request, 'refresh', 'browse'}:
             self.refresh_button.setEnabled(True)
+            self.roast_model.clear_cursor()
             self._set_error(failure.message)
             self._render_load_more()
         elif operation == self._more_request:
             self._set_error(failure.message)
             self._more_request = None
+            if not failure.retryable:
+                self.roast_model.clear_cursor()
             self._render_load_more()
         elif operation == self._open_request:
             self._set_error(failure.message)
@@ -1398,13 +1494,11 @@ class RoastServerBrowserDialog(QDialog):
         try:
             if self._online:
                 request_id = self._controller.open_roast(row.roast.roast_uuid)
-                expected_sha = (
-                    row.cached_sha256
-                    if row.cached_revision == row.roast.revision_count
-                    else None
-                )
+                expected_revision = None
+                expected_sha = None
             elif row.cached is not None:
                 request_id = self._controller.open_cached(row.cached)
+                expected_revision = row.cached.revision.revision_number
                 expected_sha = row.cached.revision.sha256
             else:
                 return
@@ -1414,7 +1508,7 @@ class RoastServerBrowserDialog(QDialog):
         self._start_open(
             request_id,
             row.roast.roast_uuid,
-            row.roast.revision_count,
+            expected_revision,
             expected_sha,
         )
 
@@ -1422,13 +1516,14 @@ class RoastServerBrowserDialog(QDialog):
         self,
         request_id: str,
         roast_uuid: UUID,
-        revision_number: int,
+        revision_number: int | None,
         sha256: str | None,
     ) -> None:
         self._open_request = request_id
         self._open_expected = (roast_uuid, revision_number, sha256)
         self.progress_bar.show()
         self.cancel_open_button.show()
+        self.cancel_open_button.setFocus(Qt.FocusReason.OtherFocusReason)
         self.open_button.setEnabled(False)
         self._set_error('')
 
@@ -1453,10 +1548,19 @@ class RoastServerBrowserDialog(QDialog):
         roast_uuid, revision_number, sha256 = expected
         if (
             value.roast_uuid != roast_uuid
-            or value.revision_number != revision_number
+            or (revision_number is not None and value.revision_number != revision_number)
             or (sha256 is not None and value.sha256 != sha256)
         ):
             return
+        resolve_cached = getattr(self._controller, 'cached_revision_for', None)
+        cached = (
+            cast(Callable[[ServerProfileSource], CachedRevision | None], resolve_cached)(
+                value
+            )
+            if callable(resolve_cached)
+            else None
+        )
+        self.roast_model.mark_profile_ready(value, cached)
         if value.stale:
             self.status_label.setText(
                 _tr('Opened verified cached revision {revision} (stale).').format(
@@ -1479,7 +1583,10 @@ class RoastServerBrowserDialog(QDialog):
             or expected is None
             or not isinstance(value, CachedRevision)
             or value.roast.roast_uuid != expected[0]
-            or value.revision.revision_number != expected[1]
+            or (
+                expected[1] is not None
+                and value.revision.revision_number != expected[1]
+            )
             or (expected[2] is not None and value.revision.sha256 != expected[2])
         ):
             return
@@ -1559,6 +1666,12 @@ class RoastServerBrowserDialog(QDialog):
         self._refresh_request = None
         self._more_request = None
         self._cancel_open()
+        close_browser = getattr(self._controller, 'close_browser', None)
+        if callable(close_browser):
+            try:
+                cast(Callable[[], None], close_browser)()
+            except RuntimeError:
+                self._set_error(_tr(_GENERIC_OPERATION_FAILURE))
         save_geometry = getattr(self._controller, 'save_browser_geometry', None)
         if callable(save_geometry):
             try:
@@ -1609,6 +1722,26 @@ class RoastServerBrowserDialog(QDialog):
         bounded_top_left = QRect(left, top, width, height).topLeft()
         if frame.topLeft() != bounded_top_left:
             self.move(bounded_top_left)
+
+
+def _format_label(name: str, color: LabelColor, archived: bool) -> str:
+    color_names: dict[LabelColor, str] = {
+        'slate': _tr('Slate'),
+        'red': _tr('Red'),
+        'orange': _tr('Orange'),
+        'amber': _tr('Amber'),
+        'green': _tr('Green'),
+        'teal': _tr('Teal'),
+        'blue': _tr('Blue'),
+        'violet': _tr('Violet'),
+    }
+    color_name = color_names[color]
+    if archived:
+        return _tr('{name} ({color}, archived)').format(
+            name=name,
+            color=color_name,
+        )
+    return _tr('{name} ({color})').format(name=name, color=color_name)
 
 
 def _format_batch(

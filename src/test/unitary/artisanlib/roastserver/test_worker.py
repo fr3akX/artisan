@@ -2485,6 +2485,7 @@ def test_browse_online_then_retained_offline_cache_fallback(
     cached = cast(CachedRevision, worker_harness.wait_for_spy(published, 0)[1])
 
     page_spy = QSignalSpy(worker_harness.worker.archivePageReady)
+    finished_spy = QSignalSpy(worker_harness.worker.browseFinished)
     online_spy = QSignalSpy(worker_harness.worker.onlineChanged)
     filters = ArchiveFilters(search='Worker')
     first_id = worker_harness.command_vault.put(
@@ -2494,6 +2495,7 @@ def test_browse_online_then_retained_offline_cache_fallback(
     online_payload = worker_harness.wait_for_spy(page_spy, 0)
 
     assert online_payload == [first_id, worker_harness.client.page]
+    assert worker_harness.wait_for_spy(finished_spy, 0) == [first_id]
     assert online_spy[-1] == [True]
     assert worker_harness.client.calls[-1] == ('list_roasts', filters, None, 50)
 
@@ -2507,6 +2509,7 @@ def test_browse_online_then_retained_offline_cache_fallback(
     fallback = worker_harness.wait_for_spy(page_spy, 1)
 
     assert fallback == [second_id, CachedPage((cached,))]
+    assert worker_harness.wait_for_spy(finished_spy, 1) == [second_id]
     assert worker_harness.wait_for_spy(failed, 0) == [second_id, worker_harness.client.failure.failure]
     assert online_spy[-1] == [False]
     assert len(worker_harness.client.enter_threads) == len(worker_harness.client.exit_threads)
@@ -2602,6 +2605,89 @@ def test_retryable_detail_failure_revalidates_last_known_current_cache_fallback(
 
     worker_harness.wait_for_spy(failed, 0)
     assert worker_harness.wait_for_spy(fallback, 0) == [request_id, cached]
+
+
+def test_cancel_fence_after_validation_before_publish_discards_only_exact_stage(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    blocker = PermitBoundaryBlocker()
+    harness = WorkerHarness(
+        tmp_path,
+        qcoreapplication,
+        operation_hook=blocker.block,
+    )
+    published = QSignalSpy(harness.worker.cachePublished)
+    try:
+        _first_id, first = harness.open_online()
+        _second_id, second = harness.open_online()
+        blocker.select('publish_staged')
+        first_publish_id = harness.command_vault.put(first)
+        harness.bus.publish_worker.emit(first_publish_id)
+        assert blocker.entered.wait(timeout=2)
+
+        first.token.cancel()
+        blocker.release.set()
+        harness.wait_until(
+            lambda: any(path == first.staged_path for path, _thread in harness.cache.discard_calls)
+        )
+
+        assert first.token.is_cancelled()
+        assert len(published) == 0
+        assert not first.staged_path.exists()
+        assert second.staged_path.exists()
+
+        second_publish_id = harness.command_vault.put(second)
+        harness.bus.publish_worker.emit(second_publish_id)
+        payload = harness.wait_for_spy(published, 0)
+        assert payload[0] == second_publish_id
+        assert cast(CachedRevision, payload[1]).path.exists()
+    finally:
+        blocker.release.set()
+        harness.stop()
+
+
+def test_cancel_after_publication_linearizes_preserves_cache_and_skips_prune(
+    worker_harness: WorkerHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    original_publish = worker_harness.cache.publish
+
+    def blocking_publish(
+        namespace: Namespace,
+        detail: RoastDetail,
+        receipt: DownloadReceipt,
+        staged_path: Path,
+        validated_at: datetime,
+    ) -> CachedRevision:
+        entered.set()
+        if not release.wait(timeout=5):
+            raise RuntimeError('blocked cache publication timed out')
+        return original_publish(
+            namespace,
+            detail,
+            receipt,
+            staged_path,
+            validated_at,
+        )
+
+    monkeypatch.setattr(worker_harness.cache, 'publish', blocking_publish)
+    published = QSignalSpy(worker_harness.worker.cachePublished)
+    _open_id, request = worker_harness.open_online()
+    publish_id = worker_harness.command_vault.put(request)
+    worker_harness.bus.publish_worker.emit(publish_id)
+    assert entered.wait(timeout=2)
+
+    request.token.cancel()
+    release.set()
+    payload = worker_harness.wait_for_spy(published, 0)
+
+    cached = cast(CachedRevision, payload[1])
+    assert cached.path.exists()
+    assert cached.path.read_bytes() == PROFILE_BYTES
+    assert worker_harness.cache.prune_calls == []
 
 
 def test_online_download_publish_cached_validation_and_cache_signals(
