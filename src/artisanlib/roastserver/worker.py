@@ -82,13 +82,44 @@ _LEASE_SECONDS: Final[int] = 60
 _MAX_CREDENTIAL_TRANSACTIONS: Final[int] = 1
 
 
+class ConfigurationPermit:
+    """A bounded operation linearized before a later configuration revocation."""
+
+    def __init__(self, release: Callable[[], None], generation: int) -> None:
+        self._release_callback: Callable[[], None] | None = release
+        self.generation = generation
+
+    @override
+    def __repr__(self) -> str:
+        return '<ConfigurationPermit>'
+
+    def __enter__(self) -> ConfigurationPermit:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        self.release()
+
+    def release(self) -> None:
+        release = self._release_callback
+        if release is None:
+            return
+        self._release_callback = None
+        release()
+
+
 class ConfigurationFence:
-    """Secret-free shared generation fence for queued worker configuration."""
+    """Secret-free linearizable permits for one revocable configuration."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._generation = 0
         self._revoked = True
+        self._active: dict[int, int] = {}
 
     @override
     def __repr__(self) -> str:
@@ -101,6 +132,7 @@ class ConfigurationFence:
             return self._generation
 
     def revoke(self) -> int:
+        """Revoke synchronously without waiting for already-linearized work."""
         with self._lock:
             self._generation += 1
             self._revoked = True
@@ -114,14 +146,29 @@ class ConfigurationFence:
         with self._lock:
             return generation == self._generation and not self._revoked
 
-    def run_if_authorized(
-        self, generation: int, action: Callable[[], None]
-    ) -> bool:
+    def acquire(self, generation: int) -> ConfigurationPermit | None:
+        """Linearize one exact-generation operation or reject it after revoke."""
         with self._lock:
             if generation != self._generation or self._revoked:
-                return False
-            action()
-            return True
+                return None
+            self._active[generation] = self._active.get(generation, 0) + 1
+            return ConfigurationPermit(
+                lambda: self._release(generation), generation
+            )
+
+    def active_permits(self, generation: int | None = None) -> int:
+        with self._lock:
+            if generation is None:
+                return sum(self._active.values())
+            return self._active.get(generation, 0)
+
+    def _release(self, generation: int) -> None:
+        with self._lock:
+            active = self._active.get(generation, 0)
+            if active <= 1:
+                self._active.pop(generation, None)
+            else:
+                self._active[generation] = active - 1
 
 
 class OpaqueVault[T]:
@@ -186,6 +233,13 @@ class OpaqueVault[T]:
         with self._lock:
             self._values.clear()
             self._latest_id = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingConnectionRecovery:
+    authenticated_identity: ServerIdentity | None
+    credential_present: bool
+    failure: PublicFailure
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,12 +346,14 @@ class _StaleConfiguration(RuntimeError):
 
 
 type TimerFactory = Callable[[QObject], QTimer]
+type OperationHook = Callable[[str], None]
 
 
 class RoastServerWorker(QObject):
     connectionTested = pyqtSignal(str, object)
     credentialCommitted = pyqtSignal(str, object)
     connectionActivated = pyqtSignal(str, object)
+    connectionRollbackFinished = pyqtSignal(str, bool)
     pendingConnectionRecoveryRequired = pyqtSignal(str, object)
     configurationValidated = pyqtSignal(object)
     credentialRemoved = pyqtSignal(str)
@@ -325,6 +381,7 @@ class RoastServerWorker(QObject):
         command_vault: OpaqueVault[object],
         configuration_fence: ConfigurationFence | None = None,
         timer_factory: TimerFactory | None = None,
+        operation_hook: OperationHook | None = None,
     ) -> None:
         super().__init__()
         self._outbox = outbox
@@ -337,6 +394,7 @@ class RoastServerWorker(QObject):
         self._command_vault = command_vault
         self._configuration_fence = configuration_fence or ConfigurationFence()
         self._timer_factory = timer_factory or QTimer
+        self._operation_hook = operation_hook
         self._timer: QTimer | None = None
         self._configuration: WorkerConfiguration | None = None
         self._credential: str | None = None
@@ -471,9 +529,10 @@ class RoastServerWorker(QObject):
             self._stop_timer()
             if configuration.pending_connection:
                 transaction_id = uuid4().hex
+                failure = _failure(FailureKind.CREDENTIAL_REJECTED)
                 self.pendingConnectionRecoveryRequired.emit(
                     transaction_id,
-                    _failure(FailureKind.CREDENTIAL_REJECTED),
+                    PendingConnectionRecovery(None, False, failure),
                 )
             self._emit_aggregates(namespace)
             return
@@ -489,7 +548,13 @@ class RoastServerWorker(QObject):
             if self._cancelled() or self._reject_stale_configuration(configuration):
                 return
             self.onlineChanged.emit(False)
-            self._emit_failure('configure', error.failure)
+            if configuration.pending_connection and not error.failure.retryable:
+                self.pendingConnectionRecoveryRequired.emit(
+                    uuid4().hex,
+                    PendingConnectionRecovery(None, True, error.failure),
+                )
+            else:
+                self._emit_failure('configure', error.failure)
             if error.failure.retryable:
                 self._schedule_authentication_retry()
             else:
@@ -518,9 +583,14 @@ class RoastServerWorker(QObject):
         if authenticated != identity:
             self.onlineChanged.emit(False)
             self._stop_timer()
-            self._emit_failure(
-                'configure', _failure(FailureKind.CREDENTIAL_REJECTED)
-            )
+            failure = _failure(FailureKind.CREDENTIAL_REJECTED)
+            if configuration.pending_connection:
+                self.pendingConnectionRecoveryRequired.emit(
+                    uuid4().hex,
+                    PendingConnectionRecovery(authenticated, True, failure),
+                )
+            else:
+                self._emit_failure('configure', failure)
             self._emit_aggregates(namespace)
             return
         if configuration.pending_connection:
@@ -541,15 +611,13 @@ class RoastServerWorker(QObject):
             self._emit_aggregates(namespace)
             return
 
-        def install_authorization() -> None:
-            self._credential = credential
-            self._authorized_target = (configuration.origin, authenticated)
-
-        if not self._configuration_fence.run_if_authorized(
-            configuration.generation, install_authorization
-        ):
+        permit = self._operation_permit(configuration, 'install_authorization')
+        if permit is None:
             self._reject_stale_configuration(configuration)
             return
+        with permit:
+            self._credential = credential
+            self._authorized_target = (configuration.origin, authenticated)
         self.configurationValidated.emit(configuration)
         self._apply_authorized_configuration(configuration)
 
@@ -574,8 +642,13 @@ class RoastServerWorker(QObject):
         now = self._now()
         if self._reject_stale_configuration(configuration):
             return
+        permit = self._operation_permit(configuration, 'resume_namespace')
+        if permit is None:
+            self._reject_stale_configuration(configuration)
+            return
         try:
-            self._outbox.resume_namespace(namespace, now)
+            with permit:
+                self._outbox.resume_namespace(namespace, now)
         except (OutboxError, ValueError):
             self._credential = None
             self._authorized_target = None
@@ -595,9 +668,8 @@ class RoastServerWorker(QObject):
             timer is not None
             and not self._interrupted()
             and configuration is not None
-            and self._configuration_fence.authorizes(configuration.generation)
         ):
-            timer.start(5_000)
+            self._arm_timer(configuration, timer, 5_000)
 
     @pyqtSlot(str)
     def test_connection(self, opaque_id: str) -> None:
@@ -693,20 +765,24 @@ class RoastServerWorker(QObject):
                 self._emit_failure(request_id, _failure(FailureKind.KEYRING))
             return
         if not self._credential_vault.is_current(transaction_id):
-            self._rollback_transaction(transaction_id)
+            self._rollback_and_signal(transaction_id)
             return
         try:
+            transaction.keyring_committed = True
             self._credentials.set(transaction.origin, transaction.candidate)
+            if self._interrupted():
+                return
             readback = self._credentials.get(transaction.origin)
             if readback != transaction.candidate:
                 raise CredentialStoreError
-            if not self._credential_vault.is_current(transaction_id):
-                self._rollback_transaction(transaction_id)
+            if self._interrupted():
                 return
-            transaction.keyring_committed = True
+            if not self._credential_vault.is_current(transaction_id):
+                self._rollback_and_signal(transaction_id)
+                return
         except CredentialStoreError:
-            self._rollback_transaction(transaction_id)
-            if not self._cancelled():
+            if not self._interrupted():
+                self._rollback_and_signal(transaction_id)
                 self._emit_failure(request_id, _failure(FailureKind.KEYRING))
             return
         if not self._cancelled():
@@ -732,20 +808,22 @@ class RoastServerWorker(QObject):
             != namespace_for(transaction.origin, transaction.identity.organization.id)
         ):
             if not self._cancelled():
-                self._rollback_transaction(transaction_id)
+                self._rollback_and_signal(transaction_id)
                 self._emit_failure(
                     request_id, _failure(FailureKind.CREDENTIAL_REJECTED)
                 )
             return
         if self._reject_stale_configuration(configuration):
-            self._rollback_transaction(transaction_id)
+            if not self._interrupted():
+                self._rollback_and_signal(transaction_id)
             return
         try:
             readback = self._credentials.get(transaction.origin)
             if readback != transaction.candidate:
                 raise CredentialStoreError
             if self._reject_stale_configuration(configuration):
-                self._rollback_transaction(transaction_id)
+                if not self._interrupted():
+                    self._rollback_and_signal(transaction_id)
                 return
             with self._client_factory(
                 transaction.origin, transaction.candidate
@@ -761,26 +839,30 @@ class RoastServerWorker(QObject):
                 )
         except CredentialStoreError:
             stale = self._reject_stale_configuration(configuration)
-            self._rollback_transaction(transaction_id)
+            if not self._interrupted():
+                self._rollback_and_signal(transaction_id)
             if not self._cancelled() and not stale:
                 self._emit_failure(request_id, _failure(FailureKind.KEYRING))
             return
         except ApiFailure as error:
             stale = self._reject_stale_configuration(configuration)
-            self._rollback_transaction(transaction_id)
+            if not self._interrupted():
+                self._rollback_and_signal(transaction_id)
             if not self._cancelled() and not stale:
                 self.onlineChanged.emit(False)
                 self._emit_failure(request_id, error.failure)
             return
         except _DeliveryFailure as error:
             stale = self._reject_stale_configuration(configuration)
-            self._rollback_transaction(transaction_id)
+            if not self._interrupted():
+                self._rollback_and_signal(transaction_id)
             if not self._cancelled() and not stale:
                 self._emit_failure(request_id, error.failure)
             return
         except Exception:  # pylint: disable=broad-exception-caught
             stale = self._reject_stale_configuration(configuration)
-            self._rollback_transaction(transaction_id)
+            if not self._interrupted():
+                self._rollback_and_signal(transaction_id)
             if not self._cancelled() and not stale:
                 self._emit_failure(
                     request_id, _failure(FailureKind.INVALID_RESPONSE)
@@ -791,20 +873,20 @@ class RoastServerWorker(QObject):
             and not self._credential_vault.is_current(transaction_id))
             or self._reject_stale_configuration(configuration)
         ):
-            self._rollback_transaction(transaction_id)
+            if not self._interrupted():
+                self._rollback_and_signal(transaction_id)
             return
-        def install_activation() -> None:
+        permit = self._operation_permit(configuration, 'install_activation')
+        if permit is None:
+            self._reject_stale_configuration(configuration)
+            if not self._interrupted():
+                self._rollback_and_signal(transaction_id)
+            return
+        with permit:
             self._credential = transaction.candidate
             self._authorized_target = (transaction.origin, transaction.identity)
             self._authorized_transaction_id = transaction_id
             transaction.activation_emitted = True
-
-        if not self._configuration_fence.run_if_authorized(
-            configuration.generation, install_activation
-        ):
-            self._reject_stale_configuration(configuration)
-            self._rollback_transaction(transaction_id)
-            return
         if not self._cancelled():
             self.connectionActivated.emit(request_id, transaction.identity)
 
@@ -834,10 +916,9 @@ class RoastServerWorker(QObject):
         if self._reject_wrong_thread(request_id, FailureKind.KEYRING):
             return
         if transaction_id not in self._credential_transactions:
-            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            self.connectionRollbackFinished.emit(request_id, False)
             return
-        if not self._rollback_transaction(transaction_id):
-            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+        self._rollback_and_signal(transaction_id)
 
     @pyqtSlot(str)
     def cancel_connection_transaction(self, transaction_id: str) -> None:
@@ -848,8 +929,7 @@ class RoastServerWorker(QObject):
             self._emit_failure(request_id, _failure(FailureKind.KEYRING))
             return
         if transaction_id in self._credential_transactions:
-            if not self._rollback_transaction(transaction_id):
-                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            self._rollback_and_signal(transaction_id)
             return
         if transaction_id == self._authorized_transaction_id:
             self._authorized_transaction_id = None
@@ -861,18 +941,27 @@ class RoastServerWorker(QObject):
                     configuration.namespace, 'credential_removed'
                 )
             self._stop_timer()
+            self.connectionRollbackFinished.emit(request_id, False)
+            return
+        self.connectionRollbackFinished.emit(request_id, False)
 
     def _make_credential_transaction_room(self) -> None:
         while len(self._credential_transactions) >= _MAX_CREDENTIAL_TRANSACTIONS:
             oldest = next(iter(self._credential_transactions))
-            if not self._rollback_transaction(oldest):
-                self._emit_failure(oldest, _failure(FailureKind.KEYRING))
+            self._rollback_and_signal(oldest)
+
+    def _rollback_and_signal(self, transaction_id: str) -> bool:
+        if self._interrupted():
+            return False
+        succeeded = self._rollback_transaction(transaction_id)
+        self.connectionRollbackFinished.emit(transaction_id, succeeded)
+        return succeeded
 
     def _rollback_transaction(self, transaction_id: str) -> bool:
         transaction = self._credential_transactions.pop(transaction_id, None)
         if transaction is None:
             return False
-        succeeded = True
+        succeeded = not (transaction.keyring_committed and transaction.recovered)
         try:
             if transaction.keyring_committed and not transaction.recovered:
                 if transaction.old_credential is None:
@@ -1073,9 +1162,14 @@ class RoastServerWorker(QObject):
         now = self._now()
         try:
             self._outbox.recover_expired_leases(now)
-            if self._cancelled() or self._reject_stale_configuration(configuration):
+            if self._cancelled():
                 return
-            outcome = self._outbox.lease_next(namespace, now, _LEASE_SECONDS)
+            permit = self._operation_permit(configuration, 'lease_next')
+            if permit is None:
+                self._reject_stale_configuration(configuration)
+                return
+            with permit:
+                outcome = self._outbox.lease_next(namespace, now, _LEASE_SECONDS)
         except (OutboxError, OSError, ValueError):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
             self._emit_aggregates(namespace)
@@ -1193,20 +1287,24 @@ class RoastServerWorker(QObject):
         with snapshot, self._client_factory(configuration.origin, credential) as client:
             if self._cancelled():
                 return
-            if not self._configuration_fence.authorizes(configuration.generation):
+            permit = self._operation_permit(configuration, 'post_aroast')
+            if permit is None:
                 raise _StaleConfiguration
-            client.post_aroast(job.roast_uuid, job.aroast_json.encode('utf-8'))
+            with permit:
+                client.post_aroast(job.roast_uuid, job.aroast_json.encode('utf-8'))
             if self._cancelled():
                 return
-            if not self._configuration_fence.authorizes(configuration.generation):
+            permit = self._operation_permit(configuration, 'upload_revision')
+            if permit is None:
                 raise _StaleConfiguration
-            upload = client.upload_revision(
-                job.roast_uuid,
-                job.content_sha256,
-                job.idempotency_key,
-                job.revision_json.encode('utf-8'),
-                snapshot,
-            )
+            with permit:
+                upload = client.upload_revision(
+                    job.roast_uuid,
+                    job.content_sha256,
+                    job.idempotency_key,
+                    job.revision_json.encode('utf-8'),
+                    snapshot,
+                )
             if self._cancelled():
                 return
             if not self._configuration_fence.authorizes(configuration.generation):
@@ -1363,11 +1461,22 @@ class RoastServerWorker(QObject):
             with self._client_factory(configuration.origin, credential) as client:
                 if self._cancelled():
                     return
-                page = client.list_roasts(request.filters, cursor=request.cursor, limit=50)
+                permit = self._operation_permit(configuration, 'list_roasts')
+                if permit is None:
+                    raise _StaleConfiguration
+                with permit:
+                    page = client.list_roasts(
+                        request.filters, cursor=request.cursor, limit=50
+                    )
                 if self._cancelled():
                     return
             if not isinstance(page, RoastPage):
                 raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
+        except _StaleConfiguration:
+            self._browse_fallback(
+                request_id, request, _failure(FailureKind.OFFLINE)
+            )
+            return
         except ApiFailure as error:
             if self._cancelled():
                 return
@@ -1453,7 +1562,11 @@ class RoastServerWorker(QObject):
             with self._client_factory(configuration.origin, credential) as client:
                 if self._cancelled():
                     return
-                detail_value: object = client.get_roast(request.roast_uuid)
+                permit = self._operation_permit(configuration, 'get_roast')
+                if permit is None:
+                    raise _StaleConfiguration
+                with permit:
+                    detail_value: object = client.get_roast(request.roast_uuid)
                 if self._cancelled():
                     return
                 if (
@@ -1467,7 +1580,11 @@ class RoastServerWorker(QObject):
                 if self._cancelled():
                     self._discard_stage(staged_path)
                     return
-                receipt = client.download_revision(detail, output)
+                permit = self._operation_permit(configuration, 'download_revision')
+                if permit is None:
+                    raise _StaleConfiguration
+                with permit:
+                    receipt = client.download_revision(detail, output)
                 if self._cancelled():
                     self._discard_stage(staged_path)
                     return
@@ -1480,6 +1597,13 @@ class RoastServerWorker(QObject):
             self._pending_stages[staged_path] = _PendingStage(
                 request.namespace, publish_request
             )
+        except _StaleConfiguration:
+            if staged_path is not None:
+                self._discard_stage(staged_path)
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.OFFLINE))
+                self.onlineChanged.emit(False)
+            return
         except ApiFailure as error:
             if staged_path is not None:
                 self._discard_stage(staged_path)
@@ -1801,8 +1925,9 @@ class RoastServerWorker(QObject):
         self._credential_vault.clear()
         self._profile_vault.clear()
         self._command_vault.clear()
-        for transaction_id in tuple(self._credential_transactions):
-            self._rollback_transaction(transaction_id)
+        for transaction in self._credential_transactions.values():
+            transaction.candidate = ''
+            transaction.old_credential = None
         self._credential_transactions.clear()
         self._credential = None
         self._authorized_target = None
@@ -1925,10 +2050,30 @@ class RoastServerWorker(QObject):
             return
         seconds = max(0.0, (due.astimezone(UTC) - self._now()).total_seconds())
         milliseconds = min(_MAX_TIMER_MILLISECONDS, math.ceil(seconds * 1_000))
-        if not self._configuration_fence.authorizes(configuration.generation):
+        self._arm_timer(configuration, timer, milliseconds)
+
+    def _arm_timer(
+        self,
+        configuration: WorkerConfiguration,
+        timer: QTimer,
+        milliseconds: int,
+    ) -> None:
+        permit = self._operation_permit(configuration, 'timer_start')
+        if permit is None:
             self._stop_timer()
             return
-        timer.start(milliseconds)
+        with permit:
+            timer.start(milliseconds)
+
+    def _operation_permit(
+        self,
+        configuration: WorkerConfiguration,
+        operation: str,
+    ) -> ConfigurationPermit | None:
+        hook = self._operation_hook
+        if hook is not None:
+            hook(operation)
+        return self._configuration_fence.acquire(configuration.generation)
 
     def _stop_timer(self) -> None:
         if self._timer is not None:
@@ -2042,8 +2187,6 @@ def _valid_configuration(value: object) -> WorkerConfiguration | None:
     expected = namespace_for(origin, identity_value.organization.id)
     if namespace_value != expected:
         return None
-    if pending_connection and activation_id is not None:
-        return None
     return value
 
 
@@ -2155,9 +2298,12 @@ __all__ = [
     'BrowseRequest',
     'CachedOpenRequest',
     'ClearUnusedRequest',
+    'ConfigurationFence',
+    'ConfigurationPermit',
     'ConnectionTestRequest',
     'OnlineOpenRequest',
     'OpaqueVault',
+    'PendingConnectionRecovery',
     'ProtectedPathsRequest',
     'PublishRequest',
     'RemoveCredentialRequest',

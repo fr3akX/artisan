@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Final, Protocol, cast, override
 from uuid import UUID
 
-from PyQt6.QtCore import QByteArray, QObject, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QByteArray, QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 
 from artisanlib.atypes import ProfileData
 from artisanlib.roastserver.api import ClientFactory
@@ -78,6 +78,7 @@ from artisanlib.roastserver.worker import (
     ConnectionTestRequest,
     OnlineOpenRequest,
     OpaqueVault,
+    PendingConnectionRecovery,
     ProtectedPathsRequest,
     PublishRequest,
     RemoveCredentialRequest,
@@ -100,6 +101,8 @@ _ENABLE_MESSAGE: Final[str] = 'Enable Roast Server before using this command.'
 _CONNECTION_MESSAGE: Final[str] = 'Test the connection before using this command.'
 _INVALID_OPTIONS_MESSAGE: Final[str] = 'Invalid Roast Server options.'
 _INVALID_REQUEST_MESSAGE: Final[str] = 'Invalid Roast Server request.'
+_SETTLEMENT_MESSAGE: Final[str] = 'Roast Server credential rollback is still settling.'
+_ROLLBACK_SETTLEMENT_TIMEOUT_MS: Final[int] = 15_000
 
 
 class ControllerError(RuntimeError):
@@ -191,6 +194,7 @@ class RoastServerController(QObject):
         self._authorized_startup_validation: str | None = None
         self._connection_tests: dict[str, str] = {}
         self._activation_previous: dict[str, ConnectorSettings] = {}
+        self._rollback_settlements: set[str] = set()
         self._active_connection_test: str | None = None
         self._credential_removals: set[str] = set()
         self._browse_epoch = 0
@@ -277,6 +281,11 @@ class RoastServerController(QObject):
         _connect(worker.credentialCommitted, self._on_credential_committed, queued)
         _connect(worker.connectionActivated, self._on_connection_activated, queued)
         _connect(
+            worker.connectionRollbackFinished,
+            self._on_connection_rollback_finished,
+            queued,
+        )
+        _connect(
             worker.pendingConnectionRecoveryRequired,
             self._on_pending_connection_recovery_required,
             queued,
@@ -321,13 +330,12 @@ class RoastServerController(QObject):
             return True
         if not self._stop_requested:
             self._stop_requested = True
+            self._thread.requestInterruption()
             self._revoke_configuration()
-            self._restore_unaccepted_activation_for_shutdown()
             self._invalidate_requests()
             self._credential_vault.clear()
             self._profile_vault.clear()
             self._command_vault.clear()
-            self._thread.requestInterruption()
             self._stopWorker.emit()
         stopped = self._thread.wait(timeout_ms)
         if not stopped:
@@ -345,6 +353,11 @@ class RoastServerController(QObject):
             raise ControllerError(_INVALID_REQUEST_MESSAGE)
 
         self._cancel_connection_transactions()
+        if (
+            self._activation_previous
+            or self._settings.pending_connection is not None
+        ):
+            raise ControllerError(_SETTLEMENT_MESSAGE)
         try:
             self._settings = self._settings_store.save_options(
                 False,
@@ -378,6 +391,9 @@ class RoastServerController(QObject):
         cache_limit_bytes: int,
     ) -> None:
         self._require_command_state()
+        if self._settings.pending_connection is not None:
+            self._cancel_connection_transactions()
+            raise ControllerError(_SETTLEMENT_MESSAGE)
         enabled_value: object = enabled
         automatic_upload_value: object = automatic_upload
         cache_limit_value: object = cache_limit_bytes
@@ -468,6 +484,9 @@ class RoastServerController(QObject):
 
     def remove_credential(self) -> None:
         self._require_command_state()
+        if self._settings.pending_connection is not None:
+            self._cancel_connection_transactions()
+            raise ControllerError(_SETTLEMENT_MESSAGE)
         generation = self._revoke_configuration()
         paused = self._configuration(enabled=False)
         if not self._set_automatic_upload_off('remove'):
@@ -732,8 +751,7 @@ class RoastServerController(QObject):
             return
         if pending is None or pending.identity != value:
             self._active_connection_test = None
-            self._activation_previous.pop(request_id, None)
-            self._cancelConnectionWorker.emit(request_id)
+            self._begin_rollback_settlement(request_id)
             self._emit_failure(request_id, FailureKind.CREDENTIAL_REJECTED)
             return
         previous = self._activation_previous.get(
@@ -745,29 +763,6 @@ class RoastServerController(QObject):
                 pending_connection=None,
             ),
         )
-        try:
-            self._settings = self._settings_store.activate_pending_connection(
-                pending.origin, value
-            )
-            self._known_namespace = _settings_namespace(self._settings)
-        except SettingsError:
-            self._active_connection_test = None
-            self._activation_previous.pop(request_id, None)
-            try:
-                self._settings = self._settings_store.restore_connection_state(
-                    previous
-                )
-            except SettingsError:
-                self._settings = replace(
-                    previous,
-                    enabled=False,
-                    automatic_upload=False,
-                    pending_connection=None,
-                )
-            self._known_namespace = _settings_namespace(self._settings)
-            self._rollbackWorker.emit(request_id)
-            self._settings_failure(request_id)
-            return
         self._activation_previous[request_id] = previous
         self._identity = None
         self._proof = None
@@ -788,22 +783,41 @@ class RoastServerController(QObject):
         ):
             self._cancelConnectionWorker.emit(request_id)
             return
-        if request_id not in self._activation_previous:
+        previous = self._activation_previous.get(request_id)
+        pending = self._settings.pending_connection
+        if previous is None or pending is None or pending.identity != value:
             self._active_connection_test = None
-            self._cancelConnectionWorker.emit(request_id)
+            self._begin_rollback_settlement(request_id)
             self._emit_failure(request_id, FailureKind.CREDENTIAL_REJECTED)
             return
-        if (
-            self._settings.pending_connection is not None
-            or self._settings.identity != value
-        ):
+        try:
+            self._settings = self._settings_store.activate_pending_connection(
+                pending.origin, value
+            )
+            self._known_namespace = _settings_namespace(self._settings)
+        except SettingsError:
             self._active_connection_test = None
-            self._activation_previous.pop(request_id, None)
-            self._cancelConnectionWorker.emit(request_id)
-            self._emit_failure(request_id, FailureKind.CREDENTIAL_REJECTED)
+            try:
+                self._settings = self._settings_store.save_pending_connection(
+                    pending.origin, value
+                )
+            except SettingsError:
+                pass
+            else:
+                self._begin_rollback_settlement(request_id)
+            self._identity = None
+            self._proof = None
+            self._invalidate_archive_state()
+            self.settingsChanged.emit(self._settings)
+            self.identityChanged.emit(None)
+            self._queue_configuration(
+                self._configuration(enabled=False, activation_id=request_id)
+            )
+            self._emit_failure(request_id, FailureKind.SETTINGS)
             return
         self._active_connection_test = None
         self._activation_previous.pop(request_id, None)
+        self._rollback_settlements.discard(request_id)
         self._identity = value
         self._proof = (self._settings.origin, value.organization.id)
         self._invalidate_archive_state()
@@ -812,23 +826,88 @@ class RoastServerController(QObject):
         self.settingsChanged.emit(self._settings)
         self.identityChanged.emit(value)
 
+    @pyqtSlot(str, bool)
+    def _on_connection_rollback_finished(
+        self, transaction_id: str, succeeded: bool
+    ) -> None:
+        if self._stop_requested or type(succeeded) is not bool:
+            return
+        if (
+            transaction_id not in self._rollback_settlements
+            and transaction_id not in self._activation_previous
+        ):
+            return
+        self._rollback_settlements.discard(transaction_id)
+        if transaction_id == self._active_connection_test:
+            self._active_connection_test = None
+        previous = self._activation_previous.get(transaction_id)
+        if not succeeded or previous is None:
+            self._identity = None
+            self._proof = None
+            self._invalidate_archive_state()
+            self.settingsChanged.emit(self._settings)
+            self.identityChanged.emit(None)
+            self._queue_configuration(self._configuration(enabled=False))
+            self._emit_failure(transaction_id, FailureKind.KEYRING)
+            return
+        expected = self._settings.pending_connection
+        try:
+            self._settings = self._settings_store.rollback_pending_connection(
+                previous, expected
+            )
+            self._known_namespace = _settings_namespace(self._settings)
+        except SettingsError:
+            try:
+                self._settings = self._settings_store.load()
+            except SettingsError:
+                pass
+            self._identity = None
+            self._proof = None
+            self._invalidate_archive_state()
+            self.settingsChanged.emit(self._settings)
+            self.identityChanged.emit(None)
+            self._queue_configuration(self._configuration(enabled=False))
+            self._emit_failure(transaction_id, FailureKind.SETTINGS)
+            return
+        self._activation_previous.pop(transaction_id, None)
+        self._identity = None
+        self._proof = None
+        self._invalidate_archive_state()
+        self.settingsChanged.emit(self._settings)
+        self.identityChanged.emit(None)
+        self._queue_configuration(self._configuration(enabled=False))
+
     @pyqtSlot(str, object)
     def _on_pending_connection_recovery_required(
         self, transaction_id: str, value: object
     ) -> None:
         if self._stop_requested:
             return
-        expected = _failure(FailureKind.CREDENTIAL_REJECTED)
+        recovery = value if isinstance(value, PendingConnectionRecovery) else None
+        pending = self._settings.pending_connection
         if (
             self._active_connection_test is not None
-            or self._settings.pending_connection is None
-            or value != expected
+            or pending is None
+            or recovery is None
         ):
-            self._cancelConnectionWorker.emit(transaction_id)
             return
         self._proof = None
         self._identity = None
         self._invalidate_archive_state()
+        prior_matches = (
+            recovery.authenticated_identity is not None
+            and pending.origin == self._settings.origin
+            and recovery.authenticated_identity == self._settings.identity
+        )
+        first_candidate_absent = (
+            not recovery.credential_present and self._settings.identity is None
+        )
+        if not prior_matches and not first_candidate_absent:
+            self.settingsChanged.emit(self._settings)
+            self.identityChanged.emit(None)
+            self._queue_configuration(self._configuration(enabled=False))
+            self.operationFailed.emit(transaction_id, recovery.failure)
+            return
         try:
             self._settings = self._settings_store.clear_pending_connection()
             self._known_namespace = _settings_namespace(self._settings)
@@ -840,15 +919,15 @@ class RoastServerController(QObject):
             )
             self.settingsChanged.emit(self._settings)
             self.identityChanged.emit(None)
-            self._queue_configuration(self._prior_active_configuration())
-            self._cancelConnectionWorker.emit(transaction_id)
+            self._queue_configuration(self._configuration(enabled=False))
             self._emit_failure(transaction_id, FailureKind.SETTINGS)
             return
         self.settingsChanged.emit(self._settings)
         self.identityChanged.emit(None)
-        self._queue_configuration(self._configuration(enabled=False))
-        self._cancelConnectionWorker.emit(transaction_id)
-        self.operationFailed.emit(transaction_id, expected)
+        self._queue_configuration(
+            self._configuration(enabled=False), authorize_startup=True
+        )
+        self.operationFailed.emit(transaction_id, recovery.failure)
 
     @pyqtSlot(object)
     def _on_configuration_validated(self, value: object) -> None:
@@ -895,36 +974,10 @@ class RoastServerController(QObject):
         if operation == self._active_connection_test:
             self._connection_tests.pop(operation, None)
             self._active_connection_test = None
-            self._cancelConnectionWorker.emit(operation)
-        previous = self._activation_previous.pop(operation, None)
-        if previous is not None:
-            try:
-                self._settings = self._settings_store.restore_connection_state(
-                    previous
-                )
-                self._known_namespace = _settings_namespace(self._settings)
-            except SettingsError:
-                self._settings_failure(operation)
-                return
-            self._identity = None
-            self._proof = None
-            self._invalidate_archive_state()
-            self.settingsChanged.emit(self._settings)
-            self._queue_configuration(self._configuration(enabled=False))
-        elif (
-            operation == 'configure'
-            and failure.kind is FailureKind.CREDENTIAL_REJECTED
-            and self._settings.pending_connection is not None
-        ):
-            try:
-                self._settings = self._settings_store.clear_pending_connection()
-                self._known_namespace = _settings_namespace(self._settings)
-            except SettingsError:
-                self._settings_failure(operation)
-                return
-            self._invalidate_identity()
-            self.settingsChanged.emit(self._settings)
-            self._queue_configuration(self._configuration(enabled=False))
+            if operation in self._activation_previous:
+                self._begin_rollback_settlement(operation)
+            else:
+                self._cancelConnectionWorker.emit(operation)
         if failure.kind is FailureKind.CREDENTIAL_REJECTED:
             paused = self._configuration(enabled=False)
             if not self._set_automatic_upload_off(operation):
@@ -1250,42 +1303,12 @@ class RoastServerController(QObject):
             else set()
         )
 
-    def _restore_unaccepted_activation_for_shutdown(self) -> None:
-        if not self._activation_previous:
-            return
-        previous = next(reversed(self._activation_previous.values()))
-        persistence_failed = False
-        try:
-            self._settings = self._settings_store.restore_connection_state(previous)
-        except SettingsError:
-            persistence_failed = True
-            try:
-                self._settings = self._settings_store.save_options(
-                    False,
-                    False,
-                    self._settings.cache_limit_bytes,
-                )
-            except SettingsError:
-                self._settings = replace(
-                    self._settings,
-                    enabled=False,
-                    automatic_upload=False,
-                    pending_connection=None,
-                )
-        self._known_namespace = _settings_namespace(self._settings)
-        self._identity = None
-        self._proof = None
-        self._invalidate_archive_state()
-        self.settingsChanged.emit(self._settings)
-        self.identityChanged.emit(None)
-        if persistence_failed:
-            self._emit_failure('shutdown', FailureKind.SETTINGS)
-
     def _invalidate_requests(self) -> None:
         self._connection_tests.clear()
         self._active_connection_test = None
         self._credential_removals.clear()
         self._activation_previous.clear()
+        self._rollback_settlements.clear()
         self._invalidate_archive_state()
 
     def _disallow_configuration_proof(self) -> None:
@@ -1301,17 +1324,31 @@ class RoastServerController(QObject):
             return
         self._connection_tests.pop(transaction_id, None)
         self._active_connection_test = None
-        previous = self._activation_previous.pop(transaction_id, None)
-        self._cancelConnectionWorker.emit(transaction_id)
-        if previous is None:
+        if transaction_id in self._activation_previous:
+            self._begin_rollback_settlement(transaction_id)
+        else:
+            self._cancelConnectionWorker.emit(transaction_id)
+
+    def _begin_rollback_settlement(self, transaction_id: str) -> None:
+        if transaction_id in self._rollback_settlements:
             return
-        try:
-            self._settings = self._settings_store.restore_connection_state(previous)
-            self._known_namespace = _settings_namespace(self._settings)
-        except SettingsError:
-            self._settings_failure(transaction_id)
-            raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
-        self.settingsChanged.emit(self._settings)
+        if transaction_id not in self._activation_previous:
+            self._cancelConnectionWorker.emit(transaction_id)
+            return
+        self._rollback_settlements.add(transaction_id)
+        self._cancelConnectionWorker.emit(transaction_id)
+        QTimer.singleShot(
+            _ROLLBACK_SETTLEMENT_TIMEOUT_MS,
+            lambda: self._report_rollback_timeout(transaction_id),
+        )
+
+    def _report_rollback_timeout(self, transaction_id: str) -> None:
+        if self._stop_requested or transaction_id not in self._rollback_settlements:
+            return
+        self._identity = None
+        self._proof = None
+        self._queue_configuration(self._configuration(enabled=False))
+        self._emit_failure(transaction_id, FailureKind.KEYRING)
 
     def _cancel_connection_transactions(self) -> None:
         self._credential_vault.clear()
@@ -1319,8 +1356,7 @@ class RoastServerController(QObject):
         if active is not None:
             self._cancel_connection_transaction(active)
         for transaction_id in tuple(self._activation_previous):
-            self._activation_previous.pop(transaction_id, None)
-            self._cancelConnectionWorker.emit(transaction_id)
+            self._begin_rollback_settlement(transaction_id)
         self._connection_tests.clear()
 
     def _put_command(self, command: object) -> str:

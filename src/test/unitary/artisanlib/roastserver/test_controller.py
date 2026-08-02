@@ -72,6 +72,7 @@ from artisanlib.roastserver.worker import (
     ClearUnusedRequest,
     ConnectionTestRequest,
     OpaqueVault,
+    PendingConnectionRecovery,
     ProtectedPathsRequest,
     PublishRequest,
     SavedProfileRequest,
@@ -533,6 +534,7 @@ class FakeWorker(QObject):
     connectionTested = pyqtSignal(str, object)
     credentialCommitted = pyqtSignal(str, object)
     connectionActivated = pyqtSignal(str, object)
+    connectionRollbackFinished = pyqtSignal(str, bool)
     pendingConnectionRecoveryRequired = pyqtSignal(str, object)
     configurationValidated = pyqtSignal(object)
     credentialRemoved = pyqtSignal(str)
@@ -557,6 +559,8 @@ class FakeWorker(QObject):
         self.acknowledge_ids: list[str] = []
         self.rollback_ids: list[str] = []
         self.cancel_ids: list[str] = []
+        self.rollback_succeeds = True
+        self.auto_finish_rollback = True
         self.enqueue_ids: list[str] = []
         self.publish_ids: list[str] = []
         self.protect_ids: list[str] = []
@@ -616,11 +620,15 @@ class FakeWorker(QObject):
     def rollback_connection(self, request_id: str) -> None:
         self.rollback_ids.append(request_id)
         self._record('rollback_connection', request_id)
+        if self.auto_finish_rollback:
+            self.connectionRollbackFinished.emit(request_id, self.rollback_succeeds)
 
     @pyqtSlot(str)
     def cancel_connection_transaction(self, request_id: str) -> None:
         self.cancel_ids.append(request_id)
         self._record('cancel_connection_transaction', request_id)
+        if self.auto_finish_rollback:
+            self.connectionRollbackFinished.emit(request_id, self.rollback_succeeds)
 
     @pyqtSlot(str)
     def remove_credential(self, request_id: str) -> None:
@@ -698,6 +706,10 @@ class FakeWorker(QObject):
     def relay_activated(self, request_id: str, identity: object) -> None:
         self.connectionActivated.emit(request_id, identity)
 
+    @pyqtSlot(str, bool)
+    def relay_rollback(self, request_id: str, succeeded: bool) -> None:
+        self.connectionRollbackFinished.emit(request_id, succeeded)
+
     @pyqtSlot(str, object)
     def relay_recovery(self, request_id: str, failure: object) -> None:
         self.pendingConnectionRecoveryRequired.emit(request_id, failure)
@@ -768,6 +780,7 @@ class WorkerRelay(QObject):
     connection = pyqtSignal(str, object)
     committed = pyqtSignal(str, object)
     activated = pyqtSignal(str, object)
+    rollback = pyqtSignal(str, bool)
     recovery = pyqtSignal(str, object)
     validated = pyqtSignal(object)
     removed = pyqtSignal(str)
@@ -823,6 +836,7 @@ class ControllerHarness:
             self.relay.connection.connect(self.worker.relay_connection)
             self.relay.committed.connect(self.worker.relay_committed)
             self.relay.activated.connect(self.worker.relay_activated)
+            self.relay.rollback.connect(self.worker.relay_rollback)
             self.relay.recovery.connect(self.worker.relay_recovery)
             self.relay.validated.connect(self.worker.relay_validated)
             self.relay.removed.connect(self.worker.relay_removed)
@@ -1122,12 +1136,14 @@ def test_restart_recovers_committed_pending_public_identity_before_final_auth(
         harness.wait_until(
             lambda: transaction_id in harness.fake_worker.finalize_ids
         )
-        active = harness.settings_store.load()
-        assert active.identity == OTHER_IDENTITY
-        assert active.pending_connection is None
-        assert not active.enabled and not active.automatic_upload
+        journaled = harness.settings_store.load()
+        assert journaled.identity == IDENTITY
+        assert journaled.pending_connection is not None
+        assert journaled.pending_connection.identity == OTHER_IDENTITY
+        assert not journaled.enabled and not journaled.automatic_upload
         activation_configuration = harness.fake_worker.configure_values[-1]
         assert activation_configuration.activation_id == transaction_id
+        assert activation_configuration.pending_connection
         harness.relay.activated.emit(transaction_id, OTHER_IDENTITY)
         harness.wait_until(
             lambda: harness.fake_worker.configure_values[-1].activation_id is None
@@ -1263,9 +1279,10 @@ def test_pending_recovery_clear_failure_stays_on_prior_disabled_configuration(
         reject_clear,
     )
     try:
+        failure = public_failure(FailureKind.CREDENTIAL_REJECTED)
         harness.relay.recovery.emit(
             transaction_id,
-            public_failure(FailureKind.CREDENTIAL_REJECTED),
+            PendingConnectionRecovery(IDENTITY, True, failure),
         )
         harness.wait_until(lambda: len(failed) > 0)
 
@@ -1275,11 +1292,11 @@ def test_pending_recovery_clear_failure_stays_on_prior_disabled_configuration(
         ]
         assert harness.settings_store.load().pending_connection is not None
         configuration = harness.fake_worker.configure_values[-1]
-        assert configuration.identity == IDENTITY
+        assert configuration.identity == OTHER_IDENTITY
         assert configuration.namespace == namespace_for(
-            ORIGIN, IDENTITY.organization.id
+            ORIGIN, OTHER_IDENTITY.organization.id
         )
-        assert not configuration.pending_connection
+        assert configuration.pending_connection
         assert not configuration.enabled
         assert not configuration.automatic_upload
     finally:
@@ -1360,7 +1377,11 @@ def test_active_settings_failure_rolls_back_worker_and_previous_public_state(
     )
     controller_harness.relay.committed.emit(request_id, OTHER_IDENTITY)
     controller_harness.wait_until(
-        lambda: request_id in controller_harness.fake_worker.rollback_ids
+        lambda: request_id in controller_harness.fake_worker.finalize_ids
+    )
+    controller_harness.relay.activated.emit(request_id, OTHER_IDENTITY)
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.cancel_ids
     )
 
     loaded = controller_harness.settings_store.load()
@@ -1369,6 +1390,76 @@ def test_active_settings_failure_rolls_back_worker_and_previous_public_state(
     assert loaded.pending_connection is None
     assert not loaded.enabled and not loaded.automatic_upload
     assert not controller_harness.fake_worker.configure_values[-1].enabled
+
+
+def test_interactive_cancel_clears_journal_only_after_acknowledged_rollback(
+    controller_harness: ControllerHarness,
+) -> None:
+    request_id = controller_harness.controller.test_connection(
+        ORIGIN, controller_harness.ephemeral_secret
+    )
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.test_ids
+    )
+    controller_harness.relay.connection.emit(request_id, IDENTITY)
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.commit_ids
+    )
+    controller_harness.relay.committed.emit(request_id, IDENTITY)
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.finalize_ids
+    )
+    controller_harness.fake_worker.auto_finish_rollback = False
+
+    controller_harness.controller.invalidate_connection_proof()
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.cancel_ids
+    )
+
+    settling = controller_harness.settings_store.load()
+    assert settling.pending_connection is not None
+    assert not controller_harness.fake_worker.configure_values[-1].enabled
+
+    controller_harness.relay.rollback.emit(request_id, True)
+    controller_harness.wait_until(
+        lambda: controller_harness.settings_store.load().pending_connection is None
+    )
+    assert controller_harness.settings_store.load().identity is None
+
+
+def test_rollback_failure_preserves_pending_recovery_journal(
+    controller_harness: ControllerHarness,
+) -> None:
+    request_id = controller_harness.controller.test_connection(
+        ORIGIN, controller_harness.ephemeral_secret
+    )
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.test_ids
+    )
+    controller_harness.relay.connection.emit(request_id, IDENTITY)
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.commit_ids
+    )
+    controller_harness.relay.committed.emit(request_id, IDENTITY)
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.finalize_ids
+    )
+    controller_harness.fake_worker.rollback_succeeds = False
+    failed = QSignalSpy(controller_harness.controller.operationFailed)
+
+    controller_harness.controller.invalidate_connection_proof()
+    controller_harness.wait_until(
+        lambda: _spy_matches(
+            failed,
+            lambda payload: payload
+            == [request_id, public_failure(FailureKind.KEYRING)],
+        )
+    )
+
+    unresolved = controller_harness.settings_store.load()
+    assert unresolved.pending_connection is not None
+    assert unresolved.identity is None
+    assert not unresolved.enabled and not unresolved.automatic_upload
 
 
 def test_untracked_activation_signal_cannot_install_connection_proof(
@@ -1397,7 +1488,7 @@ def test_untracked_activation_signal_cannot_install_connection_proof(
     )
     assert controller_harness.fake_worker.acknowledge_ids == []
 
-    with pytest.raises(ControllerError, match='Test the connection'):
+    with pytest.raises(ControllerError, match='rollback is still settling'):
         controller_harness.controller.apply_options(
             ORIGIN,
             enabled=True,
@@ -1464,6 +1555,9 @@ def test_origin_and_organization_changes_pause_old_namespace_before_new_one(
         == namespace_for(ORIGIN, OTHER_ORGANIZATION_ID)
     )
     controller_harness.relay.activated.emit(request_id, OTHER_IDENTITY)
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.acknowledge_ids
+    )
     assert not controller_harness.fake_worker.configure_values[-1].automatic_upload
 
     before = len(controller_harness.fake_worker.configure_values)
@@ -1922,7 +2016,8 @@ def test_namespace_transition_releases_then_restores_current_open_protection(
         public_failure(FailureKind.CREDENTIAL_REJECTED),
     )
     controller_harness.wait_until(
-        lambda: len(controller_harness.fake_worker.protect_ids) > before
+        lambda: controller_harness.settings_store.load().pending_connection is None
+        and len(controller_harness.fake_worker.protect_ids) > before
     )
     restored = cast(
         ProtectedPathsRequest,
@@ -1989,6 +2084,30 @@ def test_start_is_idempotent_and_controller_rejects_cross_thread_calls(
     finally:
         thread.quit()
         assert thread.wait(2_000)
+
+
+def test_shutdown_before_keyring_commit_preserves_pending_journal(
+    controller_harness: ControllerHarness,
+) -> None:
+    request_id = controller_harness.controller.test_connection(
+        ORIGIN, controller_harness.ephemeral_secret
+    )
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.test_ids
+    )
+    controller_harness.fake_worker.block_tests = False
+    controller_harness.relay.connection.emit(request_id, IDENTITY)
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.commit_ids
+    )
+
+    assert controller_harness.controller.shutdown(2_000)
+
+    pending = controller_harness.settings_store.load()
+    assert pending.identity is None
+    assert pending.pending_connection is not None
+    assert pending.pending_connection.identity == IDENTITY
+    assert controller_harness.credentials.set_calls == []
 
 
 def test_shutdown_requests_interruption_then_queued_stop_without_terminate(
@@ -2172,9 +2291,10 @@ def _blocked_first_activation(
         recorder.final_auth_entered.is_set,
         'activation did not reach blocked final authentication',
     )
-    promoted = settings.load()
-    assert promoted.identity == IDENTITY
-    assert promoted.pending_connection is None
+    journaled = settings.load()
+    assert journaled.identity is None
+    assert journaled.pending_connection is not None
+    assert journaled.pending_connection.identity == IDENTITY
     assert transaction_id in controller._activation_previous
     return controller, settings, credentials, recorder, candidate
 
@@ -2219,7 +2339,7 @@ def _assert_first_activation_restart_matches(
         assert restarted.shutdown(2_000)
 
 
-def test_real_shutdown_before_final_activation_restores_settings_and_keyring(
+def test_real_shutdown_after_keyring_commit_preserves_journal_and_candidate(
     tmp_path: Path,
     qcoreapplication: QCoreApplication,
 ) -> None:
@@ -2228,7 +2348,9 @@ def test_real_shutdown_before_final_activation_restores_settings_and_keyring(
     )
     try:
         assert not controller.shutdown(10)
-        assert settings.load().identity is None
+        pending = settings.load()
+        assert pending.identity is None
+        assert pending.pending_connection is not None
         recorder.release_final_auth.set()
         _wait_for_qt(
             qcoreapplication,
@@ -2244,7 +2366,7 @@ def test_real_shutdown_before_final_activation_restores_settings_and_keyring(
             credentials,
             recorder,
             candidate,
-            accepted=False,
+            accepted=True,
         )
     finally:
         recorder.release_final_auth.set()
@@ -2252,7 +2374,7 @@ def test_real_shutdown_before_final_activation_restores_settings_and_keyring(
             assert controller.shutdown(2_000)
 
 
-def test_real_shutdown_before_processing_emitted_activation_restores_both_stores(
+def test_real_shutdown_after_final_auth_emission_recovers_committed_candidate(
     tmp_path: Path,
     qcoreapplication: QCoreApplication,
 ) -> None:
@@ -2285,7 +2407,7 @@ def test_real_shutdown_before_processing_emitted_activation_restores_both_stores
             credentials,
             recorder,
             candidate,
-            accepted=False,
+            accepted=True,
         )
     finally:
         recorder.release_final_auth.set()
@@ -2322,6 +2444,9 @@ def test_real_shutdown_after_acceptance_executes_queued_ack_before_stop(
             and not controller._activation_previous,
             'controller did not accept activation while worker was blocked',
         )
+        assert controller._worker._credential_transactions
+        assert settings.load().pending_connection is None
+        assert credentials.values.get(ORIGIN) == candidate
         assert not controller.shutdown(10)
         assert settings.load().identity == IDENTITY
         release_activation.set()
@@ -2348,7 +2473,95 @@ def test_real_shutdown_after_acceptance_executes_queued_ack_before_stop(
             assert controller.shutdown(2_000)
 
 
-def test_shutdown_restore_persistence_failure_is_reported_and_fail_closed(
+def test_real_shutdown_after_worker_ack_keeps_finalized_candidate(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    controller, settings, credentials, recorder, candidate = (
+        _blocked_first_activation(tmp_path, qcoreapplication, 'shutdown-post-ack')
+    )
+    try:
+        recorder.release_final_auth.set()
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: settings.load().identity == IDENTITY
+            and settings.load().pending_connection is None
+            and not controller._worker._credential_transactions,
+            'activation acknowledgement did not finalize the candidate',
+        )
+        assert controller.shutdown(2_000)
+        _assert_first_activation_restart_matches(
+            tmp_path,
+            qcoreapplication,
+            'shutdown-post-ack',
+            settings,
+            credentials,
+            recorder,
+            candidate,
+            accepted=True,
+        )
+    finally:
+        recorder.release_final_auth.set()
+        if controller.worker_thread_running:
+            assert controller.shutdown(2_000)
+
+
+def test_real_rollback_failure_keeps_journal_and_restarts_without_cross_org(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    controller, settings, credentials, recorder, candidate = (
+        _blocked_first_activation(
+            tmp_path,
+            qcoreapplication,
+            'rollback-failure-recovery',
+            seed_jobs=True,
+        )
+    )
+    failed = QSignalSpy(controller.operationFailed)
+    try:
+        credentials.failure = CredentialStoreError('fixed fake failure')
+        controller.invalidate_connection_proof()
+        recorder.release_final_auth.set()
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: _spy_matches(
+                failed,
+                lambda payload: payload
+                == [
+                    next(iter(controller._activation_previous)),
+                    public_failure(FailureKind.KEYRING),
+                ],
+            ),
+            'rollback failure was not reported',
+        )
+        unresolved = settings.load()
+        assert unresolved.pending_connection is not None
+        assert unresolved.identity is None
+        assert credentials.values.get(ORIGIN) == candidate
+        assert controller.shutdown(2_000)
+
+        credentials.failure = None
+        _assert_first_activation_restart_matches(
+            tmp_path,
+            qcoreapplication,
+            'rollback-failure-recovery',
+            settings,
+            credentials,
+            recorder,
+            candidate,
+            accepted=True,
+        )
+        assert recorder.api_calls.count('post_aroast') == 0
+        assert recorder.api_calls.count('upload_revision') == 0
+    finally:
+        credentials.failure = None
+        recorder.release_final_auth.set()
+        if controller.worker_thread_running:
+            assert controller.shutdown(2_000)
+
+
+def test_shutdown_never_attempts_cross_store_settings_rollback(
     tmp_path: Path,
     qcoreapplication: QCoreApplication,
     monkeypatch: pytest.MonkeyPatch,
@@ -2362,7 +2575,6 @@ def test_shutdown_restore_persistence_failure_is_reported_and_fail_closed(
         )
     )
     restore_calls: list[ConnectorSettings] = []
-    failed = QSignalSpy(controller.operationFailed)
 
     def reject_restore(previous: ConnectorSettings) -> ConnectorSettings:
         restore_calls.append(previous)
@@ -2371,28 +2583,17 @@ def test_shutdown_restore_persistence_failure_is_reported_and_fail_closed(
     monkeypatch.setattr(settings, 'restore_connection_state', reject_restore)
     try:
         assert not controller.shutdown(10)
-        assert restore_calls
-        assert not settings.load().enabled
-        assert not settings.load().automatic_upload
-        assert _spy_matches(
-            failed,
-            lambda payload: payload[0] == 'shutdown'
-            and payload[1] == public_failure(FailureKind.SETTINGS),
-        )
+        assert restore_calls == []
+        pending = settings.load()
+        assert pending.pending_connection is not None
+        assert not pending.enabled and not pending.automatic_upload
         recorder.release_final_auth.set()
         _wait_for_qt(
             qcoreapplication,
             lambda: not controller.worker_thread_running,
-            'fail-closed shutdown worker did not stop',
+            'journal-preserving shutdown worker did not stop',
         )
-        inspector = Outbox(
-            tmp_path / 'shutdown-restore-failure-data' / 'outbox', lambda: NOW
-        )
-        inspector.open()
-        try:
-            assert inspector.counts(namespace_for(ORIGIN, ORGANIZATION_ID)).paused == 1
-        finally:
-            inspector.close()
+        assert settings.load().pending_connection is not None
     finally:
         recorder.release_final_auth.set()
         if controller.worker_thread_running:

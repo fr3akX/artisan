@@ -199,7 +199,11 @@ class SettingsStore:
     def set_origin(self, origin: str) -> ConnectorSettings:
         canonical = canonical_origin(origin)
         current = self.load()
-        if canonical == current.origin and current.pending_connection is None:
+        if current.pending_connection is not None:
+            if canonical != current.origin:
+                raise SettingsError(SETTINGS_FAILURE_MESSAGE)
+            return current
+        if canonical == current.origin:
             return current
         target = replace(
             current,
@@ -217,6 +221,8 @@ class SettingsStore:
     ) -> ConnectorSettings:
         canonical = canonical_origin(origin)
         current = self.load()
+        if current.pending_connection is not None:
+            raise SettingsError(SETTINGS_FAILURE_MESSAGE)
         changed_origin = canonical != current.origin
         target = replace(
             current,
@@ -236,6 +242,7 @@ class SettingsStore:
         current = self.load()
         target = replace(
             current,
+            enabled=False,
             automatic_upload=False,
             pending_connection=PendingConnection(canonical, identity),
         )
@@ -245,21 +252,44 @@ class SettingsStore:
     def activate_pending_connection(
         self, origin: str, identity: ServerIdentity
     ) -> ConnectorSettings:
+        """Promote an exact candidate while retaining its journal until readback."""
         canonical = canonical_origin(origin)
         current = self.load()
         expected = PendingConnection(canonical, identity)
         if current.pending_connection != expected:
             raise SettingsError(SETTINGS_FAILURE_MESSAGE)
-        target = replace(
+        promoted = replace(
             current,
             origin=canonical,
             enabled=False,
             automatic_upload=False,
             identity=identity,
-            pending_connection=None,
+            pending_connection=expected,
         )
-        self._persist_security(target)
-        return target
+        self._persist_security(promoted)
+        activated = replace(promoted, pending_connection=None)
+        self._persist_security(activated)
+        return activated
+
+    def rollback_pending_connection(
+        self,
+        previous: ConnectorSettings,
+        expected: PendingConnection | None,
+    ) -> ConnectorSettings:
+        """Restore prior public state before clearing an acknowledged journal."""
+        current = self.load()
+        if expected is None or current.pending_connection != expected:
+            raise SettingsError(SETTINGS_FAILURE_MESSAGE)
+        restored_with_journal = replace(
+            previous,
+            enabled=False,
+            automatic_upload=False,
+            pending_connection=expected,
+        )
+        self._persist_security(restored_with_journal)
+        settled = replace(restored_with_journal, pending_connection=None)
+        self._persist_security(settled)
+        return settled
 
     def clear_pending_connection(self) -> ConnectorSettings:
         current = self.load()
@@ -277,6 +307,8 @@ class SettingsStore:
     def restore_connection_state(
         self, previous: ConnectorSettings
     ) -> ConnectorSettings:
+        if self.load().pending_connection is not None:
+            raise SettingsError(SETTINGS_FAILURE_MESSAGE)
         target = replace(
             previous,
             automatic_upload=False,
@@ -289,6 +321,10 @@ class SettingsStore:
         self, enabled: bool, automatic_upload: bool, cache_limit_bytes: int
     ) -> ConnectorSettings:
         current = self.load()
+        if current.pending_connection is not None and (
+            enabled or automatic_upload
+        ):
+            raise SettingsError(SETTINGS_FAILURE_MESSAGE)
         if automatic_upload and current.identity is None:
             raise SettingsError(
                 'Automatic upload requires a confirmed identity for the current origin.'
@@ -299,7 +335,6 @@ class SettingsStore:
             enabled=enabled,
             automatic_upload=automatic_upload,
             cache_limit_bytes=bounded_cache_limit_bytes,
-            pending_connection=None,
         )
         self._persist_security(target)
         return target

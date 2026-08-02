@@ -439,6 +439,96 @@ def test_pending_connection_is_public_only_and_promotes_in_two_durable_phases(
     assert not active.automatic_upload
 
 
+def test_activation_keeps_recovery_journal_until_promoted_active_readback(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+) -> None:
+    previous_store = SettingsStore(qsettings)
+    previous = previous_store.load()
+    previous_store.save_pending_connection('https://example.test', identity)
+    readbacks: list[tuple[object, object]] = []
+
+    def recording_readback() -> QSettings:
+        fresh = QSettings(qsettings.fileName(), qsettings.format())
+        fresh.sync()
+        readbacks.append(
+            (
+                fresh.value('RoastServer/identityOrganizationID'),
+                fresh.value('RoastServer/pendingIdentityOrganizationID'),
+            )
+        )
+        return fresh
+
+    activated = SettingsStore(
+        qsettings,
+        readback_factory=recording_readback,
+    ).activate_pending_connection('https://example.test', identity)
+
+    organization_id = str(identity.organization.id)
+    assert readbacks[-2:] == [
+        (organization_id, organization_id),
+        (organization_id, None),
+    ]
+    assert activated.identity == identity
+    assert activated.pending_connection is None
+    assert previous.identity is None
+
+
+def test_acknowledged_rollback_restores_active_before_clearing_journal(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+) -> None:
+    store = SettingsStore(qsettings)
+    previous = store.load()
+    pending = store.save_pending_connection('https://example.test', identity)
+    readbacks: list[tuple[object, object]] = []
+
+    def recording_readback() -> QSettings:
+        fresh = QSettings(qsettings.fileName(), qsettings.format())
+        fresh.sync()
+        readbacks.append(
+            (
+                fresh.value('RoastServer/identityOrganizationID'),
+                fresh.value('RoastServer/pendingIdentityOrganizationID'),
+            )
+        )
+        return fresh
+
+    settled = SettingsStore(
+        qsettings,
+        readback_factory=recording_readback,
+    ).rollback_pending_connection(previous, pending.pending_connection)
+
+    assert pending.pending_connection is not None
+    assert readbacks[-2:] == [
+        (None, str(identity.organization.id)),
+        (None, None),
+    ]
+    assert settled.identity is None
+    assert settled.pending_connection is None
+    assert not settled.enabled and not settled.automatic_upload
+
+
+def test_ordinary_setting_writes_cannot_clear_an_unsettled_journal(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+) -> None:
+    store = SettingsStore(qsettings)
+    previous = store.load()
+    pending = store.save_pending_connection('https://example.test', identity)
+
+    with pytest.raises(SettingsError, match=SETTINGS_FAILURE_MESSAGE):
+        store.set_origin('https://other.example.test')
+    with pytest.raises(SettingsError, match=SETTINGS_FAILURE_MESSAGE):
+        store.save_connection('https://example.test', identity)
+    with pytest.raises(SettingsError, match=SETTINGS_FAILURE_MESSAGE):
+        store.save_options(True, False, DEFAULT_CACHE_LIMIT_BYTES)
+    with pytest.raises(SettingsError, match=SETTINGS_FAILURE_MESSAGE):
+        store.restore_connection_state(previous)
+
+    assert store.load().pending_connection == pending.pending_connection
+
+
 def test_clear_pending_connection_durably_retains_prior_active_but_disables_it(
     qsettings: QSettings,
     identity: ServerIdentity,

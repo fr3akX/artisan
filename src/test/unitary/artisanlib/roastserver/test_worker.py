@@ -672,6 +672,28 @@ class StockTimerProbe(QObject):
         self.captured.emit()
 
 
+class PermitBoundaryBlocker:
+    def __init__(self) -> None:
+        self.target: str | None = None
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.returned = threading.Event()
+
+    def block(self, operation: str) -> None:
+        if operation != self.target:
+            return
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError('permit boundary blocker timed out')
+        self.returned.set()
+
+    def select(self, operation: str) -> None:
+        self.target = operation
+        self.entered.clear()
+        self.release.clear()
+        self.returned.clear()
+
+
 class WorkerHarness:
     def __init__(
         self,
@@ -680,6 +702,7 @@ class WorkerHarness:
         clock: MutableClock | None = None,
         *,
         authenticated_identity: ServerIdentity = IDENTITY,
+        operation_hook: Callable[[str], None] | None = None,
     ) -> None:
         self.tmp_path = tmp_path
         self.app = app
@@ -713,6 +736,7 @@ class WorkerHarness:
             command_vault=self.command_vault,
             configuration_fence=self.configuration_fence,
             timer_factory=self._timer_factory,
+            operation_hook=operation_hook,
         )
         self.worker.moveToThread(self.thread)
         self.bus.configure_worker.connect(self.worker.configure)
@@ -948,11 +972,20 @@ def test_configuration_fence_is_secret_free_and_revocation_is_monotonic() -> Non
     first = fence.advance()
     assert fence.is_current(first)
     assert fence.authorizes(first)
+    permit = fence.acquire(first)
+    assert permit is not None
+    assert fence.active_permits(first) == 1
+
     revoked = fence.revoke()
+
     assert revoked > first
     assert fence.is_current(revoked)
     assert not fence.authorizes(first)
     assert not fence.authorizes(revoked)
+    assert fence.acquire(first) is None
+    assert fence.active_permits(first) == 1
+    permit.release()
+    assert fence.active_permits(first) == 0
     current = fence.advance()
     assert current > revoked
     assert fence.authorizes(current)
@@ -1198,6 +1231,228 @@ def test_revoked_generation_timer_entry_never_leases_or_calls_delivery_api(
     assert worker_harness.worker._authorized_target is None
     assert worker_harness.timer is not None
     assert not worker_harness.timer.logically_active
+
+
+@pytest.mark.parametrize(
+    'operation',
+    [
+        'install_authorization',
+        'resume_namespace',
+        'timer_start',
+        'lease_next',
+        'post_aroast',
+        'upload_revision',
+        'list_roasts',
+        'get_roast',
+        'download_revision',
+    ],
+)
+def test_revocation_while_blocked_before_each_permit_has_zero_boundary_side_effect(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+    operation: str,
+) -> None:
+    blocker = PermitBoundaryBlocker()
+    harness = WorkerHarness(
+        tmp_path / operation,
+        qcoreapplication,
+        operation_hook=blocker.block,
+    )
+
+    def api_call_count(method: str) -> int:
+        return sum(call[0] == method for call in harness.client.calls)
+
+    resume_count = 0
+    timer = cast(DeterministicTimer, harness.timer)
+    delay_count = 0
+    leased_count = 0
+    post_count = 0
+    upload_count = 0
+    list_count = 0
+    get_count = 0
+    download_count = 0
+    try:
+        if operation in {'lease_next', 'post_aroast', 'upload_revision'}:
+            harness.enqueue_saved_profile()
+        blocker.select(operation)
+        if operation in {'install_authorization', 'resume_namespace'}:
+            resume_count = len(harness.outbox.resume_calls)
+            harness.bus.configure_worker.emit(
+                WorkerConfiguration(
+                    origin=ORIGIN,
+                    namespace=NAMESPACE,
+                    enabled=True,
+                    automatic_upload=True,
+                    client_instance_uuid=CLIENT_UUID,
+                    cache_limit_bytes=64 * 1024 * 1024,
+                    generation=harness.configuration_fence.advance(),
+                    identity=IDENTITY,
+                )
+            )
+        elif operation == 'timer_start':
+            delay_count = len(timer.delays)
+            request_id = harness.profile_vault.put(
+                SavedProfileRequest(
+                    NAMESPACE,
+                    PROFILE_BYTES,
+                    ProfileData(roastUUID=str(ROAST_UUID)),
+                    NOW,
+                    False,
+                )
+            )
+            harness.bus.enqueue_worker.emit(request_id)
+        elif operation in {'lease_next', 'post_aroast', 'upload_revision'}:
+            leased_count = len(harness.outbox.leased)
+            post_count = api_call_count('post_aroast')
+            upload_count = api_call_count('upload_revision')
+            harness.bus.tick_worker.emit()
+        elif operation == 'list_roasts':
+            list_count = api_call_count('list_roasts')
+            request_id = harness.command_vault.put(
+                BrowseRequest(NAMESPACE, ArchiveFilters(), None, True)
+            )
+            harness.bus.browse_worker.emit(request_id)
+        else:
+            get_count = api_call_count('get_roast')
+            download_count = api_call_count('download_revision')
+            request_id = harness.command_vault.put(
+                OnlineOpenRequest(NAMESPACE, ROAST_UUID)
+            )
+            harness.bus.online_worker.emit(request_id)
+
+        assert blocker.entered.wait(timeout=2)
+        revoked_generation = harness.configuration_fence.revoke()
+        assert harness.configuration_fence.active_permits() == 0
+        blocker.release.set()
+        harness.wait_until(blocker.returned.is_set)
+        for _ in range(20):
+            qcoreapplication.processEvents()
+            time.sleep(0.001)
+
+        assert harness.configuration_fence.is_current(revoked_generation)
+        if operation == 'install_authorization':
+            assert harness.worker._credential is None
+            assert harness.worker._authorized_target is None
+        elif operation == 'resume_namespace':
+            assert len(harness.outbox.resume_calls) == resume_count
+        elif operation == 'timer_start':
+            assert len(timer.delays) == delay_count
+        elif operation == 'lease_next':
+            assert len(harness.outbox.leased) == leased_count
+        elif operation == 'post_aroast':
+            assert api_call_count('post_aroast') == post_count
+        elif operation == 'upload_revision':
+            assert api_call_count('post_aroast') == post_count + 1
+            assert api_call_count('upload_revision') == upload_count
+        elif operation == 'list_roasts':
+            assert api_call_count('list_roasts') == list_count
+        elif operation == 'get_roast':
+            assert api_call_count('get_roast') == get_count
+        else:
+            assert api_call_count('get_roast') == get_count + 1
+            assert api_call_count('download_revision') == download_count
+    finally:
+        blocker.release.set()
+        harness.stop()
+
+
+def test_revocation_before_activation_install_permit_has_zero_authorization(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    blocker = PermitBoundaryBlocker()
+    harness = WorkerHarness(
+        tmp_path / 'install-activation',
+        qcoreapplication,
+        operation_hook=blocker.block,
+    )
+    activated = QSignalSpy(harness.worker.connectionActivated)
+    rolled_back = QSignalSpy(harness.worker.connectionRollbackFinished)
+    candidate = secrets.token_urlsafe(32)
+    old_digest = harness.credentials.stored_digest()
+    try:
+        transaction_id = harness.request_connection_test(candidate)
+        harness.wait_until(
+            lambda: transaction_id in harness.worker._credential_transactions
+        )
+        harness.bus.commit_worker.emit(transaction_id)
+        harness.wait_until(
+            lambda: harness.worker._credential_transactions[
+                transaction_id
+            ].keyring_committed
+        )
+        harness.bus.configure_worker.emit(
+            WorkerConfiguration(
+                origin=ORIGIN,
+                namespace=NAMESPACE,
+                enabled=False,
+                automatic_upload=False,
+                client_instance_uuid=CLIENT_UUID,
+                cache_limit_bytes=64 * 1024 * 1024,
+                generation=harness.configuration_fence.advance(),
+                identity=IDENTITY,
+                pending_connection=True,
+                activation_id=transaction_id,
+            )
+        )
+        harness.wait_until(
+            lambda: harness.worker._configuration is not None
+            and harness.worker._configuration.activation_id == transaction_id
+        )
+        blocker.select('install_activation')
+        harness.bus.finalize_worker.emit(transaction_id)
+        assert blocker.entered.wait(timeout=2)
+
+        harness.configuration_fence.revoke()
+        blocker.release.set()
+        harness.wait_until(lambda: len(rolled_back) == 1)
+
+        assert len(activated) == 0
+        assert harness.worker._credential is None
+        assert harness.worker._authorized_target is None
+        assert harness.credentials.stored_digest() == old_digest
+    finally:
+        blocker.release.set()
+        harness.stop()
+
+
+def test_permit_acquired_before_revocation_is_bounded_in_flight(
+    worker_harness: WorkerHarness,
+) -> None:
+    worker_harness.enqueue_saved_profile()
+    configuration = worker_harness.worker._configuration
+    assert configuration is not None
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block_started_post(method: str) -> None:
+        if method != 'post_aroast':
+            return
+        entered.set()
+        if not release.wait(timeout=5):
+            raise RuntimeError('in-flight permit test timed out')
+
+    worker_harness.client.callback = block_started_post
+    worker_harness.bus.tick_worker.emit()
+    assert entered.wait(timeout=2)
+
+    assert worker_harness.configuration_fence.active_permits(
+        configuration.generation
+    ) == 1
+    worker_harness.configuration_fence.revoke()
+    assert worker_harness.configuration_fence.active_permits(
+        configuration.generation
+    ) == 1
+    release.set()
+    worker_harness.wait_until(
+        lambda: worker_harness.configuration_fence.active_permits(
+            configuration.generation
+        )
+        == 0
+    )
+
+    assert sum(call[0] == 'post_aroast' for call in worker_harness.client.calls) == 1
+    assert all(call[0] != 'upload_revision' for call in worker_harness.client.calls)
 
 
 def test_candidate_activation_commits_only_between_two_exact_auth_checks(
@@ -1485,7 +1740,7 @@ def test_cancel_emitted_unacknowledged_activation_restores_keyring_and_auth(
     assert_secret_absent(candidate, worker_harness.worker)
 
 
-def test_shutdown_rolls_back_emitted_unacknowledged_activation(
+def test_shutdown_preserves_emitted_unacknowledged_activation_for_recovery(
     worker_harness: WorkerHarness,
 ) -> None:
     activated = QSignalSpy(worker_harness.worker.connectionActivated)
@@ -1519,8 +1774,9 @@ def test_shutdown_rolls_back_emitted_unacknowledged_activation(
 
     worker_harness.stop()
 
-    assert worker_harness.credentials.stored_digest() == old_digest
-    assert worker_harness.credentials.set_calls[-1][1] == old_digest
+    assert worker_harness.credentials.stored_digest() == secret_digest(candidate)
+    assert worker_harness.credentials.set_calls[-1][1] == secret_digest(candidate)
+    assert worker_harness.credentials.stored_digest() != old_digest
     assert_secret_absent(candidate, worker_harness.credentials)
 
 
