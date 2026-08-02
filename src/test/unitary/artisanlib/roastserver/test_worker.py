@@ -615,6 +615,7 @@ class CommandBus(QObject):
     commit_worker = pyqtSignal(str)
     finalize_worker = pyqtSignal(str)
     rollback_worker = pyqtSignal(str)
+    cancel_transaction_worker = pyqtSignal(str)
     enqueue_worker = pyqtSignal(str)
     retry_worker = pyqtSignal(str)
     remove_worker = pyqtSignal(str)
@@ -715,6 +716,9 @@ class WorkerHarness:
         self.bus.commit_worker.connect(self.worker.commit_connection)
         self.bus.finalize_worker.connect(self.worker.finalize_connection)
         self.bus.rollback_worker.connect(self.worker.rollback_connection)
+        self.bus.cancel_transaction_worker.connect(
+            self.worker.cancel_connection_transaction
+        )
         self.bus.enqueue_worker.connect(self.worker.enqueue_saved)
         self.bus.retry_worker.connect(self.worker.retry_job)
         self.bus.remove_worker.connect(self.worker.remove_job)
@@ -965,6 +969,7 @@ def test_every_external_slot_rejects_direct_wrong_thread_use_without_io(
     worker_harness.worker.commit_connection('a' * 32)
     worker_harness.worker.finalize_connection('b' * 32)
     worker_harness.worker.rollback_connection('c' * 32)
+    worker_harness.worker.cancel_connection_transaction('f' * 32)
     worker_harness.worker.remove_credential(command_ids[0])
     worker_harness.worker.enqueue_saved(profile_id)
     worker_harness.worker.process_queue_once()
@@ -980,7 +985,7 @@ def test_every_external_slot_rejects_direct_wrong_thread_use_without_io(
     worker_harness.worker.clear_unused(command_ids[6])
     worker_harness.worker.stop()
 
-    assert len(failed) == 20
+    assert len(failed) == 21
     assert not worker_harness.secret_vault.contains(candidate_id)
     assert not worker_harness.profile_vault.contains(profile_id)
     assert all(
@@ -1117,12 +1122,146 @@ def test_candidate_activation_commits_only_between_two_exact_auth_checks(
         ('test_connection',),
         ('test_connection',),
     ]
+    assert worker_harness.worker._credential_transactions == {}
     signal_payloads = tuple(
         list(spy[index])
         for spy in (tested, committed, activated)
         for index in range(len(spy))
     )
     assert_secret_absent(candidate, signal_payloads)
+
+
+def test_superseded_tests_bound_worker_transactions_and_cannot_commit_old_id(
+    worker_harness: WorkerHarness,
+) -> None:
+    tested = QSignalSpy(worker_harness.worker.connectionTested)
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    candidates = [secrets.token_urlsafe(32) for _ in range(12)]
+    request_ids: list[str] = []
+
+    for index, candidate in enumerate(candidates):
+        request_id = worker_harness.request_connection_test(candidate)
+        request_ids.append(request_id)
+        assert worker_harness.wait_for_spy(tested, index) == [request_id, IDENTITY]
+        assert tuple(worker_harness.worker._credential_transactions) == (request_id,)
+        assert worker_harness.secret_vault.size() == 0
+
+    set_calls = tuple(worker_harness.credentials.set_calls)
+    worker_harness.bus.commit_worker.emit(request_ids[0])
+    assert worker_harness.wait_for_spy(failed, 0) == [
+        request_ids[0],
+        public_failure(FailureKind.KEYRING, retryable=False),
+    ]
+
+    assert tuple(worker_harness.credentials.set_calls) == set_calls
+    assert tuple(worker_harness.worker._credential_transactions) == (
+        request_ids[-1],
+    )
+    assert worker_harness.credentials.stored_digest() == secret_digest(
+        worker_harness.ephemeral_secret
+    )
+    assert worker_harness.worker._credential is None
+    assert worker_harness.worker._authorized_target is None
+    for candidate in candidates:
+        assert_secret_absent(candidate, worker_harness.worker)
+        assert_secret_absent(candidate, tested)
+
+
+def test_cancel_committed_transaction_restores_old_keyring_and_never_authorizes(
+    worker_harness: WorkerHarness,
+) -> None:
+    committed = QSignalSpy(worker_harness.worker.credentialCommitted)
+    candidate = secrets.token_urlsafe(32)
+    old_digest = worker_harness.credentials.stored_digest()
+    transaction_id = worker_harness.request_connection_test(candidate)
+    worker_harness.wait_until(
+        lambda: transaction_id in worker_harness.worker._credential_transactions
+    )
+    worker_harness.bus.commit_worker.emit(transaction_id)
+    assert worker_harness.wait_for_spy(committed, 0) == [transaction_id, IDENTITY]
+
+    worker_harness.bus.cancel_transaction_worker.emit(transaction_id)
+    worker_harness.wait_until(
+        lambda: transaction_id not in worker_harness.worker._credential_transactions
+        and worker_harness.credentials.stored_digest() == old_digest
+    )
+
+    assert worker_harness.credentials.set_calls[-1][1] == old_digest
+    assert worker_harness.worker._credential is None
+    assert worker_harness.worker._authorized_target is None
+    assert_secret_absent(candidate, worker_harness.worker)
+    assert_secret_absent(candidate, committed)
+
+
+def test_cancel_first_committed_transaction_deletes_candidate_keyring(
+    worker_harness: WorkerHarness,
+) -> None:
+    committed = QSignalSpy(worker_harness.worker.credentialCommitted)
+    candidate = secrets.token_urlsafe(32)
+    candidate_digest = secret_digest(candidate)
+    worker_harness.credentials.remove_active()
+    transaction_id = worker_harness.request_connection_test(candidate)
+    worker_harness.wait_until(
+        lambda: transaction_id in worker_harness.worker._credential_transactions
+    )
+    worker_harness.bus.commit_worker.emit(transaction_id)
+    assert worker_harness.wait_for_spy(committed, 0) == [transaction_id, IDENTITY]
+
+    worker_harness.bus.cancel_transaction_worker.emit(transaction_id)
+    worker_harness.wait_until(
+        lambda: transaction_id not in worker_harness.worker._credential_transactions
+        and bool(worker_harness.credentials.delete_calls)
+    )
+
+    assert worker_harness.credentials.set_calls[-1][1] == candidate_digest
+    assert worker_harness.credentials.stored_digest() == secret_digest('')
+    assert worker_harness.credentials.delete_calls[-1][0] == ORIGIN
+    assert worker_harness.worker._credential is None
+    assert worker_harness.worker._authorized_target is None
+    assert_secret_absent(candidate, worker_harness.worker)
+    assert_secret_absent(candidate, committed)
+
+
+def test_cancel_delayed_completed_transaction_revokes_worker_authorization(
+    worker_harness: WorkerHarness,
+) -> None:
+    activated = QSignalSpy(worker_harness.worker.connectionActivated)
+    resume_calls = tuple(worker_harness.outbox.resume_calls)
+    transaction_id = worker_harness.request_connection_test(
+        secrets.token_urlsafe(32)
+    )
+    worker_harness.wait_until(
+        lambda: transaction_id in worker_harness.worker._credential_transactions
+    )
+    worker_harness.bus.commit_worker.emit(transaction_id)
+    worker_harness.wait_until(
+        lambda: worker_harness.worker._credential_transactions[
+            transaction_id
+        ].keyring_committed
+    )
+    worker_harness.bus.configure_worker.emit(
+        WorkerConfiguration(
+            origin=ORIGIN,
+            namespace=NAMESPACE,
+            enabled=False,
+            automatic_upload=False,
+            client_instance_uuid=CLIENT_UUID,
+            cache_limit_bytes=64 * 1024 * 1024,
+            identity=IDENTITY,
+            activation_id=transaction_id,
+        )
+    )
+    worker_harness.bus.finalize_worker.emit(transaction_id)
+    assert worker_harness.wait_for_spy(activated, 0) == [transaction_id, IDENTITY]
+    assert worker_harness.worker._authorized_target == (ORIGIN, IDENTITY)
+
+    worker_harness.bus.cancel_transaction_worker.emit(transaction_id)
+    worker_harness.wait_until(
+        lambda: worker_harness.worker._authorized_target is None
+    )
+
+    assert worker_harness.worker._credential is None
+    assert tuple(worker_harness.outbox.resume_calls) == resume_calls
 
 
 def test_final_auth_failure_rolls_keyring_back_to_old_credential(
@@ -1157,6 +1296,7 @@ def test_final_auth_failure_rolls_keyring_back_to_old_credential(
     ]
     assert worker_harness.credentials.stored_digest() == old_digest
     assert worker_harness.credentials.set_calls[-1][1] == old_digest
+    assert worker_harness.worker._credential_transactions == {}
     assert_secret_absent(candidate, failed)
 
 

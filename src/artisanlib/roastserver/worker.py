@@ -79,6 +79,7 @@ from artisanlib.roastserver.settings import (
 _REQUEST_ID_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
 _MAX_TIMER_MILLISECONDS: Final[int] = 2_147_483_647
 _LEASE_SECONDS: Final[int] = 60
+_MAX_CREDENTIAL_TRANSACTIONS: Final[int] = 1
 
 
 class OpaqueVault[T]:
@@ -218,6 +219,7 @@ class RoastServerWorker(QObject):
     connectionTested = pyqtSignal(str, object)
     credentialCommitted = pyqtSignal(str, object)
     connectionActivated = pyqtSignal(str, object)
+    pendingConnectionRecoveryRequired = pyqtSignal(str, object)
     configurationValidated = pyqtSignal(object)
     credentialRemoved = pyqtSignal(str)
     operationFailed = pyqtSignal(str, object)
@@ -258,6 +260,7 @@ class RoastServerWorker(QObject):
         self._configuration: WorkerConfiguration | None = None
         self._credential: str | None = None
         self._authorized_target: tuple[str, ServerIdentity] | None = None
+        self._authorized_transaction_id: str | None = None
         self._credential_transactions: dict[str, _CredentialTransaction] = {}
         self._pending_stages: dict[Path, _PendingStage] = {}
         self._open_cache_paths: frozenset[Path] = frozenset()
@@ -330,6 +333,7 @@ class RoastServerWorker(QObject):
         self._configuration = configuration
         self._credential = None
         self._authorized_target = None
+        self._authorized_transaction_id = None
         if not self._started or not self._outbox_open or self._stopped:
             return
         self._activate_configuration(previous)
@@ -381,6 +385,12 @@ class RoastServerWorker(QObject):
         if credential is None or credential == '':
             self.onlineChanged.emit(False)
             self._stop_timer()
+            if configuration.pending_connection:
+                transaction_id = uuid4().hex
+                self.pendingConnectionRecoveryRequired.emit(
+                    transaction_id,
+                    _failure(FailureKind.CREDENTIAL_REJECTED),
+                )
             self._emit_aggregates(namespace)
             return
 
@@ -427,6 +437,7 @@ class RoastServerWorker(QObject):
             return
         if configuration.pending_connection:
             transaction_id = uuid4().hex
+            self._make_credential_transaction_room()
             self._credential_transactions[transaction_id] = _CredentialTransaction(
                 origin=configuration.origin,
                 candidate=credential,
@@ -491,6 +502,7 @@ class RoastServerWorker(QObject):
         candidate = ''
         old_credential: str | None = None
         try:
+            self._make_credential_transaction_room()
             request = self._credential_vault.take(opaque_id)
             if self._cancelled():
                 return
@@ -637,6 +649,7 @@ class RoastServerWorker(QObject):
             return
         self._credential = transaction.candidate
         self._authorized_target = (transaction.origin, transaction.identity)
+        self._authorized_transaction_id = transaction_id
         identity = transaction.identity
         self._credential_transactions.pop(transaction_id, None)
         transaction.candidate = ''
@@ -654,6 +667,35 @@ class RoastServerWorker(QObject):
             return
         if not self._rollback_transaction(transaction_id):
             self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+
+    @pyqtSlot(str)
+    def cancel_connection_transaction(self, transaction_id: str) -> None:
+        request_id = _public_request_id(transaction_id)
+        if self._reject_wrong_thread(request_id, FailureKind.KEYRING):
+            return
+        if request_id != transaction_id:
+            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        if transaction_id in self._credential_transactions:
+            if not self._rollback_transaction(transaction_id):
+                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        if transaction_id == self._authorized_transaction_id:
+            self._authorized_transaction_id = None
+            self._credential = None
+            self._authorized_target = None
+            configuration = self._configuration
+            if configuration is not None and configuration.namespace is not None:
+                self._pause_namespace(
+                    configuration.namespace, 'credential_removed'
+                )
+            self._stop_timer()
+
+    def _make_credential_transaction_room(self) -> None:
+        while len(self._credential_transactions) >= _MAX_CREDENTIAL_TRANSACTIONS:
+            oldest = next(iter(self._credential_transactions))
+            if not self._rollback_transaction(oldest):
+                self._emit_failure(oldest, _failure(FailureKind.KEYRING))
 
     def _rollback_transaction(self, transaction_id: str) -> bool:
         transaction = self._credential_transactions.pop(transaction_id, None)
@@ -681,6 +723,7 @@ class RoastServerWorker(QObject):
         transaction.old_credential = None
         self._credential = None
         self._authorized_target = None
+        self._authorized_transaction_id = None
         configuration = self._configuration
         if configuration is not None and configuration.namespace is not None:
             self._pause_namespace(configuration.namespace, 'credential_removed')
@@ -731,6 +774,7 @@ class RoastServerWorker(QObject):
         namespace = configuration.namespace
         self._credential = None
         self._authorized_target = None
+        self._authorized_transaction_id = None
         if namespace is not None:
             self._discard_namespace_stages(namespace)
             self._pause_namespace(namespace, 'credential_removed')
@@ -1578,6 +1622,7 @@ class RoastServerWorker(QObject):
         self._credential_transactions.clear()
         self._credential = None
         self._authorized_target = None
+        self._authorized_transaction_id = None
         try:
             self._cache.close()
         except CacheError as error:

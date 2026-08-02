@@ -277,6 +277,51 @@ class RestartAuthenticationClient:
         return object()
 
 
+class DigestAuthenticationRecorder:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self.digests: list[str] = []
+        self.tested_ids: list[str] = []
+
+    @override
+    def __repr__(self) -> str:
+        return '<DigestAuthenticationRecorder credentials=<redacted>>'
+
+    def __call__(self, _origin: str, credential: str) -> DigestAuthenticationClient:
+        with self._condition:
+            self.digests.append(hashlib.sha256(credential.encode('utf-8')).hexdigest())
+        return DigestAuthenticationClient()
+
+    def wait_for_tests(self, count: int, timeout: float = 2) -> None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while len(self.tested_ids) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._condition.wait(remaining):
+                    raise AssertionError('worker did not consume delayed-UI test')
+
+    def record_tested(self, request_id: str, _identity: object) -> None:
+        with self._condition:
+            self.tested_ids.append(request_id)
+            self._condition.notify_all()
+
+
+class DigestAuthenticationClient:
+    def __enter__(self) -> DigestAuthenticationClient:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        return None
+
+    def test_connection(self) -> ServerIdentity:
+        return IDENTITY
+
+
 class BlockingAuthenticationClient:
     def __init__(self) -> None:
         self.entered = threading.Event()
@@ -310,6 +355,10 @@ class FakeCredentialStore:
         self.delete_calls: list[tuple[str, int]] = []
         self.failure: CredentialStoreError | None = None
 
+    @override
+    def __repr__(self) -> str:
+        return '<FakeCredentialStore values=<redacted>>'
+
     def get(self, origin: str) -> str | None:
         self.get_calls.append((origin, int(QThread.currentThreadId())))
         if self.failure is not None:
@@ -337,6 +386,7 @@ class FakeWorker(QObject):
     connectionTested = pyqtSignal(str, object)
     credentialCommitted = pyqtSignal(str, object)
     connectionActivated = pyqtSignal(str, object)
+    pendingConnectionRecoveryRequired = pyqtSignal(str, object)
     configurationValidated = pyqtSignal(object)
     credentialRemoved = pyqtSignal(str)
     operationFailed = pyqtSignal(str, object)
@@ -358,6 +408,7 @@ class FakeWorker(QObject):
         self.commit_ids: list[str] = []
         self.finalize_ids: list[str] = []
         self.rollback_ids: list[str] = []
+        self.cancel_ids: list[str] = []
         self.enqueue_ids: list[str] = []
         self.publish_ids: list[str] = []
         self.protect_ids: list[str] = []
@@ -412,6 +463,11 @@ class FakeWorker(QObject):
     def rollback_connection(self, request_id: str) -> None:
         self.rollback_ids.append(request_id)
         self._record('rollback_connection', request_id)
+
+    @pyqtSlot(str)
+    def cancel_connection_transaction(self, request_id: str) -> None:
+        self.cancel_ids.append(request_id)
+        self._record('cancel_connection_transaction', request_id)
 
     @pyqtSlot(str)
     def remove_credential(self, request_id: str) -> None:
@@ -489,6 +545,10 @@ class FakeWorker(QObject):
     def relay_activated(self, request_id: str, identity: object) -> None:
         self.connectionActivated.emit(request_id, identity)
 
+    @pyqtSlot(str, object)
+    def relay_recovery(self, request_id: str, failure: object) -> None:
+        self.pendingConnectionRecoveryRequired.emit(request_id, failure)
+
     @pyqtSlot(object)
     def relay_validated(self, configuration: object) -> None:
         self.configurationValidated.emit(configuration)
@@ -538,6 +598,7 @@ class WorkerRelay(QObject):
     connection = pyqtSignal(str, object)
     committed = pyqtSignal(str, object)
     activated = pyqtSignal(str, object)
+    recovery = pyqtSignal(str, object)
     validated = pyqtSignal(object)
     removed = pyqtSignal(str)
     failure = pyqtSignal(str, object)
@@ -591,6 +652,7 @@ class ControllerHarness:
             self.relay.connection.connect(self.worker.relay_connection)
             self.relay.committed.connect(self.worker.relay_committed)
             self.relay.activated.connect(self.worker.relay_activated)
+            self.relay.recovery.connect(self.worker.relay_recovery)
             self.relay.validated.connect(self.worker.relay_validated)
             self.relay.removed.connect(self.worker.relay_removed)
             self.relay.failure.connect(self.worker.relay_failure)
@@ -828,6 +890,98 @@ def test_candidate_credential_crosses_only_the_vault(
     assert controller_harness.credentials.set_calls == []
 
 
+def test_new_test_and_every_stale_transaction_event_queue_cancellation(
+    controller_harness: ControllerHarness,
+) -> None:
+    first_id = controller_harness.controller.test_connection(
+        ORIGIN, secrets.token_urlsafe(32)
+    )
+    controller_harness.wait_until(
+        lambda: first_id in controller_harness.fake_worker.test_ids
+    )
+
+    second_id = controller_harness.controller.test_connection(
+        ORIGIN, secrets.token_urlsafe(32)
+    )
+    controller_harness.wait_until(
+        lambda: second_id in controller_harness.fake_worker.test_ids
+        and first_id in controller_harness.fake_worker.cancel_ids
+    )
+    calls = controller_harness.fake_worker.calls
+    cancel_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[:2] == ('cancel_connection_transaction', first_id)
+    )
+    second_test_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[:2] == ('test_connection', second_id)
+    )
+    assert cancel_index < second_test_index
+
+    expected_cancellations = len(controller_harness.fake_worker.cancel_ids) + 3
+    controller_harness.relay.connection.emit(first_id, IDENTITY)
+    controller_harness.relay.committed.emit(first_id, IDENTITY)
+    controller_harness.relay.activated.emit(first_id, IDENTITY)
+    controller_harness.wait_until(
+        lambda: len(controller_harness.fake_worker.cancel_ids)
+        == expected_cancellations
+    )
+
+    loaded = controller_harness.settings_store.load()
+    assert loaded.identity is None
+    assert loaded.pending_connection is None
+    assert controller_harness.fake_worker.commit_ids == []
+    assert controller_harness.fake_worker.finalize_ids == []
+
+
+def test_pending_recovery_clear_failure_stays_on_prior_disabled_configuration(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def prepare(store: SettingsStore) -> None:
+        store.save_connection(ORIGIN, IDENTITY)
+        store.save_options(True, False, 64 * 1024 * 1024)
+        store.save_pending_connection(ORIGIN, OTHER_IDENTITY)
+
+    harness = ControllerHarness(tmp_path, qcoreapplication, prepare)
+    failed = QSignalSpy(harness.controller.operationFailed)
+    transaction_id = 'e' * 32
+
+    def reject_clear() -> object:
+        raise SettingsError('backend detail')
+
+    monkeypatch.setattr(
+        harness.settings_store,
+        'clear_pending_connection',
+        reject_clear,
+    )
+    try:
+        harness.relay.recovery.emit(
+            transaction_id,
+            public_failure(FailureKind.CREDENTIAL_REJECTED),
+        )
+        harness.wait_until(lambda: len(failed) > 0)
+
+        assert list(failed[-1]) == [
+            transaction_id,
+            public_failure(FailureKind.SETTINGS),
+        ]
+        assert harness.settings_store.load().pending_connection is not None
+        configuration = harness.fake_worker.configure_values[-1]
+        assert configuration.identity == IDENTITY
+        assert configuration.namespace == namespace_for(
+            ORIGIN, IDENTITY.organization.id
+        )
+        assert not configuration.pending_connection
+        assert not configuration.enabled
+        assert not configuration.automatic_upload
+    finally:
+        harness.stop()
+
+
 def test_identity_persists_only_after_worker_success_and_forwards_on_ui_thread(
     controller_harness: ControllerHarness,
 ) -> None:
@@ -932,7 +1086,7 @@ def test_untracked_activation_signal_cannot_install_connection_proof(
 
     controller_harness.relay.activated.emit(forged_id, IDENTITY)
     controller_harness.wait_until(
-        lambda: forged_id in controller_harness.fake_worker.rollback_ids
+        lambda: forged_id in controller_harness.fake_worker.cancel_ids
     )
 
     with pytest.raises(ControllerError, match='Test the connection'):
@@ -1725,6 +1879,129 @@ def test_real_restart_at_every_credential_activation_cut_never_uploads(
     finally:
         assert controller.shutdown(2_000)
     assert recorder.upload_calls == 0
+
+
+def test_real_delayed_ui_many_tests_keep_only_newest_secret_and_commit(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    settings = SettingsStore(
+        QSettings(str(tmp_path / 'delayed-tests.ini'), QSettings.Format.IniFormat)
+    )
+    settings.set_origin(ORIGIN)
+    credentials = FakeCredentialStore()
+    recorder = DigestAuthenticationRecorder()
+    controller = RoastServerController(
+        settings=settings,
+        credentials=credentials,
+        data_root=tmp_path / 'delayed-tests-data',
+        client_factory=cast(ClientFactory, recorder),
+        profile_validator=lambda _path: None,
+        clock=lambda: NOW,
+    )
+    direct_connect = cast(
+        Callable[[Callable[[str, object], None], Qt.ConnectionType], object],
+        controller._worker.connectionTested.connect,
+    )
+    direct_connect(recorder.record_tested, Qt.ConnectionType.DirectConnection)
+    controller.start()
+    candidates = [secrets.token_urlsafe(32) for _ in range(10)]
+    request_ids: list[str] = []
+    try:
+        for index, candidate in enumerate(candidates, start=1):
+            request_ids.append(controller.test_connection(ORIGIN, candidate))
+            recorder.wait_for_tests(index)
+
+        assert controller._credential_vault.size() == 0
+        assert tuple(controller._worker._credential_transactions) == (
+            request_ids[-1],
+        )
+        assert credentials.set_calls == []
+
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: settings.load().identity == IDENTITY,
+            'newest delayed-UI transaction did not activate',
+        )
+        assert controller._credential_vault.size() == 0
+        assert controller._worker._credential_transactions == {}
+        assert [call[1] for call in credentials.set_calls] == [
+            hashlib.sha256(candidates[-1].encode('utf-8')).hexdigest()
+        ]
+        assert recorder.digests == [
+            hashlib.sha256(candidate.encode('utf-8')).hexdigest()
+            for candidate in candidates
+        ] + [hashlib.sha256(candidates[-1].encode('utf-8')).hexdigest()]
+        for candidate in candidates:
+            assert_secret_absent(candidate, controller)
+            assert_secret_absent(candidate, recorder)
+    finally:
+        assert controller.shutdown(2_000)
+
+
+def test_real_restart_first_activation_pre_keyring_cut_recovers_and_can_retest(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    settings = SettingsStore(
+        QSettings(str(tmp_path / 'first-cut.ini'), QSettings.Format.IniFormat)
+    )
+    settings.set_origin(ORIGIN)
+    settings.save_pending_connection(ORIGIN, IDENTITY)
+    credentials = FakeCredentialStore()
+    candidate = secrets.token_urlsafe(32)
+    unused = secrets.token_urlsafe(32)
+    recorder = RestartAuthenticationRecorder(candidate, unused)
+    controller = RoastServerController(
+        settings=settings,
+        credentials=credentials,
+        data_root=tmp_path / 'first-cut-data',
+        client_factory=cast(ClientFactory, recorder),
+        profile_validator=lambda _path: None,
+        clock=lambda: NOW,
+    )
+    failed = QSignalSpy(controller.operationFailed)
+    identities = QSignalSpy(controller.identityChanged)
+    controller.start()
+    try:
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: settings.load().pending_connection is None,
+            'pre-keyring restart did not durably clear pending state',
+        )
+        recovered = settings.load()
+        assert recovered.identity is None
+        assert not recovered.enabled and not recovered.automatic_upload
+        assert recorder.authenticated_organizations == []
+        assert _spy_matches(
+            failed,
+            lambda payload: isinstance(payload[0], str)
+            and len(payload[0]) == 32
+            and payload[1] == public_failure(FailureKind.CREDENTIAL_REJECTED),
+        )
+
+        request_id = controller.test_connection(ORIGIN, candidate)
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: settings.load().identity == IDENTITY,
+            'clean recovery could not activate a later credential',
+        )
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: _spy_matches(
+                identities, lambda payload: payload[0] == IDENTITY
+            ),
+            'later activation did not establish connection proof',
+        )
+        assert request_id
+        activated = settings.load()
+        assert activated.pending_connection is None
+        assert not activated.enabled and not activated.automatic_upload
+        assert recorder.upload_calls == 0
+        assert_secret_absent(candidate, controller)
+        assert_secret_absent(unused, controller)
+    finally:
+        assert controller.shutdown(2_000)
 
 
 def test_real_startup_offline_authentication_still_enqueues_but_never_uploads(

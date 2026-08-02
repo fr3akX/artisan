@@ -439,6 +439,28 @@ def test_pending_connection_is_public_only_and_promotes_in_two_durable_phases(
     assert not active.automatic_upload
 
 
+def test_clear_pending_connection_durably_retains_prior_active_but_disables_it(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+) -> None:
+    store = SettingsStore(qsettings)
+    store.save_connection(DEFAULT_ORIGIN, identity)
+    store.save_options(True, True, DEFAULT_CACHE_LIMIT_BYTES)
+    store.save_pending_connection('https://example.test', identity)
+
+    cleared = store.clear_pending_connection()
+    fresh = SettingsStore(
+        QSettings(qsettings.fileName(), qsettings.format())
+    ).load()
+
+    assert cleared == fresh
+    assert fresh.origin == DEFAULT_ORIGIN
+    assert fresh.identity == identity
+    assert fresh.pending_connection is None
+    assert not fresh.enabled
+    assert not fresh.automatic_upload
+
+
 @pytest.mark.parametrize(
     'status',
     [QSettings.Status.AccessError, QSettings.Status.FormatError],

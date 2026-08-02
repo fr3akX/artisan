@@ -267,6 +267,7 @@ class SettingsStore:
             return current
         target = replace(
             current,
+            enabled=False,
             automatic_upload=False,
             pending_connection=None,
         )
