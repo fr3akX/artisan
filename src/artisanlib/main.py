@@ -1542,7 +1542,7 @@ class ApplicationWindow(QMainWindow):
         'main_menu_actions_with_shortcuts', 'ui_mode', 'UIModeMenu',  'productionModeAction', 'defaultModeAction', 'expertModeAction', 'calculatorAction',
         'helpAboutAction', 'checkUpdateAction', 'errorAction', 'messageAction', 'serialAction', 'platformAction', 'aboutQtAction',
         'helpDocumentationAction', 'KshortCAction', 'profile_data_type_adapter', 'official_build',
-        'roastserver_controller', 'roastserver_settings', 'roastserver_config_dialog', 'roastserver_browser_dialog',
+        'roastserver_controller', 'roastserver_settings', 'roastserver_config_dialog', 'roastserver_browser_dialog', 'roastserver_open_source',
         'roastServerUploadAction', 'roastServerRoastsAction', 'roastServerConfigAction',
         'roasthubs_org_id', 'roasthubs_machine_id', 'roasthubs_token' ]
 
@@ -1629,6 +1629,7 @@ class ApplicationWindow(QMainWindow):
         self.roastserver_settings:'ConnectorSettings|None' = None # noqa: UP037
         self.roastserver_config_dialog:'RoastServerConfigDialog|None' = None # noqa: UP037
         self.roastserver_browser_dialog:'RoastServerBrowserDialog|None' = None # noqa: UP037
+        self.roastserver_open_source:'tuple[Path,ServerProfileSource]|None' = None # noqa: UP037 # runtime import intentionally remains lazy
 
         self.setAcceptDrops(True) # enable drag-and-drop
 
@@ -13920,10 +13921,8 @@ class ApplicationWindow(QMainWindow):
     def loadFileSlot(self, filename:str) -> None:
         self.loadFile(filename)
 
-    def validateRoastServerProfile(self, path:Path) -> None:
-        profile = deserialize(str(path))
-        if not profile:
-            raise ValueError('invalid Roast Server profile')
+    @staticmethod
+    def normalizeRoastServerProfile(profile:dict[str,Any]) -> None:
         if 'samplinginterval' in profile and profile['samplinginterval'] is None:
             del profile['samplinginterval']
         if 'extramarkers1' in profile:
@@ -13936,25 +13935,269 @@ class ApplicationWindow(QMainWindow):
                 'None' if marker is None else marker
                 for marker in profile['extramarkers2']
             ]
-        self.validateProfileDict(profile, quiet=True, validate_signature=True)
+
+    def validatedRoastServerProfile(self, path:Path) -> ProfileData:
+        profile = deserialize(str(path))
+        if not profile:
+            raise ValueError('invalid Roast Server profile')
+        self.normalizeRoastServerProfile(profile)
+        return self.validateProfileDict(
+            profile, quiet=True, validate_signature=True)
+
+    def validateRoastServerProfile(self, path:Path) -> None:
+        self.validatedRoastServerProfile(path)
 
     @pyqtSlot(str, object)
     def openRoastServerProfile(
         self, filename:str, source:'ServerProfileSource'
     ) -> bool:
-        self.loadFile(filename)
-        if self.curFile != filename:
-            return False
+        return self.loadFile(filename, server_source=source)
+
+    def clearRoastServerOpenSource(self, local_path:Path) -> bool:
+        try:
+            open_source = self.roastserver_open_source
+        except (AttributeError, RuntimeError):
+            open_source = None
+        if open_source is None:
+            return True
         controller = self.roastserver_controller
-        if controller is not None:
-            controller.record_open_source(Path(filename), source)
+        if controller is None:
+            self.roastserver_open_source = None
+            return True
+        try:
+            controller.record_local_save(local_path)
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+            return False
+        self.roastserver_open_source = None
         return True
 
+    def snapshotRoastServerBackground(self) -> dict[str,Any]:
+        state = {
+            name: copyd.deepcopy(getattr(self.qmc, name))
+            for name in (
+                'background',
+                'backgroundprofile',
+                'backgroundprofile_moved_x',
+                'backgroundprofile_moved_y',
+                'backgroundpath',
+                'backgroundUUID',
+                'titleB',
+                'roastbatchnrB',
+                'roastbatchprefixB',
+                'roastbatchposB',
+                'temp1B',
+                'temp2B',
+                'temp1BX',
+                'temp2BX',
+                'timeB',
+                'stemp1B',
+                'stemp2B',
+                'stemp1BX',
+                'stemp2BX',
+                'extraname1B',
+                'extraname2B',
+                'backgroundEvents',
+                'backgroundEtypes',
+                'backgroundEvalues',
+                'backgroundEStrings',
+                'backgroundFlavors',
+                'timeindexB',
+                'TP_time_B_loaded',
+                'AUCbackground',
+                'analysisresultsstr',
+            )
+        }
+        state['l_annotations_dict'] = self.qmc.l_annotations_dict.copy()
+        state['l_background_annotations'] = self.qmc.l_background_annotations[:]
+        return state
+
+    def restoreRoastServerLoad(
+        self,
+        profile:ProfileData,
+        cur_file:str|None,
+        dirty:bool,
+        plus_modified_at:float|None,
+        plus_sync_hash:str|None,
+        open_source:'tuple[Path,ServerProfileSource]|None',
+        background_state:dict[str,Any]|None,
+        summarystats_startup:bool,
+        attempted_path:Path,
+        source_recorded:bool,
+    ) -> None:
+        controller = self.roastserver_controller
+        try:
+            self.qmc.reset(redraw=False,soundOn=False)
+            if not self.setProfile(
+                    cur_file, copyd.deepcopy(profile), quiet=True, reset=False):
+                raise RuntimeError('Roast Server profile rollback failed')
+            if background_state is not None:
+                for name, value in background_state.items():
+                    setattr(self.qmc, name, value)
+            self.orderEvents()
+            self.etypeComboBox.clear()
+            self.etypeComboBox.addItems(self.qmc.etypes)
+            self.qmc.clearLCDs()
+            if self.qmc.backgroundprofile is not None:
+                self.qmc.timealign(redraw=False,recompute=False)
+            self.qmc.redraw()
+            self.updatePhasesLCDs()
+        finally:
+            self.summarystats_startup = summarystats_startup
+            self.curFile = cur_file
+            self.qmc.plus_file_last_modified = plus_modified_at
+            self.qmc.plus_sync_record_hash = plus_sync_hash
+            self.qmc.safesaveflag = dirty
+            if dirty:
+                self.qmc.fileDirtySignal.emit()
+            else:
+                self.qmc.fileCleanSignal.emit()
+            if source_recorded and controller is not None:
+                try:
+                    if open_source is None:
+                        controller.record_local_save(attempted_path)
+                    else:
+                        controller.record_open_source(*open_source)
+                except Exception as error: # pylint: disable=broad-except
+                    _log.exception(error)
+            self.roastserver_open_source = open_source
+            self.updateWindowTitle()
+
+    def loadRoastServerProfile(
+        self,
+        filename:str,
+        source:'ServerProfileSource',
+    ) -> bool:
+        controller = self.roastserver_controller
+        path = Path(filename)
+        try:
+            if (
+                controller is None
+                or not controller.is_expected_open_source(path, source)
+            ):
+                return False
+            profile = self.validatedRoastServerProfile(path)
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+            _, _, exc_tb = sys.exc_info()
+            self.qmc.adderror((
+                QApplication.translate('Error Message', 'Value Error:')
+                + ' fileload() {0}').format(str(error)),
+                getattr(exc_tb, 'tb_lineno', '?'))
+            return False
+
+        try:
+            previous_profile = copyd.deepcopy(self.getProfile())
+            previous_cur_file = self.curFile
+            previous_dirty = self.qmc.safesaveflag
+            previous_plus_modified_at = self.qmc.plus_file_last_modified
+            previous_plus_sync_hash = self.qmc.plus_sync_record_hash
+            previous_open_source = self.roastserver_open_source
+            previous_background_state = (
+                self.snapshotRoastServerBackground()
+                if self.qmc.clearBgbeforeprofileload
+                else None
+            )
+            previous_summarystats_startup = self.summarystats_startup
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+            _, _, exc_tb = sys.exc_info()
+            self.qmc.adderror((
+                QApplication.translate('Error Message', 'Exception:')
+                + ' loadFile() {0}').format(str(error)),
+                getattr(exc_tb, 'tb_lineno', '?'))
+            return False
+        source_recorded = False
+        mutation_started = False
+        try:
+            mutation_started = True
+            if self.qmc.clearBgbeforeprofileload:
+                self.deleteBackground()
+            if not self.qmc.reset(redraw=False,soundOn=False):
+                raise RuntimeError('Roast Server profile load was cancelled')
+            original_extra_devices = profile.get('extradevices', [])[:]
+            if not self.setProfile(
+                    filename, copyd.deepcopy(profile), quiet=True, reset=False):
+                raise RuntimeError('Roast Server profile could not be applied')
+            self.orderEvents()
+            self.etypeComboBox.clear()
+            self.etypeComboBox.addItems(self.qmc.etypes)
+            profile_changed = self.qmc.extradevices != original_extra_devices
+            self.qmc.clearLCDs()
+            if self.qmc.backgroundprofile is not None:
+                self.qmc.timealign(redraw=False,recompute=False)
+            if self.qmc.hideBgafterprofileload:
+                self.qmc.background = False
+                self.autoAdjustAxis()
+            if self.qmc.statssummary and self.summarystats_startup and self.qmc.autotimex:
+                self.summarystats_startup = False
+                self.qmc.redraw(
+                    recomputeAllDeltas=False, re_smooth_foreground=False)
+            self.qmc.redraw()
+            self.updatePhasesLCDs()
+            self.checkColors(self.getcolorPairsToCheck())
+            self.curFile = None
+            self.qmc.plus_file_last_modified = None
+            self.qmc.plus_sync_record_hash = None
+            self.qmc.safesaveflag = False
+            self.qmc.fileCleanSignal.emit()
+            self.updateWindowTitle()
+            controller.record_open_source(path, source)
+            source_recorded = True
+            self.roastserver_open_source = (path, source)
+            state = (
+                QApplication.translate('Message', 'stale cached copy')
+                if source.stale
+                else QApplication.translate('Message', 'online verified copy')
+            )
+            self.sendmessage(QApplication.translate(
+                'Message',
+                'Roast Server revision {0} opened read-only ({1})').format(
+                    source.revision_number, state))
+            _log.info(
+                'Roast Server profile revision %s loaded read-only',
+                source.revision_number)
+            if profile_changed:
+                _log.info('Roast Server profile device settings were adjusted')
+            return True
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+            if mutation_started:
+                try:
+                    self.restoreRoastServerLoad(
+                        previous_profile,
+                        previous_cur_file,
+                        previous_dirty,
+                        previous_plus_modified_at,
+                        previous_plus_sync_hash,
+                        previous_open_source,
+                        previous_background_state,
+                        previous_summarystats_startup,
+                        path,
+                        source_recorded,
+                    )
+                except Exception as rollback_error: # pylint: disable=broad-except
+                    _log.exception(rollback_error)
+            _, _, exc_tb = sys.exc_info()
+            self.qmc.adderror((
+                QApplication.translate('Error Message', 'Exception:')
+                + ' loadFile() {0}').format(str(error)),
+                getattr(exc_tb, 'tb_lineno', '?'))
+            return False
+
     #loads stored profiles. Called from file menu (NOTE: background profile is not loaded if quiet=True!)
-    def loadFile(self, filename:str, quiet:bool = False) -> None:
+    def loadFile(
+        self,
+        filename:str,
+        quiet:bool = False,
+        *,
+        server_source:'ServerProfileSource|None' = None,
+    ) -> bool:
         if self.comparator is not None or self.qmc.designerflag or self.qmc.wheelflag or self.qmc.ax is None:
             # only load a profile if not in Comparator/Designer/WheelChart/FlavorChart mode
-            return
+            return False
+        if server_source is not None:
+            return self.loadRoastServerProfile(filename, server_source)
         f:QFile|None = None
         try:
             f = QFile(filename)
@@ -13966,7 +14209,7 @@ class ApplicationWindow(QMainWindow):
             f.close()
             if firstChar != '{':
                 self.sendmessage(QApplication.translate('Message','Invalid artisan format'))
-                return
+                return False
             if self.qmc.clearBgbeforeprofileload:
                 self.deleteBackground()
             res = self.qmc.reset(redraw=False,soundOn=False)
@@ -14087,6 +14330,8 @@ class ApplicationWindow(QMainWindow):
 
                 #check colors
                 self.checkColors(self.getcolorPairsToCheck())
+                self.clearRoastServerOpenSource(Path(filename))
+                return True
 
         except OSError as ex:
             _, _, exc_tb = sys.exc_info()
@@ -14112,6 +14357,7 @@ class ApplicationWindow(QMainWindow):
         finally:
             if f is not None:
                 f.close()
+        return False
 
 
 
@@ -17646,10 +17892,57 @@ class ApplicationWindow(QMainWindow):
     def fileSave_copy_action(self, _:bool = False) -> None:
         self.fileSave(None,copy=True)
 
+    @staticmethod
+    def isRoastServerCachePath(filename:str, cache_path:Path) -> bool:
+        candidate = Path(filename)
+        try:
+            if candidate.resolve(strict=False) == cache_path.resolve(strict=False):
+                return True
+        except (OSError, RuntimeError):
+            pass
+        try:
+            return candidate.exists() and cache_path.exists() and os.path.samefile(
+                candidate, cache_path)
+        except OSError:
+            return False
+
+    def restoreRoastServerSaveState(
+        self,
+        state:tuple[str|None,bool,float|None,str|None]|None,
+        source:'tuple[Path,ServerProfileSource]|None',
+    ) -> None:
+        if state is None or source is None:
+            return
+        cur_file, dirty, plus_modified_at, plus_sync_hash = state
+        self.curFile = cur_file
+        self.qmc.plus_file_last_modified = plus_modified_at
+        self.qmc.plus_sync_record_hash = plus_sync_hash
+        self.qmc.safesaveflag = dirty
+        self.roastserver_open_source = source
+        if dirty:
+            self.qmc.fileDirtySignal.emit()
+        else:
+            self.qmc.fileCleanSignal.emit()
+        self.updateWindowTitle()
+
     #saves recorded profile in hard drive. Called from file menu
     # returns True if file was saved successfully
     # if copy is True, a new UUID is generated to be saved along the file
     def fileSave(self, fname:str|None, copy:bool = False) -> bool:
+        try:
+            server_open_source = self.roastserver_open_source
+        except (AttributeError, RuntimeError):
+            server_open_source = None
+        server_save_state = (
+            (
+                self.curFile,
+                self.qmc.safesaveflag,
+                self.qmc.plus_file_last_modified,
+                self.qmc.plus_sync_record_hash,
+            )
+            if server_open_source is not None
+            else None
+        )
         try:
             filename = fname
             if not filename:
@@ -17666,6 +17959,15 @@ class ApplicationWindow(QMainWindow):
                     prefix = self.qmc.autosaveprefix
                 fname = path.absoluteFilePath(self.generateFilename(prefix=prefix))
                 filename = self.ArtisanSaveFileDialog(msg=QApplication.translate('Message', 'Save Profile'), path=fname)
+            if (
+                filename
+                and server_open_source is not None
+                and self.isRoastServerCachePath(filename, server_open_source[0])
+            ):
+                self.sendmessage(QApplication.translate(
+                    'Message',
+                    'Roast Server cached profiles are read-only. Choose a different Save As location.'))
+                return False
             if filename:
                 #write
                 pf = self.getProfile(copy, generate_hash=True)
@@ -17702,17 +18004,32 @@ class ApplicationWindow(QMainWindow):
                         self.autosave(filename_also)
 
                     if not copy:
+                        if (
+                            server_open_source is not None
+                            and not self.clearRoastServerOpenSource(Path(filename))
+                        ):
+                            raise RuntimeError(
+                                'Roast Server cache protection could not be released')
                         self.notifyRoastServerSavedProfile(
                             serialization_result.serialized_profile,
                             detached_profile,
                             serialization_result.modified_at)
+                    elif server_open_source is not None:
+                        self.restoreRoastServerSaveState(
+                            server_save_state, server_open_source)
                     return True
+                self.restoreRoastServerSaveState(
+                    server_save_state, server_open_source)
                 self.sendmessage(QApplication.translate('Message','Cancelled'))
                 return False
+            self.restoreRoastServerSaveState(
+                server_save_state, server_open_source)
             self.sendmessage(QApplication.translate('Message','Cancelled'))
             return False
         except Exception as ex: # pylint: disable=broad-except
             _log.exception(ex)
+            self.restoreRoastServerSaveState(
+                server_save_state, server_open_source)
             _, _, exc_tb = sys.exc_info()
             self.qmc.adderror((QApplication.translate('Error Message', 'Exception:') + ' filesave(): {0}').format(str(ex)),getattr(exc_tb, 'tb_lineno', '?'))
             return False

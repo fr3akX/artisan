@@ -831,20 +831,29 @@ class RoastServerController(QObject):
         self._known_cached_revisions.move_to_end(source.roast_uuid)
         return cached
 
-    def record_open_source(
+    def is_expected_open_source(
         self, path: Path, source: ServerProfileSource
-    ) -> None:
+    ) -> bool:
         self._require_command_state()
         try:
             canonical_path = _absolute_path(path)
         except (OSError, TypeError, ValueError):
-            return
+            return False
         expected = self._ready_cache_paths.get(canonical_path)
-        if expected is None or expected != source:
-            return
         namespace = self._active_namespace(require_enabled=False)
-        if namespace is None or source.namespace != namespace:
+        return (
+            expected is not None
+            and expected == source
+            and namespace is not None
+            and source.namespace == namespace
+        )
+
+    def record_open_source(
+        self, path: Path, source: ServerProfileSource
+    ) -> None:
+        if not self.is_expected_open_source(path, source):
             return
+        canonical_path = _absolute_path(path)
         if self._current_open_cache_path is not None:
             self._open_cache_paths.discard(self._current_open_cache_path)
         self._current_open_cache_path = canonical_path

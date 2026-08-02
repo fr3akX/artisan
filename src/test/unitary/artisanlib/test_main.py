@@ -117,8 +117,10 @@ from pathlib import Path
 from collections.abc import Generator
 from typing import Any
 from unittest.mock import Mock, patch
+from uuid import UUID
 
 import numpy as np
+from pydantic import TypeAdapter
 import pytest
 
 _original_import = builtins.__import__
@@ -185,10 +187,41 @@ if not QApplication.instance():
     app = QApplication(sys.argv)
 
 from artisanlib import main as main_module
-from artisanlib.atypes import RecentRoast
+from artisanlib import util as util_module
+from artisanlib.atypes import ProfileData, RecentRoast
 from artisanlib.main import ApplicationWindow, UI_MODE
+from artisanlib.roastserver import dialogs as roastserver_dialogs
+from artisanlib.roastserver.contract import Namespace, ServerProfileSource
+from artisanlib.util import deserialize as util_deserialize
 from artisanlib.util import serialize_with_timestamp as util_serialize_with_timestamp
 from artisanlib.widgets import MyQLCDNumber, SliderUnclickable
+from plus.stock import Blend, BlendList
+
+_PROFILE_DATA_ADAPTER = TypeAdapter(ProfileData)
+_PROFILE_DATA_ADAPTER.rebuild(
+    _types_namespace={'Blend': Blend, 'BlendList': BlendList})
+_MAIN_TEST_MODULES = {
+    'artisanlib.main': main_module,
+    'artisanlib.util': util_module,
+    'artisanlib.roastserver.dialogs': roastserver_dialogs,
+    **{
+        name: module
+        for name in (
+            'plus.config',
+            'plus.controller',
+            'plus.register',
+            'plus.schedule',
+            'plus.stock',
+            'plus.sync',
+            'plus.util',
+        )
+        if (module := sys.modules.get(name)) is not None
+    },
+}
+_MAIN_PLUS_ATTRIBUTES = {
+    name: getattr(main_module.plus, name)
+    for name in ('config', 'controller', 'register', 'schedule', 'stock', 'sync', 'util')
+}
 
 
 @pytest.fixture(autouse=True)
@@ -199,6 +232,17 @@ def reset_main_state() -> Generator[None, None, None]:
     This fixture automatically runs for every test to prevent cross-test contamination
     and ensures that each test starts with a clean state.
     """
+    replaced_modules = {
+        name: sys.modules.get(name) for name in _MAIN_TEST_MODULES
+    }
+    replaced_plus_attributes = {
+        name: getattr(main_module.plus, name, None)
+        for name in _MAIN_PLUS_ATTRIBUTES
+    }
+    for name, module in _MAIN_TEST_MODULES.items():
+        sys.modules[name] = module
+    for name, module in _MAIN_PLUS_ATTRIBUTES.items():
+        setattr(main_module.plus, name, module)
     # Before each test, ensure Qt modules are available and not mocked
     # This is critical when other tests have mocked Qt modules
     qt_modules_needed = ['PyQt6.QtCore', 'PyQt6.QtWidgets', 'PyQt6.QtGui']
@@ -219,6 +263,14 @@ def reset_main_state() -> Generator[None, None, None]:
     # aggressive module manipulation to avoid Qt segmentation faults
 
     yield
+
+    for name, module in replaced_modules.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+    for name, module in replaced_plus_attributes.items():
+        setattr(main_module.plus, name, module)
 
     # Clean up after each test
     # Process any pending Qt events to ensure clean state
@@ -3830,6 +3882,19 @@ class TestFileUtilities:
         assert result == 'clean_filename.txt'
 
 
+SERVER_SOURCE = ServerProfileSource(
+    namespace=Namespace(
+        origin='https://archive.example.test',
+        organization_id=UUID('11111111-1111-4111-8111-111111111111'),
+        key='archive-example-test--11111111111141118111111111111111',
+    ),
+    roast_uuid=UUID('22222222-2222-4222-8222-222222222222'),
+    revision_number=7,
+    sha256='a' * 64,
+    stale=False,
+)
+
+
 ROASTSERVER_PROFILE: dict[str, Any] = {
     'roastUUID': '0123456789abcdef0123456789abcdef',
     'title': 'Connector test',
@@ -4508,21 +4573,361 @@ class TestRoastServerMainIntegration:
         window.validateProfileDict.assert_called_once_with(
             normalized, quiet=True, validate_signature=True)
 
-    def test_roastserver_open_slot_delegates_until_read_only_integration(
+    def test_roastserver_open_slot_delegates_to_read_only_load(
         self, tmp_path: Path
     ) -> None:
         window = ApplicationWindow.__new__(ApplicationWindow)
         profile_path = tmp_path / 'verified.alog'
-        source = Mock()
-        controller = Mock()
-        window.roastserver_controller = controller
+        window.roastserver_controller = Mock()
+        window.loadFile = Mock(return_value=True)
+
+        assert window.openRoastServerProfile(str(profile_path), SERVER_SOURCE)
+        window.loadFile.assert_called_once_with(
+            str(profile_path), server_source=SERVER_SOURCE)
+        window.roastserver_controller.record_open_source.assert_not_called()
+
+
+class TestRoastServerReadOnlyLoad:
+    @staticmethod
+    def load_window() -> tuple[ApplicationWindow, dict[str, Any]]:
+        profile_path = Path('test/data/profile1.alog')
+        previous = util_deserialize(str(profile_path))
+        assert previous
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.comparator = None
+        window.curFile = 'previous.alog'
+        window.roastserver_open_source = None
+        window.roastserver_controller = Mock()
+        window.roastserver_controller.is_expected_open_source.return_value = True
+        window.qmc = Mock()
+        window.qmc.designerflag = False
+        window.qmc.wheelflag = False
+        window.qmc.ax = Mock()
+        window.qmc.clearBgbeforeprofileload = False
+        window.qmc.extradevices = previous.get('extradevices', [])
+        window.qmc.safesaveflag = True
+        window.qmc.plus_file_last_modified = datetime(2025, 1, 1, tzinfo=UTC)
+        window.qmc.plus_sync_record_hash = 'previous-plus-hash'
+        window.qmc.backgroundprofile = None
+        window.qmc.hideBgafterprofileload = False
+        window.qmc.background = False
+        window.qmc.statssummary = False
+        window.qmc.autotimex = False
+        window.qmc.reset = Mock(return_value=True)
+        window.qmc.fileDirtySignal = Mock()
+        window.qmc.fileDirtySignal.emit = Mock()
+        window.qmc.fileCleanSignal = Mock()
+        window.qmc.fileCleanSignal.emit = Mock()
+        window.qmc.clearLCDs = Mock()
+        window.qmc.timealign = Mock()
+        window.qmc.redraw = Mock()
+        window.qmc.adderror = Mock()
+        window.getProfile = Mock(return_value=copy.deepcopy(previous))
+        window.profile_data_type_adapter = _PROFILE_DATA_ADAPTER
+        window.official_build = False
+        window.setProfile = Mock(return_value=True)
+        window.setProfileDict = Mock(return_value=True)
+        window.orderEvents = Mock()
+        window.etypeComboBox = Mock()
+        window.setCurrentFile = Mock(
+            side_effect=lambda filename: setattr(window, 'curFile', filename))
+        window.deleteBackground = Mock()
+        window.sendmessage = Mock()
+        window.updatePhasesLCDs = Mock()
+        window.updateWindowTitle = Mock()
+        window.plusAddPath = Mock()
+        window.plus_account = None
+        window.checkColors = Mock()
+        window.getcolorPairsToCheck = Mock(return_value=[])
+        window.autoAdjustAxis = Mock()
+        window.updatePlusStatus = Mock()
+        window.summarystats_startup = True
+        return window, previous
+
+    @pytest.mark.parametrize('plus_connected', [False, True])
+    def test_server_load_prevalidates_real_file_and_skips_all_plus_recent_hooks(
+        self, tmp_path: Path, plus_connected: bool
+    ) -> None:
+        window, _previous = self.load_window()
+        window.plus_account = 'connected@example.test' if plus_connected else None
+        cache_file = tmp_path / 'cache.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        cache_before = (cache_file.read_bytes(), cache_file.stat().st_mtime_ns)
+
+        with patch(
+            'artisanlib.main.deserialize', wraps=util_deserialize
+        ) as deserialize_mock, patch(
+            'artisanlib.main.plus.sync.sync'
+        ) as plus_sync, patch(
+            'artisanlib.main.plus.schedule.update_completed_item_from_loaded_profile'
+        ) as schedule_update, patch(
+            'artisanlib.main.plus.util.getModificationDate'
+        ) as modification_date, patch(
+            'artisanlib.main.plus.register.addPath'
+        ) as register_add, patch(
+            'artisanlib.main.plus.register.getPath'
+        ) as register_get, patch(
+            'artisanlib.main.QSettings'
+        ) as settings:
+            assert window.loadFile(
+                str(cache_file), server_source=SERVER_SOURCE)
+
+        deserialize_mock.assert_called_once_with(str(cache_file))
+        window.roastserver_controller.is_expected_open_source.assert_called_once_with(
+            cache_file, SERVER_SOURCE)
+        window.plusAddPath.assert_not_called()
+        window.setCurrentFile.assert_not_called()
+        window.updatePlusStatus.assert_not_called()
+        plus_sync.assert_not_called()
+        schedule_update.assert_not_called()
+        modification_date.assert_not_called()
+        register_add.assert_not_called()
+        register_get.assert_not_called()
+        settings.return_value.setValue.assert_not_called()
+        assert window.curFile is None
+        assert window.qmc.plus_file_last_modified is None
+        assert window.qmc.plus_sync_record_hash is None
+        assert not window.qmc.safesaveflag
+        window.qmc.fileCleanSignal.emit.assert_called_once_with()
+        window.roastserver_controller.record_open_source.assert_called_once_with(
+            cache_file, SERVER_SOURCE)
+        assert window.roastserver_open_source == (cache_file, SERVER_SOURCE)
+        assert window.sendmessage.call_args.args == (
+            QApplication.translate(
+                'Message',
+                'Roast Server revision {0} opened read-only ({1})').format(
+                    SERVER_SOURCE.revision_number,
+                    QApplication.translate('Message', 'online verified copy')),
+        )
+        assert (cache_file.read_bytes(), cache_file.stat().st_mtime_ns) == cache_before
+
+    @pytest.mark.parametrize(
+        'failure',
+        ['reset', 'apply', 'order', 'clear-lcd', 'redraw', 'phases', 'colors'],
+    )
+    def test_server_load_apply_and_redraw_failures_restore_full_snapshot(
+        self, tmp_path: Path, failure: str
+    ) -> None:
+        window, previous = self.load_window()
+        cache_file = tmp_path / 'verified.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        old_source_path = tmp_path / 'old-cache.alog'
+        old_source = copy.deepcopy(SERVER_SOURCE)
+        window.roastserver_open_source = (old_source_path, old_source)
+        previous_modified = window.qmc.plus_file_last_modified
+        previous_hash = window.qmc.plus_sync_record_hash
+        window.setProfile.side_effect = [True, True]
+        if failure == 'reset':
+            window.qmc.reset.side_effect = [False, True]
+        elif failure == 'apply':
+            window.setProfile.side_effect = [False, True]
+        elif failure == 'order':
+            window.orderEvents.side_effect = [RuntimeError('order failed'), None]
+        elif failure == 'clear-lcd':
+            window.qmc.clearLCDs.side_effect = [RuntimeError('LCD failed'), None]
+        elif failure == 'redraw':
+            window.qmc.redraw.side_effect = [RuntimeError('redraw failed'), None]
+        elif failure == 'phases':
+            window.updatePhasesLCDs.side_effect = [
+                RuntimeError('phase LCD failed'), None]
+        else:
+            window.checkColors.side_effect = RuntimeError('colors failed')
+
+        assert not window.loadFile(
+            str(cache_file), server_source=SERVER_SOURCE)
+
+        assert window.setProfile.call_args_list[-1].args[1] == previous
+        assert window.setProfile.call_args_list[-1].args[1] is not previous
+        assert window.curFile == 'previous.alog'
+        assert window.qmc.safesaveflag
+        assert window.qmc.plus_file_last_modified == previous_modified
+        assert window.qmc.plus_sync_record_hash == previous_hash
+        assert window.roastserver_open_source == (old_source_path, old_source)
+        window.qmc.fileDirtySignal.emit.assert_called_once_with()
+        window.roastserver_controller.record_open_source.assert_not_called()
+
+    def test_server_redraw_failure_restores_deleted_background_ui(
+        self, tmp_path: Path
+    ) -> None:
+        window, _previous = self.load_window()
+        cache_file = tmp_path / 'verified.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        window.qmc.clearBgbeforeprofileload = True
+        window.qmc.background = True
+        window.qmc.backgroundprofile = {'title': 'previous background'}
+        window.qmc.backgroundpath = 'previous-background.alog'
+        window.qmc.l_annotations_dict = {7: ['background annotation']}
+        window.qmc.l_background_annotations = ['background artist']
+        expected_background = copy.deepcopy(window.qmc.backgroundprofile)
+        expected_annotations = window.qmc.l_annotations_dict.copy()
+
+        def delete_background() -> None:
+            window.qmc.background = False
+            window.qmc.backgroundprofile = None
+            window.qmc.backgroundpath = ''
+            window.qmc.l_annotations_dict = {}
+            window.qmc.l_background_annotations = []
+
+        window.deleteBackground.side_effect = delete_background
+        window.setProfile.side_effect = [True, True]
+        window.qmc.redraw.side_effect = [RuntimeError('redraw failed'), None]
+
+        assert not window.loadFile(
+            str(cache_file), server_source=SERVER_SOURCE)
+
+        assert window.qmc.background
+        assert window.qmc.backgroundprofile == expected_background
+        assert window.qmc.backgroundpath == 'previous-background.alog'
+        assert window.qmc.l_annotations_dict == expected_annotations
+        assert window.qmc.l_background_annotations == ['background artist']
+
+    def test_server_source_identity_and_profile_validation_precede_any_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        window, _previous = self.load_window()
+        cache_file = tmp_path / 'untrusted.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        window.roastserver_controller.is_expected_open_source.return_value = False
+
+        with patch('artisanlib.main.deserialize', wraps=util_deserialize) as deserialize_mock:
+            assert not window.loadFile(
+                str(cache_file), server_source=SERVER_SOURCE)
+
+        deserialize_mock.assert_not_called()
+        window.getProfile.assert_not_called()
+        window.qmc.reset.assert_not_called()
+        window.setProfile.assert_not_called()
+        window.roastserver_controller.record_open_source.assert_not_called()
+
+        window.roastserver_controller.is_expected_open_source.return_value = True
+        invalid = tmp_path / 'invalid.alog'
+        invalid.write_text("{'not': object()}", encoding='utf-8')
+        assert not window.loadFile(str(invalid), server_source=SERVER_SOURCE)
+        window.getProfile.assert_not_called()
+        window.qmc.reset.assert_not_called()
+        window.setProfile.assert_not_called()
+
+    def test_successful_local_load_clears_transient_server_source(
+        self, tmp_path: Path
+    ) -> None:
+        window, _previous = self.load_window()
+        local_file = tmp_path / 'local.alog'
+        local_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        window.roastserver_open_source = (
+            tmp_path / 'protected-cache.alog', SERVER_SOURCE)
+
+        with patch(
+            'artisanlib.main.plus.util.getModificationDate',
+            return_value=datetime(2026, 1, 1, tzinfo=UTC),
+        ):
+            assert window.loadFile(str(local_file))
+
+        window.roastserver_controller.record_local_save.assert_called_once_with(
+            local_file)
+        assert window.roastserver_open_source is None
+        assert window.curFile == str(local_file)
+
+
+class TestRoastServerReadOnlySaveTransition:
+    @staticmethod
+    def source_window(
+        tmp_path: Path,
+    ) -> tuple[ApplicationWindow, Mock, Path, Path]:
+        window, controller, _profile = roastserver_save_window()
+        cache_file = tmp_path / 'cache.alog'
+        cache_file.write_bytes(b'protected cache bytes')
+        destination = tmp_path / 'saved-as.alog'
         window.curFile = None
+        window.roastserver_open_source = (cache_file, SERVER_SOURCE)
+        window.qmc.safesaveflag = False
+        window.qmc.plus_sync_record_hash = None
+        window.updateWindowTitle = Mock()
+        window.ArtisanSaveFileDialog.return_value = str(destination)
+        return window, controller, cache_file, destination
 
-        def load(filename: str) -> None:
-            window.curFile = filename
+    def test_save_after_server_open_forces_save_as_and_resumes_normal_hooks(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, cache_file, destination = self.source_window(tmp_path)
+        before = (cache_file.read_bytes(), cache_file.stat().st_mtime_ns)
 
-        window.loadFile = Mock(side_effect=load)
+        window.fileSave_current_action()
 
-        assert window.openRoastServerProfile(str(profile_path), source)
-        window.loadFile.assert_called_once_with(str(profile_path))
-        controller.record_open_source.assert_called_once_with(profile_path, source)
+        window.ArtisanSaveFileDialog.assert_called_once()
+        window.plusAddPath.assert_called_once()
+        controller.record_local_save.assert_called_once_with(destination)
+        controller.saved_profile.assert_called_once()
+        assert window.roastserver_open_source is None
+        assert window.curFile == str(destination)
+        assert (cache_file.read_bytes(), cache_file.stat().st_mtime_ns) == before
+
+    def test_cancel_or_failed_save_retains_read_only_source_and_cache(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, cache_file, destination = self.source_window(tmp_path)
+        source = window.roastserver_open_source
+        before = (cache_file.read_bytes(), cache_file.stat().st_mtime_ns)
+        window.ArtisanSaveFileDialog.return_value = ''
+
+        assert not window.fileSave(None)
+        assert window.roastserver_open_source == source
+        assert window.curFile is None
+        controller.record_local_save.assert_not_called()
+        controller.saved_profile.assert_not_called()
+
+        window.ArtisanSaveFileDialog.return_value = str(destination)
+        with patch(
+            'artisanlib.main.serialize_with_timestamp',
+            side_effect=OSError('save failed'),
+        ):
+            assert not window.fileSave(None)
+        assert window.roastserver_open_source == source
+        assert window.curFile is None
+        assert window.qmc.plus_file_last_modified is None
+        assert window.qmc.plus_sync_record_hash is None
+        controller.record_local_save.assert_not_called()
+        controller.saved_profile.assert_not_called()
+        assert (cache_file.read_bytes(), cache_file.stat().st_mtime_ns) == before
+
+    @pytest.mark.parametrize('failure', ['post-save', 'cache-release'])
+    def test_post_write_failure_restores_read_only_transition_state(
+        self, tmp_path: Path, failure: str
+    ) -> None:
+        window, controller, cache_file, destination = self.source_window(tmp_path)
+        source = window.roastserver_open_source
+        before = (cache_file.read_bytes(), cache_file.stat().st_mtime_ns)
+        if failure == 'post-save':
+            window.setCurrentFile.side_effect = RuntimeError('post-save failed')
+        else:
+            controller.record_local_save.side_effect = RuntimeError(
+                'cache release failed')
+
+        assert not window.fileSave(None)
+
+        assert destination.exists()
+        assert window.roastserver_open_source == source
+        assert window.curFile is None
+        assert not window.qmc.safesaveflag
+        assert window.qmc.plus_file_last_modified is None
+        assert window.qmc.plus_sync_record_hash is None
+        controller.saved_profile.assert_not_called()
+        assert (cache_file.read_bytes(), cache_file.stat().st_mtime_ns) == before
+
+    def test_save_as_can_never_select_the_protected_cache_file(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, cache_file, _destination = self.source_window(tmp_path)
+        source = window.roastserver_open_source
+        before = (cache_file.read_bytes(), cache_file.stat().st_mtime_ns)
+        window.ArtisanSaveFileDialog.return_value = str(cache_file)
+
+        with patch('artisanlib.main.serialize_with_timestamp') as serialize_mock:
+            assert not window.fileSave(None)
+
+        serialize_mock.assert_not_called()
+        window.plusAddPath.assert_not_called()
+        controller.record_local_save.assert_not_called()
+        controller.saved_profile.assert_not_called()
+        assert window.roastserver_open_source == source
+        assert window.curFile is None
+        assert (cache_file.read_bytes(), cache_file.stat().st_mtime_ns) == before

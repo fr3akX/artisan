@@ -2336,6 +2336,14 @@ def test_cached_open_is_stale_and_only_successful_open_paths_are_protected(
     source = cast(ServerProfileSource, payload[1])
     assert payload == [str(cached.path), source]
     assert source.stale
+    assert controller_harness.controller.is_expected_open_source(
+        cached.path, source)
+    assert not controller_harness.controller.is_expected_open_source(
+        cached.path.with_name('other.alog'), source)
+    assert not controller_harness.controller.is_expected_open_source(
+        cached.path, replace(source, stale=False))
+    assert controller_harness.controller._current_open_cache_path is None
+    assert controller_harness.controller._current_open_cache_source is None
 
     controller_harness.controller.clear_unused_cache()
     controller_harness.wait_until(
