@@ -74,6 +74,7 @@ from artisanlib.roastserver.worker import (
     BrowseRequest,
     CachedOpenRequest,
     ClearUnusedRequest,
+    ConfigurationFence,
     ConnectionTestRequest,
     OnlineOpenRequest,
     OpaqueVault,
@@ -185,6 +186,7 @@ class RoastServerController(QObject):
         self._identity: ServerIdentity | None = None
         self._known_namespace = _settings_namespace(self._settings)
         self._proof: tuple[str, UUID] | None = None
+        self._configuration_fence = ConfigurationFence()
         self._latest_configuration_validation: str | None = None
         self._authorized_startup_validation: str | None = None
         self._connection_tests: dict[str, str] = {}
@@ -220,6 +222,7 @@ class RoastServerController(QObject):
             credential_vault=self._credential_vault,
             profile_vault=self._profile_vault,
             command_vault=self._command_vault,
+            configuration_fence=self._configuration_fence,
         )
         self._thread = QThread(self)
         self._worker_object = worker_object
@@ -318,6 +321,8 @@ class RoastServerController(QObject):
             return True
         if not self._stop_requested:
             self._stop_requested = True
+            self._revoke_configuration()
+            self._restore_unaccepted_activation_for_shutdown()
             self._invalidate_requests()
             self._credential_vault.clear()
             self._profile_vault.clear()
@@ -333,6 +338,7 @@ class RoastServerController(QObject):
 
     def test_connection(self, origin: str, candidate: str) -> str:
         self._require_command_state()
+        generation = self._revoke_configuration()
         canonical = _canonical_origin(origin)
         candidate_value: object = candidate
         if not isinstance(candidate_value, str) or candidate_value == '':
@@ -346,11 +352,13 @@ class RoastServerController(QObject):
                 self._settings.cache_limit_bytes,
             )
         except SettingsError:
-            self._settings_failure('connection')
+            self._settings_failure('connection', generation=generation)
             raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
         self.settingsChanged.emit(self._settings)
         self._invalidate_identity()
-        self._queue_configuration(self._configuration(enabled=False))
+        self._queue_configuration(
+            self._configuration(enabled=False), generation=generation
+        )
         try:
             request_id = self._credential_vault.put_latest(
                 ConnectionTestRequest(canonical, candidate)
@@ -384,14 +392,15 @@ class RoastServerController(QObject):
             raise ControllerError(_INVALID_OPTIONS_MESSAGE)
         canonical = _canonical_origin(origin)
         if canonical != self._settings.origin:
+            generation = self._revoke_configuration()
             old_configuration = self._configuration(enabled=False)
-            self._queue_configuration(old_configuration)
+            self._queue_configuration(old_configuration, generation=generation)
             self._invalidate_identity()
             try:
                 self._settings = self._settings_store.set_origin(canonical)
                 self._known_namespace = _settings_namespace(self._settings)
             except SettingsError:
-                self._settings_failure('settings')
+                self._settings_failure('settings', generation=generation)
                 raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
         if automatic_upload and not self._has_current_proof(canonical):
             raise ControllerError(_TEST_CONNECTION_MESSAGE)
@@ -407,7 +416,7 @@ class RoastServerController(QObject):
 
     def invalidate_connection_proof(self) -> None:
         self._require_command_state()
-        self._disallow_configuration_proof()
+        generation = self._revoke_configuration()
         self._cancel_connection_transactions()
         try:
             self._settings = self._settings_store.save_options(
@@ -416,11 +425,13 @@ class RoastServerController(QObject):
                 self._settings.cache_limit_bytes,
             )
         except SettingsError:
-            self._settings_failure('settings')
+            self._settings_failure('settings', generation=generation)
             raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
         self.settingsChanged.emit(self._settings)
         self._invalidate_identity()
-        self._queue_configuration(self._configuration(enabled=False))
+        self._queue_configuration(
+            self._configuration(enabled=False), generation=generation
+        )
 
     def cancel_connection_test(self, request_id: str) -> None:
         self._require_command_state()
@@ -429,9 +440,12 @@ class RoastServerController(QObject):
             raise ControllerError(_INVALID_REQUEST_MESSAGE)
         if request_id != self._active_connection_test:
             return
+        generation = self._revoke_configuration()
         self._credential_vault.clear()
         self._cancel_connection_transaction(request_id)
-        self._queue_configuration(self._configuration(enabled=False))
+        self._queue_configuration(
+            self._configuration(enabled=False), generation=generation
+        )
 
     def save_configuration_geometry(self, geometry: QByteArray) -> None:
         self._require_command_state()
@@ -454,11 +468,12 @@ class RoastServerController(QObject):
 
     def remove_credential(self) -> None:
         self._require_command_state()
+        generation = self._revoke_configuration()
         paused = self._configuration(enabled=False)
         if not self._set_automatic_upload_off('remove'):
             raise ControllerError(_INVALID_OPTIONS_MESSAGE)
         self._invalidate_identity()
-        self._queue_configuration(paused)
+        self._queue_configuration(paused, generation=generation)
         try:
             request_id = self._command_vault.put(
                 RemoveCredentialRequest(self._settings.origin)
@@ -669,9 +684,10 @@ class RoastServerController(QObject):
 
     @pyqtSlot(str, object)
     def _on_connection_tested(self, request_id: str, value: object) -> None:
+        if self._stop_requested:
+            return
         if (
-            self._stop_requested
-            or request_id != self._active_connection_test
+            request_id != self._active_connection_test
             or not isinstance(value, ServerIdentity)
         ):
             self._cancelConnectionWorker.emit(request_id)
@@ -700,7 +716,9 @@ class RoastServerController(QObject):
 
     @pyqtSlot(str, object)
     def _on_credential_committed(self, request_id: str, value: object) -> None:
-        if self._stop_requested or not isinstance(value, ServerIdentity):
+        if self._stop_requested:
+            return
+        if not isinstance(value, ServerIdentity):
             self._cancelConnectionWorker.emit(request_id)
             return
         pending = self._settings.pending_connection
@@ -762,9 +780,10 @@ class RoastServerController(QObject):
 
     @pyqtSlot(str, object)
     def _on_connection_activated(self, request_id: str, value: object) -> None:
+        if self._stop_requested:
+            return
         if (
-            self._stop_requested
-            or request_id != self._active_connection_test
+            request_id != self._active_connection_test
             or not isinstance(value, ServerIdentity)
         ):
             self._cancelConnectionWorker.emit(request_id)
@@ -797,10 +816,11 @@ class RoastServerController(QObject):
     def _on_pending_connection_recovery_required(
         self, transaction_id: str, value: object
     ) -> None:
+        if self._stop_requested:
+            return
         expected = _failure(FailureKind.CREDENTIAL_REJECTED)
         if (
-            self._stop_requested
-            or self._active_connection_test is not None
+            self._active_connection_test is not None
             or self._settings.pending_connection is None
             or value != expected
         ):
@@ -838,6 +858,7 @@ class RoastServerController(QObject):
         if (
             validation_id != self._latest_configuration_validation
             or validation_id != self._authorized_startup_validation
+            or not self._configuration_fence.authorizes(value.generation)
         ):
             return
         identity = self._settings.identity
@@ -858,13 +879,15 @@ class RoastServerController(QObject):
 
     @pyqtSlot(str)
     def _on_credential_removed(self, request_id: str) -> None:
-        if request_id not in self._credential_removals:
+        if self._stop_requested or request_id not in self._credential_removals:
             return
         self._credential_removals.discard(request_id)
         self.onlineChanged.emit(False)
 
     @pyqtSlot(str, object)
     def _on_operation_failed(self, operation: str, value: object) -> None:
+        if self._stop_requested:
+            return
         if not isinstance(value, PublicFailure):
             failure = _failure(FailureKind.INVALID_RESPONSE)
         else:
@@ -912,21 +935,27 @@ class RoastServerController(QObject):
 
     @pyqtSlot(object)
     def _on_queue_changed(self, value: object) -> None:
-        if isinstance(value, QueueCounts):
+        if not self._stop_requested and isinstance(value, QueueCounts):
             self.queueChanged.emit(value)
 
     @pyqtSlot(object)
     def _on_failed_jobs_changed(self, value: object) -> None:
-        if isinstance(value, tuple) and all(isinstance(item, FailedJob) for item in value):
+        if (
+            not self._stop_requested
+            and isinstance(value, tuple)
+            and all(isinstance(item, FailedJob) for item in value)
+        ):
             self.failedJobsChanged.emit(value)
 
     @pyqtSlot(object)
     def _on_cache_stats_changed(self, value: object) -> None:
-        if isinstance(value, CacheStats):
+        if not self._stop_requested and isinstance(value, CacheStats):
             self.cacheStatsChanged.emit(value)
 
     @pyqtSlot(str, object)
     def _on_archive_page(self, request_id: str, value: object) -> None:
+        if self._stop_requested:
+            return
         epoch = self._browse_requests.pop(request_id, None)
         if epoch is None or epoch != self._browse_epoch:
             return
@@ -943,11 +972,13 @@ class RoastServerController(QObject):
 
     @pyqtSlot(str, object)
     def _on_download_staged(self, request_id: str, value: object) -> None:
+        if self._stop_requested:
+            return
         tracked = self._online_requests.pop(request_id, None)
         if not isinstance(value, PublishRequest):
             self._emit_failure(request_id, FailureKind.INVALID_RESPONSE)
             return
-        if self._stop_requested or tracked is None:
+        if tracked is None:
             self._discard_stage(value.staged_path)
             return
         namespace, roast_uuid, epoch = tracked
@@ -982,6 +1013,8 @@ class RoastServerController(QObject):
 
     @pyqtSlot(str, object)
     def _on_cached_ready(self, request_id: str, value: object) -> None:
+        if self._stop_requested:
+            return
         tracked = self._cached_requests.pop(request_id, None)
         if tracked is None or not isinstance(value, CachedRevision):
             return
@@ -996,6 +1029,8 @@ class RoastServerController(QObject):
 
     @pyqtSlot(str, object)
     def _on_cache_published(self, request_id: str, value: object) -> None:
+        if self._stop_requested:
+            return
         tracked = self._publish_requests.pop(request_id, None)
         if tracked is None or not isinstance(value, CachedRevision):
             return
@@ -1015,7 +1050,7 @@ class RoastServerController(QObject):
 
     @pyqtSlot(bool)
     def _on_online_changed(self, value: bool) -> None:
-        if type(value) is bool:
+        if not self._stop_requested and type(value) is bool:
             self.onlineChanged.emit(value)
 
     def _emit_profile_ready(self, cached: CachedRevision, *, stale: bool) -> None:
@@ -1029,13 +1064,20 @@ class RoastServerController(QObject):
         configuration: WorkerConfiguration,
         *,
         authorize_startup: bool = False,
+        generation: int | None = None,
     ) -> None:
-        self._latest_configuration_validation = configuration.validation_id
-        self._authorized_startup_validation = (
-            configuration.validation_id if authorize_startup else None
+        selected_generation = (
+            self._configuration_fence.advance()
+            if generation is None
+            else generation
         )
-        self._configureWorker.emit(configuration)
-        self._queue_protected_paths(configuration.namespace)
+        queued = replace(configuration, generation=selected_generation)
+        self._latest_configuration_validation = queued.validation_id
+        self._authorized_startup_validation = (
+            queued.validation_id if authorize_startup else None
+        )
+        self._configureWorker.emit(queued)
+        self._queue_protected_paths(queued.namespace)
 
     def _queue_current_protected_paths(self) -> None:
         configuration = self._configuration()
@@ -1164,7 +1206,12 @@ class RoastServerController(QObject):
         self.settingsChanged.emit(self._settings)
         return True
 
-    def _settings_failure(self, operation: str) -> None:
+    def _settings_failure(
+        self, operation: str, *, generation: int | None = None
+    ) -> None:
+        selected_generation = (
+            self._revoke_configuration() if generation is None else generation
+        )
         self._proof = None
         self._identity = None
         self._settings = replace(
@@ -1175,7 +1222,9 @@ class RoastServerController(QObject):
         self._invalidate_archive_state()
         self.settingsChanged.emit(self._settings)
         self.identityChanged.emit(None)
-        self._queue_configuration(self._configuration(enabled=False))
+        self._queue_configuration(
+            self._configuration(enabled=False), generation=selected_generation
+        )
         self._emit_failure(operation, FailureKind.SETTINGS)
 
     def _invalidate_identity(self) -> None:
@@ -1201,6 +1250,37 @@ class RoastServerController(QObject):
             else set()
         )
 
+    def _restore_unaccepted_activation_for_shutdown(self) -> None:
+        if not self._activation_previous:
+            return
+        previous = next(reversed(self._activation_previous.values()))
+        persistence_failed = False
+        try:
+            self._settings = self._settings_store.restore_connection_state(previous)
+        except SettingsError:
+            persistence_failed = True
+            try:
+                self._settings = self._settings_store.save_options(
+                    False,
+                    False,
+                    self._settings.cache_limit_bytes,
+                )
+            except SettingsError:
+                self._settings = replace(
+                    self._settings,
+                    enabled=False,
+                    automatic_upload=False,
+                    pending_connection=None,
+                )
+        self._known_namespace = _settings_namespace(self._settings)
+        self._identity = None
+        self._proof = None
+        self._invalidate_archive_state()
+        self.settingsChanged.emit(self._settings)
+        self.identityChanged.emit(None)
+        if persistence_failed:
+            self._emit_failure('shutdown', FailureKind.SETTINGS)
+
     def _invalidate_requests(self) -> None:
         self._connection_tests.clear()
         self._active_connection_test = None
@@ -1211,6 +1291,10 @@ class RoastServerController(QObject):
     def _disallow_configuration_proof(self) -> None:
         self._latest_configuration_validation = None
         self._authorized_startup_validation = None
+
+    def _revoke_configuration(self) -> int:
+        self._disallow_configuration_proof()
+        return self._configuration_fence.revoke()
 
     def _cancel_connection_transaction(self, transaction_id: str) -> None:
         if transaction_id != self._active_connection_test:

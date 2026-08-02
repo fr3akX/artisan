@@ -46,6 +46,7 @@ from artisanlib.roastserver.contract import (
     FailureKind,
     IdentityOrganization,
     IdentityUser,
+    Namespace,
     PublicFailure,
     Revision,
     RoastDetail,
@@ -60,6 +61,7 @@ from artisanlib.roastserver.metadata import project_profile
 from artisanlib.roastserver.outbox import FailedJob, Job, Outbox, QueueCounts
 from artisanlib.roastserver.settings import (
     SETTINGS_FAILURE_MESSAGE,
+    ConnectorSettings,
     CredentialStoreError,
     SettingsError,
     SettingsStore,
@@ -329,6 +331,7 @@ class SupersessionAuthenticationRecorder:
         self.first_entered = threading.Event()
         self.release_first = threading.Event()
         self.http_digests: list[str] = []
+        self.delivery_calls: list[str] = []
         self.tested_ids: list[str] = []
 
     @override
@@ -392,6 +395,78 @@ class SupersessionAuthenticationClient:
     def test_connection(self) -> ServerIdentity:
         self._recorder.record_http(self._digest, self._block)
         return IDENTITY
+
+    def post_aroast(self, *_args: object, **_kwargs: object) -> None:
+        self._recorder.delivery_calls.append('post_aroast')
+
+    def upload_revision(self, *_args: object, **_kwargs: object) -> object:
+        self._recorder.delivery_calls.append('upload_revision')
+        return object()
+
+
+class ActivationShutdownRecorder:
+    def __init__(self, candidate: str) -> None:
+        self._candidate_digest = hashlib.sha256(candidate.encode('utf-8')).hexdigest()
+        self._lock = threading.Lock()
+        self._candidate_authentications = 0
+        self.final_auth_entered = threading.Event()
+        self.release_final_auth = threading.Event()
+        self.api_calls: list[str] = []
+
+    @override
+    def __repr__(self) -> str:
+        return '<ActivationShutdownRecorder credential=<redacted>>'
+
+    def __call__(
+        self, _origin: str, credential: str
+    ) -> ActivationShutdownClient:
+        digest = hashlib.sha256(credential.encode('utf-8')).hexdigest()
+        return ActivationShutdownClient(self, digest == self._candidate_digest)
+
+    def authenticate(self, candidate: bool) -> ServerIdentity:
+        with self._lock:
+            if candidate:
+                self._candidate_authentications += 1
+                final_auth = self._candidate_authentications == 2
+            else:
+                final_auth = False
+            self.api_calls.append('test_connection')
+        if not candidate:
+            raise ApiFailure(public_failure(FailureKind.CREDENTIAL_REJECTED), 401, None)
+        if final_auth:
+            self.final_auth_entered.set()
+            if not self.release_final_auth.wait(timeout=5):
+                raise RuntimeError('blocked activation shutdown timed out')
+        return IDENTITY
+
+
+class ActivationShutdownClient:
+    def __init__(
+        self, recorder: ActivationShutdownRecorder, candidate: bool
+    ) -> None:
+        self._recorder = recorder
+        self._candidate = candidate
+
+    def __enter__(self) -> ActivationShutdownClient:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        return None
+
+    def test_connection(self) -> ServerIdentity:
+        return self._recorder.authenticate(self._candidate)
+
+    def post_aroast(self, *_args: object, **_kwargs: object) -> None:
+        self._recorder.api_calls.append('post_aroast')
+
+    def upload_revision(self, *_args: object, **_kwargs: object) -> object:
+        self._recorder.api_calls.append('upload_revision')
+        return object()
 
 
 class BlockingAuthenticationClient:
@@ -672,6 +747,23 @@ class FakeWorker(QObject):
         self.onlineChanged.emit(value)
 
 
+class WorkerQueueBlocker(QObject):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    @pyqtSlot()
+    def block(self) -> None:
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError('worker queue blocker timed out')
+
+
+class WorkerBlockRelay(QObject):
+    block = pyqtSignal()
+
+
 class WorkerRelay(QObject):
     connection = pyqtSignal(str, object)
     committed = pyqtSignal(str, object)
@@ -724,6 +816,7 @@ class ControllerHarness:
 
         def worker_factory(**kwargs: object) -> FakeWorker:
             assert kwargs['credential_vault'] is self.secret_vault
+            assert repr(kwargs['configuration_fence']) == '<ConfigurationFence>'
             assert kwargs['profile_vault'] is self.profile_vault
             assert kwargs['command_vault'] is self.command_vault
             self.worker = FakeWorker(**kwargs)
@@ -940,6 +1033,8 @@ def test_persisted_identity_never_proves_connection_before_worker_validation(
         assert configuration.automatic_upload
         assert isinstance(getattr(configuration, 'validation_id', None), str)
         assert len(configuration.validation_id) == 32
+        assert type(getattr(configuration, 'generation', None)) is int
+        assert configuration.generation > 0
         with pytest.raises(ControllerError, match='Test the connection'):
             harness.controller.apply_options(
                 ORIGIN,
@@ -978,6 +1073,13 @@ def test_invalidation_rejects_stale_and_fresh_disabled_configuration_proof(
         harness.wait_until(lambda: len(harness.fake_worker.configure_values) >= 2)
         disabled = harness.fake_worker.configure_values[-1]
         assert startup.validation_id != disabled.validation_id
+        assert startup.generation != disabled.generation
+        assert not harness.controller._configuration_fence.authorizes(
+            startup.generation
+        )
+        assert not harness.controller._configuration_fence.authorizes(
+            disabled.generation
+        )
         assert not disabled.enabled and not disabled.automatic_upload
 
         harness.relay.validated.emit(startup)
@@ -1937,11 +2039,27 @@ class RecordingOutbox(Outbox):
     def __init__(self, root: Path, clock: Callable[[], datetime]) -> None:
         super().__init__(root, clock)
         self.open_threads: list[int] = []
+        self.resume_calls: list[Namespace] = []
+        self.leased: list[Job] = []
 
     @override
     def open(self) -> None:
         self.open_threads.append(int(QThread.currentThreadId()))
         super().open()
+
+    @override
+    def resume_namespace(self, namespace: Namespace, now: datetime) -> int:
+        self.resume_calls.append(namespace)
+        return super().resume_namespace(namespace, now)
+
+    @override
+    def lease_next(
+        self, namespace: Namespace, now: datetime, lease_seconds: int = 60
+    ) -> Job | None:
+        outcome = super().lease_next(namespace, now, lease_seconds)
+        if isinstance(outcome, Job):
+            self.leased.append(outcome)
+        return outcome
 
     @property
     def closed(self) -> bool:
@@ -2014,6 +2132,271 @@ def _seed_crash_cut_jobs(data_root: Path, settings: SettingsStore) -> None:
             )
     finally:
         outbox.close()
+
+
+def _blocked_first_activation(
+    tmp_path: Path,
+    app: QCoreApplication,
+    name: str,
+    *,
+    seed_jobs: bool = False,
+) -> tuple[
+    RoastServerController,
+    SettingsStore,
+    FakeCredentialStore,
+    ActivationShutdownRecorder,
+    str,
+]:
+    settings = SettingsStore(
+        QSettings(str(tmp_path / f'{name}.ini'), QSettings.Format.IniFormat)
+    )
+    settings.set_origin(ORIGIN)
+    credentials = FakeCredentialStore()
+    candidate = secrets.token_urlsafe(32)
+    recorder = ActivationShutdownRecorder(candidate)
+    data_root = tmp_path / f'{name}-data'
+    if seed_jobs:
+        _seed_crash_cut_jobs(data_root, settings)
+    controller = RoastServerController(
+        settings=settings,
+        credentials=credentials,
+        data_root=data_root,
+        client_factory=cast(ClientFactory, recorder),
+        profile_validator=lambda _path: None,
+        clock=lambda: NOW,
+    )
+    controller.start()
+    transaction_id = controller.test_connection(ORIGIN, candidate)
+    _wait_for_qt(
+        app,
+        recorder.final_auth_entered.is_set,
+        'activation did not reach blocked final authentication',
+    )
+    promoted = settings.load()
+    assert promoted.identity == IDENTITY
+    assert promoted.pending_connection is None
+    assert transaction_id in controller._activation_previous
+    return controller, settings, credentials, recorder, candidate
+
+
+def _assert_first_activation_restart_matches(
+    tmp_path: Path,
+    app: QCoreApplication,
+    name: str,
+    settings: SettingsStore,
+    credentials: FakeCredentialStore,
+    recorder: ActivationShutdownRecorder,
+    candidate: str,
+    *,
+    accepted: bool,
+) -> None:
+    restarted = RoastServerController(
+        settings=settings,
+        credentials=credentials,
+        data_root=tmp_path / f'{name}-data',
+        client_factory=cast(ClientFactory, recorder),
+        profile_validator=lambda _path: None,
+        clock=lambda: NOW,
+    )
+    restarted.start()
+    try:
+        if accepted:
+            _wait_for_qt(
+                app,
+                lambda: restarted._identity == IDENTITY,
+                'restart did not validate accepted candidate settings and keyring',
+            )
+            assert credentials.values.get(ORIGIN) == candidate
+            assert settings.load().identity == IDENTITY
+        else:
+            for _ in range(20):
+                app.processEvents()
+                time.sleep(0.001)
+            assert restarted._identity is None
+            assert ORIGIN not in credentials.values
+            assert settings.load().identity is None
+    finally:
+        assert restarted.shutdown(2_000)
+
+
+def test_real_shutdown_before_final_activation_restores_settings_and_keyring(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    controller, settings, credentials, recorder, candidate = (
+        _blocked_first_activation(tmp_path, qcoreapplication, 'shutdown-before-final')
+    )
+    try:
+        assert not controller.shutdown(10)
+        assert settings.load().identity is None
+        recorder.release_final_auth.set()
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: not controller.worker_thread_running,
+            'worker did not stop after blocked final authentication returned',
+        )
+        assert controller.shutdown(2_000)
+        _assert_first_activation_restart_matches(
+            tmp_path,
+            qcoreapplication,
+            'shutdown-before-final',
+            settings,
+            credentials,
+            recorder,
+            candidate,
+            accepted=False,
+        )
+    finally:
+        recorder.release_final_auth.set()
+        if controller.worker_thread_running:
+            assert controller.shutdown(2_000)
+
+
+def test_real_shutdown_before_processing_emitted_activation_restores_both_stores(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    controller, settings, credentials, recorder, candidate = (
+        _blocked_first_activation(tmp_path, qcoreapplication, 'shutdown-before-process')
+    )
+    emitted = threading.Event()
+    direct_connect = cast(
+        Callable[[Callable[[str, object], None], Qt.ConnectionType], object],
+        controller._worker.connectionActivated.connect,
+    )
+    direct_connect(
+        lambda _transaction_id, _identity: emitted.set(),
+        Qt.ConnectionType.DirectConnection,
+    )
+    identities = QSignalSpy(controller.identityChanged)
+    try:
+        recorder.release_final_auth.set()
+        assert emitted.wait(timeout=2)
+        assert controller._activation_previous
+        assert controller.shutdown(2_000)
+        for _ in range(20):
+            qcoreapplication.processEvents()
+        assert all(list(identities[index]) != [IDENTITY] for index in range(len(identities)))
+        _assert_first_activation_restart_matches(
+            tmp_path,
+            qcoreapplication,
+            'shutdown-before-process',
+            settings,
+            credentials,
+            recorder,
+            candidate,
+            accepted=False,
+        )
+    finally:
+        recorder.release_final_auth.set()
+        if controller.worker_thread_running:
+            assert controller.shutdown(2_000)
+
+
+def test_real_shutdown_after_acceptance_executes_queued_ack_before_stop(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    controller, settings, credentials, recorder, candidate = (
+        _blocked_first_activation(tmp_path, qcoreapplication, 'shutdown-after-accept')
+    )
+    activation_blocked = threading.Event()
+    release_activation = threading.Event()
+
+    def block_after_emit(_transaction_id: str, _identity: object) -> None:
+        activation_blocked.set()
+        if not release_activation.wait(timeout=5):
+            raise RuntimeError('accepted activation blocker timed out')
+
+    direct_connect = cast(
+        Callable[[Callable[[str, object], None], Qt.ConnectionType], object],
+        controller._worker.connectionActivated.connect,
+    )
+    direct_connect(block_after_emit, Qt.ConnectionType.DirectConnection)
+    try:
+        recorder.release_final_auth.set()
+        assert activation_blocked.wait(timeout=2)
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: controller._identity == IDENTITY
+            and not controller._activation_previous,
+            'controller did not accept activation while worker was blocked',
+        )
+        assert not controller.shutdown(10)
+        assert settings.load().identity == IDENTITY
+        release_activation.set()
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: not controller.worker_thread_running,
+            'acknowledgement and stop did not drain in sender order',
+        )
+        assert controller.shutdown(2_000)
+        _assert_first_activation_restart_matches(
+            tmp_path,
+            qcoreapplication,
+            'shutdown-after-accept',
+            settings,
+            credentials,
+            recorder,
+            candidate,
+            accepted=True,
+        )
+    finally:
+        recorder.release_final_auth.set()
+        release_activation.set()
+        if controller.worker_thread_running:
+            assert controller.shutdown(2_000)
+
+
+def test_shutdown_restore_persistence_failure_is_reported_and_fail_closed(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, settings, _credentials, recorder, _candidate = (
+        _blocked_first_activation(
+            tmp_path,
+            qcoreapplication,
+            'shutdown-restore-failure',
+            seed_jobs=True,
+        )
+    )
+    restore_calls: list[ConnectorSettings] = []
+    failed = QSignalSpy(controller.operationFailed)
+
+    def reject_restore(previous: ConnectorSettings) -> ConnectorSettings:
+        restore_calls.append(previous)
+        raise SettingsError('backend detail')
+
+    monkeypatch.setattr(settings, 'restore_connection_state', reject_restore)
+    try:
+        assert not controller.shutdown(10)
+        assert restore_calls
+        assert not settings.load().enabled
+        assert not settings.load().automatic_upload
+        assert _spy_matches(
+            failed,
+            lambda payload: payload[0] == 'shutdown'
+            and payload[1] == public_failure(FailureKind.SETTINGS),
+        )
+        recorder.release_final_auth.set()
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: not controller.worker_thread_running,
+            'fail-closed shutdown worker did not stop',
+        )
+        inspector = Outbox(
+            tmp_path / 'shutdown-restore-failure-data' / 'outbox', lambda: NOW
+        )
+        inspector.open()
+        try:
+            assert inspector.counts(namespace_for(ORIGIN, ORGANIZATION_ID)).paused == 1
+        finally:
+            inspector.close()
+    finally:
+        recorder.release_final_auth.set()
+        if controller.worker_thread_running:
+            assert controller.shutdown(2_000)
 
 
 @pytest.mark.parametrize(
@@ -2093,7 +2476,7 @@ def test_real_restart_at_every_credential_activation_cut_never_uploads(
     assert recorder.upload_calls == 0
 
 
-def test_real_blocked_configuration_edit_rejects_stale_and_fresh_validation(
+def test_real_blocked_startup_edit_fences_auth_resume_timer_and_due_delivery(
     tmp_path: Path,
     qcoreapplication: QCoreApplication,
 ) -> None:
@@ -2103,43 +2486,84 @@ def test_real_blocked_configuration_edit_rejects_stale_and_fresh_validation(
     settings.set_origin(ORIGIN)
     settings.save_connection(ORIGIN, IDENTITY)
     settings.save_options(True, True, 64 * 1024 * 1024)
+    data_root = tmp_path / 'blocked-validation-data'
+    _seed_crash_cut_jobs(data_root, settings)
     credentials = FakeCredentialStore()
     persisted_secret = secrets.token_urlsafe(32)
     credentials.values[ORIGIN] = persisted_secret
     recorder = SupersessionAuthenticationRecorder()
+    outboxes: list[RecordingOutbox] = []
+
+    def outbox_factory(root: Path, clock: Callable[[], datetime]) -> RecordingOutbox:
+        outbox = RecordingOutbox(root, clock)
+        outboxes.append(outbox)
+        return outbox
+
     controller = RoastServerController(
         settings=settings,
         credentials=credentials,
-        data_root=tmp_path / 'blocked-validation-data',
+        data_root=data_root,
         client_factory=cast(ClientFactory, recorder),
         profile_validator=lambda _path: None,
+        outbox_factory=outbox_factory,
         clock=lambda: NOW,
     )
     validated = QSignalSpy(controller._worker.configurationValidated)
     identities = QSignalSpy(controller.identityChanged)
+    blocker = WorkerQueueBlocker()
+    blocker.moveToThread(controller._thread)
+    relay = WorkerBlockRelay()
+    block_connect = cast(
+        Callable[[Callable[[], None], Qt.ConnectionType], object],
+        relay.block.connect,
+    )
+    block_connect(blocker.block, Qt.ConnectionType.QueuedConnection)
+    stop_connect = cast(
+        Callable[[Callable[[], None], Qt.ConnectionType], object],
+        controller._worker.stopped.connect,
+    )
+    stop_connect(blocker.deleteLater, Qt.ConnectionType.DirectConnection)
     controller.start()
     assert recorder.first_entered.wait(timeout=2)
     try:
+        relay.block.emit()
         controller.invalidate_connection_proof()
         recorder.release_first.set()
+        assert blocker.entered.wait(timeout=2)
+
+        namespace = namespace_for(ORIGIN, ORGANIZATION_ID)
+        configuration = controller._worker._configuration
+        assert configuration is not None and configuration.enabled
+        assert controller._worker._credential is None
+        assert controller._worker._authorized_target is None
+        assert outboxes[0].resume_calls == []
+        assert outboxes[0].leased == []
+        assert outboxes[0].counts(namespace).paused == 1
+        assert recorder.http_digests and len(recorder.http_digests) == 1
+        assert recorder.delivery_calls == []
+        assert len(validated) == 0
+        assert controller._worker._timer is not None
+        assert not controller._worker._timer.isActive()
+
+        blocker.release.set()
         _wait_for_qt(
             qcoreapplication,
-            lambda: len(validated) >= 2,
-            'worker did not return stale and fresh configuration validations',
+            lambda: controller._worker._configuration is not None
+            and not controller._worker._configuration.enabled,
+            'worker did not install the revoked disabled configuration',
         )
         for _ in range(20):
             qcoreapplication.processEvents()
             time.sleep(0.001)
 
-        configurations = [
-            cast(WorkerConfiguration, validated[index][0])
-            for index in range(len(validated))
-        ]
-        assert len({configuration.validation_id for configuration in configurations}) >= 2
+        assert len(validated) == 0
         assert all(
             list(identities[index]) != [IDENTITY]
             for index in range(len(identities))
         )
+        assert outboxes[0].resume_calls == []
+        assert outboxes[0].leased == []
+        assert recorder.delivery_calls == []
         with pytest.raises(ControllerError, match='Test the connection'):
             controller.apply_options(
                 ORIGIN,
@@ -2152,6 +2576,7 @@ def test_real_blocked_configuration_edit_rejects_stale_and_fresh_validation(
         assert_secret_absent(persisted_secret, recorder)
     finally:
         recorder.release_first.set()
+        blocker.release.set()
         assert controller.shutdown(2_000)
 
 

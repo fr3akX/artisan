@@ -83,6 +83,7 @@ from artisanlib.roastserver.worker import (
     BrowseRequest,
     CachedOpenRequest,
     ClearUnusedRequest,
+    ConfigurationFence,
     ConnectionTestRequest,
     OnlineOpenRequest,
     OpaqueVault,
@@ -694,6 +695,7 @@ class WorkerHarness:
         self.secret_vault: OpaqueVault[ConnectionTestRequest] = OpaqueVault()
         self.profile_vault: OpaqueVault[SavedProfileRequest] = OpaqueVault()
         self.command_vault: OpaqueVault[object] = OpaqueVault()
+        self.configuration_fence = ConfigurationFence()
         self.timer: DeterministicTimer | None = None
         self.timer_created_thread: int | None = None
         self.thread = QThread()
@@ -709,6 +711,7 @@ class WorkerHarness:
             credential_vault=self.secret_vault,
             profile_vault=self.profile_vault,
             command_vault=self.command_vault,
+            configuration_fence=self.configuration_fence,
             timer_factory=self._timer_factory,
         )
         self.worker.moveToThread(self.thread)
@@ -794,10 +797,26 @@ class WorkerHarness:
                 automatic_upload=automatic_upload,
                 client_instance_uuid=CLIENT_UUID,
                 cache_limit_bytes=64 * 1024 * 1024,
+                generation=self.configuration_fence.advance(),
                 identity=identity,
             )
         )
         self.wait_until(lambda: len(self.queue_spy) > before)
+
+    def activation_configuration(
+        self, transaction_id: str
+    ) -> WorkerConfiguration:
+        return WorkerConfiguration(
+            origin=ORIGIN,
+            namespace=NAMESPACE,
+            enabled=False,
+            automatic_upload=False,
+            client_instance_uuid=CLIENT_UUID,
+            cache_limit_bytes=64 * 1024 * 1024,
+            generation=self.configuration_fence.advance(),
+            identity=IDENTITY,
+            activation_id=transaction_id,
+        )
 
     @property
     def queue_spy(self) -> QSignalSpy:
@@ -922,6 +941,24 @@ def test_opaque_vault_latest_generation_replaces_and_fences_consumed_values() ->
     assert_secret_absent(second_secret, vault)
 
 
+def test_configuration_fence_is_secret_free_and_revocation_is_monotonic() -> None:
+    fence = ConfigurationFence()
+    secret = secrets.token_urlsafe(32)
+
+    first = fence.advance()
+    assert fence.is_current(first)
+    assert fence.authorizes(first)
+    revoked = fence.revoke()
+    assert revoked > first
+    assert fence.is_current(revoked)
+    assert not fence.authorizes(first)
+    assert not fence.authorizes(revoked)
+    current = fence.advance()
+    assert current > revoked
+    assert fence.authorizes(current)
+    assert secret not in repr(fence)
+
+
 def test_direct_wrong_thread_candidate_slot_erases_secret_without_io(
     worker_harness: WorkerHarness,
 ) -> None:
@@ -981,6 +1018,7 @@ def test_every_external_slot_rejects_direct_wrong_thread_use_without_io(
         automatic_upload=True,
         client_instance_uuid=CLIENT_UUID,
         cache_limit_bytes=64 * 1024 * 1024,
+        generation=worker_harness.configuration_fence.advance(),
         identity=IDENTITY,
     )
     boundary_calls = (
@@ -1117,6 +1155,51 @@ def test_delivery_requires_the_exact_authenticated_configuration_fence(
     assert all(call[0] != 'upload_revision' for call in worker_harness.client.calls)
 
 
+def test_generation_revoked_during_keyring_read_never_installs_or_authenticates(
+    worker_harness: WorkerHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_get = worker_harness.credentials.get
+    resume_calls = tuple(worker_harness.outbox.resume_calls)
+    factory_calls = tuple(worker_harness.client_factory.calls)
+
+    def revoke_after_read(origin: str) -> str | None:
+        credential = original_get(origin)
+        worker_harness.configuration_fence.revoke()
+        return credential
+
+    monkeypatch.setattr(worker_harness.credentials, 'get', revoke_after_read)
+    before = len(worker_harness.queue_spy)
+    worker_harness.configure()
+    worker_harness.wait_until(lambda: len(worker_harness.queue_spy) > before)
+
+    assert tuple(worker_harness.client_factory.calls) == factory_calls
+    assert tuple(worker_harness.outbox.resume_calls) == resume_calls
+    assert worker_harness.worker._credential is None
+    assert worker_harness.worker._authorized_target is None
+    assert worker_harness.timer is not None
+    assert not worker_harness.timer.logically_active
+
+
+def test_revoked_generation_timer_entry_never_leases_or_calls_delivery_api(
+    worker_harness: WorkerHarness,
+) -> None:
+    worker_harness.enqueue_saved_profile()
+    leased = tuple(worker_harness.outbox.leased)
+    worker_harness.configuration_fence.revoke()
+    before = tuple(worker_harness.client.calls)
+
+    worker_harness.run_one_queue_tick()
+
+    assert tuple(worker_harness.outbox.leased) == leased
+    assert tuple(worker_harness.client.calls) == before
+    assert worker_harness.outbox.counts(NAMESPACE).paused == 1
+    assert worker_harness.worker._credential is None
+    assert worker_harness.worker._authorized_target is None
+    assert worker_harness.timer is not None
+    assert not worker_harness.timer.logically_active
+
+
 def test_candidate_activation_commits_only_between_two_exact_auth_checks(
     worker_harness: WorkerHarness,
 ) -> None:
@@ -1144,6 +1227,7 @@ def test_candidate_activation_commits_only_between_two_exact_auth_checks(
             automatic_upload=False,
             client_instance_uuid=CLIENT_UUID,
             cache_limit_bytes=64 * 1024 * 1024,
+            generation=worker_harness.configuration_fence.advance(),
             identity=IDENTITY,
             activation_id=transaction_id,
         )
@@ -1289,6 +1373,7 @@ def test_synchronous_vault_cancel_during_final_auth_rolls_keyring_back(
             automatic_upload=False,
             client_instance_uuid=CLIENT_UUID,
             cache_limit_bytes=64 * 1024 * 1024,
+            generation=worker_harness.configuration_fence.advance(),
             identity=IDENTITY,
             activation_id=transaction_id,
         )
@@ -1337,6 +1422,7 @@ def test_cancel_delayed_completed_transaction_revokes_worker_authorization(
             automatic_upload=False,
             client_instance_uuid=CLIENT_UUID,
             cache_limit_bytes=64 * 1024 * 1024,
+            generation=worker_harness.configuration_fence.advance(),
             identity=IDENTITY,
             activation_id=transaction_id,
         )
@@ -1378,6 +1464,7 @@ def test_cancel_emitted_unacknowledged_activation_restores_keyring_and_auth(
             automatic_upload=False,
             client_instance_uuid=CLIENT_UUID,
             cache_limit_bytes=64 * 1024 * 1024,
+            generation=worker_harness.configuration_fence.advance(),
             identity=IDENTITY,
             activation_id=transaction_id,
         )
@@ -1422,6 +1509,7 @@ def test_shutdown_rolls_back_emitted_unacknowledged_activation(
             automatic_upload=False,
             client_instance_uuid=CLIENT_UUID,
             cache_limit_bytes=64 * 1024 * 1024,
+            generation=worker_harness.configuration_fence.advance(),
             identity=IDENTITY,
             activation_id=transaction_id,
         )
@@ -1454,6 +1542,7 @@ def test_final_auth_failure_rolls_keyring_back_to_old_credential(
             automatic_upload=False,
             client_instance_uuid=CLIENT_UUID,
             cache_limit_bytes=64 * 1024 * 1024,
+            generation=worker_harness.configuration_fence.advance(),
             identity=IDENTITY,
             activation_id=transaction_id,
         )
@@ -1881,6 +1970,7 @@ def test_disable_missing_credential_restore_and_namespace_switch_are_isolated(
         automatic_upload=True,
         client_instance_uuid=CLIENT_UUID,
         cache_limit_bytes=64 * 1024 * 1024,
+        generation=worker_harness.configuration_fence.advance(),
     )
     worker_harness.bus.configure_worker.emit(invalid)
     payload = worker_harness.wait_for_spy(failed, 0)
@@ -1903,6 +1993,7 @@ def test_configuration_rejects_missing_opaque_validation_correlation(
             automatic_upload=True,
             client_instance_uuid=CLIENT_UUID,
             cache_limit_bytes=64 * 1024 * 1024,
+            generation=worker_harness.configuration_fence.advance(),
             validation_id='',
             identity=IDENTITY,
         )
@@ -1932,6 +2023,7 @@ def test_configuration_rejects_cache_limits_outside_settings_bounds(
             automatic_upload=True,
             client_instance_uuid=CLIENT_UUID,
             cache_limit_bytes=cache_limit_bytes,
+            generation=worker_harness.configuration_fence.advance(),
         )
     )
 
@@ -2319,6 +2411,7 @@ def test_stock_qtimer_automatically_delivers_persisted_retry_and_destroys_in_aff
     credential_vault: OpaqueVault[ConnectionTestRequest] = OpaqueVault()
     profile_vault: OpaqueVault[SavedProfileRequest] = OpaqueVault()
     command_vault: OpaqueVault[object] = OpaqueVault()
+    configuration_fence = ConfigurationFence()
     worker = RoastServerWorker(
         outbox=outbox,
         cache=cache,
@@ -2328,6 +2421,7 @@ def test_stock_qtimer_automatically_delivers_persisted_retry_and_destroys_in_aff
         credential_vault=credential_vault,
         profile_vault=profile_vault,
         command_vault=command_vault,
+        configuration_fence=configuration_fence,
     )
     thread = QThread()
     bus = CommandBus()
@@ -2368,6 +2462,7 @@ def test_stock_qtimer_automatically_delivers_persisted_retry_and_destroys_in_aff
                 automatic_upload=True,
                 client_instance_uuid=CLIENT_UUID,
                 cache_limit_bytes=MIN_CACHE_LIMIT_BYTES,
+                generation=configuration_fence.advance(),
                 identity=IDENTITY,
             )
         )
