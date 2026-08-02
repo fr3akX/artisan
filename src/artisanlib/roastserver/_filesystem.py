@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import ctypes
+from dataclasses import dataclass
 from ctypes import wintypes
 import errno
 import importlib
@@ -91,6 +92,36 @@ class _WindowsAccessAllowedAce(ctypes.Structure):
 class _WindowsFileDispositionInfo(ctypes.Structure):
     _fields_ = [('DeleteFile', wintypes.BOOLEAN)]
 
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsReplaceFileEntry:
+    """One canonical entry observed immediately after ``ReplaceFileW`` failed."""
+
+    path: Path
+    exists: bool | None
+    identity: tuple[int, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsReplaceFileObservation:
+    """All names whose ownership can change on a failed ``ReplaceFileW``."""
+
+    error_code: int
+    destination: WindowsReplaceFileEntry
+    replacement: WindowsReplaceFileEntry
+    backup: WindowsReplaceFileEntry
+
+
+class WindowsReplaceFileError(OSError):
+    """A failed ``ReplaceFileW`` together with its observed side effects."""
+
+    def __init__(self, observation: WindowsReplaceFileObservation) -> None:
+        super().__init__(
+            observation.error_code,
+            'Windows write-through replacement with backup failed',
+        )
+        self.observation = observation
 
 
 class _WindowsNativeApi(Protocol):
@@ -760,13 +791,24 @@ class _WindowsNativeLayer:
                 self._ctypes.get_last_error(), 'Windows write-through replacement failed'
             )
 
+    @staticmethod
+    def _replace_file_entry(path: Path) -> WindowsReplaceFileEntry:
+        try:
+            entry_stat = os.lstat(path)
+        except FileNotFoundError:
+            return WindowsReplaceFileEntry(path, False, None)
+        except OSError:
+            return WindowsReplaceFileEntry(path, None, None)
+        return WindowsReplaceFileEntry(
+            path, True, (entry_stat.st_dev, entry_stat.st_ino))
+
     def replace_with_backup(
         self,
         replacement: Path,
         destination: Path,
         backup: Path,
     ) -> None:
-        if not self._kernel32.ReplaceFileW(
+        if self._kernel32.ReplaceFileW(
             os.fspath(destination),
             os.fspath(replacement),
             os.fspath(backup),
@@ -774,10 +816,14 @@ class _WindowsNativeLayer:
             None,
             None,
         ):
-            raise OSError(
-                self._ctypes.get_last_error(),
-                'Windows write-through replacement with backup failed',
-            )
+            return
+        error_code = cast(int, self._ctypes.get_last_error())
+        raise WindowsReplaceFileError(WindowsReplaceFileObservation(
+            error_code=error_code,
+            destination=self._replace_file_entry(destination),
+            replacement=self._replace_file_entry(replacement),
+            backup=self._replace_file_entry(backup),
+        ))
 
     def unlink(self, path: Path) -> None:
         handles = self._open_chain(
@@ -1694,6 +1740,9 @@ __all__ = [
     '_WindowsFileDispositionInfo',
     '_WindowsNativeApi',
     '_WindowsNativeLayer',
+    'WindowsReplaceFileEntry',
+    'WindowsReplaceFileError',
+    'WindowsReplaceFileObservation',
     'acquire_file_lock',
     'create_generated_file',
     'directory_entry_is_reparse',

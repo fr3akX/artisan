@@ -1800,6 +1800,58 @@ def test_windows_replacefile_seam_captures_backup_and_writes_through() -> None:
     assert raised.value.errno == 5
 
 
+@pytest.mark.parametrize(
+    'outcome',
+    ['no-changes', 'destination-missing-backup', 'replacement-installed-backup'],
+)
+def test_windows_replacefile_false_reports_every_documented_observed_outcome(
+    tmp_path: Path, outcome: str
+) -> None:
+    replacement = tmp_path / 'profile.part'
+    destination = tmp_path / 'profile.alog'
+    backup = tmp_path / '.artisan-backup.alog'
+    replacement.write_bytes(b'replacement')
+    destination.write_bytes(b'destination')
+    replacement_identity = (
+        replacement.stat().st_dev, replacement.stat().st_ino)
+    destination_identity = (
+        destination.stat().st_dev, destination.stat().st_ino)
+
+    def replace_file(*_arguments: object) -> bool:
+        if outcome != 'no-changes':
+            os.replace(destination, backup)
+        if outcome == 'replacement-installed-backup':
+            os.replace(replacement, destination)
+        return False
+
+    layer = object.__new__(filesystem_module._WindowsNativeLayer)
+    layer._kernel32 = type(
+        'Kernel', (), {'ReplaceFileW': staticmethod(replace_file)})()
+    layer._ctypes = type(
+        'Ctypes', (), {'get_last_error': staticmethod(lambda: 5)})()
+
+    with pytest.raises(filesystem_module.WindowsReplaceFileError) as raised:
+        layer.replace_with_backup(replacement, destination, backup)
+
+    observation = raised.value.observation
+    assert observation.error_code == 5
+    assert observation.destination.path == destination
+    assert observation.replacement.path == replacement
+    assert observation.backup.path == backup
+    if outcome == 'no-changes':
+        assert observation.destination.identity == destination_identity
+        assert observation.replacement.identity == replacement_identity
+        assert observation.backup.exists is False
+    elif outcome == 'destination-missing-backup':
+        assert observation.destination.exists is False
+        assert observation.replacement.identity == replacement_identity
+        assert observation.backup.identity == destination_identity
+    else:
+        assert observation.destination.identity == replacement_identity
+        assert observation.replacement.exists is False
+        assert observation.backup.identity == destination_identity
+
+
 def test_shared_windows_generated_replace_holds_verified_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

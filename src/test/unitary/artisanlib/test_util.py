@@ -2301,7 +2301,7 @@ class TestSerialize:
         serialize_with_timestamp(str(destination), {'value': 'ordered'})
 
         assert events[0] == 'write'
-        assert events.count('fsync') == (1 if os.name == 'nt' else 2)
+        assert events.count('fsync') == (1 if os.name == 'nt' else 3)
         assert events.index('write') < events.index('publish')
         assert events[-1] == ('publish' if os.name == 'nt' else 'fsync')
 
@@ -2339,6 +2339,23 @@ class TestSerialize:
         assert str(destination) not in str(raised.value)
         assert destination.read_bytes() == before
         assert not list(tmp_path.glob('.artisan-*.tmp'))
+
+    def test_serialization_failure_cleanup_never_scans_unowned_generated_names(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        destination = tmp_path / 'cleanup-scope.alog'
+        destination.write_bytes(b'prior entry')
+        unowned = tmp_path / '.artisan-unowned.tmp'
+        unowned.write_bytes(b'do not remove')
+        monkeypatch.setattr(
+            'artisanlib.util.os.write', Mock(side_effect=OSError('write failed')))
+
+        with pytest.raises(OSError, match='profile serialization failed'):
+            serialize_with_timestamp(str(destination), {'value': 'replacement'})
+
+        assert destination.read_bytes() == b'prior entry'
+        assert unowned.read_bytes() == b'do not remove'
+        assert list(tmp_path.glob('.artisan-*')) == [unowned]
 
     def test_serialize_with_timestamp_fstat_failure_leaves_destination_unchanged(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2724,6 +2741,330 @@ class TestSerialize:
 
         assert destination.read_bytes() == concurrent
 
+    def test_one_shot_post_capture_hash_failure_restores_existing_destination(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'captured-hash-failure.alog'
+        destination.write_bytes(b'prior entry')
+        real_exchange = util_module._exchange_serialization_entries
+        real_fingerprint = util_module._serialization_entry_fingerprint
+        capture_observed = False
+        failed = False
+
+        def exchange(
+            parent: Any, first_name: str, second_name: str
+        ) -> None:
+            nonlocal capture_observed
+            real_exchange(parent, first_name, second_name)
+            capture_observed = True
+
+        def fingerprint(
+            parent: Any, name: str, *, max_bytes: int | None = None
+        ) -> Any:
+            nonlocal failed
+            if capture_observed and not failed:
+                failed = True
+                raise OSError('injected one-shot captured hash failure')
+            return real_fingerprint(parent, name, max_bytes=max_bytes)
+
+        monkeypatch.setattr(
+            util_module, '_exchange_serialization_entries', exchange)
+        monkeypatch.setattr(
+            util_module, '_serialization_entry_fingerprint', fingerprint)
+
+        with pytest.raises(OSError, match='profile serialization failed'):
+            serialize_with_timestamp(str(destination), {'value': 'replacement'})
+
+        assert failed
+        assert destination.read_bytes() == b'prior entry'
+        assert not list(tmp_path.glob('.artisan-*'))
+
+    def test_one_shot_absent_post_capture_hash_failure_restores_absence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'absent-captured-hash-failure.alog'
+        real_move = util_module._move_serialization_entry_no_replace
+        real_fingerprint = util_module._serialization_entry_fingerprint
+        capture_observed = False
+        failed = False
+
+        def move(
+            parent: Any, first_name: str, second_name: str
+        ) -> None:
+            nonlocal capture_observed
+            real_move(parent, first_name, second_name)
+            capture_observed = True
+
+        def fingerprint(
+            parent: Any, name: str, *, max_bytes: int | None = None
+        ) -> Any:
+            nonlocal failed
+            if capture_observed and not failed:
+                failed = True
+                raise OSError('injected one-shot absent hash failure')
+            return real_fingerprint(parent, name, max_bytes=max_bytes)
+
+        monkeypatch.setattr(
+            util_module, '_move_serialization_entry_no_replace', move)
+        monkeypatch.setattr(
+            util_module, '_serialization_entry_fingerprint', fingerprint)
+
+        with pytest.raises(OSError, match='profile serialization failed'):
+            serialize_with_timestamp(str(destination), {'value': 'replacement'})
+
+        assert failed
+        assert not destination.exists()
+        assert not list(tmp_path.glob('.artisan-*'))
+
+    def test_post_capture_metadata_failure_is_published_to_transaction_before_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'captured-metadata-failure.alog'
+        destination.write_bytes(b'prior entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        real_set_times = util_module._set_serialization_entry_times
+        failed = False
+
+        def fail_once(
+            parent: Any, name: str, times: tuple[int, int]
+        ) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError('injected timestamp failure')
+            real_set_times(parent, name, times)
+
+        monkeypatch.setattr(
+            util_module, '_set_serialization_entry_times', fail_once)
+
+        with pytest.raises(OSError, match='profile destination publication failed'):
+            transaction.serialize({'value': 'replacement'})
+
+        assert transaction._active
+        assert transaction._published_fingerprint is not None
+        assert transaction._backup_name is not None
+        assert (tmp_path / transaction._backup_name).read_bytes() == b'prior entry'
+
+        transaction.rollback()
+        assert destination.read_bytes() == b'prior entry'
+        assert not list(tmp_path.glob('.artisan-*'))
+
+    def test_persistent_post_capture_metadata_failure_preserves_backup_for_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'persistent-captured-metadata.alog'
+        destination.write_bytes(b'prior entry')
+        prior_stat = destination.stat()
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        real_set_times = util_module._set_serialization_entry_times
+        monkeypatch.setattr(
+            util_module,
+            '_set_serialization_entry_times',
+            Mock(side_effect=OSError('injected persistent timestamp failure')),
+        )
+
+        with pytest.raises(OSError, match='profile destination publication failed'):
+            transaction.serialize({'value': 'replacement'})
+        with pytest.raises(OSError, match='profile destination rollback failed'):
+            transaction.rollback()
+
+        assert transaction._active
+        assert transaction._backup_name is not None
+        assert destination.read_bytes() == b"{'value': 'replacement'}"
+        assert (tmp_path / transaction._backup_name).read_bytes() == b'prior entry'
+
+        monkeypatch.setattr(
+            util_module, '_set_serialization_entry_times', real_set_times)
+        transaction.rollback()
+        restored_stat = destination.stat()
+        assert destination.read_bytes() == b'prior entry'
+        assert restored_stat.st_mtime_ns == prior_stat.st_mtime_ns
+        assert not list(tmp_path.glob('.artisan-*'))
+
+    def test_persistent_post_capture_hash_failure_preserves_recoverable_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'persistent-captured-hash.alog'
+        destination.write_bytes(b'prior entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        real_exchange = util_module._exchange_serialization_entries
+        real_fingerprint = util_module._serialization_entry_fingerprint
+        capture_observed = False
+
+        def exchange(
+            parent: Any, first_name: str, second_name: str
+        ) -> None:
+            nonlocal capture_observed
+            real_exchange(parent, first_name, second_name)
+            capture_observed = True
+
+        def fail_after_capture(
+            parent: Any, name: str, *, max_bytes: int | None = None
+        ) -> Any:
+            if capture_observed:
+                raise OSError('injected persistent captured hash failure')
+            return real_fingerprint(parent, name, max_bytes=max_bytes)
+
+        monkeypatch.setattr(
+            util_module, '_exchange_serialization_entries', exchange)
+        monkeypatch.setattr(
+            util_module, '_serialization_entry_fingerprint', fail_after_capture)
+
+        with pytest.raises(OSError, match='profile destination publication failed'):
+            transaction.serialize({'value': 'replacement'})
+        with pytest.raises(OSError, match='profile destination rollback failed'):
+            transaction.rollback()
+
+        assert transaction._active
+        assert transaction._backup_name is not None
+        assert destination.read_bytes() == b"{'value': 'replacement'}"
+        assert (tmp_path / transaction._backup_name).read_bytes() == b'prior entry'
+
+        monkeypatch.setattr(
+            util_module, '_serialization_entry_fingerprint', real_fingerprint)
+        transaction.rollback()
+        assert destination.read_bytes() == b'prior entry'
+        assert not list(tmp_path.glob('.artisan-*'))
+
+    def test_absent_rollback_hash_failure_records_quarantine_and_preserves_concurrent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'absent-quarantine-hash.alog'
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        published = transaction.serialize({'value': 'published'}).serialized_profile
+        real_move = util_module._move_serialization_entry_no_replace
+        real_fingerprint = util_module._serialization_entry_fingerprint
+        moves = 0
+
+        def quarantine_then_create(
+            parent: Any, source_name: str, destination_name: str
+        ) -> None:
+            nonlocal moves
+            moves += 1
+            real_move(parent, source_name, destination_name)
+            if moves == 1:
+                destination.write_bytes(b'concurrent entry')
+
+        def fail_quarantine_hash(
+            parent: Any, name: str, *, max_bytes: int | None = None
+        ) -> Any:
+            if name.endswith('.quarantine'):
+                raise OSError('injected quarantine hash failure')
+            return real_fingerprint(parent, name, max_bytes=max_bytes)
+
+        monkeypatch.setattr(
+            util_module, '_move_serialization_entry_no_replace', quarantine_then_create)
+        monkeypatch.setattr(
+            util_module, '_serialization_entry_fingerprint', fail_quarantine_hash)
+
+        with pytest.raises(OSError, match='profile destination rollback failed'):
+            transaction.rollback()
+
+        assert transaction._active
+        assert transaction._quarantine_name is not None
+        quarantine = tmp_path / transaction._quarantine_name
+        assert destination.read_bytes() == b'concurrent entry'
+        assert quarantine.read_bytes() == published
+
+        preserved_concurrent = tmp_path / 'preserved-concurrent.alog'
+        destination.rename(preserved_concurrent)
+        monkeypatch.setattr(
+            util_module, '_serialization_entry_fingerprint', real_fingerprint)
+        transaction.rollback()
+
+        assert not destination.exists()
+        assert preserved_concurrent.read_bytes() == b'concurrent entry'
+        assert not quarantine.exists()
+
+    @pytest.mark.parametrize('destination_exists', [False, True])
+    def test_commit_preflight_sync_failure_remains_rollback_capable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        destination_exists: bool,
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'commit-preflight-sync.alog'
+        if destination_exists:
+            destination.write_bytes(b'prior entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        transaction.serialize({'value': 'published'})
+        real_sync = util_module._sync_serialization_directory
+        monkeypatch.setattr(
+            util_module,
+            '_sync_serialization_directory',
+            Mock(side_effect=OSError('injected commit preflight sync failure')),
+        )
+
+        with pytest.raises(OSError, match='profile destination commit failed'):
+            transaction.commit()
+
+        assert transaction._active
+        if destination_exists:
+            assert transaction._backup_name is not None
+        monkeypatch.setattr(
+            util_module, '_sync_serialization_directory', real_sync)
+        transaction.rollback()
+        assert destination.exists() is destination_exists
+        if destination_exists:
+            assert destination.read_bytes() == b'prior entry'
+
+    def test_post_backup_unlink_sync_failure_is_only_durability_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'post-commit-sync.alog'
+        destination.write_bytes(b'prior entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        published = transaction.serialize({'value': 'published'}).serialized_profile
+        real_sync = util_module._sync_serialization_directory
+        real_unlink = util_module._unlink_serialization_entry
+        backup_unlinked = False
+
+        def unlink(parent: Any, name: str) -> None:
+            nonlocal backup_unlinked
+            real_unlink(parent, name)
+            backup_unlinked = True
+
+        def sync(parent: Any) -> None:
+            if backup_unlinked:
+                raise OSError('injected post-commit directory sync failure')
+            real_sync(parent)
+
+        monkeypatch.setattr(util_module, '_unlink_serialization_entry', unlink)
+        monkeypatch.setattr(util_module, '_sync_serialization_directory', sync)
+
+        with caplog.at_level('WARNING', logger='artisanlib.util'):
+            transaction.commit()
+
+        assert not transaction._active
+        assert transaction._backup_name is None
+        assert destination.read_bytes() == published
+        assert 'profile destination post-commit durability warning' in caplog.text
+
     def test_posix_native_rename_seams_use_platform_signatures_and_flags(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2836,6 +3177,127 @@ class TestSerialize:
 
         assert not backup.exists()
         assert destination.read_bytes() == b"{'value': 'replacement'}"
+
+    @pytest.mark.parametrize(
+        'outcome',
+        [
+            'no-changes',
+            'destination-missing-backup',
+            'replacement-installed-backup',
+            'concurrent-destination-backup',
+        ],
+    )
+    def test_windows_replacefile_false_reconciles_observed_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: str,
+    ) -> None:
+        from artisanlib import util as util_module
+        from artisanlib.roastserver import _filesystem as filesystem_module
+
+        destination = tmp_path / 'windows-false.alog'
+        destination.write_bytes(b'prior Windows entry')
+
+        def entry(path: Path) -> Any:
+            try:
+                path_stat = os.lstat(path)
+            except FileNotFoundError:
+                return filesystem_module.WindowsReplaceFileEntry(
+                    path, False, None)
+            return filesystem_module.WindowsReplaceFileEntry(
+                path, True, (path_stat.st_dev, path_stat.st_ino))
+
+        replace_calls = 0
+
+        class Native:
+            @staticmethod
+            def open_readonly(path: Path, *, directory: bool = False) -> int:
+                flags = os.O_RDONLY
+                if directory:
+                    flags |= getattr(os, 'O_DIRECTORY', 0)
+                return os.open(path, flags)
+
+            @staticmethod
+            def canonical_path(_descriptor: int) -> Path:
+                return tmp_path
+
+            @staticmethod
+            def replace_with_backup(
+                replacement: Path, target: Path, backup: Path
+            ) -> None:
+                nonlocal replace_calls
+                replace_calls += 1
+                if replace_calls > 1:
+                    os.replace(target, backup)
+                    os.replace(replacement, target)
+                    return
+                if outcome != 'no-changes':
+                    os.replace(target, backup)
+                if outcome == 'replacement-installed-backup':
+                    os.replace(replacement, target)
+                elif outcome == 'concurrent-destination-backup':
+                    target.write_bytes(b'concurrent Windows entry')
+                observation = filesystem_module.WindowsReplaceFileObservation(
+                    error_code=5,
+                    destination=entry(target),
+                    replacement=entry(replacement),
+                    backup=entry(backup),
+                )
+                raise filesystem_module.WindowsReplaceFileError(observation)
+
+            @staticmethod
+            def move_no_replace(source: Path, target: Path) -> None:
+                if target.exists():
+                    raise FileExistsError('destination exists')
+                os.rename(source, target)
+
+            @staticmethod
+            def flush_directory(_directory: Path) -> None:
+                return None
+
+            @staticmethod
+            def unlink(path: Path) -> None:
+                os.unlink(path)
+
+        monkeypatch.setattr(
+            util_module, '_serialization_is_windows', lambda: True)
+        monkeypatch.setattr(
+            util_module, '_serialization_windows_native', Native)
+
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        with pytest.raises(OSError, match='profile destination publication failed'):
+            transaction.serialize({'value': 'replacement'})
+
+        if outcome == 'concurrent-destination-backup':
+            with pytest.raises(OSError, match='profile destination rollback failed'):
+                transaction.rollback()
+            assert transaction._active
+            assert transaction._backup_name is not None
+            assert destination.read_bytes() == b'concurrent Windows entry'
+            assert (tmp_path / transaction._backup_name).read_bytes() == b'prior Windows entry'
+            assert len(list(tmp_path.glob('.artisan-*'))) == 1
+        else:
+            transaction.rollback()
+            assert destination.read_bytes() == b'prior Windows entry'
+            assert not list(tmp_path.glob('.artisan-*'))
+
+    @pytest.mark.win32
+    @pytest.mark.skipif(os.name != 'nt', reason='requires native Windows ReplaceFileW')
+    def test_windows_native_replacefile_transaction_can_rollback(
+        self, tmp_path: Path
+    ) -> None:
+        destination = tmp_path / 'native-replacefile.alog'
+        destination.write_bytes(b'prior Windows entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+
+        transaction.serialize({'value': 'native replacement'})
+        transaction.rollback()
+
+        assert destination.read_bytes() == b'prior Windows entry'
+        assert not list(tmp_path.glob('.artisan-*'))
 
     def test_windows_transaction_uses_retained_canonical_parent_for_every_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2988,6 +3450,7 @@ class TestSerialize:
         assert destination.read_bytes() == serialized
         assert events == [
             'replacefile-write-through',
+            'flush-directory',
             'flush-directory',
             'unlink-backup',
             'flush-directory',

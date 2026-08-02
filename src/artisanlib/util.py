@@ -43,7 +43,7 @@ import numpy
 import functools
 import datetime
 import errno
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from bisect import bisect_right
 from pathlib import Path
 from matplotlib import colors
@@ -53,6 +53,7 @@ from typing import Final, Literal, Any, TypeGuard, cast, TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from artisanlib.main import Artisan # pylint: disable=unused-import
+    from artisanlib.roastserver._filesystem import WindowsReplaceFileObservation
     import numpy.typing as npt # pylint: disable=unused-import
     from artisanlib.atypes import ProfileData # pylint: disable=unused-import
     from proto import artisan_roast_pb2 # pylint: disable=unused-import
@@ -1625,6 +1626,17 @@ def _new_serialization_entry_name(
     raise OSError('profile serialization private entry could not be allocated')
 
 
+class _SerializationReplaceFailure(OSError):
+    def __init__(
+        self,
+        backup_name:str,
+        observation:'WindowsReplaceFileObservation',
+    ) -> None:
+        super().__init__('atomic profile replacement reported side effects')
+        self.backup_name = backup_name
+        self.observation = observation
+
+
 def _replace_serialization_entry_with_backup(
     parent:_SerializationParent,
     replacement_name:str,
@@ -1635,11 +1647,18 @@ def _replace_serialization_entry_with_backup(
             parent, replacement_name, destination_name)
         return replacement_name
     backup_name = _new_serialization_entry_name(parent, '.bak')
-    _serialization_windows_native().replace_with_backup(
-        parent.path / replacement_name,
-        parent.path / destination_name,
-        parent.path / backup_name,
-    )
+    try:
+        _serialization_windows_native().replace_with_backup(
+            parent.path / replacement_name,
+            parent.path / destination_name,
+            parent.path / backup_name,
+        )
+    except Exception as error:
+        from artisanlib.roastserver._filesystem import WindowsReplaceFileError
+        if isinstance(error, WindowsReplaceFileError):
+            raise _SerializationReplaceFailure(
+                backup_name, error.observation) from error
+        raise
     return backup_name
 
 
@@ -1852,64 +1871,14 @@ def _captured_serialization_entry_matches(
     )
 
 
-class _SerializationRecoveryError(OSError):
-    def __init__(self, backup_name:str) -> None:
-        super().__init__('profile serialization recovery retained a backup')
-        self.backup_name = backup_name
-
-
-def _restore_existing_serialization_entry(
+def _unlink_owned_serialization_entry(
     parent:_SerializationParent,
-    backup_name:str,
-    destination_name:str,
-    expected_outgoing:_SerializationEntryFingerprint,
+    name:str,
+    expected:os.stat_result,
 ) -> None:
-    outgoing_name = _replace_serialization_entry_with_backup(
-        parent, backup_name, destination_name)
-    try:
-        captured = _serialization_entry_fingerprint(parent, outgoing_name)
-        if not _serialization_fingerprints_match(
-            expected_outgoing, captured, include_ctime=False
-        ):
-            restored_backup_name = _replace_serialization_entry_with_backup(
-                parent, outgoing_name, destination_name)
-            _sync_serialization_directory(parent)
-            raise _SerializationRecoveryError(restored_backup_name)
-        _unlink_serialization_entry(parent, outgoing_name)
-    finally:
-        _sync_serialization_directory(parent)
-
-
-def _remove_absent_serialization_publication(
-    parent:_SerializationParent,
-    destination_name:str,
-    published:_SerializationEntryFingerprint,
-) -> None:
-    quarantine_name = _new_serialization_entry_name(parent, '.quarantine')
-    _move_serialization_entry_no_replace(
-        parent, destination_name, quarantine_name)
-    try:
-        captured = _serialization_entry_fingerprint(parent, quarantine_name)
-        if not _serialization_fingerprints_match(
-            published, captured, include_ctime=False
-        ):
-            _move_serialization_entry_no_replace(
-                parent, quarantine_name, destination_name)
-            raise OSError('profile serialization ownership changed')
-        _unlink_serialization_entry(parent, quarantine_name)
-    except Exception:
-        if (
-            _serialization_entry_stat(parent, quarantine_name) is not None
-            and _serialization_entry_stat(parent, destination_name) is None
-        ):
-            try:
-                _move_serialization_entry_no_replace(
-                    parent, quarantine_name, destination_name)
-            except OSError:
-                pass
-        raise
-    finally:
-        _sync_serialization_directory(parent)
+    current = _serialization_entry_stat(parent, name)
+    if current is not None and _same_entry(expected, current):
+        _unlink_serialization_entry(parent, name)
 
 
 def _publish_serialization_bytes(
@@ -1918,6 +1887,7 @@ def _publish_serialization_bytes(
     serialized:bytes,
     expected_entry:os.stat_result|None,
     expected_fingerprint:_SerializationEntryFingerprint|None,
+    transaction:'FileDestinationTransaction',
     *,
     restored_mode:int|None = None,
     restored_times:tuple[int, int]|None = None,
@@ -1926,9 +1896,8 @@ def _publish_serialization_bytes(
     descriptor:int|None = None
     temporary_name:str|None = None
     temporary_path:Path|None = None
+    temporary_stat:os.stat_result|None = None
     temporary_needs_cleanup = False
-    publication:_SerializationPublication|None = None
-    captured_backup_name:str|None = None
     try:
         descriptor, temporary_name, temporary_path = _open_serialization_temp(parent)
         temporary_needs_cleanup = True
@@ -1959,9 +1928,8 @@ def _publish_serialization_bytes(
         descriptor = None
         temporary_fingerprint = _serialization_entry_fingerprint(
             parent, temporary_name)
-        if not _same_entry(temporary_stat, cast(
-                os.stat_result,
-                _serialization_entry_stat(parent, temporary_name))):
+        temporary_entry = _serialization_entry_stat(parent, temporary_name)
+        if temporary_entry is None or not _same_entry(temporary_stat, temporary_entry):
             raise OSError('profile serialization temporary identity changed')
 
         destination = parent.path / destination_name
@@ -1975,45 +1943,60 @@ def _publish_serialization_bytes(
             _move_serialization_entry_no_replace(
                 parent, temporary_name, destination_name)
             temporary_needs_cleanup = False
+            transaction._record_publication_capture(  # pylint: disable=protected-access
+                temporary_fingerprint, None)
             published = _serialization_entry_fingerprint(
                 parent, destination_name)
             if not _serialization_fingerprints_match(
                 temporary_fingerprint, published, include_ctime=False
             ):
-                _remove_absent_serialization_publication(
-                    parent, destination_name, temporary_fingerprint)
                 raise OSError('profile serialization publication changed')
-            try:
-                _sync_serialization_directory(parent)
-            except Exception:
-                _remove_absent_serialization_publication(
-                    parent, destination_name, temporary_fingerprint)
-                raise
-            publication = _SerializationPublication(
+            transaction._record_publication_verified(  # pylint: disable=protected-access
+                published)
+            _sync_serialization_directory(parent)
+            return _SerializationPublication(
                 SerializationResult(serialized, modified_at), published, None)
-            return publication
 
         if expected_entry is None:
             raise OSError('profile serialization expected state is invalid')
-        captured_backup_name = _replace_serialization_entry_with_backup(
-            parent, temporary_name, destination_name)
+        try:
+            captured_backup_name = _replace_serialization_entry_with_backup(
+                parent, temporary_name, destination_name)
+        except _SerializationReplaceFailure as replace_error:
+            observation = replace_error.observation
+            if observation.backup.exists is not False:
+                captured_backup_name = replace_error.backup_name
+                transaction._record_publication_capture(  # pylint: disable=protected-access
+                    temporary_fingerprint, captured_backup_name)
+                temporary_needs_cleanup = observation.replacement.exists is not False
+                if observation.destination.exists is False:
+                    _move_serialization_entry_no_replace(
+                        parent, captured_backup_name, destination_name)
+                    transaction._clear_publication_capture()  # pylint: disable=protected-access
+                    _sync_serialization_directory(parent)
+            else:
+                expected_identity = (
+                    expected_fingerprint.device, expected_fingerprint.inode)
+                temporary_identity = (
+                    temporary_fingerprint.device, temporary_fingerprint.inode)
+                if not (
+                    observation.destination.exists is True
+                    and observation.destination.identity == expected_identity
+                    and observation.replacement.exists is True
+                    and observation.replacement.identity == temporary_identity
+                ):
+                    _log.error(
+                        'profile serialization replacement failure has an '
+                        'unrecoverable observed outcome')
+            raise
         temporary_needs_cleanup = False
+        transaction._record_publication_capture(  # pylint: disable=protected-access
+            temporary_fingerprint, captured_backup_name)
         captured = _serialization_entry_fingerprint(
             parent, captured_backup_name)
         if not _captured_serialization_entry_matches(
             destination_before_capture, expected_fingerprint, captured
         ):
-            try:
-                _restore_existing_serialization_entry(
-                    parent,
-                    captured_backup_name,
-                    destination_name,
-                    temporary_fingerprint,
-                )
-                captured_backup_name = None
-            except _SerializationRecoveryError as recovery_error:
-                captured_backup_name = recovery_error.backup_name
-                raise
             raise OSError('profile serialization destination changed')
         _set_serialization_entry_times(
             parent,
@@ -2025,39 +2008,15 @@ def _publish_serialization_bytes(
         if not _serialization_fingerprints_match(
             temporary_fingerprint, published, include_ctime=False
         ):
-            try:
-                _restore_existing_serialization_entry(
-                    parent,
-                    captured_backup_name,
-                    destination_name,
-                    temporary_fingerprint,
-                )
-                captured_backup_name = None
-            except _SerializationRecoveryError as recovery_error:
-                captured_backup_name = recovery_error.backup_name
-                raise
             raise OSError('profile serialization publication changed')
-        try:
-            _sync_serialization_directory(parent)
-        except Exception:
-            try:
-                _restore_existing_serialization_entry(
-                    parent,
-                    captured_backup_name,
-                    destination_name,
-                    temporary_fingerprint,
-                )
-                captured_backup_name = None
-            except _SerializationRecoveryError as recovery_error:
-                captured_backup_name = recovery_error.backup_name
-                raise
-            raise
-        publication = _SerializationPublication(
+        transaction._record_publication_verified(  # pylint: disable=protected-access
+            published)
+        _sync_serialization_directory(parent)
+        return _SerializationPublication(
             SerializationResult(serialized, modified_at),
             published,
             captured_backup_name,
         )
-        return publication
     finally:
         if descriptor is not None:
             try:
@@ -2066,12 +2025,16 @@ def _publish_serialization_bytes(
                 pass
         if temporary_name is not None and temporary_needs_cleanup:
             try:
-                _unlink_serialization_entry(parent, temporary_name)
+                if temporary_stat is None:
+                    # The exclusive generated name is already transaction-owned
+                    # even if writing or its first descriptor stat failed.
+                    _unlink_serialization_entry(parent, temporary_name)
+                else:
+                    _unlink_owned_serialization_entry(
+                        parent, temporary_name, temporary_stat)
             except OSError:
-                pass
-        # A returned publication transfers exact backup ownership to its caller.
-        if publication is None and captured_backup_name is not None:
-            _log.error('profile serialization retained a recovery backup')
+                _log.error(
+                    'profile serialization temporary recovery cleanup failed')
 
 
 def _atomic_write_bytes(
@@ -2122,6 +2085,10 @@ class FileDestinationTransaction:
     _prior_fingerprint:_SerializationEntryFingerprint|None
     _published_fingerprint:_SerializationEntryFingerprint|None = None
     _backup_name:str|None = None
+    _published_ctime_exact:bool = False
+    _quarantine_name:str|None = None
+    _outgoing_name:str|None = None
+    _recovery_names:set[str] = field(default_factory=set)
     _active:bool = True
 
     @classmethod
@@ -2175,6 +2142,26 @@ class FileDestinationTransaction:
     def serialize(self, obj:dict[str, Any]) -> SerializationResult:
         return self._serialize_bytes(serialize_bytes(obj))
 
+    def _record_publication_capture(
+        self,
+        published:_SerializationEntryFingerprint,
+        backup_name:str|None,
+    ) -> None:
+        self._published_fingerprint = published
+        self._published_ctime_exact = False
+        self._backup_name = backup_name
+
+    def _record_publication_verified(
+        self, published:_SerializationEntryFingerprint
+    ) -> None:
+        self._published_fingerprint = published
+        self._published_ctime_exact = True
+
+    def _clear_publication_capture(self) -> None:
+        self._published_fingerprint = None
+        self._published_ctime_exact = False
+        self._backup_name = None
+
     def _serialize_bytes(
         self,
         serialized:bytes,
@@ -2191,17 +2178,20 @@ class FileDestinationTransaction:
                 serialized,
                 self._prior_entry,
                 self._prior_fingerprint,
+                self,
                 restored_mode=restored_mode,
                 restored_times=restored_times,
             )
-            self._published_fingerprint = publication.published
-            self._backup_name = publication.backup_name
             return publication.result
         except Exception:
             raise OSError('profile destination publication failed') from None
 
     def commit(self) -> None:
-        if not self._active or self._published_fingerprint is None:
+        if (
+            not self._active
+            or self._published_fingerprint is None
+            or not self._published_ctime_exact
+        ):
             raise OSError('profile destination commit failed')
         try:
             current = _serialization_entry_fingerprint(
@@ -2210,11 +2200,33 @@ class FileDestinationTransaction:
                 self._published_fingerprint, current, include_ctime=True
             ):
                 raise OSError('profile destination ownership changed')
-            if self._backup_name is not None:
-                _unlink_serialization_entry(self._parent, self._backup_name)
-                self._backup_name = None
+            # This is the last propagated durability barrier. For an existing
+            # destination it deliberately runs while the exact prior backup is
+            # still available for rollback.
+            _sync_serialization_directory(self._parent)
+            backup_name = self._backup_name
+            if backup_name is None:
+                self._finish_after_irreversible(
+                    'profile destination post-commit durability warning')
+                return
+            try:
+                _unlink_serialization_entry(self._parent, backup_name)
+            except Exception: # pylint: disable=broad-except
+                # A native unlink can report a close error after disposition
+                # succeeded. Once the exact owned name is gone, commit is
+                # irreversible and must not be reported as rollback-capable.
+                if _serialization_entry_stat(self._parent, backup_name) is not None:
+                    raise
+                _log.warning(
+                    'profile destination post-commit durability warning')
+            self._backup_name = None
+            try:
                 _sync_serialization_directory(self._parent)
-            self._finish()
+            except Exception: # pylint: disable=broad-except
+                _log.warning(
+                    'profile destination post-commit durability warning')
+            self._finish_after_irreversible(
+                'profile destination post-commit durability warning')
         except Exception:
             raise OSError('profile destination commit failed') from None
 
@@ -2226,82 +2238,161 @@ class FileDestinationTransaction:
             return
         try:
             _serialization_prerollback_hook(self.destination)
-            current_before_capture = _serialization_entry_stat(
-                self._parent, self.destination.name)
             if not self.existed:
-                self._rollback_absent(current_before_capture)
+                self._rollback_absent()
             else:
-                self._rollback_existing(current_before_capture)
-            self._finish()
-        except Exception:
-            if self._active:
-                self._finish(preserve_backup=self._backup_name is not None)
+                self._rollback_existing()
+            self._finish_after_irreversible(
+                'profile destination post-rollback durability warning')
+        except Exception: # pylint: disable=broad-except
+            # Recovery names and the retained canonical parent stay attached to
+            # this transaction so a caller can retry after a transient verifier
+            # or metadata failure. No generated entry is forgotten or scanned.
             raise OSError('profile destination rollback failed') from None
 
-    def _rollback_absent(
+    def _publication_capture_matches(
         self,
         current_before_capture:os.stat_result|None,
-    ) -> None:
-        published = cast(
-            _SerializationEntryFingerprint, self._published_fingerprint)
+        captured:_SerializationEntryFingerprint,
+    ) -> bool:
+        published = self._published_fingerprint
+        return bool(
+            published is not None
+            and current_before_capture is not None
+            and _serialization_stat_matches_fingerprint(
+                current_before_capture,
+                published,
+                include_ctime=self._published_ctime_exact,
+            )
+            and _serialization_fingerprints_match(
+                published, captured, include_ctime=False)
+            and captured.ctime_ns >= published.ctime_ns
+        )
+
+    def _restore_quarantined_publication(self) -> None:
+        quarantine_name = self._quarantine_name
+        if quarantine_name is None:
+            return
+        _move_serialization_entry_no_replace(
+            self._parent, quarantine_name, self.destination.name)
+        self._quarantine_name = None
+        # Rename updates ctime. The original content/identity expectation stays
+        # valid, but a later retry must accept that known recovery transition.
+        self._published_ctime_exact = False
+        _sync_serialization_directory(self._parent)
+
+    def _rollback_absent(self) -> None:
+        if self._quarantine_name is not None:
+            self._restore_quarantined_publication()
+        current_before_capture = _serialization_entry_stat(
+            self._parent, self.destination.name)
         quarantine_name = _new_serialization_entry_name(
             self._parent, '.quarantine')
         _move_serialization_entry_no_replace(
             self._parent, self.destination.name, quarantine_name)
-        captured = _serialization_entry_fingerprint(
-            self._parent, quarantine_name)
-        if not (
-            current_before_capture is not None
-            and _serialization_stat_matches_fingerprint(
-                current_before_capture, published, include_ctime=True)
-            and _serialization_fingerprints_match(
-                published, captured, include_ctime=False)
-            and captured.ctime_ns >= published.ctime_ns
-        ):
-            _move_serialization_entry_no_replace(
-                self._parent, quarantine_name, self.destination.name)
-            _sync_serialization_directory(self._parent)
-            raise OSError('profile destination ownership changed')
-        _unlink_serialization_entry(self._parent, quarantine_name)
+        # Publish quarantine ownership before hashing/statting the captured
+        # entry. Every later exception can therefore restore or retain it.
+        self._quarantine_name = quarantine_name
+        try:
+            captured = _serialization_entry_fingerprint(
+                self._parent, quarantine_name)
+            if not self._publication_capture_matches(
+                current_before_capture, captured):
+                raise OSError('profile destination ownership changed')
+        except Exception: # pylint: disable=broad-except
+            try:
+                self._restore_quarantined_publication()
+            except Exception: # pylint: disable=broad-except
+                # Preserve both destination and exact quarantine.
+                pass
+            raise
+        # Verify directory durability while the publication is recoverable from
+        # quarantine. Its exact unlink is the irreversible rollback point.
         _sync_serialization_directory(self._parent)
+        _unlink_serialization_entry(self._parent, quarantine_name)
+        self._quarantine_name = None
+        try:
+            _sync_serialization_directory(self._parent)
+        except Exception: # pylint: disable=broad-except
+            _log.warning(
+                'profile destination post-rollback durability warning')
 
-    def _rollback_existing(
-        self,
-        current_before_capture:os.stat_result|None,
-    ) -> None:
-        backup_name = self._backup_name
+    def _replace_for_existing_rollback(
+        self, replacement_name:str
+    ) -> str:
+        try:
+            return _replace_serialization_entry_with_backup(
+                self._parent, replacement_name, self.destination.name)
+        except _SerializationReplaceFailure as replace_error:
+            observation = replace_error.observation
+            recovery_name = replace_error.backup_name
+            if observation.backup.exists is not False:
+                if observation.destination.exists is False:
+                    _move_serialization_entry_no_replace(
+                        self._parent, recovery_name, self.destination.name)
+                    _sync_serialization_directory(self._parent)
+                elif observation.replacement.exists is False:
+                    return recovery_name
+                else:
+                    self._recovery_names.add(recovery_name)
+            raise
+
+    def _rollback_existing(self) -> None:
         published = self._published_fingerprint
-        if backup_name is None or published is None:
+        if published is None:
             raise OSError('profile destination rollback state is invalid')
-        outgoing_name = _replace_serialization_entry_with_backup(
-            self._parent, backup_name, self.destination.name)
+        if self._outgoing_name is not None:
+            self._backup_name = self._replace_for_existing_rollback(
+                self._outgoing_name)
+            self._outgoing_name = None
+        backup_name = self._backup_name
+        if backup_name is None:
+            raise OSError('profile destination rollback state is invalid')
+        if self.atime_ns is not None and self.mtime_ns is not None:
+            _set_serialization_entry_times(
+                self._parent, backup_name, (self.atime_ns, self.mtime_ns))
+        current_before_capture = _serialization_entry_stat(
+            self._parent, self.destination.name)
+        outgoing_name = self._replace_for_existing_rollback(backup_name)
         self._backup_name = None
+        self._outgoing_name = outgoing_name
         try:
             captured = _serialization_entry_fingerprint(
                 self._parent, outgoing_name)
-            if not (
-                current_before_capture is not None
-                and _serialization_stat_matches_fingerprint(
-                    current_before_capture, published, include_ctime=True)
-                and _serialization_fingerprints_match(
-                    published, captured, include_ctime=False)
-                and captured.ctime_ns >= published.ctime_ns
-            ):
+            if not self._publication_capture_matches(
+                current_before_capture, captured):
                 raise OSError('profile destination ownership changed')
         except Exception:
-            self._backup_name = _replace_serialization_entry_with_backup(
-                self._parent, outgoing_name, self.destination.name)
+            self._backup_name = self._replace_for_existing_rollback(
+                outgoing_name)
+            self._outgoing_name = None
             _sync_serialization_directory(self._parent)
             raise
-        _unlink_serialization_entry(self._parent, outgoing_name)
         _sync_serialization_directory(self._parent)
+        _unlink_serialization_entry(self._parent, outgoing_name)
+        self._outgoing_name = None
+        try:
+            _sync_serialization_directory(self._parent)
+        except Exception: # pylint: disable=broad-except
+            _log.warning(
+                'profile destination post-rollback durability warning')
 
-    def _finish(self, *, preserve_backup:bool = False) -> None:
+    def _finish_after_irreversible(self, warning:str) -> None:
+        try:
+            self._finish()
+        except Exception: # pylint: disable=broad-except
+            _log.warning(warning)
+
+    def _finish(self) -> None:
         if self._active:
             self.content = None
             self.symlink_target = None
-            if not preserve_backup:
-                self._backup_name = None
+            self._published_fingerprint = None
+            self._published_ctime_exact = False
+            self._backup_name = None
+            self._quarantine_name = None
+            self._outgoing_name = None
+            self._recovery_names.clear()
             self._active = False
             self._parent.close()
 
