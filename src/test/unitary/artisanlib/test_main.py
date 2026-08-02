@@ -5,6 +5,7 @@
 # This MUST happen before any other imports to prevent contamination
 
 import sys
+from types import SimpleNamespace
 
 # Enhanced Qt restoration logic to handle interference from other test modules
 qt_module_names = ['PyQt6', 'PyQt6.QtCore', 'PyQt6.QtWidgets', 'PyQt6.QtGui']
@@ -118,7 +119,7 @@ import tempfile
 from pathlib import Path
 from collections.abc import Generator
 from typing import Any
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 from uuid import UUID
 
 import numpy as np
@@ -194,6 +195,7 @@ from artisanlib.atypes import ProfileData, RecentRoast
 from artisanlib.main import ApplicationWindow, UI_MODE
 from artisanlib.roastserver import dialogs as roastserver_dialogs
 from artisanlib.roastserver.contract import MAX_PROFILE_BYTES, Namespace, ServerProfileSource
+from artisanlib.util import FileDestinationTransaction
 from artisanlib.util import deserialize as util_deserialize
 from artisanlib.util import serialize_with_timestamp as util_serialize_with_timestamp
 from artisanlib.widgets import MyQLCDNumber, SliderUnclickable
@@ -4778,8 +4780,90 @@ class TestRoastServerMainIntegration:
         assert copy.deepcopy(observed_state()) == before
         window.consolidateSpecialEvents.assert_not_called()
         window.ensureCorrectExtraDeviceListLength.assert_not_called()
-        window.computedProfileInformation.assert_called_once_with(update_bbp=False)
+        window.computedProfileInformation.assert_not_called()
+        assert 'computed' not in profile
         qmc.adderror.assert_not_called()
+
+    def test_canvas_server_reset_skips_dirty_external_and_presentation_hooks_on_failure(
+        self,
+    ) -> None:
+        from artisanlib.canvas import tgraphcanvas
+
+        class Semaphore:
+            @staticmethod
+            def acquire(_count: int) -> None:
+                return None
+
+            @staticmethod
+            def available() -> int:
+                return 1
+
+            @staticmethod
+            def release(_count: int) -> None:
+                raise AssertionError('unexpected semaphore release')
+
+        aw = MagicMock()
+        aw.resetBBPMetrics.side_effect = RuntimeError('injected reset failure')
+        canvas = SimpleNamespace(
+            aw=aw,
+            checkSaved=Mock(side_effect=AssertionError('dirty prompt called')),
+            restoreExtraDeviceSettingsBackup=Mock(),
+            resetTimer=Mock(),
+            profileDataSemaphore=Semaphore(),
+            designerflag=False,
+            roastUUID='sentinel',
+            roastbatchnr=4,
+            roastbatchpos=2,
+            roastbatchprefix='old',
+            batchprefix='batch',
+            scheduleID='schedule',
+            scheduleDate='date',
+            plus_sync_record_hash='hash',
+            plus_file_last_modified=123.0,
+            end_weight_est=1.0,
+            roastpropertiesflag=False,
+            flagKeepON=False,
+            weight=(1.0, 2.0, 'g'),
+            volume=(1.0, 2.0, 'l'),
+            roasted_defects_weight=1.0,
+            timex=[],
+            cuppingnotes='notes',
+            whole_color=1.0,
+            ground_color=2.0,
+            moisture_roasted=3.0,
+            density_roasted=(1.0, 'g', 1.0, 'l'),
+            AUCvalue=1.0,
+            AUCsinceFCs=1.0,
+            AUCguideTime=1.0,
+            profile_sampling_interval=1.0,
+            statisticstimes=[1, 2, 3, 4, 5],
+            flagon=False,
+            errorlog=['sentinel'],
+            meterreads=[],
+            meterreads_default=[],
+            clearMeasurements=Mock(),
+            backgroundprofile=None,
+            autotimex=False,
+            background=False,
+            locktimex=False,
+            endofx=60,
+            adderror=Mock(),
+        )
+
+        assert tgraphcanvas.reset(
+            canvas, redraw=False, soundOn=True, server_read_only=True)
+
+        canvas.checkSaved.assert_not_called()
+        canvas.restoreExtraDeviceSettingsBackup.assert_not_called()
+        canvas.resetTimer.assert_not_called()
+        aw.eventactionx.assert_not_called()
+        aw.soundpopSignal.emit.assert_not_called()
+        aw.buttonONOFF.setText.assert_not_called()
+        aw.buttonSTARTSTOP.setText.assert_not_called()
+        aw.setTimerColorSignal.emit.assert_not_called()
+        aw.ntb.update.assert_not_called()
+        canvas.clearMeasurements.assert_called_once_with(
+            update_presentation=False)
 
     def test_computed_profile_read_only_mode_does_not_update_bbp(self) -> None:
         window = ApplicationWindow.__new__(ApplicationWindow)
@@ -4860,6 +4944,7 @@ class TestRoastServerReadOnlyLoad:
         window.roastserver_controller.current_protection_token.return_value = (
             protection_token)
         window.roastserver_controller.record_open_source.return_value = object()
+        window.roastserver_controller.owns_protection_token.return_value = True
         window.roastserver_controller.record_local_save.return_value = protection_token
         window.roastserver_controller.restore_protection.return_value = True
         window.qmc = Mock()
@@ -4877,6 +4962,7 @@ class TestRoastServerReadOnlyLoad:
         window.qmc.statssummary = False
         window.qmc.autotimex = False
         window.qmc.reset = Mock(return_value=True)
+        window.qmc.checkSaved = Mock(return_value=True)
         window.qmc.fileDirtySignal = Mock()
         window.qmc.fileDirtySignal.emit = Mock()
         window.qmc.fileCleanSignal = Mock()
@@ -5045,33 +5131,195 @@ class TestRoastServerReadOnlyLoad:
             setattr(window.qmc, name, value)
         return window, previous
 
-    def test_server_load_protects_exact_expected_token_before_deserialize(
+    def test_server_load_checks_dirty_state_before_snapshot_protect_and_deserialize(
         self, tmp_path: Path
     ) -> None:
         window, _previous = self.load_window()
         cache_file = tmp_path / 'cache.alog'
         cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
-        expected_token = object()
+        old_token = object()
         opened_token = object()
-        window.roastserver_controller.current_protection_token.return_value = (
-            expected_token)
+        current_token: list[object | None] = [old_token]
+        old_source = (tmp_path / 'old-cache.alog', SERVER_SOURCE)
+        window.roastserver_open_source = old_source
         ordering: list[str] = []
 
-        def protect(*_args: Any, **_kwargs: Any) -> object:
+        def check_saved() -> bool:
+            ordering.append('check-saved')
+            # Model the nested Save As performed by checkSaved(): it releases T0
+            # and clears the old transient source before the outer load captures state.
+            assert current_token[0] is old_token
+            current_token[0] = None
+            window.roastserver_open_source = None
+            return True
+
+        def snapshot_profile(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            ordering.append('snapshot')
+            assert current_token[0] is None
+            assert window.roastserver_open_source is None
+            return copy.deepcopy(_previous)
+
+        def protect(*_args: Any, **kwargs: Any) -> object:
             ordering.append('protect')
+            assert kwargs['expected'] is None
+            current_token[0] = opened_token
             return opened_token
 
         def read_profile(path: str) -> dict[str, Any]:
             ordering.append('deserialize')
             return util_deserialize(path)
 
+        window.qmc.checkSaved.side_effect = check_saved
+        window.getProfile.side_effect = snapshot_profile
+        window.roastserver_controller.current_protection_token.side_effect = (
+            lambda: current_token[0])
         window.roastserver_controller.record_open_source.side_effect = protect
         with patch('artisanlib.main.deserialize', side_effect=read_profile):
             assert window.loadFile(str(cache_file), server_source=SERVER_SOURCE)
 
-        assert ordering[:2] == ['protect', 'deserialize']
-        window.roastserver_controller.record_open_source.assert_called_once_with(
-            cache_file, SERVER_SOURCE, expected=expected_token)
+        assert ordering[:4] == [
+            'check-saved', 'snapshot', 'protect', 'deserialize']
+        window.qmc.reset.assert_called_with(
+            redraw=False, soundOn=False, server_read_only=True)
+
+    def test_dirty_server_load_completes_real_nested_save_as_before_protecting_t1(
+        self, tmp_path: Path
+    ) -> None:
+        from artisanlib.canvas import tgraphcanvas
+
+        window, previous = self.load_window()
+        incoming = tmp_path / 'incoming-cache.alog'
+        incoming.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        old_cache = tmp_path / 'old-cache.alog'
+        old_cache.write_bytes(b'old protected cache')
+        nested_destination = tmp_path / 'nested-save-as.alog'
+        window.curFile = None
+        window.roastserver_open_source = (old_cache, SERVER_SOURCE)
+        window.qmc.safesaveflag = True
+        window.qmc.timex = [0.0, 1.0, 2.0, 3.0]
+        check_saved_canvas = SimpleNamespace(
+            safesaveflag=True,
+            timex=window.qmc.timex,
+            aw=window,
+            fileCleanSignal=window.qmc.fileCleanSignal,
+        )
+        window.qmc.autosaveimage = False
+        window.qmc.flagon = False
+        window.qmc.plus_store = None
+        window.qmc.plus_store_label = None
+        window.qmc.plus_coffee = None
+        window.qmc.plus_coffee_label = None
+        window.qmc.plus_blend_spec = None
+        window.qmc.plus_blend_label = None
+        window.qmc.plus_blend_spec_labels = None
+        window.qmc.roastUUID = previous['roastUUID']
+        window.qmc.roastbatchnr = 0
+        window.qmc.roastbatchprefix = ''
+        window.qmc.autosaveprefix = ''
+        window.qmc.batchcounter = -1
+        window.qmc.batchprefix = ''
+        window.getDefaultPath = Mock(return_value=str(tmp_path))
+        window.generateFilename = Mock(return_value='nested-save-as.alog')
+        window.ArtisanSaveFileDialog = Mock(return_value=str(nested_destination))
+        window.MaxRecentFiles = 20
+        window.roastServerRecentFiles = Mock(return_value=[])
+        window.roastServerWriteRecentFiles = Mock()
+        window.roastServerPlusPath = Mock(return_value=None)
+        window.roastServerSetPlusPath = Mock(return_value=True)
+        window.roastServerRestorePlusPath = Mock(return_value=True)
+        window.refreshRoastServerActions = Mock()
+        window.getProfile.return_value = copy.deepcopy(previous)
+        window.qmc.fileCleanSignal.emit.side_effect = lambda: setattr(
+            window.qmc, 'safesaveflag', False)
+        old_token = object()
+        incoming_token = object()
+        current_token: list[object | None] = [old_token]
+        transitions: list[tuple[str, object | None]] = []
+
+        def release(_path: Path, *, expected: object) -> object:
+            assert expected is old_token
+            assert current_token[0] is old_token
+            transitions.append(('release-t0', current_token[0]))
+            current_token[0] = None
+            return old_token
+
+        def protect(
+            _path: Path,
+            _source: ServerProfileSource,
+            *,
+            expected: object | None,
+        ) -> object:
+            assert expected is None
+            assert current_token[0] is None
+            transitions.append(('protect-t1', current_token[0]))
+            current_token[0] = incoming_token
+            return incoming_token
+
+        window.roastserver_controller.current_protection_token.side_effect = (
+            lambda: current_token[0])
+        window.roastserver_controller.record_local_save.side_effect = release
+        window.roastserver_controller.record_open_source.side_effect = protect
+        window.roastserver_controller.owns_protection_token.side_effect = (
+            lambda token: current_token[0] is token)
+        window.qmc.checkSaved.side_effect = lambda: tgraphcanvas.checkSaved(
+            check_saved_canvas)
+
+        with patch.object(
+            main_module.QMessageBox,
+            'warning',
+            return_value=main_module.QMessageBox.StandardButton.Save,
+        ):
+            assert window.loadFile(str(incoming), server_source=SERVER_SOURCE)
+
+        assert nested_destination.exists()
+        assert transitions == [('release-t0', old_token), ('protect-t1', None)]
+        assert current_token[0] is incoming_token
+        assert window.roastserver_open_source == (incoming, SERVER_SOURCE)
+
+    def test_cancelled_nested_save_as_aborts_before_snapshot_or_protection(
+        self, tmp_path: Path
+    ) -> None:
+        window, _previous = self.load_window()
+        cache_file = tmp_path / 'cache.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        window.qmc.checkSaved.return_value = False
+
+        assert not window.loadFile(str(cache_file), server_source=SERVER_SOURCE)
+
+        window.getProfile.assert_not_called()
+        window.roastserver_controller.record_open_source.assert_not_called()
+        window.qmc.reset.assert_not_called()
+
+    def test_server_load_final_exact_token_mismatch_aborts_and_rolls_back(
+        self, tmp_path: Path
+    ) -> None:
+        window, _previous = self.load_window()
+        cache_file = tmp_path / 'cache.alog'
+        cache_file.write_bytes(Path('test/data/profile1.alog').read_bytes())
+        previous_token = object()
+        opened_token = object()
+        replacement_token = object()
+        current_token: list[object | None] = [previous_token]
+
+        def protect(*_args: Any, **_kwargs: Any) -> object:
+            current_token[0] = opened_token
+            return opened_token
+
+        window.roastserver_controller.current_protection_token.side_effect = (
+            lambda: current_token[0])
+        window.roastserver_controller.record_open_source.side_effect = protect
+        window.sendmessage.side_effect = lambda *_args: current_token.__setitem__(
+            0, replacement_token)
+        window.roastserver_controller.restore_protection.return_value = False
+        window.roastserver_controller.owns_protection_token.side_effect = (
+            lambda token: current_token[0] is token)
+
+        assert not window.loadFile(str(cache_file), server_source=SERVER_SOURCE)
+
+        assert window.curFile == 'previous.alog'
+        assert window.qmc.safesaveflag
+        window.roastserver_controller.restore_protection.assert_called_once_with(
+            previous_token, opened_token)
 
     def test_snapshot_copy_failure_aborts_before_protection_or_deserialize(
         self, tmp_path: Path
@@ -5127,8 +5375,10 @@ class TestRoastServerReadOnlyLoad:
                 str(cache_file), server_source=SERVER_SOURCE)
 
         deserialize_mock.assert_called_once_with(str(cache_file))
-        window.roastserver_controller.is_expected_open_source.assert_called_once_with(
-            cache_file, SERVER_SOURCE)
+        assert window.roastserver_controller.is_expected_open_source.call_args_list == [
+            call(cache_file, SERVER_SOURCE),
+            call(cache_file, SERVER_SOURCE),
+        ]
         window.plusAddPath.assert_not_called()
         window.setCurrentFile.assert_not_called()
         window.updatePlusStatus.assert_not_called()
@@ -5679,8 +5929,9 @@ class TestRoastServerReadOnlySaveTransition:
         controller.saved_profile.assert_not_called()
 
         window.ArtisanSaveFileDialog.return_value = str(destination)
-        with patch(
-            'artisanlib.main.serialize_with_timestamp',
+        with patch.object(
+            main_module.FileDestinationTransaction,
+            'serialize',
             side_effect=OSError('save failed'),
         ):
             assert not window.fileSave(None)
@@ -5694,8 +5945,7 @@ class TestRoastServerReadOnlySaveTransition:
 
     @pytest.mark.parametrize(
         'failure', [
-            'timestamp', 'autosave', 'clean', 'title', 'qsettings', 'register',
-            'refresh', 'release',
+            'clean', 'title', 'qsettings', 'register', 'refresh', 'release',
         ])
     @pytest.mark.parametrize('destination_exists', [False, True])
     def test_every_post_write_failure_restores_exact_destination_transaction(
@@ -5717,22 +5967,7 @@ class TestRoastServerReadOnlySaveTransition:
                 destination.chmod(original_mode)
             os.utime(destination, ns=original_times)
 
-        if failure == 'timestamp':
-            timestamp_context = patch(
-                'artisanlib.main.plus.util.getModificationDate',
-                side_effect=OSError('timestamp failed'),
-            )
-        else:
-            timestamp_context = patch(
-                'artisanlib.main.plus.util.getModificationDate',
-                return_value=datetime(2026, 1, 1, tzinfo=UTC),
-            )
-        if failure == 'autosave':
-            window.qmc.autosaveimage = True
-            window.qmc.flagon = False
-            window.qmc.autosavealsopath = ''
-            window.autosave.side_effect = OSError('autosave failed')
-        elif failure == 'clean':
+        if failure == 'clean':
             window.qmc.fileCleanSignal.emit.side_effect = OSError('clean failed')
         elif failure == 'title':
             window.updateWindowTitle.side_effect = OSError('title failed')
@@ -5745,8 +5980,7 @@ class TestRoastServerReadOnlySaveTransition:
         elif failure == 'release':
             controller.record_local_save.return_value = False
 
-        with timestamp_context:
-            assert not window.fileSave(None)
+        assert not window.fileSave(None)
 
         if destination_exists:
             after_stat = destination.stat()
@@ -5771,12 +6005,19 @@ class TestRoastServerReadOnlySaveTransition:
             destination.write_bytes(original_bytes)
             original_stat = destination.stat()
 
-        def publish_then_fail(filename: str, profile: dict[str, Any]) -> object:
-            util_serialize_with_timestamp(filename, profile)
+        real_serialize = FileDestinationTransaction.serialize
+
+        def publish_then_fail(
+            transaction: FileDestinationTransaction,
+            profile: dict[str, Any],
+        ) -> object:
+            real_serialize(transaction, profile)
             raise OSError('injected postpublication failure')
 
-        with patch(
-            'artisanlib.main.serialize_with_timestamp',
+        with patch.object(
+            main_module.FileDestinationTransaction,
+            'serialize',
+            autospec=True,
             side_effect=publish_then_fail,
         ):
             assert not window.fileSave(None)
@@ -5803,6 +6044,62 @@ class TestRoastServerReadOnlySaveTransition:
         assert after.st_mtime_ns == before.st_mtime_ns
         controller.record_local_save.assert_not_called()
         controller.saved_profile.assert_not_called()
+
+    def test_server_save_as_runs_auxiliary_export_only_after_commit_as_best_effort(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, _cache_file, destination = self.source_window(tmp_path)
+        window.qmc.autosaveimage = True
+        window.qmc.flagon = False
+        window.qmc.autosavealsopath = ''
+        window.autosave.side_effect = OSError('auxiliary export failed')
+        ordered: list[str] = []
+        real_commit = main_module.FileDestinationTransaction.commit
+
+        def commit(transaction: FileDestinationTransaction) -> None:
+            real_commit(transaction)
+            ordered.append('commit')
+
+        window.autosave.side_effect = lambda *_args: (
+            ordered.append('autosave'),
+            (_ for _ in ()).throw(OSError('auxiliary export failed')),
+        )
+        with patch.object(
+            main_module.FileDestinationTransaction, 'commit', commit
+        ):
+            assert window.fileSave(None)
+
+        assert ordered == ['commit', 'autosave']
+        assert destination.exists()
+        assert window.roastserver_open_source is None
+        controller.saved_profile.assert_called_once()
+        assert any(
+            'auxiliary' in str(call.args[0]).lower()
+            for call in window.qmc.adderror.call_args_list
+        )
+
+    @pytest.mark.parametrize('failure', ['qsettings', 'register', 'release'])
+    def test_precommit_failure_never_runs_or_leaves_auxiliary_export(
+        self, tmp_path: Path, failure: str
+    ) -> None:
+        window, controller, _cache_file, destination = self.source_window(tmp_path)
+        auxiliary = tmp_path / 'saved-as.pdf'
+        window.qmc.autosaveimage = True
+        window.qmc.flagon = False
+        window.qmc.autosavealsopath = ''
+        window.autosave.side_effect = lambda *_args: auxiliary.write_bytes(b'residue')
+        if failure == 'qsettings':
+            window.roastServerWriteRecentFiles.side_effect = OSError('settings failed')
+        elif failure == 'register':
+            window.roastServerSetPlusPath.return_value = False
+        else:
+            controller.record_local_save.return_value = False
+
+        assert not window.fileSave(None)
+
+        window.autosave.assert_not_called()
+        assert not auxiliary.exists()
+        assert not destination.exists()
 
     def test_server_save_as_releases_expected_token_as_final_fallible_commit(
         self, tmp_path: Path

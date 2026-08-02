@@ -18,6 +18,7 @@ Key Features:
 from datetime import UTC, datetime
 import os
 import stat
+import subprocess
 import warnings
 import math
 import pytest
@@ -178,6 +179,7 @@ from artisanlib.util import (
     medfilt,
     polyRoR,
     arrayRoR,
+    FileDestinationTransaction,
     deserialize,
     serialize,
     serialize_with_timestamp,
@@ -2278,9 +2280,13 @@ class TestSerialize:
             events.append('fsync')
             real_fsync(descriptor)
 
-        def recording_replace(source: str, target: str) -> None:
+        def recording_replace(
+            source: str,
+            target: str,
+            **kwargs: Any,
+        ) -> None:
             events.append('replace')
-            real_replace(source, target)
+            real_replace(source, target, **kwargs)
 
         monkeypatch.setattr('artisanlib.util.os.write', recording_write)
         monkeypatch.setattr('artisanlib.util.os.fsync', recording_fsync)
@@ -2387,18 +2393,11 @@ class TestSerialize:
         destination.write_bytes(b'first entry')
         replacement = tmp_path / 'racer.alog'
         replacement.write_bytes(b'racer entry')
-        real_lstat = os.lstat
-        destination_stats = 0
+        def race(_destination: Path) -> None:
+            os.replace(replacement, destination)
 
-        def racing_lstat(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> os.stat_result:
-            nonlocal destination_stats
-            if os.fspath(path) == str(destination):
-                destination_stats += 1
-                if destination_stats == 2:
-                    os.replace(replacement, destination)
-            return real_lstat(path)
-
-        monkeypatch.setattr('artisanlib.util.os.lstat', racing_lstat)
+        monkeypatch.setattr(
+            'artisanlib.util._serialization_prepublish_hook', race)
 
         with pytest.raises(OSError, match='profile serialization failed'):
             serialize(str(destination), {'value': 'must not win race'})
@@ -2464,6 +2463,162 @@ class TestSerialize:
         assert destination.read_bytes() == b'attacker entry'
         assert not list(tmp_path.glob('.artisan-*.tmp'))
 
+    @pytest.mark.parametrize('destination_exists', [False, True])
+    def test_destination_transaction_publication_cas_preserves_concurrent_entry(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        destination_exists: bool,
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'transaction-race.alog'
+        if destination_exists:
+            destination.write_bytes(b'prior entry')
+        attacker = tmp_path / 'attacker.alog'
+        attacker.write_bytes(b'concurrent entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+
+        def race(_destination: Path) -> None:
+            os.replace(attacker, destination)
+
+        monkeypatch.setattr(
+            util_module, '_serialization_prepublish_hook', race)
+        with pytest.raises(OSError, match='profile destination publication failed'):
+            transaction.serialize({'value': 'must not publish'})
+        transaction.rollback()
+
+        assert destination.read_bytes() == b'concurrent entry'
+        assert not list(tmp_path.glob('.artisan-*.tmp'))
+
+    @pytest.mark.parametrize('destination_exists', [False, True])
+    def test_destination_transaction_rollback_never_replaces_concurrent_entry(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        destination_exists: bool,
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'transaction-rollback-race.alog'
+        if destination_exists:
+            destination.write_bytes(b'prior entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        transaction.serialize({'value': 'published'})
+        attacker = tmp_path / 'attacker.alog'
+        attacker.write_bytes(b'concurrent replacement')
+
+        def race(_destination: Path) -> None:
+            os.replace(attacker, destination)
+
+        monkeypatch.setattr(
+            util_module, '_serialization_prerollback_hook', race)
+        with pytest.raises(OSError, match='profile destination rollback failed'):
+            transaction.rollback()
+
+        assert destination.read_bytes() == b'concurrent replacement'
+        assert not list(tmp_path.glob('.artisan-*.tmp'))
+
+    def test_windows_transaction_uses_retained_canonical_parent_for_every_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        requested_parent = tmp_path / 'requested' / 'parent'
+        canonical_parent = tmp_path / 'canonical' / 'parent'
+        requested_parent.mkdir(parents=True)
+        canonical_parent.mkdir(parents=True)
+        requested = requested_parent / 'profile.alog'
+        canonical = canonical_parent / requested.name
+        events: list[tuple[str, Path, Path] | tuple[str, Path]] = []
+
+        class Native:
+            @staticmethod
+            def open_readonly(path: Path, *, directory: bool = False) -> int:
+                selected = canonical_parent if directory else path
+                flags = os.O_RDONLY
+                if directory:
+                    flags |= getattr(os, 'O_DIRECTORY', 0)
+                return os.open(selected, flags)
+
+            @staticmethod
+            def canonical_path(_descriptor: int) -> Path:
+                return canonical_parent
+
+            @staticmethod
+            def replace(source: Path, target: Path) -> None:
+                events.append(('replace', source, target))
+                os.replace(source, target)
+
+            @staticmethod
+            def flush_directory(directory: Path) -> None:
+                events.append(('flush', directory))
+
+        monkeypatch.setattr(
+            util_module, '_serialization_is_windows', lambda: True)
+        monkeypatch.setattr(
+            util_module, '_serialization_windows_native', Native)
+
+        transaction = FileDestinationTransaction.begin(
+            str(requested), max_bytes=1024)
+        transaction.serialize({'value': 'canonical'})
+        transaction.commit()
+
+        assert not requested.exists()
+        assert canonical.read_bytes() == b"{'value': 'canonical'}"
+        assert events
+        for event in events:
+            assert requested_parent not in event[1:]
+            assert all(
+                requested_parent not in path.parents
+                for path in event[1:]
+                if isinstance(path, Path)
+            )
+
+    @pytest.mark.win32
+    @pytest.mark.skipif(os.name != 'nt', reason='requires native Windows junctions')
+    def test_windows_retained_parent_cannot_be_redirected_by_junction_rebind(
+        self, tmp_path: Path
+    ) -> None:
+        route = tmp_path / 'route'
+        original_parent = route / 'parent'
+        original_parent.mkdir(parents=True)
+        attacker_route = tmp_path / 'attacker'
+        attacker_parent = attacker_route / 'parent'
+        attacker_parent.mkdir(parents=True)
+        destination = original_parent / 'profile.alog'
+        attacker_destination = attacker_parent / destination.name
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        moved_route = tmp_path / 'moved-route'
+        try:
+            route.rename(moved_route)
+        except OSError:
+            transaction.rollback()
+            pytest.skip('Windows prevented ancestor rebind while parent handle was held')
+        junction = subprocess.run(
+            ['cmd', '/c', 'mklink', '/J', str(route), str(attacker_route)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if junction.returncode != 0:
+            transaction.rollback()
+            pytest.skip('Windows junction creation is unavailable')
+
+        try:
+            try:
+                transaction.serialize({'value': 'safe'})
+                transaction.commit()
+            except OSError:
+                transaction.rollback()
+            assert not attacker_destination.exists()
+        finally:
+            if route.exists():
+                os.rmdir(route)
+
     def test_windows_overwrite_uses_write_through_native_replace_and_flush(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2475,6 +2630,17 @@ class TestSerialize:
 
         class Native:
             @staticmethod
+            def open_readonly(path: Path, *, directory: bool = False) -> int:
+                flags = os.O_RDONLY
+                if directory:
+                    flags |= getattr(os, 'O_DIRECTORY', 0)
+                return os.open(path, flags)
+
+            @staticmethod
+            def canonical_path(_descriptor: int) -> Path:
+                return tmp_path
+
+            @staticmethod
             def replace(source: Path, target: Path) -> None:
                 events.append('replace-write-through')
                 os.replace(source, target)
@@ -2483,6 +2649,10 @@ class TestSerialize:
             def flush_directory(directory: Path) -> None:
                 assert directory == tmp_path
                 events.append('flush-directory')
+
+            @staticmethod
+            def unlink(path: Path) -> None:
+                os.unlink(path)
 
         monkeypatch.setattr(
             util_module, '_serialization_is_windows', lambda: True)

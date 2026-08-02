@@ -857,6 +857,10 @@ class RoastServerController(QObject):
         self._require_command_state()
         return self._protection_registry.current()
 
+    def owns_protection_token(self, expected: ProtectionToken) -> bool:
+        self._require_command_state()
+        return self._protection_registry.current() is expected
+
     def protection_guard(
         self, expected: ProtectionToken | None
     ) -> AbstractContextManager[None]:

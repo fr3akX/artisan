@@ -7911,11 +7911,17 @@ class tgraphcanvas(QObject):
         if self.aw.largePhasesLCDs_dialog is not None:
             self.aw.largePhasesLCDs_dialog.updateDecimals()
 
-    def clearMeasurements(self, andLCDs:bool=True) -> None:
+    def clearMeasurements(
+        self,
+        andLCDs:bool = True,
+        *,
+        update_presentation:bool = True,
+    ) -> None:
         try:
             #### lock shared resources #####
             self.profileDataSemaphore.acquire(1)
-            self.fileCleanSignal.emit()
+            if update_presentation:
+                self.fileCleanSignal.emit()
             self.rateofchange1 = 0.0
             self.rateofchange2 = 0.0
             charge:float= 0
@@ -7940,13 +7946,14 @@ class tgraphcanvas(QObject):
             self.replayedBackgroundEvents=set()
             self.beepedBackgroundEvents=set()
             self.clearEvents() # clear special events
-            self.aw.lcd1.display('00:00')
-            if self.aw.WebLCDs:
-                self.updateWebLCDs(time='00:00')
-            if self.aw.largeLCDs_dialog is not None:
-                self.updateLargeLCDsTimeSignal.emit('00:00')
-            if andLCDs:
-                self.clearLCDs()
+            if update_presentation:
+                self.aw.lcd1.display('00:00')
+                if self.aw.WebLCDs:
+                    self.updateWebLCDs(time='00:00')
+                if self.aw.largeLCDs_dialog is not None:
+                    self.updateLargeLCDsTimeSignal.emit('00:00')
+                if andLCDs:
+                    self.clearLCDs()
 
         except Exception as ex: # pylint: disable=broad-except
             _log.exception(ex)
@@ -7987,21 +7994,27 @@ class tgraphcanvas(QObject):
         server_read_only:bool = False,
     ) -> bool:
 #        _log.debug('PRINT reset(keepProperties=%s,onMonitor=%s)',keepProperties,onMonitor)
-        try:
-            focused_widget = QApplication.focusWidget()
-            if focused_widget and focused_widget != self.aw.centralWidget():
-                focused_widget.clearFocus()
-        except Exception as e: # pylint: disable=broad-except
-            _log.exception(e)
+        if not server_read_only:
+            try:
+                focused_widget = QApplication.focusWidget()
+                if focused_widget and focused_widget != self.aw.centralWidget():
+                    focused_widget.clearFocus()
+            except Exception as e: # pylint: disable=broad-except
+                _log.exception(e)
 
-        if not self.checkSaved():
+        if not server_read_only and not self.checkSaved():
             return False
 
         # restore and clear extra device settings which might have been created on loading a profile with different extra devices settings configuration
         if not server_read_only:
             self.aw.restoreExtraDeviceSettingsBackup()
 
-        if onMonitor and self.flagOpenCompleted and self.aw.curFile is not None:
+        if (
+            not server_read_only
+            and onMonitor
+            and self.flagOpenCompleted
+            and self.aw.curFile is not None
+        ):
             # always if ON is pressed while a profile is loaded, the profile is send to the Viewer
             # the file URL of the saved profile (if any) is send to the ArtisanViewer app to be opened if already running
             try:
@@ -8011,10 +8024,10 @@ class tgraphcanvas(QObject):
             except Exception as e: # pylint: disable=broad-except
                 _log.exception(e)
 
-        if soundOn:
+        if soundOn and not server_read_only:
             self.aw.soundpopSignal.emit()
 
-        if fireResetAction:
+        if fireResetAction and not server_read_only:
             try:
                 # the RESET button action needs to be fired outside of the semaphore to avoid lockups
                 self.aw.eventactionx(self.xextrabuttonactions[0],self.xextrabuttonactionstrings[0])
@@ -8032,8 +8045,10 @@ class tgraphcanvas(QObject):
 
             #### lock shared resources #####
             self.profileDataSemaphore.acquire(1)
-            #reset time
-            self.resetTimer()
+            # Server profile application must not alter the running timer or
+            # any timer presentation while its profile transaction can fail.
+            if not server_read_only:
+                self.resetTimer()
 
             self.roastUUID = None # reset UUID
             self.roastbatchnr = 0 # initialized to 0, set to increased batchcounter on DROP
@@ -8044,36 +8059,37 @@ class tgraphcanvas(QObject):
             self.scheduleID = None
             self.scheduleDate = None
 
-            self.aw.AUClcd.setNumDigits(3)
-            self.aw.buttonFCs.setDisabled(False)
-            self.aw.buttonFCe.setDisabled(False)
-            self.aw.buttonSCs.setDisabled(False)
-            self.aw.buttonSCe.setDisabled(False)
-            self.aw.buttonRESET.setDisabled(False)
-            self.aw.buttonCHARGE.setDisabled(False)
-            self.aw.buttonDROP.setDisabled(False)
-            self.aw.buttonDRY.setDisabled(False)
-            self.aw.buttonCOOL.setDisabled(False)
-            self.aw.buttonFCs.setFlat(False)
-            self.aw.buttonFCe.setFlat(False)
-            self.aw.buttonSCs.setFlat(False)
-            self.aw.buttonSCe.setFlat(False)
-            self.aw.buttonRESET.setFlat(False)
-            self.aw.buttonCHARGE.setFlat(False)
-            self.aw.buttonCHARGE.stopAnimation()
-            self.aw.buttonDROP.setFlat(False)
-            self.aw.buttonDRY.setFlat(False)
-            self.aw.buttonCOOL.setFlat(False)
-            self.aw.buttonONOFF.setText(QApplication.translate('Button', 'ON'))
-            if self.aw.simulator:
-                self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles_simulator['OFF'])
-            else:
-                self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles['OFF'])
-            self.aw.buttonSTARTSTOP.setText(QApplication.translate('Button', 'START'))
-            if self.aw.simulator:
-                self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles_simulator['STOP'])
-            else:
-                self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles['STOP'])
+            if not server_read_only:
+                self.aw.AUClcd.setNumDigits(3)
+                self.aw.buttonFCs.setDisabled(False)
+                self.aw.buttonFCe.setDisabled(False)
+                self.aw.buttonSCs.setDisabled(False)
+                self.aw.buttonSCe.setDisabled(False)
+                self.aw.buttonRESET.setDisabled(False)
+                self.aw.buttonCHARGE.setDisabled(False)
+                self.aw.buttonDROP.setDisabled(False)
+                self.aw.buttonDRY.setDisabled(False)
+                self.aw.buttonCOOL.setDisabled(False)
+                self.aw.buttonFCs.setFlat(False)
+                self.aw.buttonFCe.setFlat(False)
+                self.aw.buttonSCs.setFlat(False)
+                self.aw.buttonSCe.setFlat(False)
+                self.aw.buttonRESET.setFlat(False)
+                self.aw.buttonCHARGE.setFlat(False)
+                self.aw.buttonCHARGE.stopAnimation()
+                self.aw.buttonDROP.setFlat(False)
+                self.aw.buttonDRY.setFlat(False)
+                self.aw.buttonCOOL.setFlat(False)
+                self.aw.buttonONOFF.setText(QApplication.translate('Button', 'ON'))
+                if self.aw.simulator:
+                    self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles_simulator['OFF'])
+                else:
+                    self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles['OFF'])
+                self.aw.buttonSTARTSTOP.setText(QApplication.translate('Button', 'START'))
+                if self.aw.simulator:
+                    self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles_simulator['STOP'])
+                else:
+                    self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles['STOP'])
 
             # quantification is blocked if lock_quantification_sampling_ticks is not 0
             # (eg. after a change of the event value by button or slider actions)
@@ -8174,10 +8190,11 @@ class tgraphcanvas(QObject):
 
             self.E1timex,self.E2timex,self.E3timex,self.E4timex = [],[],[],[]
             self.E1values,self.E2values,self.E3values,self.E4values = [],[],[],[]
-            self.aw.eNumberSpinBox.setValue(0)
-            self.aw.lineEvent.setText('')
-            self.aw.etypeComboBox.setCurrentIndex(0)
-            self.aw.valueEdit.setText('')
+            if not server_read_only:
+                self.aw.eNumberSpinBox.setValue(0)
+                self.aw.lineEvent.setText('')
+                self.aw.etypeComboBox.setCurrentIndex(0)
+                self.aw.valueEdit.setText('')
             #used to find length of arms in annotations
             self.ystep_down = 0
             self.ystep_up = 0
@@ -8194,14 +8211,13 @@ class tgraphcanvas(QObject):
 
             # reset keyboard mode
             self.aw.keyboardmoveindex = 0 # points to the last activated button in keyboardButtonList; we start with the CHARGE button
-            self.aw.resetKeyboardButtonMarks()
-
-            self.aw.setTimerColorSignal.emit('timer')
-
-            try:
-                self.aw.ntb.update() # reset the MPL navigation history
-            except Exception as e: # pylint: disable=broad-except
-                _log.exception(e)
+            if not server_read_only:
+                self.aw.resetKeyboardButtonMarks()
+                self.aw.setTimerColorSignal.emit('timer')
+                try:
+                    self.aw.ntb.update() # reset the MPL navigation history
+                except Exception as e: # pylint: disable=broad-except
+                    _log.exception(e)
 
             #roast flags
             self.heavyFC_flag = False
@@ -8235,25 +8251,28 @@ class tgraphcanvas(QObject):
 #            elif self.mode == 'F':
 #                self.designertemp1init = [500,500,500,500,500,500,500]
 #                self.designertemp2init = [380,300,390,395,410,412,420]
-            self.disconnect_designer()  #sets designer flag false
-            self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+            if not server_read_only:
+                self.disconnect_designer()  #sets designer flag false
+                self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
 
-            # disconnect analyzer signal
-            if self.analyzer_connect_id is not None:
-                self.fig.canvas.mpl_disconnect(self.analyzer_connect_id)
+                # disconnect analyzer signal
+                if self.analyzer_connect_id is not None:
+                    self.fig.canvas.mpl_disconnect(self.analyzer_connect_id)
 
             #reset cupping flavor values
             self.flavors = [5.]*len(self.flavorlabels)
             self.flavors_total_correction = 0
 
-            try:
-                # reset color of last pressed button
-                if self.aw.lastbuttonpressed != -1:
-                    self.aw.setExtraEventButtonStyle(self.aw.lastbuttonpressed, style='normal')
-                # reset lastbuttonpressed
-                self.aw.lastbuttonpressed = -1
-            except Exception: # pylint: disable=broad-except
-                pass
+            if not server_read_only:
+                try:
+                    # reset color of last pressed button
+                    if self.aw.lastbuttonpressed != -1:
+                        self.aw.setExtraEventButtonStyle(
+                            self.aw.lastbuttonpressed, style='normal')
+                    # reset lastbuttonpressed
+                    self.aw.lastbuttonpressed = -1
+                except Exception: # pylint: disable=broad-except
+                    pass
 
             #self.aw.pidcontrol.sv = None
             self.aw.fujipid.sv = None
@@ -8268,11 +8287,12 @@ class tgraphcanvas(QObject):
             # and avoid accidental overwriting of existing data
             #current file name
             self.aw.curFile = None
-            self.aw.updateWindowTitle()
+            if not server_read_only:
+                self.aw.updateWindowTitle()
 
-            # if on turn mouse crosslines off
-            if self.crossmarker:
-                self.togglecrosslines()
+                # if on turn mouse crosslines off
+                if self.crossmarker:
+                    self.togglecrosslines()
 
             #remove the analysis results annotation if it exists
             self.analysisresultsstr = ''
@@ -8289,7 +8309,7 @@ class tgraphcanvas(QObject):
 
             self.l_timeline = None # clear timeline Artist to get the linecount correct after changning a machine setup
 
-            if not self.flagon:
+            if not self.flagon and not server_read_only:
                 self.aw.hideDefaultButtons()
                 self.aw.enableEditMenus()
 
@@ -8303,8 +8323,9 @@ class tgraphcanvas(QObject):
             self.designerflag = False
             self.wheelflag = False
 
-            #check and turn off mouse cross marker
-            if self.crossmarker:
+            # check and turn off mouse cross marker for an ordinary reset only;
+            # server profile application preserves its callback and UI state.
+            if self.crossmarker and not server_read_only:
                 self.togglecrosslines()
 
         except Exception as ex: # pylint: disable=broad-except
@@ -8317,14 +8338,15 @@ class tgraphcanvas(QObject):
 
         # now clear all measurements and redraw
 
-        self.clearMeasurements()
-        #clear PhasesLCDs
-        self.aw.updatePhasesLCDs()
-        #clear AUC LCD
-        self.aw.updateAUCLCD()
+        self.clearMeasurements(update_presentation=not server_read_only)
+        if not server_read_only:
+            #clear PhasesLCDs
+            self.aw.updatePhasesLCDs()
+            #clear AUC LCD
+            self.aw.updateAUCLCD()
 
         # if background is loaded we move it back to its original position (after regular load):
-        if self.backgroundprofile is not None:
+        if self.backgroundprofile is not None and not server_read_only:
             if self.backgroundprofile_moved_x != 0:
                 self.movebackground('left',self.backgroundprofile_moved_x)
             if self.backgroundprofile_moved_y != 0:
@@ -8340,12 +8362,10 @@ class tgraphcanvas(QObject):
         if self.endofx < 1:
             self.endofx = 60
 
-        self.aw.qmc.timealign(redraw=False)
-
         if not server_read_only:
+            self.aw.qmc.timealign(redraw=False)
             self.aw.updatePlusStatus()
-
-        self.aw.announce_current_ui_mode()
+            self.aw.announce_current_ui_mode()
 
         ### REDRAW  ##
         if redraw:
@@ -8365,7 +8385,8 @@ class tgraphcanvas(QObject):
             pass
 
 
-        self.aw.sendmessage(QApplication.translate('Message','Scope has been reset'))
+        if not server_read_only:
+            self.aw.sendmessage(QApplication.translate('Message','Scope has been reset'))
 
         #QApplication.processEvents() # this one seems to be needed for a proper redraw in fullscreen mode on OS X if a profile was loaded and NEW is pressed
         #   this processEvents() seems not to be needed any longer!?

@@ -223,7 +223,7 @@ from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, en
         application_organization_domain, application_desktop_file_name, getDataDirectory, getDocumentsDirectory, getAppPath, getResourcePath, debugLogLevelToggle,
         debugLogLevelActive, setDebugLogLevel, createGradient, natsort, setDeviceDebugLogLevel,
         comma2dot, is_proper_temp, weight_units, weight_units_lower, volume_units, float2float, float2str,
-        convertWeight, convertVolume, rgba_colorname2argb_colorname, render_weight, FileDestinationTransaction, serialize_with_timestamp, snapshot_file_destination, serialize, deserialize, csv_load, exportProfile2CSV, findTPint,
+        convertWeight, convertVolume, rgba_colorname2argb_colorname, render_weight, FileDestinationTransaction, SerializationResult, serialize_with_timestamp, serialize, deserialize, csv_load, exportProfile2CSV, findTPint,
         eventtime2string, toDim, signature_message, rec_int_to_float, smooth_list)
 
 from artisanlib.qtsingleapplication import QtSingleApplication
@@ -14316,6 +14316,12 @@ class ApplicationWindow(QMainWindow):
         ):
             return False
         try:
+            # checkSaved() may perform a nested Save As and release the current
+            # cache token. It must finish before T0 is captured or T1 protected.
+            if not self.qmc.checkSaved():
+                return False
+            if not controller.is_expected_open_source(path, source):
+                return False
             previous_state = self.snapshotRoastServerLoad()
         except Exception as error: # pylint: disable=broad-except
             _log.exception(error)
@@ -14386,6 +14392,9 @@ class ApplicationWindow(QMainWindow):
                         'Message',
                         'Roast Server {0} revision {1} opened read-only ({2})').format(
                             source.namespace.origin, source.revision_number, state))
+                    if not controller.owns_protection_token(opened_token):
+                        raise RuntimeError(
+                            'Roast Server cache protection ownership changed')
                     _log.info(
                         'Roast Server profile revision %s loaded read-only',
                         source.revision_number)
@@ -18191,8 +18200,8 @@ class ApplicationWindow(QMainWindow):
                 if server_read_only:
                     raise
             profile['elevation'] = self.qmc.elevation
-            profile['computed'] = self.computedProfileInformation(
-                update_bbp=not server_read_only)
+            if not server_read_only:
+                profile['computed'] = self.computedProfileInformation()
             # add positions of main event annotations and custom event flags
             profile['anno_positions'] = self.qmc.getAnnoPositions()
             profile['flag_positions'] = self.qmc.getFlagPositions()
@@ -18458,8 +18467,11 @@ class ApplicationWindow(QMainWindow):
         previous_plus_path:str|None = None
         roast_uuid:str|None = None
         destination_state:FileDestinationTransaction|None = None
+        serialization_result:SerializationResult
+        detached_profile:ProfileData
         recent_attempted = False
         register_attempted = False
+        protection_released = False
         with controller.protection_guard(expected_token):
             try:
                 previous_recent = self.roastServerRecentFiles()
@@ -18474,27 +18486,15 @@ class ApplicationWindow(QMainWindow):
                 roast_uuid = uuid_value
                 previous_plus_path = self.roastServerPlusPath(roast_uuid)
                 from artisanlib.roastserver.contract import MAX_PROFILE_BYTES
-                destination_state = snapshot_file_destination(
+                destination_state = FileDestinationTransaction.begin(
                     filename, max_bytes=MAX_PROFILE_BYTES)
-                serialization_result = serialize_with_timestamp(
-                    filename, cast(dict[str,Any], profile))
+                serialization_result = destination_state.serialize(
+                    cast(dict[str,Any], profile))
                 detached_profile = copyd.deepcopy(profile)
 
-                modified_at = plus.util.getModificationDate(filename)
-                if self.qmc.autosaveimage and not self.qmc.flagon:
-                    if QFileInfo(filename).suffix() == 'alog':
-                        name_also = QFileInfo(filename).completeBaseName()
-                    else:
-                        name_also = QFileInfo(filename).fileName()
-                    path_also = QDir()
-                    if self.qmc.autosavealsopath != '':
-                        path_also.setPath(self.qmc.autosavealsopath)
-                    else:
-                        path_also.setPath(QFileInfo(filename).path())
-                    self.autosave(path_also.absoluteFilePath(name_also))
-
                 self.curFile = filename
-                self.qmc.plus_file_last_modified = modified_at
+                self.qmc.plus_file_last_modified = (
+                    serialization_result.modified_at.timestamp())
                 self.qmc.fileCleanSignal.emit()
                 self.updateWindowTitle()
                 recent = previous_recent[:]
@@ -18511,25 +18511,29 @@ class ApplicationWindow(QMainWindow):
                     raise RuntimeError('artisan.plus profile registration failed')
                 self.refreshRoastServerActions()
 
-                released = controller.record_local_save(
-                    Path(filename), expected=expected_token)
+                try:
+                    released = controller.record_local_save(
+                        Path(filename), expected=expected_token)
+                except Exception:
+                    protection_released = (
+                        controller.current_protection_token() is None)
+                    raise
                 if released is not expected_token:
+                    protection_released = (
+                        controller.current_protection_token() is None)
                     raise RuntimeError(
                         'Roast Server cache protection could not be released')
-
+                protection_released = True
                 self.roastserver_open_source = None
                 destination_state.commit()
-                self.notifyRoastServerSavedProfile(
-                    serialization_result.serialized_profile,
-                    detached_profile,
-                    serialization_result.modified_at)
-                try:
-                    self.sendmessage(QApplication.translate('Message','Profile saved'))
-                except Exception as error: # pylint: disable=broad-except
-                    _log.exception(error)
-                _log.info('profile saved: %s', filename)
-                return True
             except Exception:
+                if protection_released:
+                    try:
+                        if not controller.restore_protection(
+                                expected_token, None):
+                            _log.error('Roast Server protection rollback failed')
+                    except Exception as error: # pylint: disable=broad-except
+                        _log.exception(error)
                 if register_attempted and roast_uuid is not None:
                     try:
                         if not self.roastServerRestorePlusPath(
@@ -18548,6 +18552,42 @@ class ApplicationWindow(QMainWindow):
                     except Exception as error: # pylint: disable=broad-except
                         _log.exception(error)
                 raise
+
+        # The main save is committed. Auxiliary formats are intentionally
+        # best-effort and no exception below may roll the .alog transaction back.
+        try:
+            if self.qmc.autosaveimage and not self.qmc.flagon:
+                if QFileInfo(filename).suffix() == 'alog':
+                    name_also = QFileInfo(filename).completeBaseName()
+                else:
+                    name_also = QFileInfo(filename).fileName()
+                path_also = QDir()
+                if self.qmc.autosavealsopath != '':
+                    path_also.setPath(self.qmc.autosavealsopath)
+                else:
+                    path_also.setPath(QFileInfo(filename).path())
+                self.autosave(path_also.absoluteFilePath(name_also))
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+            try:
+                self.qmc.adderror(QApplication.translate(
+                    'Error Message',
+                    'Auxiliary profile export failed.'))
+            except Exception as report_error: # pylint: disable=broad-except
+                _log.exception(report_error)
+        try:
+            self.notifyRoastServerSavedProfile(
+                serialization_result.serialized_profile,
+                detached_profile,
+                serialization_result.modified_at)
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+        try:
+            self.sendmessage(QApplication.translate('Message','Profile saved'))
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+        _log.info('profile saved: %s', filename)
+        return True
 
     #saves recorded profile in hard drive. Called from file menu
     # returns True if file was saved successfully

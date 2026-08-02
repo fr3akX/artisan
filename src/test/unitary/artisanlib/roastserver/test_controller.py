@@ -2427,6 +2427,9 @@ def test_protection_updates_are_synchronous_and_restore_exact_previous_token(
 
     assert token is not None
     assert controller_harness.controller.current_protection_token() is token
+    assert controller_harness.controller.owns_protection_token(token)
+    assert not controller_harness.controller.owns_protection_token(
+        replace(token, serial=token.serial + 1))
     assert controller_harness.controller.record_open_source(
         cached.path, replace(source, stale=False), expected=token) is None
     assert controller_harness.controller.current_protection_token() is token

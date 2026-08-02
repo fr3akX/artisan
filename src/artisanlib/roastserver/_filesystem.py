@@ -96,6 +96,8 @@ class _WindowsFileDispositionInfo(ctypes.Structure):
 class _WindowsNativeApi(Protocol):
     def open_readonly(self, path: Path, *, directory: bool = False) -> int: ...
 
+    def canonical_path(self, descriptor: int) -> Path: ...
+
     def open_lock(self, path: Path) -> int: ...
 
     def set_private_permissions(self, path: Path, mode: int) -> None: ...
@@ -162,6 +164,8 @@ class _WindowsNativeLayer:
     _FILE_DISPOSITION_INFO_CLASS = 4
     _MOVEFILE_REPLACE_EXISTING = 0x1
     _MOVEFILE_WRITE_THROUGH = 0x8
+    _FILE_NAME_NORMALIZED = 0x0
+    _VOLUME_NAME_GUID = 0x1
 
     def __init__(self) -> None:
         self._ctypes: Any = ctypes
@@ -191,6 +195,11 @@ class _WindowsNativeLayer:
             self._kernel32.GetFileInformationByHandle,
             [wintypes.HANDLE, wintypes.LPVOID],
             wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._kernel32.GetFinalPathNameByHandleW,
+            [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD],
+            wintypes.DWORD,
         )
         self._set_prototype(self._kernel32.GetCurrentProcess, [], wintypes.HANDLE)
         self._set_prototype(
@@ -440,6 +449,26 @@ class _WindowsNativeLayer:
                 self._close(final)
             for handle in reversed(handles):
                 self._close(handle)
+
+    def canonical_path(self, descriptor: int) -> Path:
+        msvcrt = cast(Any, importlib.import_module('msvcrt'))
+        handle = msvcrt.get_osfhandle(descriptor)
+        if self._attributes(handle) & self._FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError(errno.ELOOP, 'reparse point rejected')
+        flags = self._FILE_NAME_NORMALIZED | self._VOLUME_NAME_GUID
+        required = self._kernel32.GetFinalPathNameByHandleW(
+            handle, None, 0, flags)
+        if required == 0:
+            raise self._error()
+        buffer = self._ctypes.create_unicode_buffer(required + 1)
+        written = self._kernel32.GetFinalPathNameByHandleW(
+            handle, buffer, len(buffer), flags)
+        if written == 0 or written >= len(buffer):
+            raise self._error()
+        value = cast(str, buffer.value)
+        if not value.startswith('\\\\?\\Volume{'):
+            raise OSError(errno.EINVAL, 'Windows canonical volume path is invalid')
+        return Path(value)
 
     def open_lock(self, path: Path) -> int:
         msvcrt = cast(Any, importlib.import_module('msvcrt'))

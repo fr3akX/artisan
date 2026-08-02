@@ -1780,7 +1780,58 @@ def test_windows_native_api_prototypes_match_sdk(monkeypatch: pytest.MonkeyPatch
     assert libraries['advapi32'].GetLengthSid.restype is outbox_module.wintypes.DWORD
     assert libraries['advapi32'].IsValidSid.argtypes == [outbox_module.wintypes.LPVOID]
     assert libraries['advapi32'].IsValidSid.restype is outbox_module.wintypes.BOOL
+    assert libraries['kernel32'].GetFinalPathNameByHandleW.argtypes == [
+        outbox_module.wintypes.HANDLE,
+        outbox_module.wintypes.LPWSTR,
+        outbox_module.wintypes.DWORD,
+        outbox_module.wintypes.DWORD,
+    ]
+    assert libraries['kernel32'].GetFinalPathNameByHandleW.restype is (
+        outbox_module.wintypes.DWORD)
     assert layer._file_disposition_info is outbox_module._WindowsFileDispositionInfo
+
+
+def test_windows_native_canonical_path_uses_retained_handle_and_volume_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = r'\\?\Volume{11111111-1111-1111-1111-111111111111}\safe\parent'
+    calls: list[tuple[int, int, int]] = []
+
+    def final_path(
+        handle: int,
+        buffer: Any,
+        size: int,
+        flags: int,
+    ) -> int:
+        calls.append((handle, size, flags))
+        if buffer is None:
+            return len(canonical)
+        buffer.value = canonical
+        return len(canonical)
+
+    layer = object.__new__(outbox_module._WindowsNativeLayer)
+    layer._kernel32 = SimpleNamespace(GetFinalPathNameByHandleW=final_path)
+    layer._ctypes = ctypes
+    monkeypatch.setattr(layer, '_attributes', lambda _handle: 0)
+    fake_msvcrt = SimpleNamespace(get_osfhandle=lambda descriptor: descriptor + 100)
+    original_import = outbox_module.importlib.import_module
+    monkeypatch.setattr(
+        outbox_module.importlib,
+        'import_module',
+        lambda name: fake_msvcrt if name == 'msvcrt' else original_import(name),
+    )
+
+    assert layer.canonical_path(23) == Path(canonical)
+    expected_flags = layer._FILE_NAME_NORMALIZED | layer._VOLUME_NAME_GUID
+    assert calls == [(123, 0, expected_flags), (123, len(canonical) + 1, expected_flags)]
+
+    monkeypatch.setattr(
+        layer,
+        '_attributes',
+        lambda _handle: layer._FILE_ATTRIBUTE_REPARSE_POINT,
+    )
+    with pytest.raises(OSError, match='reparse'):
+        layer.canonical_path(23)
 
 
 def test_windows_native_unlink_uses_exact_file_disposition_info_and_cleans_up(
