@@ -33,6 +33,7 @@ import getpass
 import ast
 import platform
 import math
+import stat
 import datetime
 import warnings
 import numpy
@@ -220,7 +221,7 @@ from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, en
         application_organization_domain, application_desktop_file_name, getDataDirectory, getDocumentsDirectory, getAppPath, getResourcePath, debugLogLevelToggle,
         debugLogLevelActive, setDebugLogLevel, createGradient, natsort, setDeviceDebugLogLevel,
         comma2dot, is_proper_temp, weight_units, weight_units_lower, volume_units, float2float, float2str,
-        convertWeight, convertVolume, rgba_colorname2argb_colorname, render_weight, serialize_bytes, serialize, deserialize, csv_load, exportProfile2CSV, findTPint,
+        convertWeight, convertVolume, rgba_colorname2argb_colorname, render_weight, serialize_with_timestamp, serialize, deserialize, csv_load, exportProfile2CSV, findTPint,
         eventtime2string, toDim, signature_message, rec_int_to_float, smooth_list)
 
 from artisanlib.qtsingleapplication import QtSingleApplication
@@ -2545,6 +2546,7 @@ class ApplicationWindow(QMainWindow):
         self.roastServerConfigAction = QAction(
             QApplication.translate('Menu', 'Roast Server...'), self)
         self.roastServerConfigAction.triggered.connect(self.showRoastServerConfig)
+        self.connectRoastServerActionRefresh()
 
         self.temperatureConfMenu:QMenu = QMenu(QApplication.translate('Menu', 'Temperature'))
 
@@ -4580,13 +4582,76 @@ class ApplicationWindow(QMainWindow):
         self.roastserver_browser_dialog.activateWindow()
 
     @staticmethod
-    def roastServerProfileModifiedAt(filename:str) -> datetime.datetime|None:
+    def readRoastServerProfile(
+        filename:str,
+    ) -> tuple[bytes, ProfileData, datetime.datetime]:
+        from artisanlib.roastserver._filesystem import open_path_readonly
+        from artisanlib.roastserver.contract import MAX_PROFILE_BYTES
+
+        descriptor = open_path_readonly(Path(filename))
         try:
-            return datetime.datetime.fromtimestamp(
-                Path(filename).stat().st_mtime, tz=datetime.UTC)
-        except (OSError, OverflowError, ValueError) as error:
-            _log.error('could not determine saved profile timestamp: %s', error)
-            return None
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_size < 1
+                or before.st_size > MAX_PROFILE_BYTES
+            ):
+                raise ValueError('invalid Roast Server profile file')
+            serialized = bytearray()
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError('Roast Server profile changed while reading')
+                serialized.extend(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise ValueError('Roast Server profile changed while reading')
+            after = os.fstat(descriptor)
+            before_identity = (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns)
+            after_identity = (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns)
+            if before_identity != after_identity or len(serialized) != before.st_size:
+                raise ValueError('Roast Server profile changed while reading')
+            modified_at = datetime.datetime.fromtimestamp(
+                after.st_mtime, tz=datetime.UTC)
+            parsed:object = ast.literal_eval(bytes(serialized).decode('utf-8'))
+            if not isinstance(parsed, dict):
+                raise ValueError('invalid Roast Server profile')
+            profile = copyd.deepcopy(cast(ProfileData, parsed))
+            return bytes(serialized), profile, modified_at
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def roastServerRegularProfile(filename:str|None) -> bool:
+        if filename is None or Path(filename).suffix.lower() != '.alog':
+            return False
+        try:
+            return stat.S_ISREG(os.stat(filename, follow_symlinks=False).st_mode)
+        except (OSError, ValueError):
+            return False
+
+    def connectRoastServerActionRefresh(self) -> None:
+        self.qmc.fileDirtySignal.connect(self.refreshRoastServerActions)
+        self.qmc.fileCleanSignal.connect(self.refreshRoastServerActions)
+
+    def refreshRoastServerActions(self) -> None:
+        viewer = self.app.artisanviewerMode
+        load_available = self.fileLoadAction.isEnabled()
+        edit_available = load_available and self.fileSaveAction.isEnabled()
+        self.roastServerConfigAction.setEnabled(
+            not viewer and self.deviceAction.isEnabled())
+        self.roastServerRoastsAction.setEnabled(load_available)
+        self.roastServerUploadAction.setEnabled(
+            not viewer
+            and edit_available
+            and not self.qmc.safesaveflag
+            and self.roastServerRegularProfile(self.curFile)
+        )
 
     @pyqtSlot()
     @pyqtSlot(bool)
@@ -4599,23 +4664,14 @@ class ApplicationWindow(QMainWindow):
             or self.qmc.safesaveflag
             or filename is None
             or Path(filename).suffix.lower() != '.alog'
-            or not Path(filename).is_file()
         ):
             self.sendmessage(QApplication.translate(
                 'Message',
                 'Save the current profile as a clean Artisan .alog file before uploading it to Roast Server.'))
             return
-        modified_at = self.roastServerProfileModifiedAt(filename)
-        if modified_at is None:
-            self.sendmessage(QApplication.translate(
-                'Message', 'Roast Server upload could not be queued.'))
-            return
         try:
-            pf = copyd.deepcopy(self.getProfile(copy=False, generate_hash=False))
-            if not pf:
-                raise ValueError('invalid Roast Server profile')
-            serialized_profile = serialize_bytes(cast(dict[str,Any], pf))
-            controller.manual_upload(serialized_profile, pf, modified_at)
+            serialized_profile, profile, modified_at = self.readRoastServerProfile(filename)
+            controller.manual_upload(serialized_profile, profile, modified_at)
         except Exception as error: # pylint: disable=broad-except
             _log.exception(error)
             self.sendmessage(QApplication.translate(
@@ -4714,6 +4770,7 @@ class ApplicationWindow(QMainWindow):
         self.set_menu(ui_mode)
         # configure toolbar
         self.set_toolbar(ui_mode)
+        self.refreshRoastServerActions()
         # send message
         self.announce_current_ui_mode()
 
@@ -12233,12 +12290,17 @@ class ApplicationWindow(QMainWindow):
         self.openRecentMenu.setEnabled(False) # open recent
         self.importMenu.setEnabled(False) # import
         self.convMenu.setEnabled(False) # convert
+        self.roastServerRoastsAction.setEnabled(False)
+        self.roastServerUploadAction.setEnabled(False)
+        self.refreshRoastServerActions()
 
     def enableLoadImportConvertMenus(self) -> None:
         self.fileLoadAction.setEnabled(True) # open
         self.openRecentMenu.setEnabled(True) # open recent
         self.importMenu.setEnabled(True) # import
         self.convMenu.setEnabled(True) # convert
+        self.roastServerRoastsAction.setEnabled(True)
+        self.refreshRoastServerActions()
 
     def enableEditMenus(self) -> None:
         self.newRoastMenu.setEnabled(True)
@@ -12248,6 +12310,8 @@ class ApplicationWindow(QMainWindow):
         self.fileSaveAction.setEnabled(True)
         self.fileSaveAsAction.setEnabled(True)
         self.fileSaveCopyAsAction.setEnabled(True)
+        self.roastServerRoastsAction.setEnabled(True)
+        self.roastServerUploadAction.setEnabled(True)
         self.exportMenu.setEnabled(True)
         self.convMenu.setEnabled(True)
         self.saveGraphMenu.setEnabled(True)
@@ -12266,6 +12330,7 @@ class ApplicationWindow(QMainWindow):
         self.temperatureMenu.setEnabled(True)
         self.temperatureConfMenu.setEnabled(True)
         self.languageMenu.setEnabled(True)
+        self.roastServerConfigAction.setEnabled(True)
         self.deviceAction.setEnabled(True)
         self.commportAction.setEnabled(True)
         self.curvesAction.setEnabled(True)
@@ -12324,6 +12389,8 @@ class ApplicationWindow(QMainWindow):
             self.fileSaveAsAction.setEnabled(False)
             self.fileSaveCopyAsAction.setEnabled(False)
             self.exportMenu.setEnabled(False)
+        self.roastServerRoastsAction.setEnabled(compare)
+        self.roastServerUploadAction.setEnabled(False)
         self.convMenu.setEnabled(False)
         if not wheel and not compare and not sampling:
             self.saveGraphMenu.setEnabled(False)
@@ -12361,6 +12428,7 @@ class ApplicationWindow(QMainWindow):
         self.themeMenu.setEnabled(False)
         self.temperatureConfMenu.setEnabled(False)
         self.languageMenu.setEnabled(False)
+        self.roastServerConfigAction.setEnabled(compare)
         # TOOLS menu
         self.analyzeMenu.setEnabled(False)
         if not compare:
@@ -12412,6 +12480,9 @@ class ApplicationWindow(QMainWindow):
             self.hideSliders()
             self.slidersAction.setEnabled(False)
             self.simulatorAction.setEnabled(False)
+            self.roastServerConfigAction.setEnabled(False)
+            self.roastServerUploadAction.setEnabled(False)
+        self.refreshRoastServerActions()
 
     def update_minieventline_visibility(self) -> None:
         # update visibility (based on the app state)
@@ -13441,8 +13512,9 @@ class ApplicationWindow(QMainWindow):
     # returns filename on success, None otherwise
     def automaticsave(self, interactive:bool = True) -> str|None:
         filename:str|None = None
-        pf:ProfileData|None = None
+        detached_profile:ProfileData|None = None
         serialized_profile:bytes|None = None
+        saved_modified_at:datetime.datetime|None = None
         try:
             if self.qmc.autosaveflag:
                 if self.qmc.autosavepath == '':
@@ -13461,19 +13533,26 @@ class ApplicationWindow(QMainWindow):
                 filename_path = os.path.join(self.qmc.autosavepath,filename)
                 oldDir = QDir.currentPath()
                 res = QDir.setCurrent(self.qmc.autosavepath)
-                if res:
-                    #write
-                    pf = self.getProfile(generate_hash=True)
-                    # pf should not be modified before saving anymore this would break its hash
-                    self.plusAddPath(cast(dict[str, Any], pf), filename_path)
-                    serialized_profile = serialize(filename_path, cast(dict[str, Any], pf))
-                    self.sendmessage(QApplication.translate('Message','Profile {0} saved in: {1}').format(filename,self.qmc.autosavepath))
-                    self.setCurrentFile(filename_path,self.qmc.autosaveaddtorecentfilesflag)
-                    self.qmc.fileCleanSignal.emit()
-                else:
-                    self.sendmessage(QApplication.translate('Message','Autosave path does not exist. Autosave failed.'))
-                #restore dirs
-                post_save_succeeded = QDir.setCurrent(oldDir)
+                post_save_succeeded = False
+                try:
+                    if res:
+                        #write
+                        pf = self.getProfile(generate_hash=True)
+                        # pf should not be modified before saving anymore this would break its hash
+                        self.plusAddPath(cast(dict[str, Any], pf), filename_path)
+                        serialization_result = serialize_with_timestamp(
+                            filename_path, cast(dict[str, Any], pf))
+                        detached_profile = copyd.deepcopy(pf)
+                        serialized_profile = serialization_result.serialized_profile
+                        saved_modified_at = serialization_result.modified_at
+                        self.sendmessage(QApplication.translate('Message','Profile {0} saved in: {1}').format(filename,self.qmc.autosavepath))
+                        self.setCurrentFile(filename_path,self.qmc.autosaveaddtorecentfilesflag)
+                        self.qmc.fileCleanSignal.emit()
+                    else:
+                        self.sendmessage(QApplication.translate('Message','Autosave path does not exist. Autosave failed.'))
+                finally:
+                    #restore dirs
+                    post_save_succeeded = QDir.setCurrent(oldDir)
                 # file might be autosaved but not uploaded to plus yet (no DROP registered). This needs to be indicated by a red plus icon
                 try:
                     self.updatePlusStatus()
@@ -13491,9 +13570,15 @@ class ApplicationWindow(QMainWindow):
                     if other_filename_path.endswith('.alog'):
                         other_filename_path = other_filename_path[0:-5]
                     self.autosave(other_filename_path)
-                if res and post_save_succeeded and pf is not None and serialized_profile is not None:
+                if (
+                    res
+                    and post_save_succeeded
+                    and detached_profile is not None
+                    and serialized_profile is not None
+                    and saved_modified_at is not None
+                ):
                     self.notifyRoastServerSavedProfile(
-                        serialized_profile, pf, filename_path)
+                        serialized_profile, detached_profile, saved_modified_at)
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
             _, _, exc_tb = sys.exc_info()
@@ -13628,6 +13713,7 @@ class ApplicationWindow(QMainWindow):
     # fileNamePath holds the full path to the loaded profile
     def setCurrentFile(self, fileNamePath:str|None, addToRecent:bool = True) -> None:
         self.curFile = fileNamePath
+        self.refreshRoastServerActions()
         if self.curFile is not None:
             try:
                 if addToRecent:
@@ -17533,17 +17619,13 @@ class ApplicationWindow(QMainWindow):
     def notifyRoastServerSavedProfile(
         self,
         serialized_profile:bytes,
-        profile:'ProfileData',
-        filename:str,
+        detached_profile:'ProfileData',
+        modified_at:datetime.datetime,
     ) -> None:
         controller = self.roastserver_controller
         if controller is None:
             return
-        modified_at = self.roastServerProfileModifiedAt(filename)
-        if modified_at is None:
-            return
         try:
-            detached_profile = copyd.deepcopy(profile)
             controller.saved_profile(
                 serialized_profile, detached_profile, modified_at)
         except Exception as error: # pylint: disable=broad-except
@@ -17591,7 +17673,9 @@ class ApplicationWindow(QMainWindow):
                 if pf:
                     # we save the file and set the filename
                     self.plusAddPath(cast(dict[str,Any], pf), filename)
-                    serialized_profile = serialize(filename, cast(dict[str,Any], pf))
+                    serialization_result = serialize_with_timestamp(
+                        filename, cast(dict[str,Any], pf))
+                    detached_profile = copyd.deepcopy(pf)
                     self.sendmessage(QApplication.translate('Message','Profile saved'))
                     _log.info('profile saved: %s', filename)
                     if not copy:
@@ -17617,9 +17701,11 @@ class ApplicationWindow(QMainWindow):
 
                         self.autosave(filename_also)
 
-                    if not copy and self.qmc.plus_file_last_modified is not None:
+                    if not copy:
                         self.notifyRoastServerSavedProfile(
-                            serialized_profile, pf, filename)
+                            serialization_result.serialized_profile,
+                            detached_profile,
+                            serialization_result.modified_at)
                     return True
                 self.sendmessage(QApplication.translate('Message','Cancelled'))
                 return False

@@ -38,6 +38,7 @@ import ast
 import numpy
 import functools
 import datetime
+from dataclasses import dataclass
 from bisect import bisect_right
 from pathlib import Path
 from matplotlib import colors
@@ -1353,17 +1354,32 @@ def computeDeltas(
 ### serialize/deserialize
 
 
+@dataclass(frozen=True, slots=True)
+class SerializationResult:
+    serialized_profile:bytes
+    modified_at:datetime.datetime
+
+
 def serialize_bytes(obj:dict[str, Any]) -> bytes:
     return repr(obj).encode('utf-8')
 
 
-#Write object to file
-def serialize(filename:str, obj:dict[str, Any]) -> bytes:
+def serialize_with_timestamp(filename:str, obj:dict[str, Any]) -> SerializationResult:
     serialized = serialize_bytes(obj)
     fn = str(filename)
     with open(fn, 'wb') as f:
-        f.write(serialized)
-    return serialized
+        written = f.write(serialized)
+        if written != len(serialized):
+            raise OSError('profile serialization write was incomplete')
+        f.flush()
+        modified_at = datetime.datetime.fromtimestamp(
+            os.fstat(f.fileno()).st_mtime, tz=datetime.UTC)
+    return SerializationResult(serialized, modified_at)
+
+
+#Write object to file
+def serialize(filename:str, obj:dict[str, Any]) -> bytes:
+    return serialize_with_timestamp(filename, obj).serialized_profile
 
 
 #Read object from file
