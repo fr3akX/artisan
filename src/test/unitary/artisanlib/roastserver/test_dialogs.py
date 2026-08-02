@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
@@ -112,6 +112,55 @@ class BlockingDialogClient:
         if not self.release.wait(timeout=5):
             raise RuntimeError('blocked dialog authentication timed out')
         self.completed.set()
+        return IDENTITY
+
+
+class WritableCredentialStore:
+    def __init__(self, origin: str, credential: str | None) -> None:
+        self.values: dict[str, str] = {}
+        if credential is not None:
+            self.values[origin] = credential
+
+    @override
+    def __repr__(self) -> str:
+        return '<WritableCredentialStore credentials=<redacted>>'
+
+    def get(self, origin: str) -> str | None:
+        return self.values.get(origin)
+
+    def set(self, origin: str, credential: str) -> None:
+        self.values[origin] = credential
+
+    def delete(self, origin: str) -> None:
+        self.values.pop(origin, None)
+
+
+class StagedActivationClient:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._authentication_count = 0
+        self.final_auth_entered = threading.Event()
+        self.release_final_auth = threading.Event()
+
+    def __enter__(self) -> StagedActivationClient:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        return None
+
+    def test_connection(self) -> ServerIdentity:
+        with self._lock:
+            self._authentication_count += 1
+            final_auth = self._authentication_count == 2
+        if final_auth:
+            self.final_auth_entered.set()
+            if not self.release_final_auth.wait(timeout=5):
+                raise RuntimeError('blocked final authentication timed out')
         return IDENTITY
 
 
@@ -366,6 +415,17 @@ def test_credential_copy_never_places_runtime_secret_on_clipboard(
     dialog.credential_edit.clear()
 
 
+def test_config_edit_without_local_proof_always_invalidates_controller(
+    dialog: RoastServerConfigDialog,
+    controller: FakeController,
+) -> None:
+    dialog.server_edit.setText(NEW_ORIGIN)
+    assert controller.invalidate_calls == 1
+
+    dialog.credential_edit.setText(secrets.token_urlsafe(24))
+    assert controller.invalidate_calls == 2
+
+
 def test_config_any_origin_or_credential_edit_immediately_revokes_auto_proof(
     dialog: RoastServerConfigDialog,
     controller: FakeController,
@@ -394,7 +454,7 @@ def test_config_any_origin_or_credential_edit_immediately_revokes_auto_proof(
     dialog.credential_edit.setText(secrets.token_urlsafe(24))
 
     assert not dialog.automatic_upload_check.isEnabled()
-    assert controller.invalidate_calls == 2
+    assert controller.invalidate_calls == 4
     assert controller.apply_calls == []
 
 
@@ -404,11 +464,11 @@ def test_config_edit_cancels_an_opaque_test_transaction_immediately(
 ) -> None:
     dialog.credential_edit.setText(secrets.token_urlsafe(24))
     dialog.test_button.click()
-    assert controller.invalidate_calls == 0
+    assert controller.invalidate_calls == 1
 
     dialog.server_edit.setText('https://newer.example.test')
 
-    assert controller.invalidate_calls == 1
+    assert controller.invalidate_calls == 2
     assert not dialog.automatic_upload_check.isEnabled()
 
 
@@ -688,6 +748,143 @@ def test_each_close_path_cancels_real_blocked_auth_without_keyring_or_identity(
         assert_secret_absent(candidate, controller)
     finally:
         client.release.set()
+        assert controller.shutdown(2_000)
+        value.hide()
+        value.deleteLater()
+        qapp.processEvents()
+
+
+def test_real_startup_edit_without_test_revokes_backend_proof_and_automatic_upload(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    settings_store = SettingsStore(
+        QSettings(str(tmp_path / 'dialog-startup-edit.ini'), QSettings.Format.IniFormat)
+    )
+    settings_store.set_origin(ORIGIN)
+    settings_store.save_connection(ORIGIN, IDENTITY)
+    settings_store.save_options(True, True, 64 * 1024 * 1024)
+    persisted_credential = secrets.token_urlsafe(32)
+    credentials = WritableCredentialStore(ORIGIN, persisted_credential)
+    client = BlockingDialogClient()
+    controller = RoastServerController(
+        settings=settings_store,
+        credentials=credentials,
+        data_root=tmp_path / 'dialog-startup-edit-data',
+        client_factory=cast(ClientFactory, lambda _origin, _credential: client),
+        profile_validator=lambda _path: None,
+    )
+    value = RoastServerConfigDialog(controller, settings_store.load())
+    value.show()
+    controller.start()
+    assert client.entered.wait(timeout=2)
+    try:
+        value.server_edit.setText(NEW_ORIGIN)
+        assert not settings_store.load().automatic_upload
+
+        client.release.set()
+        assert client.completed.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            configuration = controller._worker._configuration
+            if configuration is not None and not configuration.enabled:
+                break
+            time.sleep(0.001)
+        for _ in range(10):
+            qapp.processEvents()
+            time.sleep(0.001)
+
+        loaded = settings_store.load()
+        assert controller._proof is None
+        assert controller._identity is None
+        assert controller._active_namespace(require_enabled=False) is None
+        assert not loaded.enabled and not loaded.automatic_upload
+        assert controller._worker._configuration is not None
+        assert not controller._worker._configuration.enabled
+        assert value.identity_label.text() == 'Not connected'
+        assert not value.automatic_upload_check.isEnabled()
+        assert credentials.values[ORIGIN] == persisted_credential
+    finally:
+        client.release.set()
+        assert controller.shutdown(2_000)
+        value.hide()
+        value.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize('old_credential', [None, 'old-credential'])
+def test_real_hide_after_emitted_activation_rolls_back_keyring_settings_and_auth(
+    qapp: QApplication,
+    tmp_path: Path,
+    old_credential: str | None,
+) -> None:
+    settings_store = SettingsStore(
+        QSettings(str(tmp_path / 'dialog-delayed-activation.ini'), QSettings.Format.IniFormat)
+    )
+    settings_store.set_origin(ORIGIN)
+    previous = settings_store.load()
+    credentials = WritableCredentialStore(ORIGIN, old_credential)
+    client = StagedActivationClient()
+    controller = RoastServerController(
+        settings=settings_store,
+        credentials=credentials,
+        data_root=tmp_path / 'dialog-delayed-activation-data',
+        client_factory=cast(ClientFactory, lambda _origin, _credential: client),
+        profile_validator=lambda _path: None,
+    )
+    activation_emitted = threading.Event()
+    direct_connect = cast(
+        Callable[[Callable[[str, object], None], Qt.ConnectionType], object],
+        controller._worker.connectionActivated.connect,
+    )
+    direct_connect(
+        lambda _transaction_id, _identity: activation_emitted.set(),
+        Qt.ConnectionType.DirectConnection,
+    )
+    value = RoastServerConfigDialog(controller, previous)
+    value.show()
+    controller.start()
+    qapp.processEvents()
+    candidate = secrets.token_urlsafe(40)
+    try:
+        value.credential_edit.setText(candidate)
+        value.test_button.click()
+        deadline = time.monotonic() + 2
+        while not client.final_auth_entered.is_set():
+            qapp.processEvents()
+            if time.monotonic() >= deadline:
+                raise AssertionError('worker did not enter final authentication')
+            time.sleep(0.001)
+
+        client.release_final_auth.set()
+        assert activation_emitted.wait(timeout=2)
+        value.reject()
+        assert not value.isVisible()
+        qapp.processEvents()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            if not controller._worker._credential_transactions:
+                break
+            time.sleep(0.001)
+
+        restored = settings_store.load()
+        assert replace(restored, configuration_geometry=None) == previous
+        assert restored.configuration_geometry is not None
+        if old_credential is None:
+            assert ORIGIN not in credentials.values
+        else:
+            assert credentials.values[ORIGIN] == old_credential
+        assert controller._proof is None
+        assert controller._identity is None
+        assert controller._worker._credential is None
+        assert controller._worker._authorized_target is None
+        assert controller._worker._credential_transactions == {}
+        assert_secret_absent(candidate, controller)
+        assert_secret_absent(candidate, value)
+    finally:
+        client.release_final_auth.set()
         assert controller.shutdown(2_000)
         value.hide()
         value.deleteLater()

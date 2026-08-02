@@ -140,6 +140,7 @@ class RoastServerController(QObject):
     _testWorker = pyqtSignal(str)
     _commitWorker = pyqtSignal(str)
     _finalizeWorker = pyqtSignal(str)
+    _acknowledgeConnectionWorker = pyqtSignal(str)
     _rollbackWorker = pyqtSignal(str)
     _cancelConnectionWorker = pyqtSignal(str)
     _removeCredentialWorker = pyqtSignal(str)
@@ -244,6 +245,11 @@ class RoastServerController(QObject):
         _connect(self._testWorker, worker.test_connection, queued)
         _connect(self._commitWorker, worker.commit_connection, queued)
         _connect(self._finalizeWorker, worker.finalize_connection, queued)
+        _connect(
+            self._acknowledgeConnectionWorker,
+            worker.acknowledge_connection_activation,
+            queued,
+        )
         _connect(self._rollbackWorker, worker.rollback_connection, queued)
         _connect(
             self._cancelConnectionWorker,
@@ -782,9 +788,10 @@ class RoastServerController(QObject):
         self._identity = value
         self._proof = (self._settings.origin, value.organization.id)
         self._invalidate_archive_state()
+        self._acknowledgeConnectionWorker.emit(request_id)
+        self._queue_configuration(self._configuration())
         self.settingsChanged.emit(self._settings)
         self.identityChanged.emit(value)
-        self._queue_configuration(self._configuration())
 
     @pyqtSlot(str, object)
     def _on_pending_connection_recovery_required(

@@ -231,6 +231,7 @@ class _CredentialTransaction:
     identity: ServerIdentity
     keyring_committed: bool
     recovered: bool = False
+    activation_emitted: bool = False
 
     @override
     def __repr__(self) -> str:
@@ -364,7 +365,8 @@ class RoastServerWorker(QObject):
         self._configuration = configuration
         self._credential = None
         self._authorized_target = None
-        self._authorized_transaction_id = None
+        if self._authorized_transaction_id not in self._credential_transactions:
+            self._authorized_transaction_id = None
         if not self._started or not self._outbox_open or self._stopped:
             return
         self._activate_configuration(previous)
@@ -644,6 +646,7 @@ class RoastServerWorker(QObject):
             self._cancelled()
             or transaction is None
             or not transaction.keyring_committed
+            or transaction.activation_emitted
             or configuration is None
             or configuration.activation_id != transaction_id
             or configuration.origin != transaction.origin
@@ -705,12 +708,29 @@ class RoastServerWorker(QObject):
         self._credential = transaction.candidate
         self._authorized_target = (transaction.origin, transaction.identity)
         self._authorized_transaction_id = transaction_id
-        identity = transaction.identity
+        transaction.activation_emitted = True
+        if not self._cancelled():
+            self.connectionActivated.emit(request_id, transaction.identity)
+
+    @pyqtSlot(str)
+    def acknowledge_connection_activation(self, transaction_id: str) -> None:
+        request_id = _public_request_id(transaction_id)
+        if self._reject_wrong_thread(request_id, FailureKind.KEYRING):
+            return
+        transaction = self._credential_transactions.get(transaction_id)
+        if (
+            self._cancelled()
+            or transaction is None
+            or not transaction.activation_emitted
+            or transaction_id != self._authorized_transaction_id
+        ):
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
         self._credential_transactions.pop(transaction_id, None)
         transaction.candidate = ''
         transaction.old_credential = None
-        if not self._cancelled():
-            self.connectionActivated.emit(request_id, identity)
+        self._authorized_transaction_id = None
 
     @pyqtSlot(str)
     def rollback_connection(self, transaction_id: str) -> None:

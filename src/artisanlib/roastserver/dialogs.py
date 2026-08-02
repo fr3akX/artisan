@@ -438,14 +438,11 @@ class RoastServerConfigDialog(QDialog):
     def _connection_edited(self) -> None:
         if self._rendering:
             return
-        invalidate_controller = (
-            self._has_current_proof() or self._testing_operation is not None
-        )
         self._connection_dirty = True
         self._testing_operation = None
         self._invalidate_proof(
             persist_automatic_off=True,
-            invalidate_controller=invalidate_controller,
+            invalidate_controller=True,
         )
 
     def _invalidate_proof(

@@ -479,6 +479,7 @@ class FakeWorker(QObject):
         self.test_ids: list[str] = []
         self.commit_ids: list[str] = []
         self.finalize_ids: list[str] = []
+        self.acknowledge_ids: list[str] = []
         self.rollback_ids: list[str] = []
         self.cancel_ids: list[str] = []
         self.enqueue_ids: list[str] = []
@@ -530,6 +531,11 @@ class FakeWorker(QObject):
     def finalize_connection(self, request_id: str) -> None:
         self.finalize_ids.append(request_id)
         self._record('finalize_connection', request_id)
+
+    @pyqtSlot(str)
+    def acknowledge_connection_activation(self, request_id: str) -> None:
+        self.acknowledge_ids.append(request_id)
+        self._record('acknowledge_connection_activation', request_id)
 
     @pyqtSlot(str)
     def rollback_connection(self, request_id: str) -> None:
@@ -1212,6 +1218,9 @@ def test_identity_persists_only_after_worker_success_and_forwards_on_ui_thread(
     )
     controller_harness.relay.activated.emit(request_id, IDENTITY)
     assert controller_harness.wait_for_spy(changed) == [IDENTITY]
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.acknowledge_ids
+    )
 
     loaded = controller_harness.settings_store.load()
     assert loaded.identity == IDENTITY
@@ -1284,6 +1293,7 @@ def test_untracked_activation_signal_cannot_install_connection_proof(
     controller_harness.wait_until(
         lambda: forged_id in controller_harness.fake_worker.cancel_ids
     )
+    assert controller_harness.fake_worker.acknowledge_ids == []
 
     with pytest.raises(ControllerError, match='Test the connection'):
         controller_harness.controller.apply_options(
@@ -2226,13 +2236,14 @@ def test_real_blocked_worker_many_tests_only_authenticate_newest_credential(
 
         _wait_for_qt(
             qcoreapplication,
-            lambda: settings.load().identity == IDENTITY,
-            'newest blocked-worker transaction did not activate',
+            lambda: settings.load().identity == IDENTITY
+            and not controller._worker._credential_transactions,
+            'newest blocked-worker transaction did not activate and acknowledge',
         )
         assert controller._worker._credential_transactions == {}
         assert [call[1] for call in credentials.set_calls] == [candidate_digests[-1]]
         assert credentials.delete_calls == []
-        assert recorder.digests == [candidate_digests[-1], candidate_digests[-1]]
+        assert recorder.digests == [candidate_digests[-1]] * 3
         for candidate in candidates:
             assert_secret_absent(candidate, controller)
             assert_secret_absent(candidate, recorder)
@@ -2293,13 +2304,19 @@ def test_real_mid_http_supersession_discards_old_response_before_keyring(
 
         _wait_for_qt(
             qcoreapplication,
-            lambda: settings.load().identity == IDENTITY,
-            'newest mid-HTTP transaction did not activate',
+            lambda: settings.load().identity == IDENTITY
+            and not controller._worker._credential_transactions,
+            'newest mid-HTTP transaction did not activate and acknowledge',
         )
         assert controller._worker._credential_transactions == {}
         assert [call[1] for call in credentials.set_calls] == [newest_digest]
         assert credentials.delete_calls == []
-        assert recorder.http_digests == [first_digest, newest_digest, newest_digest]
+        assert recorder.http_digests == [
+            first_digest,
+            newest_digest,
+            newest_digest,
+            newest_digest,
+        ]
         assert_secret_absent(first_candidate, controller)
         assert_secret_absent(newest_candidate, controller)
         assert_secret_absent(first_candidate, recorder)
