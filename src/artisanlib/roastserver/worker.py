@@ -44,11 +44,13 @@ from artisanlib.roastserver.api import ApiFailure, ClientFactory, DownloadReceip
 from artisanlib.roastserver.cache import (
     CACHE_FAILURE,
     CacheError,
+    CachedPage,
     CachedRevision,
     CacheStore,
 )
 from artisanlib.roastserver.contract import (
     FAILURE_MESSAGES,
+    MAX_CURSOR_CHARS,
     MAX_PROFILE_BYTES,
     ArchiveFilters,
     FailureKind,
@@ -58,6 +60,7 @@ from artisanlib.roastserver.contract import (
     RoastDetail,
     RoastPage,
     ServerIdentity,
+    validate_archive_filters,
 )
 from artisanlib.roastserver.metadata import project_profile
 from artisanlib.roastserver.origin import SettingsError, canonical_origin
@@ -80,6 +83,7 @@ _REQUEST_ID_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
 _MAX_TIMER_MILLISECONDS: Final[int] = 2_147_483_647
 _LEASE_SECONDS: Final[int] = 60
 _MAX_CREDENTIAL_TRANSACTIONS: Final[int] = 1
+_MAX_OFFLINE_ARCHIVE_ROWS: Final[int] = 5_000
 
 
 class ConfigurationPermit:
@@ -302,6 +306,7 @@ class BrowseRequest:
 class OnlineOpenRequest:
     namespace: Namespace
     roast_uuid: UUID
+    cached_fallback: CachedRevision | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +383,7 @@ class RoastServerWorker(QObject):
     archivePageReady = pyqtSignal(str, object)
     downloadStaged = pyqtSignal(str, object)
     cachedReady = pyqtSignal(str, object)
+    cachedFallbackReady = pyqtSignal(str, object)
     cachePublished = pyqtSignal(str, object)
     onlineChanged = pyqtSignal(bool)
     stopped = pyqtSignal()
@@ -1522,7 +1528,7 @@ class RoastServerWorker(QObject):
             return
         if self._cancelled():
             return
-        if not isinstance(value, BrowseRequest) or not self._namespace_is_current(
+        if not _valid_browse_request(value) or not self._namespace_is_current(
             value.namespace
         ):
             self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
@@ -1595,7 +1601,8 @@ class RoastServerWorker(QObject):
             self._emit_failure(request_id, failure)
         self.onlineChanged.emit(False)
         try:
-            page = self._cache.list_offline(request.namespace, request.filters)
+            cached_page = self._cache.list_offline(request.namespace, request.filters)
+            page = CachedPage(cached_page.items[:_MAX_OFFLINE_ARCHIVE_ROWS])
         except CacheError as error:
             if not self._cancelled():
                 self._emit_failure(request_id, error.failure)
@@ -1636,9 +1643,11 @@ class RoastServerWorker(QObject):
         ):
             self._emit_failure(request_id, _failure(FailureKind.OFFLINE))
             self.onlineChanged.emit(False)
+            self._offer_request_fallback(request_id, request)
             return
 
         staged_path: Path | None = None
+        detail: RoastDetail | None = None
         try:
             with self._client_factory(configuration.origin, credential) as client:
                 if self._cancelled():
@@ -1690,6 +1699,11 @@ class RoastServerWorker(QObject):
                 self._discard_stage(staged_path)
             if not self._cancelled():
                 self._handle_nonqueue_api_failure(request_id, request.namespace, error)
+                if error.failure.retryable:
+                    if detail is None:
+                        self._offer_request_fallback(request_id, request)
+                    else:
+                        self._offer_cached_fallback(request_id, request.namespace, detail)
             return
         except CacheError as error:
             if staged_path is not None:
@@ -1714,6 +1728,47 @@ class RoastServerWorker(QObject):
             return
         self.downloadStaged.emit(request_id, publish_request)
         self.onlineChanged.emit(True)
+
+    def _offer_request_fallback(
+        self,
+        request_id: str,
+        request: OnlineOpenRequest,
+    ) -> None:
+        expected = request.cached_fallback
+        if expected is None or self._cancelled():
+            return
+        try:
+            cached = self._cache.validate(expected)
+        except CacheError:
+            return
+        if (
+            cached.namespace == request.namespace
+            and cached.roast.roast_uuid == request.roast_uuid
+            and cached.revision.revision_number == cached.roast.revision_count
+            and not self._cancelled()
+        ):
+            self.cachedFallbackReady.emit(request_id, cached)
+
+    def _offer_cached_fallback(
+        self,
+        request_id: str,
+        namespace: Namespace,
+        detail: RoastDetail,
+    ) -> None:
+        revision = detail.current_revision
+        if revision is None or self._cancelled():
+            return
+        try:
+            cached = self._cache.find_current(
+                namespace,
+                detail.roast_uuid,
+                revision.revision_number,
+                revision.sha256,
+            )
+        except CacheError:
+            return
+        if cached is not None and not self._cancelled():
+            self.cachedFallbackReady.emit(request_id, cached)
 
     @pyqtSlot(str)
     def open_cached(self, opaque_id: str) -> None:
@@ -2310,6 +2365,32 @@ def _valid_saved_request(value: object) -> TypeGuard[SavedProfileRequest]:
         and modified_at.utcoffset() is not None
         and type(manual) is bool
     )
+
+
+def _valid_browse_request(value: object) -> TypeGuard[BrowseRequest]:
+    if not isinstance(value, BrowseRequest):
+        return False
+    namespace: object = value.namespace
+    cursor: object = value.cursor
+    refresh: object = value.refresh
+    if (
+        not isinstance(namespace, Namespace)
+        or type(refresh) is not bool
+        or (
+            cursor is not None
+            and (
+                not isinstance(cursor, str)
+                or cursor == ''
+                or len(cursor) > MAX_CURSOR_CHARS
+            )
+        )
+    ):
+        return False
+    try:
+        validate_archive_filters(value.filters)
+    except ValueError:
+        return False
+    return True
 
 
 def _valid_publish_request(value: object) -> TypeGuard[PublishRequest]:

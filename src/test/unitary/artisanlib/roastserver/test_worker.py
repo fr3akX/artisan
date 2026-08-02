@@ -2512,6 +2512,98 @@ def test_browse_online_then_retained_offline_cache_fallback(
     assert len(worker_harness.client.enter_threads) == len(worker_harness.client.exit_threads)
 
 
+def test_browse_rejects_unbounded_filters_and_cursor_before_api(
+    worker_harness: WorkerHarness,
+) -> None:
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    calls_before = list(worker_harness.client.calls)
+    requests = (
+        BrowseRequest(
+            NAMESPACE,
+            ArchiveFilters(search='x' * 201),
+            None,
+            True,
+        ),
+        BrowseRequest(
+            NAMESPACE,
+            ArchiveFilters(),
+            'c' * 513,
+            False,
+        ),
+    )
+
+    for expected_failures, request in enumerate(requests, start=1):
+        request_id = worker_harness.command_vault.put(request)
+        worker_harness.bus.browse_worker.emit(request_id)
+        worker_harness.wait_until(
+            lambda expected=expected_failures: len(failed) >= expected  # type: ignore[misc]
+        )
+
+    assert worker_harness.client.calls == calls_before
+    assert [list(failed[index])[1] for index in range(len(failed))] == [
+        public_failure(FailureKind.INVALID_RESPONSE, retryable=False),
+        public_failure(FailureKind.INVALID_RESPONSE, retryable=False),
+    ]
+
+
+def test_retryable_download_failure_offers_only_exact_verified_cached_revision(
+    worker_harness: WorkerHarness,
+) -> None:
+    published = QSignalSpy(worker_harness.worker.cachePublished)
+    _online_id, publish_request = worker_harness.open_online()
+    publish_id = worker_harness.command_vault.put(publish_request)
+    worker_harness.bus.publish_worker.emit(publish_id)
+    cached = cast(CachedRevision, worker_harness.wait_for_spy(published, 0)[1])
+    fallback = QSignalSpy(worker_harness.worker.cachedFallbackReady)
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    worker_harness.client.failure_method = 'download_revision'
+    worker_harness.client.failure = api_failure(503)
+    request_id = worker_harness.command_vault.put(
+        OnlineOpenRequest(NAMESPACE, ROAST_UUID)
+    )
+
+    worker_harness.bus.online_worker.emit(request_id)
+
+    assert worker_harness.wait_for_spy(failed, 0) == [
+        request_id,
+        worker_harness.client.failure.failure,
+    ]
+    assert worker_harness.wait_for_spy(fallback, 0) == [request_id, cached]
+    assert len(worker_harness.cache.discard_calls) == 1
+    assert not worker_harness.cache.discard_calls[-1][0].exists()
+
+    cached.path.write_bytes(b'corrupt cached profile')
+    second_id = worker_harness.command_vault.put(
+        OnlineOpenRequest(NAMESPACE, ROAST_UUID)
+    )
+    worker_harness.bus.online_worker.emit(second_id)
+    worker_harness.wait_for_spy(failed, 1)
+    worker_harness.wait_until(lambda: len(worker_harness.cache.discard_calls) == 2)
+    assert len(fallback) == 1
+
+
+def test_retryable_detail_failure_revalidates_last_known_current_cache_fallback(
+    worker_harness: WorkerHarness,
+) -> None:
+    published = QSignalSpy(worker_harness.worker.cachePublished)
+    _online_id, publish_request = worker_harness.open_online()
+    publish_id = worker_harness.command_vault.put(publish_request)
+    worker_harness.bus.publish_worker.emit(publish_id)
+    cached = cast(CachedRevision, worker_harness.wait_for_spy(published, 0)[1])
+    fallback = QSignalSpy(worker_harness.worker.cachedFallbackReady)
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    worker_harness.client.failure_method = 'get_roast'
+    worker_harness.client.failure = api_failure(503)
+    request_id = worker_harness.command_vault.put(
+        OnlineOpenRequest(NAMESPACE, ROAST_UUID, cached)
+    )
+
+    worker_harness.bus.online_worker.emit(request_id)
+
+    worker_harness.wait_for_spy(failed, 0)
+    assert worker_harness.wait_for_spy(fallback, 0) == [request_id, cached]
+
+
 def test_online_download_publish_cached_validation_and_cache_signals(
     worker_harness: WorkerHarness,
 ) -> None:

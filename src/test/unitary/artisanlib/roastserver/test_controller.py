@@ -39,7 +39,7 @@ import pytest
 
 from artisanlib.atypes import ProfileData
 from artisanlib.roastserver.api import ApiFailure, ClientFactory, DownloadReceipt
-from artisanlib.roastserver.cache import CacheStats, CachedRevision, CacheStore
+from artisanlib.roastserver.cache import CacheStats, CachedPage, CachedRevision, CacheStore
 from artisanlib.roastserver.contract import (
     FAILURE_MESSAGES,
     ArchiveFilters,
@@ -56,7 +56,11 @@ from artisanlib.roastserver.contract import (
     ServerIdentity,
     ServerProfileSource,
 )
-from artisanlib.roastserver.controller import ControllerError, RoastServerController
+from artisanlib.roastserver.controller import (
+    ArchivePageView,
+    ControllerError,
+    RoastServerController,
+)
 from artisanlib.roastserver.metadata import project_profile
 from artisanlib.roastserver.outbox import FailedJob, Job, Outbox, QueueCounts
 from artisanlib.roastserver.settings import (
@@ -71,6 +75,7 @@ from artisanlib.roastserver.worker import (
     BrowseRequest,
     ClearUnusedRequest,
     ConnectionTestRequest,
+    OnlineOpenRequest,
     OpaqueVault,
     PendingConnectionRecovery,
     ProtectedPathsRequest,
@@ -547,6 +552,7 @@ class FakeWorker(QObject):
     archivePageReady = pyqtSignal(str, object)
     downloadStaged = pyqtSignal(str, object)
     cachedReady = pyqtSignal(str, object)
+    cachedFallbackReady = pyqtSignal(str, object)
     cachePublished = pyqtSignal(str, object)
     onlineChanged = pyqtSignal(bool)
     stopped = pyqtSignal()
@@ -753,6 +759,10 @@ class FakeWorker(QObject):
         self.cachedReady.emit(request_id, value)
 
     @pyqtSlot(str, object)
+    def relay_cached_fallback(self, request_id: str, value: object) -> None:
+        self.cachedFallbackReady.emit(request_id, value)
+
+    @pyqtSlot(str, object)
     def relay_published(self, request_id: str, value: object) -> None:
         self.cachePublished.emit(request_id, value)
 
@@ -793,6 +803,7 @@ class WorkerRelay(QObject):
     archive = pyqtSignal(str, object)
     staged = pyqtSignal(str, object)
     cached = pyqtSignal(str, object)
+    cached_fallback = pyqtSignal(str, object)
     published = pyqtSignal(str, object)
     online = pyqtSignal(bool)
 
@@ -849,6 +860,7 @@ class ControllerHarness:
             self.relay.archive.connect(self.worker.relay_archive)
             self.relay.staged.connect(self.worker.relay_staged)
             self.relay.cached.connect(self.worker.relay_cached)
+            self.relay.cached_fallback.connect(self.worker.relay_cached_fallback)
             self.relay.published.connect(self.worker.relay_published)
             self.relay.online.connect(self.worker.relay_online)
             return self.worker
@@ -1008,16 +1020,20 @@ def test_cancel_connection_test_discards_exact_latest_request_and_late_result(
     assert controller_harness.credentials.set_calls == []
 
 
-def test_configuration_geometry_is_saved_only_through_controller(
+def test_dialog_geometries_are_detached_saved_and_preserved_by_controller(
     controller_harness: ControllerHarness,
 ) -> None:
     geometry = QByteArray(b'bounded-public-geometry')
+    browser_geometry = QByteArray(b'bounded-browser-geometry')
 
     controller_harness.controller.save_configuration_geometry(geometry)
+    controller_harness.controller.save_browser_geometry(browser_geometry)
 
-    saved = controller_harness.settings_store.load().configuration_geometry
-    assert saved == geometry
-    assert saved is not geometry
+    saved = controller_harness.settings_store.load()
+    assert saved.configuration_geometry == geometry
+    assert saved.configuration_geometry is not geometry
+    assert saved.browser_geometry == browser_geometry
+    assert saved.browser_geometry is not browser_geometry
 
 
 def test_auto_upload_cannot_enable_before_confirmed_test(
@@ -1807,7 +1823,11 @@ def test_browse_tracks_cursor_and_ignores_stale_pages(
 
     page = RoastPage((summary_for(),), 'next-cursor')
     controller_harness.relay.archive.emit(first_id, page)
-    assert controller_harness.wait_for_spy(page_spy) == [first_id, page]
+    first_payload = controller_harness.wait_for_spy(page_spy)
+    first_view = cast(ArchivePageView, first_payload[1])
+    assert first_payload[0] == first_id
+    assert first_view.rows[0].roast == page.items[0]
+    assert first_view.next_cursor == page.next_cursor
     more_id = controller_harness.controller.load_more()
     assert more_id is not None
     more_request = cast(BrowseRequest, controller_harness.command_vault.take(more_id))
@@ -1820,6 +1840,112 @@ def test_browse_tracks_cursor_and_ignores_stale_pages(
     time.sleep(0.01)
     controller_harness.app.processEvents()
     assert len(page_spy) == 1
+
+
+def test_browse_emits_immutable_page_views_and_failed_next_cursor_can_retry(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    ready = QSignalSpy(controller_harness.controller.archivePageReady)
+    failed = QSignalSpy(controller_harness.controller.operationFailed)
+    first_id = controller_harness.controller.browse(ArchiveFilters())
+    controller_harness.command_vault.take(first_id)
+    online = RoastPage((summary_for(),), 'next-cursor')
+
+    controller_harness.relay.archive.emit(first_id, online)
+
+    first_payload = controller_harness.wait_for_spy(ready)
+    first_view = cast(ArchivePageView, first_payload[1])
+    assert first_payload[0] == first_id
+    assert first_view.online
+    assert first_view.next_cursor == 'next-cursor'
+    assert first_view.retained_error is None
+    assert first_view.rows[0].roast == summary_for()
+    assert first_view.rows[0].cached_revision is None
+
+    more_id = controller_harness.controller.load_more()
+    assert more_id is not None
+    controller_harness.command_vault.take(more_id)
+    failure = public_failure(FailureKind.OFFLINE)
+    controller_harness.relay.failure.emit(more_id, failure)
+    assert controller_harness.wait_for_spy(failed) == [more_id, failure]
+
+    retry_id = controller_harness.controller.load_more()
+    assert retry_id is not None
+    retry = cast(BrowseRequest, controller_harness.command_vault.take(retry_id))
+    assert retry.cursor == 'next-cursor'
+
+
+def test_cached_page_view_carries_verified_revision_and_retained_failure(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    ready = QSignalSpy(controller_harness.controller.archivePageReady)
+    first_id = controller_harness.controller.browse(ArchiveFilters())
+    controller_harness.command_vault.take(first_id)
+    failure = public_failure(FailureKind.OFFLINE)
+    cached = cached_revision(controller_harness.tmp_path / 'offline.alog')
+
+    controller_harness.relay.failure.emit(first_id, failure)
+    controller_harness.relay.archive.emit(first_id, CachedPage((cached,)))
+
+    payload = controller_harness.wait_for_spy(ready)
+    view = cast(ArchivePageView, payload[1])
+    assert not view.online
+    assert view.retained_error == failure
+    assert view.next_cursor is None
+    assert len(view.rows) == 1
+    assert view.rows[0].cached_revision == cached.revision.revision_number
+    assert view.rows[0].cached_sha256 == cached.revision.sha256
+    assert view.rows[0].cached == cached
+    assert view.rows[0].stale
+
+    online_id = controller_harness.controller.browse(ArchiveFilters())
+    controller_harness.command_vault.take(online_id)
+    controller_harness.relay.archive.emit(
+        online_id, RoastPage((cached.roast,), None)
+    )
+    controller_harness.wait_until(lambda: len(ready) == 2)
+    open_id = controller_harness.controller.open_roast(cached.roast.roast_uuid)
+    open_request = cast(
+        OnlineOpenRequest, controller_harness.command_vault.take(open_id)
+    )
+    assert open_request.cached_fallback == cached
+
+
+def test_online_cached_fallback_and_cancel_are_exact_request_generation(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=False)
+    fallback_spy = QSignalSpy(controller_harness.controller.cachedFallbackReady)
+    ready = QSignalSpy(controller_harness.controller.profileReady)
+    cached = cached_revision(controller_harness.tmp_path / 'fallback.alog')
+    first_id = controller_harness.controller.open_roast(ROAST_UUID)
+    controller_harness.command_vault.take(first_id)
+
+    controller_harness.relay.cached_fallback.emit(first_id, cached)
+
+    assert controller_harness.wait_for_spy(fallback_spy) == [first_id, cached]
+    controller_harness.controller.cancel_open(first_id)
+    controller_harness.relay.staged.emit(
+        first_id,
+        publish_request(controller_harness.tmp_path / 'cancelled.part'),
+    )
+    time.sleep(0.01)
+    controller_harness.app.processEvents()
+    assert len(ready) == 0
+    assert not controller_harness.fake_worker.publish_ids
+
+    second_id = controller_harness.controller.open_roast(ROAST_UUID)
+    controller_harness.command_vault.take(second_id)
+    controller_harness.controller.browse(ArchiveFilters(search='new revision'))
+    controller_harness.relay.cached_fallback.emit(second_id, cached)
+    time.sleep(0.01)
+    controller_harness.app.processEvents()
+    assert len(fallback_spy) == 1
 
 
 def test_validation_precedes_publication_and_profile_ready(

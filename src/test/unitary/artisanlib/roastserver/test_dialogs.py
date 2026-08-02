@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time as datetime_time
 import hashlib
 from pathlib import Path
 import secrets
@@ -26,21 +26,34 @@ from typing import cast, override
 from uuid import UUID
 
 import pytest
-from PyQt6.QtCore import QByteArray, QObject, QSettings, Qt, pyqtSignal
+from PyQt6.QtCore import QByteArray, QDate, QObject, QSettings, Qt, pyqtSignal
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QWidget
 
 from artisanlib.roastserver.api import ClientFactory
-from artisanlib.roastserver.cache import CacheStats
+from artisanlib.roastserver.cache import CacheStats, CachedRevision
 from artisanlib.roastserver.contract import (
     FailureKind,
+    ArchiveFilters,
     IdentityOrganization,
     IdentityUser,
+    LabelSummary,
     PublicFailure,
+    Revision,
+    RoastState,
+    RoastSummary,
     ServerIdentity,
+    ServerProfileSource,
 )
 from artisanlib.roastserver.controller import RoastServerController
-from artisanlib.roastserver.dialogs import FailedJobsModel, RoastServerConfigDialog
+from artisanlib.roastserver.dialogs import (
+    ArchivePageView,
+    ArchiveRow,
+    FailedJobsModel,
+    RoastServerBrowserDialog,
+    RoastServerConfigDialog,
+    RoastTableModel,
+)
 from artisanlib.roastserver.outbox import FailedJob, QueueCounts
 from artisanlib.roastserver.settings import (
     KEYRING_FAILURE_MESSAGE,
@@ -49,6 +62,7 @@ from artisanlib.roastserver.settings import (
     ConnectorSettings,
     CredentialStoreError,
     SettingsStore,
+    namespace_for,
 )
 
 ORIGIN = 'https://old.example.test'
@@ -953,3 +967,451 @@ def test_configuration_geometry_round_trip_is_saved_and_restored_onscreen(
     source.deleteLater()
     offscreen_source.deleteLater()
     qapp.processEvents()
+
+
+BROWSER_ROAST_ONE = UUID('55555555-5555-4555-8555-555555555555')
+BROWSER_ROAST_TWO = UUID('66666666-6666-4666-8666-666666666666')
+BROWSER_NAMESPACE = namespace_for(ORIGIN, IDENTITY.organization.id)
+BROWSER_REVISION = Revision(
+    revision_number=2,
+    sha256='a' * 64,
+    byte_size=128,
+    parser_version='browser-test',
+    parse_state='parsed',
+    parse_diagnostic_code=None,
+    parse_diagnostic_message=None,
+    uploaded_at=datetime(2026, 8, 1, 13, tzinfo=UTC),
+    metadata=(),
+    reparse_recommended=False,
+)
+BROWSER_LABEL = LabelSummary(
+    label_uuid=UUID('77777777-7777-4777-8777-777777777777'),
+    name='<b>Plain & curated</b>',
+    color='green',
+    archived=False,
+)
+
+
+def browser_summary(
+    roast_uuid: UUID,
+    *,
+    roast_at: datetime,
+    state: RoastState = 'parsed',
+    title: str | None = 'Browser roast',
+) -> RoastSummary:
+    return RoastSummary(
+        roast_uuid=roast_uuid,
+        state=state,
+        roast_at=roast_at,
+        title=title,
+        batch_prefix='B',
+        batch_number=12,
+        batch_position=3,
+        operator='Operator',
+        machine='Test drum',
+        machine_setup='Setup',
+        temperature_unit='C',
+        duration_seconds=600,
+        green_weight_kg=1.0,
+        roasted_weight_kg=0.85,
+        revision_count=0 if state == 'awaiting_profile' else 2,
+        updated_at=roast_at,
+        labels=(BROWSER_LABEL,),
+    )
+
+
+BROWSER_SUMMARY_ONE = browser_summary(
+    BROWSER_ROAST_ONE, roast_at=datetime(2026, 8, 1, 12, tzinfo=UTC)
+)
+BROWSER_SUMMARY_TWO = browser_summary(
+    BROWSER_ROAST_TWO, roast_at=datetime(2026, 8, 2, 12, tzinfo=UTC)
+)
+BROWSER_CACHED = CachedRevision(
+    namespace=BROWSER_NAMESPACE,
+    roast=BROWSER_SUMMARY_ONE,
+    revision=BROWSER_REVISION,
+    path=Path('/tmp/browser-one.alog'),
+    sidecar_path=Path('/tmp/browser-one.json'),
+    downloaded_at=datetime(2026, 8, 1, 13, tzinfo=UTC),
+)
+BROWSER_SOURCE = ServerProfileSource(
+    namespace=BROWSER_NAMESPACE,
+    roast_uuid=BROWSER_ROAST_ONE,
+    revision_number=2,
+    sha256='a' * 64,
+    stale=True,
+)
+BROWSER_FAILURE = PublicFailure(
+    kind=FailureKind.OFFLINE,
+    code='offline',
+    message='Offline / server unavailable.',
+    retryable=True,
+)
+
+
+class FakeBrowserController(QObject):
+    archivePageReady = pyqtSignal(str, object)
+    operationFailed = pyqtSignal(str, object)
+    onlineChanged = pyqtSignal(bool)
+    profileReady = pyqtSignal(str, object)
+    cachedFallbackReady = pyqtSignal(str, object)
+    identityChanged = pyqtSignal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.browse_calls: list[tuple[str, ArchiveFilters, bool]] = []
+        self.load_more_calls: list[str] = []
+        self.open_roast_calls: list[tuple[str, UUID]] = []
+        self.open_cached_calls: list[tuple[str, CachedRevision]] = []
+        self.cancel_open_calls: list[str] = []
+        self.saved_geometries: list[bytes] = []
+        self._counter = 0
+
+    def _request_id(self, prefix: str) -> str:
+        self._counter += 1
+        return f'{prefix}-{self._counter}'
+
+    def browse(self, filters: ArchiveFilters, refresh: bool = True) -> str:
+        request_id = self._request_id('browse')
+        self.browse_calls.append((request_id, filters, refresh))
+        return request_id
+
+    def load_more(self) -> str | None:
+        request_id = self._request_id('more')
+        self.load_more_calls.append(request_id)
+        return request_id
+
+    def open_roast(self, roast_uuid: UUID) -> str:
+        request_id = self._request_id('online-open')
+        self.open_roast_calls.append((request_id, roast_uuid))
+        return request_id
+
+    def open_cached(self, cached: CachedRevision) -> str:
+        request_id = self._request_id('cached-open')
+        self.open_cached_calls.append((request_id, cached))
+        return request_id
+
+    def cancel_open(self, request_id: str) -> None:
+        self.cancel_open_calls.append(request_id)
+
+    def save_browser_geometry(self, geometry: QByteArray) -> None:
+        self.saved_geometries.append(bytes(geometry.data()))
+
+
+@pytest.fixture
+def browser_controller() -> FakeBrowserController:
+    return FakeBrowserController()
+
+
+@pytest.fixture
+def browser(
+    qapp: QApplication,
+    browser_controller: FakeBrowserController,
+    settings: ConnectorSettings,
+) -> Generator[RoastServerBrowserDialog, None, None]:
+    value = RoastServerBrowserDialog(browser_controller, settings)
+    value.show()
+    qapp.processEvents()
+    yield value
+    value.hide()
+    value.deleteLater()
+    qapp.processEvents()
+
+
+def online_browser_page(
+    *rows: RoastSummary, next_cursor: str | None = None
+) -> ArchivePageView:
+    return ArchivePageView(
+        rows=tuple(ArchiveRow(row, None, None, False) for row in rows),
+        next_cursor=next_cursor,
+        online=True,
+        retained_error=None,
+    )
+
+
+def cached_browser_page(*cached: CachedRevision) -> ArchivePageView:
+    return ArchivePageView(
+        rows=tuple(
+            ArchiveRow(
+                item.roast,
+                item.revision.revision_number,
+                item.revision.sha256,
+                True,
+                item,
+            )
+            for item in cached
+        ),
+        next_cursor=None,
+        online=False,
+        retained_error=BROWSER_FAILURE,
+    )
+
+
+def emit_current_page(
+    browser_controller: FakeBrowserController,
+    page: ArchivePageView,
+) -> str:
+    request_id = browser_controller.browse_calls[-1][0]
+    browser_controller.archivePageReady.emit(request_id, page)
+    return request_id
+
+
+def test_browser_model_is_read_only_plain_accessible_newest_first_and_bounded() -> None:
+    model = RoastTableModel(max_rows=50)
+    older = ArchiveRow(
+        BROWSER_SUMMARY_ONE,
+        BROWSER_REVISION.revision_number,
+        BROWSER_REVISION.sha256,
+        True,
+        BROWSER_CACHED,
+    )
+    newer = ArchiveRow(BROWSER_SUMMARY_TWO, None, None, False)
+
+    model.set_page(ArchivePageView((older, newer), 'next', True, None), append=False)
+
+    assert model.rowCount() == 2
+    assert model.columnCount() == 8
+    assert model.roast_uuids() == (BROWSER_ROAST_TWO, BROWSER_ROAST_ONE)
+    assert [
+        model.headerData(column, Qt.Orientation.Horizontal)
+        for column in range(model.columnCount())
+    ] == ['Roast date', 'Title', 'Batch', 'Machine', 'Labels', 'Parse state', 'Revisions', 'Cache']
+    label_index = model.index(1, 4)
+    assert model.data(label_index) == BROWSER_LABEL.name
+    assert model.data(label_index, Qt.ItemDataRole.EditRole) is None
+    assert model.flags(label_index) == (
+        Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+    )
+    assert model.data(
+        model.index(1, 0), RoastTableModel.RoastUuidRole
+    ) == BROWSER_ROAST_ONE
+    assert model.data(
+        model.index(1, 0), RoastTableModel.CachedRevisionRole
+    ) == BROWSER_CACHED
+    assert '<b>Plain & curated</b>' in cast(
+        str,
+        model.data(model.index(1, 0), Qt.ItemDataRole.AccessibleTextRole),
+    )
+
+    many = tuple(
+        ArchiveRow(
+            replace(BROWSER_SUMMARY_ONE, roast_uuid=UUID(int=number + 1)),
+            None,
+            None,
+            False,
+        )
+        for number in range(60)
+    )
+    model.set_page(ArchivePageView(many, 'more', True, None), append=False)
+    assert model.rowCount() == 50
+    assert not model.has_more()
+
+
+def test_browser_filter_requests_are_trimmed_capped_debounced_and_utc_inclusive(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+) -> None:
+    browser_controller.browse_calls.clear()
+    browser.search_edit.setText(f'  {"x" * 205}  ')
+    QTest.qWait(150)  # type: ignore[call-arg, arg-type]
+    assert browser_controller.browse_calls == []
+    QTest.qWait(200)  # type: ignore[call-arg, arg-type]
+    assert len(browser_controller.browse_calls) == 1
+    assert browser_controller.browse_calls[-1][1].search == 'x' * 200
+    first_request = browser_controller.browse_calls[-1][0]
+    browser_controller.archivePageReady.emit(
+        first_request, online_browser_page(BROWSER_SUMMARY_ONE)
+    )
+
+    parsed_index = browser.state_combo.findData('parse_failed')
+    assert parsed_index >= 0
+    browser.state_combo.setCurrentIndex(parsed_index)
+    browser.machine_edit.setText(f'  {"m" * 105}  ')
+    browser.start_date_edit.setDate(QDate(2026, 7, 1))
+    browser.end_date_edit.setDate(QDate(2026, 7, 31))
+    browser.start_date_check.setChecked(True)
+    browser.end_date_check.setChecked(True)
+    browser.refresh_button.click()
+
+    filters = browser_controller.browse_calls[-1][1]
+    assert filters.state == 'parse_failed'
+    assert filters.machine == 'm' * 100
+    assert filters.roast_at_from == datetime(2026, 7, 1, tzinfo=UTC)
+    assert filters.roast_at_to == datetime.combine(
+        datetime(2026, 7, 31, tzinfo=UTC).date(), datetime_time.max, UTC
+    )
+    assert filters.roast_at_from.tzinfo is UTC
+    assert filters.roast_at_to.tzinfo is UTC
+
+
+def test_browser_refresh_failure_retains_rows_and_stale_response_is_ignored(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+) -> None:
+    emit_current_page(browser_controller, online_browser_page(BROWSER_SUMMARY_ONE))
+    assert browser.roast_model.roast_uuids() == (BROWSER_ROAST_ONE,)
+
+    browser.refresh_button.click()
+    refresh_id = browser_controller.browse_calls[-1][0]
+    browser_controller.operationFailed.emit(refresh_id, BROWSER_FAILURE)
+    assert browser.roast_model.roast_uuids() == (BROWSER_ROAST_ONE,)
+    assert browser.error_label.text() == BROWSER_FAILURE.message
+
+    browser.refresh_button.click()
+    current_id = browser_controller.browse_calls[-1][0]
+    browser_controller.archivePageReady.emit(
+        refresh_id, online_browser_page(BROWSER_SUMMARY_TWO)
+    )
+    assert browser.roast_model.roast_uuids() == (BROWSER_ROAST_ONE,)
+    browser_controller.archivePageReady.emit(
+        current_id, online_browser_page(BROWSER_SUMMARY_TWO)
+    )
+    assert browser.roast_model.roast_uuids() == (BROWSER_ROAST_TWO,)
+    assert browser.error_label.text() == ''
+
+
+def test_browser_load_more_deduplicates_and_visible_fallback_matches_scroll_paging(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+    qapp: QApplication,
+) -> None:
+    emit_current_page(
+        browser_controller,
+        online_browser_page(BROWSER_SUMMARY_ONE, next_cursor='cursor'),
+    )
+    assert browser.load_more_button.isVisible()
+    assert browser.load_more_button.isEnabled()
+    assert browser.load_more_button.accessibleName() == 'Load more server roasts'
+
+    browser.load_more_button.click()
+    more_id = browser_controller.load_more_calls[-1]
+    browser_controller.archivePageReady.emit(
+        more_id,
+        online_browser_page(BROWSER_SUMMARY_ONE, BROWSER_SUMMARY_TWO),
+    )
+    assert browser.roast_model.roast_uuids() == (
+        BROWSER_ROAST_TWO,
+        BROWSER_ROAST_ONE,
+    )
+
+    browser.refresh_button.click()
+    emit_current_page(
+        browser_controller,
+        online_browser_page(BROWSER_SUMMARY_ONE, next_cursor='another'),
+    )
+    before = len(browser_controller.load_more_calls)
+    scroll = browser.roast_view.verticalScrollBar()
+    assert scroll is not None
+    scroll.setRange(0, 100)
+    scroll.setValue(98)
+    qapp.processEvents()
+    assert len(browser_controller.load_more_calls) == before + 1
+
+
+def test_browser_offline_open_revalidates_cached_and_tracks_only_matching_profile(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+) -> None:
+    emit_current_page(browser_controller, cached_browser_page(BROWSER_CACHED))
+    browser.select_roast(BROWSER_ROAST_ONE)
+    assert browser.open_button.isEnabled()
+    assert browser.status_label.text() == 'Offline — cached copies may be stale.'
+
+    browser.open_button.click()
+    open_id, cached = browser_controller.open_cached_calls[-1]
+    assert cached == BROWSER_CACHED
+    assert not browser.open_button.isEnabled()
+    assert browser.progress_bar.isVisible()
+    assert browser.cancel_open_button.isVisible()
+
+    wrong = replace(BROWSER_SOURCE, revision_number=1)
+    browser_controller.profileReady.emit(str(BROWSER_CACHED.path), wrong)
+    assert browser.progress_bar.isVisible()
+    browser_controller.profileReady.emit(str(BROWSER_CACHED.path), BROWSER_SOURCE)
+    assert not browser.progress_bar.isVisible()
+    assert browser.status_label.text() == 'Opened verified cached revision 2 (stale).'
+    assert BROWSER_SOURCE.stale
+    assert open_id not in browser_controller.cancel_open_calls
+
+
+def test_browser_awaiting_profile_disabled_fallback_is_confirmed_and_close_cancels(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+) -> None:
+    awaiting = browser_summary(
+        BROWSER_ROAST_TWO,
+        roast_at=datetime(2026, 8, 2, tzinfo=UTC),
+        state='awaiting_profile',
+    )
+    emit_current_page(
+        browser_controller,
+        online_browser_page(awaiting, BROWSER_SUMMARY_ONE),
+    )
+    browser.select_roast(BROWSER_ROAST_TWO)
+    assert not browser.open_button.isEnabled()
+
+    browser.select_roast(BROWSER_ROAST_ONE)
+    browser.open_button.click()
+    online_id = browser_controller.open_roast_calls[-1][0]
+    monkeypatch.setattr(
+        browser,
+        '_confirm_cached_fallback',
+        lambda _cached: True,
+    )
+    browser_controller.operationFailed.emit(online_id, BROWSER_FAILURE)
+    browser_controller.cachedFallbackReady.emit(online_id, BROWSER_CACHED)
+    cached_id, fallback = browser_controller.open_cached_calls[-1]
+    assert fallback == BROWSER_CACHED
+    assert cached_id != online_id
+
+    browser.close()
+    qapp.processEvents()
+    assert not browser.isVisible()
+    assert browser_controller.cancel_open_calls[-1] == cached_id
+    assert browser_controller.saved_geometries
+    browser_controller.profileReady.emit(str(BROWSER_CACHED.path), BROWSER_SOURCE)
+    assert not browser.isVisible()
+
+
+def test_browser_namespace_change_clears_rows_selection_requests_and_progress(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+) -> None:
+    emit_current_page(browser_controller, online_browser_page(BROWSER_SUMMARY_ONE))
+    browser.select_roast(BROWSER_ROAST_ONE)
+    browser.open_button.click()
+    open_id = browser_controller.open_roast_calls[-1][0]
+
+    browser_controller.identityChanged.emit(IDENTITY)
+
+    assert browser.roast_model.rowCount() == 0
+    assert browser.roast_view.currentIndex().isValid() is False
+    assert not browser.progress_bar.isVisible()
+    assert browser_controller.cancel_open_calls[-1] == open_id
+    assert not browser.load_more_button.isEnabled()
+
+
+def test_browser_is_modeless_plain_accessible_keyboard_reachable_and_onscreen(
+    browser: RoastServerBrowserDialog,
+) -> None:
+    assert not browser.isModal()
+    assert browser.error_label.textFormat() is Qt.TextFormat.PlainText
+    assert browser.status_label.textFormat() is Qt.TextFormat.PlainText
+    assert not browser.error_label.openExternalLinks()
+    assert browser.search_label.buddy() is browser.search_edit
+    assert browser.machine_label.buddy() is browser.machine_edit
+    assert browser.roast_view.accessibleName() == 'Server roast archive'
+    assert browser.open_button.accessibleName() == 'Open selected server roast'
+    assert browser.load_more_button.accessibleName() == 'Load more server roasts'
+    assert not hasattr(browser, 'comments_edit')
+    assert not browser.roast_view.editTriggers()
+    screen = browser.screen()
+    assert screen is not None
+    available = screen.availableGeometry()
+    if (
+        available.width() >= browser.minimumWidth()
+        and available.height() >= browser.minimumHeight()
+    ):
+        assert available.contains(browser.frameGeometry())

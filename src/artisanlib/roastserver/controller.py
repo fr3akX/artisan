@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import copy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import logging
 import os
@@ -55,6 +55,7 @@ from artisanlib.roastserver.contract import (
     Namespace,
     PublicFailure,
     RoastPage,
+    RoastSummary,
     ServerIdentity,
     ServerProfileSource,
     validate_archive_filters,
@@ -103,6 +104,31 @@ _INVALID_OPTIONS_MESSAGE: Final[str] = 'Invalid Roast Server options.'
 _INVALID_REQUEST_MESSAGE: Final[str] = 'Invalid Roast Server request.'
 _SETTLEMENT_MESSAGE: Final[str] = 'Roast Server credential rollback is still settling.'
 _ROLLBACK_SETTLEMENT_TIMEOUT_MS: Final[int] = 15_000
+_MAX_ARCHIVE_ROWS: Final[int] = 5_000
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveRow:
+    roast: RoastSummary
+    cached_revision: int | None
+    cached_sha256: str | None
+    stale: bool
+    cached: CachedRevision | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ArchivePageView:
+    rows: tuple[ArchiveRow, ...]
+    next_cursor: str | None
+    online: bool
+    retained_error: PublicFailure | None
+
+
+@dataclass(frozen=True, slots=True)
+class _BrowseTracking:
+    epoch: int
+    cursor: str | None
+    refresh: bool
 
 
 class ControllerError(RuntimeError):
@@ -136,6 +162,7 @@ class RoastServerController(QObject):
     failedJobsChanged = pyqtSignal(object)
     cacheStatsChanged = pyqtSignal(object)
     archivePageReady = pyqtSignal(str, object)
+    cachedFallbackReady = pyqtSignal(str, object)
     operationFailed = pyqtSignal(str, object)
     onlineChanged = pyqtSignal(bool)
     profileReady = pyqtSignal(str, object)
@@ -200,7 +227,10 @@ class RoastServerController(QObject):
         self._browse_epoch = 0
         self._browse_filters: ArchiveFilters | None = None
         self._next_cursor: str | None = None
-        self._browse_requests: dict[str, int] = {}
+        self._browse_requests: dict[str, _BrowseTracking] = {}
+        self._browse_failures: dict[str, PublicFailure] = {}
+        self._known_cached_revisions: dict[UUID, CachedRevision] = {}
+        self._current_archive_revisions: dict[UUID, int] = {}
         self._online_requests: dict[str, tuple[Namespace, UUID, int]] = {}
         self._cached_requests: dict[str, tuple[CachedRevision, int]] = {}
         self._publish_requests: dict[
@@ -299,6 +329,7 @@ class RoastServerController(QObject):
         _connect(worker.archivePageReady, self._on_archive_page, queued)
         _connect(worker.downloadStaged, self._on_download_staged, queued)
         _connect(worker.cachedReady, self._on_cached_ready, queued)
+        _connect(worker.cachedFallbackReady, self._on_cached_fallback, queued)
         _connect(worker.cachePublished, self._on_cache_published, queued)
         _connect(worker.onlineChanged, self._on_online_changed, queued)
         _connect(worker.stopped, worker_object.deleteLater, direct)
@@ -477,22 +508,33 @@ class RoastServerController(QObject):
         )
 
     def save_configuration_geometry(self, geometry: QByteArray) -> None:
+        self._save_geometry(geometry, browser=False)
+
+    def save_browser_geometry(self, geometry: QByteArray) -> None:
+        self._save_geometry(geometry, browser=True)
+
+    def _save_geometry(self, geometry: QByteArray, *, browser: bool) -> None:
         self._require_command_state()
         geometry_value: object = geometry
         if not isinstance(geometry_value, QByteArray) or geometry_value.isEmpty():
             raise ControllerError(_INVALID_REQUEST_MESSAGE)
         detached = QByteArray(geometry_value)
+        configuration_geometry = (
+            self._settings.configuration_geometry if browser else detached
+        )
+        browser_geometry = detached if browser else self._settings.browser_geometry
         try:
             self._settings_store.save_geometry(
-                detached,
-                self._settings.browser_geometry,
+                configuration_geometry,
+                browser_geometry,
             )
         except SettingsError:
             self._settings_failure('geometry')
             raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
         self._settings = replace(
             self._settings,
-            configuration_geometry=detached,
+            configuration_geometry=configuration_geometry,
+            browser_geometry=browser_geometry,
         )
 
     def remove_credential(self) -> None:
@@ -624,10 +666,13 @@ class RoastServerController(QObject):
         self._browse_filters = validated
         self._next_cursor = None
         self._browse_requests.clear()
+        self._browse_failures.clear()
         request_id = self._put_command(
             BrowseRequest(namespace, validated, None, refresh)
         )
-        self._browse_requests[request_id] = self._browse_epoch
+        self._browse_requests[request_id] = _BrowseTracking(
+            self._browse_epoch, None, refresh
+        )
         self._browseWorker.emit(request_id)
         return request_id
 
@@ -639,10 +684,16 @@ class RoastServerController(QObject):
         if namespace is None or filters is None or cursor is None:
             return None
         self._next_cursor = None
+        for stale_id, tracked in tuple(self._browse_requests.items()):
+            if tracked.cursor is not None:
+                self._browse_requests.pop(stale_id, None)
+                self._browse_failures.pop(stale_id, None)
         request_id = self._put_command(
             BrowseRequest(namespace, filters, cursor, False)
         )
-        self._browse_requests[request_id] = self._browse_epoch
+        self._browse_requests[request_id] = _BrowseTracking(
+            self._browse_epoch, cursor, False
+        )
         self._browseWorker.emit(request_id)
         return request_id
 
@@ -651,7 +702,18 @@ class RoastServerController(QObject):
         namespace = self._require_active_namespace()
         if not isinstance(roast_uuid, UUID):
             raise ControllerError(_INVALID_REQUEST_MESSAGE)
-        request_id = self._put_command(OnlineOpenRequest(namespace, roast_uuid))
+        self._online_requests.clear()
+        cached = self._known_cached_revisions.get(roast_uuid)
+        current_revision = self._current_archive_revisions.get(roast_uuid)
+        fallback = (
+            cached
+            if cached is not None
+            and cached.revision.revision_number == current_revision
+            else None
+        )
+        request_id = self._put_command(
+            OnlineOpenRequest(namespace, roast_uuid, fallback)
+        )
         self._online_requests[request_id] = (
             namespace,
             roast_uuid,
@@ -669,10 +731,22 @@ class RoastServerController(QObject):
             or cached_value.namespace != namespace
         ):
             raise ControllerError(_INVALID_REQUEST_MESSAGE)
+        self._cached_requests.clear()
         request_id = self._put_command(CachedOpenRequest(cached))
         self._cached_requests[request_id] = (cached, self._browse_epoch)
         self._openCachedWorker.emit(request_id)
         return request_id
+
+    def cancel_open(self, request_id: str) -> None:
+        self._require_command_state()
+        request_value: object = request_id
+        if not isinstance(request_value, str):
+            raise ControllerError(_INVALID_REQUEST_MESSAGE)
+        self._online_requests.pop(request_id, None)
+        self._cached_requests.pop(request_id, None)
+        for publish_id, tracked in tuple(self._publish_requests.items()):
+            if tracked[0] == request_id:
+                self._publish_requests.pop(publish_id, None)
 
     def clear_unused_cache(self) -> None:
         self._require_command_state()
@@ -982,6 +1056,11 @@ class RoastServerController(QObject):
             failure = _failure(FailureKind.INVALID_RESPONSE)
         else:
             failure = value
+        browse = self._browse_requests.get(operation)
+        if browse is not None and browse.epoch == self._browse_epoch:
+            self._browse_failures[operation] = failure
+            if browse.cursor is not None:
+                self._next_cursor = browse.cursor
         if operation == self._active_connection_test:
             self._connection_tests.pop(operation, None)
             self._active_connection_test = None
@@ -1020,19 +1099,62 @@ class RoastServerController(QObject):
     def _on_archive_page(self, request_id: str, value: object) -> None:
         if self._stop_requested:
             return
-        epoch = self._browse_requests.pop(request_id, None)
-        if epoch is None or epoch != self._browse_epoch:
+        tracked = self._browse_requests.pop(request_id, None)
+        if tracked is None or tracked.epoch != self._browse_epoch:
             return
+        retained_error = self._browse_failures.pop(request_id, None)
         if isinstance(value, RoastPage):
             self._next_cursor = value.next_cursor
+            if tracked.cursor is None:
+                self._current_archive_revisions.clear()
+            for roast in value.items:
+                self._current_archive_revisions[roast.roast_uuid] = roast.revision_count
+            rows = tuple(self._online_archive_row(roast) for roast in value.items)
+            view = ArchivePageView(
+                rows=_newest_first(rows)[:_MAX_ARCHIVE_ROWS],
+                next_cursor=value.next_cursor,
+                online=True,
+                retained_error=None,
+            )
         elif isinstance(value, CachedPage):
-            self._next_cursor = None
+            for cached in value.items:
+                self._known_cached_revisions[cached.roast.roast_uuid] = cached
+            retained_cursor = tracked.cursor if retained_error is not None else None
+            self._next_cursor = retained_cursor
+            rows = tuple(
+                ArchiveRow(
+                    roast=cached.roast,
+                    cached_revision=cached.revision.revision_number,
+                    cached_sha256=cached.revision.sha256,
+                    stale=True,
+                    cached=cached,
+                )
+                for cached in value.items
+            )
+            view = ArchivePageView(
+                rows=_newest_first(rows)[:_MAX_ARCHIVE_ROWS],
+                next_cursor=retained_cursor,
+                online=False,
+                retained_error=retained_error,
+            )
         else:
             self.operationFailed.emit(
                 request_id, _failure(FailureKind.INVALID_RESPONSE)
             )
             return
-        self.archivePageReady.emit(request_id, value)
+        self.archivePageReady.emit(request_id, view)
+
+    def _online_archive_row(self, roast: RoastSummary) -> ArchiveRow:
+        cached = self._known_cached_revisions.get(roast.roast_uuid)
+        if cached is None or cached.revision.revision_number != roast.revision_count:
+            return ArchiveRow(roast, None, None, False)
+        return ArchiveRow(
+            roast,
+            cached.revision.revision_number,
+            cached.revision.sha256,
+            False,
+            cached,
+        )
 
     @pyqtSlot(str, object)
     def _on_download_staged(self, request_id: str, value: object) -> None:
@@ -1089,7 +1211,27 @@ class RoastServerController(QObject):
             or self._active_namespace(require_enabled=True) != value.namespace
         ):
             return
+        self._known_cached_revisions[value.roast.roast_uuid] = value
         self._emit_profile_ready(value, stale=True)
+
+    @pyqtSlot(str, object)
+    def _on_cached_fallback(self, request_id: str, value: object) -> None:
+        if self._stop_requested:
+            return
+        tracked = self._online_requests.pop(request_id, None)
+        if tracked is None or not isinstance(value, CachedRevision):
+            return
+        namespace, roast_uuid, epoch = tracked
+        if (
+            epoch != self._browse_epoch
+            or value.namespace != namespace
+            or value.roast.roast_uuid != roast_uuid
+            or value.revision.revision_number != value.roast.revision_count
+            or self._active_namespace(require_enabled=True) != namespace
+        ):
+            return
+        self._known_cached_revisions[roast_uuid] = value
+        self.cachedFallbackReady.emit(request_id, value)
 
     @pyqtSlot(str, object)
     def _on_cache_published(self, request_id: str, value: object) -> None:
@@ -1110,6 +1252,7 @@ class RoastServerController(QObject):
             or self._active_namespace(require_enabled=True) != namespace
         ):
             return
+        self._known_cached_revisions[roast_uuid] = value
         self._emit_profile_ready(value, stale=False)
 
     @pyqtSlot(bool)
@@ -1304,6 +1447,9 @@ class RoastServerController(QObject):
         self._browse_filters = None
         self._next_cursor = None
         self._browse_requests.clear()
+        self._browse_failures.clear()
+        self._known_cached_revisions.clear()
+        self._current_archive_revisions.clear()
         self._online_requests.clear()
         self._cached_requests.clear()
         self._publish_requests.clear()
@@ -1406,6 +1552,16 @@ def _connect(
     connect(slot, connection_type)
 
 
+def _newest_first(rows: tuple[ArchiveRow, ...]) -> tuple[ArchiveRow, ...]:
+    return tuple(
+        sorted(
+            rows,
+            key=lambda row: (row.roast.roast_at, row.roast.roast_uuid.hex),
+            reverse=True,
+        )
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -1452,6 +1608,8 @@ def _failure(kind: FailureKind) -> PublicFailure:
 
 
 __all__ = [
+    'ArchivePageView',
+    'ArchiveRow',
     'ControllerError',
     'RoastServerController',
     'SHUTDOWN_TIMEOUT_MESSAGE',
