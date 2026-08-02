@@ -1250,6 +1250,53 @@ def test_cancel_first_committed_transaction_deletes_candidate_keyring(
     assert_secret_absent(candidate, committed)
 
 
+def test_synchronous_vault_cancel_during_final_auth_rolls_keyring_back(
+    worker_harness: WorkerHarness,
+) -> None:
+    activated = QSignalSpy(worker_harness.worker.connectionActivated)
+    candidate = secrets.token_urlsafe(32)
+    old_digest = worker_harness.credentials.stored_digest()
+    transaction_id = worker_harness.request_connection_test(candidate)
+    worker_harness.wait_until(
+        lambda: transaction_id in worker_harness.worker._credential_transactions
+    )
+    worker_harness.bus.commit_worker.emit(transaction_id)
+    worker_harness.wait_until(
+        lambda: worker_harness.worker._credential_transactions[
+            transaction_id
+        ].keyring_committed
+    )
+    worker_harness.bus.configure_worker.emit(
+        WorkerConfiguration(
+            origin=ORIGIN,
+            namespace=NAMESPACE,
+            enabled=False,
+            automatic_upload=False,
+            client_instance_uuid=CLIENT_UUID,
+            cache_limit_bytes=64 * 1024 * 1024,
+            identity=IDENTITY,
+            activation_id=transaction_id,
+        )
+    )
+
+    def cancel_during_auth(method: str) -> None:
+        if method == 'test_connection':
+            worker_harness.secret_vault.clear()
+
+    worker_harness.client.callback = cancel_during_auth
+    worker_harness.bus.finalize_worker.emit(transaction_id)
+    worker_harness.wait_until(
+        lambda: transaction_id not in worker_harness.worker._credential_transactions
+    )
+
+    assert len(activated) == 0
+    assert worker_harness.credentials.stored_digest() == old_digest
+    assert worker_harness.credentials.set_calls[-1][1] == old_digest
+    assert worker_harness.worker._credential is None
+    assert worker_harness.worker._authorized_target is None
+    assert_secret_absent(candidate, worker_harness.worker)
+
+
 def test_cancel_delayed_completed_transaction_revokes_worker_authorization(
     worker_harness: WorkerHarness,
 ) -> None:
@@ -1745,6 +1792,30 @@ def test_disable_missing_credential_restore_and_namespace_switch_are_isolated(
     assert all(call[0] != 'https://other.example.test' for call in worker_harness.credentials.get_calls)
     assert worker_harness.outbox.counts(NAMESPACE).paused == 1
     assert job.id
+
+
+def test_configuration_rejects_missing_opaque_validation_correlation(
+    worker_harness: WorkerHarness,
+) -> None:
+    failed = QSignalSpy(worker_harness.worker.operationFailed)
+    worker_harness.bus.configure_worker.emit(
+        WorkerConfiguration(
+            origin=ORIGIN,
+            namespace=NAMESPACE,
+            enabled=True,
+            automatic_upload=True,
+            client_instance_uuid=CLIENT_UUID,
+            cache_limit_bytes=64 * 1024 * 1024,
+            validation_id='',
+            identity=IDENTITY,
+        )
+    )
+
+    payload = worker_harness.wait_for_spy(failed, 0)
+    assert payload == [
+        'configure',
+        public_failure(FailureKind.INVALID_RESPONSE, retryable=False),
+    ]
 
 
 @pytest.mark.parametrize(

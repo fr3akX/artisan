@@ -18,15 +18,19 @@ from collections.abc import Generator
 from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
+from pathlib import Path
 import secrets
-from typing import cast
+import threading
+import time
+from typing import cast, override
 from uuid import UUID
 
 import pytest
-from PyQt6.QtCore import QByteArray, QObject, Qt, pyqtSignal
+from PyQt6.QtCore import QByteArray, QObject, QSettings, Qt, pyqtSignal
 from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton
+from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QWidget
 
+from artisanlib.roastserver.api import ClientFactory
 from artisanlib.roastserver.cache import CacheStats
 from artisanlib.roastserver.contract import (
     FailureKind,
@@ -35,6 +39,7 @@ from artisanlib.roastserver.contract import (
     PublicFailure,
     ServerIdentity,
 )
+from artisanlib.roastserver.controller import RoastServerController
 from artisanlib.roastserver.dialogs import FailedJobsModel, RoastServerConfigDialog
 from artisanlib.roastserver.outbox import FailedJob, QueueCounts
 from artisanlib.roastserver.settings import (
@@ -42,6 +47,8 @@ from artisanlib.roastserver.settings import (
     MAX_CACHE_LIMIT_BYTES,
     MIN_CACHE_LIMIT_BYTES,
     ConnectorSettings,
+    CredentialStoreError,
+    SettingsStore,
 )
 
 ORIGIN = 'https://old.example.test'
@@ -77,6 +84,60 @@ SAFE_FAILURE = PublicFailure(
 )
 
 
+def assert_secret_absent(secret: str, value: object) -> None:
+    rendered = value if isinstance(value, str) else repr(value)
+    if secret in rendered:
+        pytest.fail('runtime secret exposed by dialog boundary', pytrace=False)
+
+
+class BlockingDialogClient:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.completed = threading.Event()
+
+    def __enter__(self) -> BlockingDialogClient:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        return None
+
+    def test_connection(self) -> ServerIdentity:
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError('blocked dialog authentication timed out')
+        self.completed.set()
+        return IDENTITY
+
+
+class RejectingCredentialStore:
+    def __init__(self) -> None:
+        self.set_calls = 0
+        self.delete_calls = 0
+
+    @override
+    def __repr__(self) -> str:
+        return '<RejectingCredentialStore credential=<redacted>>'
+
+    def get(self, origin: str) -> str | None:
+        del origin
+        return None
+
+    def set(self, origin: str, credential: str) -> None:
+        del origin, credential
+        self.set_calls += 1
+        raise CredentialStoreError
+
+    def delete(self, origin: str) -> None:
+        del origin
+        self.delete_calls += 1
+
+
 class FakeController(QObject):
     settingsChanged = pyqtSignal(object)
     identityChanged = pyqtSignal(object)
@@ -96,6 +157,7 @@ class FakeController(QObject):
         self.clear_calls = 0
         self.remove_credential_calls = 0
         self.invalidate_calls = 0
+        self.cancel_calls: list[str] = []
         self.saved_geometries: list[bytes] = []
 
     def test_connection(self, origin: str, candidate: str) -> str:
@@ -114,6 +176,9 @@ class FakeController(QObject):
 
     def invalidate_connection_proof(self) -> None:
         self.invalidate_calls += 1
+
+    def cancel_connection_test(self, request_id: str) -> None:
+        self.cancel_calls.append(request_id)
 
     def remove_credential(self) -> None:
         self.remove_credential_calls += 1
@@ -207,11 +272,11 @@ def test_config_credential_uses_password_echo_and_auto_upload_starts_disabled(
     assert dialog.isModal() is False
 
 
-def test_config_invalid_origin_is_rejected_locally(
+def test_config_remote_http_origin_without_path_is_rejected_locally(
     dialog: RoastServerConfigDialog,
     controller: FakeController,
 ) -> None:
-    dialog.server_edit.setText('http://remote.example.test/path')
+    dialog.server_edit.setText('http://remote.example.test')
     dialog.credential_edit.setText(secrets.token_urlsafe(32))
     dialog.test_button.click()
 
@@ -220,6 +285,28 @@ def test_config_invalid_origin_is_rejected_locally(
     assert dialog.error_label.text() == 'Enter a valid HTTPS origin.'
     assert dialog.error_label.textFormat() is Qt.TextFormat.PlainText
     assert not dialog.error_label.openExternalLinks()
+
+
+@pytest.mark.parametrize(
+    ('raw', 'canonical'),
+    [
+        ('http://LOCALHOST:80/', 'http://localhost'),
+        ('http://127.0.0.1:8000/', 'http://127.0.0.1:8000'),
+        ('http://[::1]:8000/', 'http://[::1]:8000'),
+    ],
+)
+def test_config_loopback_http_origins_are_accepted_and_canonicalized(
+    dialog: RoastServerConfigDialog,
+    controller: FakeController,
+    raw: str,
+    canonical: str,
+) -> None:
+    dialog.server_edit.setText(raw)
+    dialog.credential_edit.setText(secrets.token_urlsafe(32))
+
+    dialog.test_button.click()
+
+    assert controller.test_origins == [canonical]
 
 
 def test_config_successful_test_uses_opaque_controller_flow_and_renders_identity(
@@ -241,12 +328,12 @@ def test_config_successful_test_uses_opaque_controller_flow_and_renders_identity
     assert controller.candidate_digests == [candidate_digest]
     assert dialog.credential_edit.text() == ''
     assert not dialog.automatic_upload_check.isEnabled()
-    assert candidate not in repr(dialog)
-    assert candidate not in repr(dialog.failed_model)
-    assert candidate not in repr(controller.__dict__)
+    assert_secret_absent(candidate, dialog)
+    assert_secret_absent(candidate, dialog.failed_model)
+    assert_secret_absent(candidate, controller.__dict__)
     clipboard = qapp.clipboard()
     assert clipboard is not None
-    assert candidate not in clipboard.text()
+    assert_secret_absent(candidate, clipboard.text())
 
     active = replace(settings, origin=NEW_ORIGIN, identity=IDENTITY)
     controller.settingsChanged.emit(active)
@@ -275,7 +362,7 @@ def test_credential_copy_never_places_runtime_secret_on_clipboard(
     )
     qapp.processEvents()
 
-    assert clipboard.text() != candidate
+    assert_secret_absent(candidate, clipboard.text())
     dialog.credential_edit.clear()
 
 
@@ -301,6 +388,8 @@ def test_config_any_origin_or_credential_edit_immediately_revokes_auto_proof(
     assert dialog.server_edit.text() == 'https://candidate.example.test'
 
     dialog.server_edit.setText(ORIGIN)
+    dialog.credential_edit.setText(secrets.token_urlsafe(24))
+    dialog.test_button.click()
     activate(dialog, controller, settings, automatic_upload=True, enabled=True)
     dialog.credential_edit.setText(secrets.token_urlsafe(24))
 
@@ -461,26 +550,165 @@ def test_cache_limit_is_bounded_and_clear_requires_active_configuration(
     assert controller.clear_calls == 1
 
 
-def test_accessible_labels_focus_order_and_escape_hide_modeless_dialog(
+def test_accessible_labels_exact_focus_order_default_and_close_reachability(
     dialog: RoastServerConfigDialog,
     controller: FakeController,
-    qapp: QApplication,
+    settings: ConnectorSettings,
 ) -> None:
+    activate(dialog, controller, settings)
     assert dialog.server_label.buddy() is dialog.server_edit
     assert dialog.credential_label.buddy() is dialog.credential_edit
     assert dialog.cache_limit_label.buddy() is dialog.cache_limit_spin
     assert dialog.server_edit.accessibleName() == 'Server origin'
     assert dialog.credential_edit.accessibleName() == 'Credential'
     assert dialog.failed_view.accessibleName() == 'Failed uploads'
+    assert dialog.test_button.isDefault()
+    assert dialog.test_button.autoDefault()
 
-    dialog.server_edit.setFocus()
-    assert dialog.focusWidget() is dialog.server_edit
-    assert dialog.nextInFocusChain() is not dialog
-    QTest.keyClick(dialog, Qt.Key.Key_Escape)  # type: ignore[call-overload]
+    close_button = dialog.button_box.button(dialog.button_box.StandardButton.Close)
+    assert close_button is not None
+    expected: tuple[QWidget, ...] = (
+        dialog.server_edit,
+        dialog.credential_edit,
+        dialog.test_button,
+        dialog.automatic_upload_check,
+        dialog.enabled_check,
+        dialog.cache_limit_spin,
+        close_button,
+    )
+    for current, following in zip(expected, expected[1:], strict=False):
+        current.setFocus()
+        QTest.keyClick(current, Qt.Key.Key_Tab)  # type: ignore[call-overload]
+        assert dialog.focusWidget() is following
+
+
+@pytest.mark.parametrize('close_path', ['escape', 'button', 'window-manager'])
+def test_each_close_path_cancels_exact_blocked_test_and_ignores_late_identity(
+    dialog: RoastServerConfigDialog,
+    controller: FakeController,
+    settings: ConnectorSettings,
+    qapp: QApplication,
+    close_path: str,
+) -> None:
+    candidate = secrets.token_urlsafe(40)
+    dialog.server_edit.setText(NEW_ORIGIN)
+    dialog.credential_edit.setText(candidate)
+    dialog.test_button.click()
+    dialog.error_label.setText('Testing')
+
+    if close_path == 'escape':
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)  # type: ignore[call-overload]
+    elif close_path == 'button':
+        close_button = dialog.button_box.button(dialog.button_box.StandardButton.Close)
+        assert close_button is not None
+        close_button.click()
+    else:
+        dialog.close()
     qapp.processEvents()
 
     assert not dialog.isVisible()
+    assert controller.cancel_calls == ['opaque-test-id']
+    assert dialog.credential_edit.text() == ''
+    assert dialog.error_label.text() == ''
     assert controller.saved_geometries
+    assert_secret_absent(candidate, dialog)
+    assert_secret_absent(candidate, controller.__dict__)
+
+    active = replace(settings, origin=NEW_ORIGIN, identity=IDENTITY)
+    controller.settingsChanged.emit(active)
+    controller.identityChanged.emit(IDENTITY)
+    qapp.processEvents()
+
+    assert dialog.identity_label.text() == 'Not connected'
+    assert not dialog.automatic_upload_check.isEnabled()
+    assert controller.remove_credential_calls == 0
+
+
+@pytest.mark.parametrize('close_path', ['escape', 'button', 'window-manager'])
+def test_each_close_path_cancels_real_blocked_auth_without_keyring_or_identity(
+    qapp: QApplication,
+    tmp_path: Path,
+    close_path: str,
+) -> None:
+    settings_store = SettingsStore(
+        QSettings(str(tmp_path / 'dialog-close.ini'), QSettings.Format.IniFormat)
+    )
+    settings_store.set_origin(ORIGIN)
+    credentials = RejectingCredentialStore()
+    client = BlockingDialogClient()
+    controller = RoastServerController(
+        settings=settings_store,
+        credentials=credentials,
+        data_root=tmp_path / 'dialog-close-data',
+        client_factory=cast(ClientFactory, lambda _origin, _credential: client),
+        profile_validator=lambda _path: None,
+    )
+    value = RoastServerConfigDialog(controller, settings_store.load())
+    value.show()
+    controller.start()
+    qapp.processEvents()
+    candidate = secrets.token_urlsafe(40)
+    try:
+        value.credential_edit.setText(candidate)
+        value.test_button.click()
+        assert client.entered.wait(timeout=2)
+
+        if close_path == 'escape':
+            QTest.keyClick(value, Qt.Key.Key_Escape)  # type: ignore[call-overload]
+        elif close_path == 'button':
+            close_button = value.button_box.button(value.button_box.StandardButton.Close)
+            assert close_button is not None
+            close_button.click()
+        else:
+            value.close()
+        qapp.processEvents()
+
+        assert controller._credential_vault.size() == 0
+        client.release.set()
+        assert client.completed.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            if (
+                not controller._worker._credential_transactions
+                and controller._worker._configuration is not None
+            ):
+                break
+            time.sleep(0.001)
+        for _ in range(10):
+            qapp.processEvents()
+            time.sleep(0.001)
+
+        assert credentials.set_calls == 0
+        assert credentials.delete_calls == 0
+        assert settings_store.load().identity is None
+        assert value.identity_label.text() == 'Not connected'
+        assert not value.automatic_upload_check.isEnabled()
+        assert_secret_absent(candidate, value)
+        assert_secret_absent(candidate, controller)
+    finally:
+        client.release.set()
+        assert controller.shutdown(2_000)
+        value.hide()
+        value.deleteLater()
+        qapp.processEvents()
+
+
+def test_closing_idle_dialog_preserves_established_proof(
+    dialog: RoastServerConfigDialog,
+    controller: FakeController,
+    settings: ConnectorSettings,
+    qapp: QApplication,
+) -> None:
+    activate(dialog, controller, settings, enabled=True)
+
+    QTest.keyClick(dialog, Qt.Key.Key_Escape)  # type: ignore[call-overload]
+    qapp.processEvents()
+
+    assert controller.cancel_calls == []
+    assert controller.invalidate_calls == 0
+    assert dialog.identity_label.text() == 'Owner — Roastery (admin)'
+    assert dialog.automatic_upload_check.isEnabled()
 
 
 def test_configuration_geometry_round_trip_is_saved_and_restored_onscreen(
@@ -499,7 +727,8 @@ def test_configuration_geometry_round_trip_is_saved_and_restored_onscreen(
     first_screen = first.screen()
     assert first_screen is not None
     screen = first_screen.availableGeometry()
-    assert screen.intersects(first.frameGeometry())
+    if screen.width() >= first.frameGeometry().width() and screen.height() >= first.frameGeometry().height():
+        assert screen.contains(first.frameGeometry())
     first.close()
     qapp.processEvents()
     assert controller.saved_geometries[-1]
@@ -514,7 +743,12 @@ def test_configuration_geometry_round_trip_is_saved_and_restored_onscreen(
     qapp.processEvents()
     bounded_screen = bounded.screen()
     assert bounded_screen is not None
-    assert bounded_screen.availableGeometry().intersects(bounded.frameGeometry())
+    bounded_available = bounded_screen.availableGeometry()
+    if (
+        bounded_available.width() >= bounded.minimumWidth()
+        and bounded_available.height() >= bounded.minimumHeight()
+    ):
+        assert bounded_available.contains(bounded.frameGeometry())
 
     first.deleteLater()
     bounded.close()

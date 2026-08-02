@@ -43,6 +43,7 @@ from PyQt6.QtCore import (
     QObject,
     QRect,
     Qt,
+    QTimer,
     pyqtSlot,
 )
 from PyQt6.QtGui import QCloseEvent, QShowEvent
@@ -126,6 +127,7 @@ class RoastServerDialogController(Protocol):
     ) -> None: ...
 
     def invalidate_connection_proof(self) -> None: ...
+    def cancel_connection_test(self, request_id: str) -> None: ...
     def remove_credential(self) -> None: ...
     def refresh_queue(self) -> None: ...
     def retry_job(self, job_id: str) -> None: ...
@@ -262,6 +264,7 @@ class RoastServerConfigDialog(QDialog):
         self._identity: ServerIdentity | None = None
         self._proof_origin: str | None = None
         self._testing_operation: str | None = None
+        self._ignored_operations: set[str] = set()
         self._connection_dirty = False
         self._rendering = False
 
@@ -383,16 +386,26 @@ class RoastServerConfigDialog(QDialog):
 
         self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
         layout.addWidget(self.button_box)
+        close_button = self.button_box.button(QDialogButtonBox.StandardButton.Close)
+        if close_button is None:
+            raise RuntimeError('Close button is unavailable.')
+
+        self.test_button.setDefault(True)
+        self.test_button.setAutoDefault(True)
+        for button in (
+            self.remove_credential_button,
+            self.refresh_button,
+            self.clear_cache_button,
+            close_button,
+        ):
+            button.setAutoDefault(False)
 
         QWidget.setTabOrder(self.server_edit, self.credential_edit)
         QWidget.setTabOrder(self.credential_edit, self.test_button)
-        QWidget.setTabOrder(self.test_button, self.enabled_check)
-        QWidget.setTabOrder(self.enabled_check, self.automatic_upload_check)
-        QWidget.setTabOrder(self.automatic_upload_check, self.cache_limit_spin)
-        QWidget.setTabOrder(self.cache_limit_spin, self.remove_credential_button)
-        QWidget.setTabOrder(self.remove_credential_button, self.failed_view)
-        QWidget.setTabOrder(self.failed_view, self.refresh_button)
-        QWidget.setTabOrder(self.refresh_button, self.clear_cache_button)
+        QWidget.setTabOrder(self.test_button, self.automatic_upload_check)
+        QWidget.setTabOrder(self.automatic_upload_check, self.enabled_check)
+        QWidget.setTabOrder(self.enabled_check, self.cache_limit_spin)
+        QWidget.setTabOrder(self.cache_limit_spin, close_button)
 
         self.server_edit.textChanged.connect(self._connection_edited)
         self.credential_edit.textChanged.connect(self._connection_edited)
@@ -622,7 +635,11 @@ class RoastServerConfigDialog(QDialog):
         if value is None:
             self._invalidate_proof(persist_automatic_off=False)
             return
-        if not _looks_like_identity(value) or value != self._settings.identity:
+        if (
+            (self._connection_dirty and self._testing_operation is None)
+            or not _looks_like_identity(value)
+            or value != self._settings.identity
+        ):
             return
         try:
             editor_origin = canonical_origin(self.server_edit.text())
@@ -704,6 +721,8 @@ class RoastServerConfigDialog(QDialog):
 
     @pyqtSlot(str, object)
     def _on_operation_failed(self, operation: str, value: object) -> None:
+        if operation in self._ignored_operations:
+            return
         if not _looks_like_failure(value):
             self._set_error(_tr(_GENERIC_OPERATION_FAILURE))
             return
@@ -734,7 +753,17 @@ class RoastServerConfigDialog(QDialog):
             self._rendering = False
 
     def _prepare_hide(self) -> None:
+        operation = self._testing_operation
+        self._testing_operation = None
+        if operation is not None:
+            self._ignored_operations.add(operation)
+            self._connection_dirty = True
+            try:
+                self._controller.cancel_connection_test(operation)
+            except RuntimeError:
+                pass
         self._clear_candidate()
+        self._set_error('')
         try:
             self._controller.save_configuration_geometry(self.saveGeometry())
         except RuntimeError:
@@ -756,22 +785,29 @@ class RoastServerConfigDialog(QDialog):
     def showEvent(self, a0: QShowEvent | None) -> None:
         super().showEvent(a0)
         self._bound_to_screen()
+        QTimer.singleShot(0, self._bound_to_screen)
 
     def _bound_to_screen(self) -> None:
         screen = self.screen() or QApplication.primaryScreen()
         if screen is None:
             return
         available = screen.availableGeometry()
-        current = self.frameGeometry()
-        width = min(current.width(), available.width())
-        height = min(current.height(), available.height())
-        left = min(max(current.left(), available.left()), available.right() - width + 1)
-        top = min(max(current.top(), available.top()), available.bottom() - height + 1)
-        bounded = QRect(left, top, width, height)
-        if current != bounded:
-            self.resize(width, height)
-            frame_offset = self.frameGeometry().topLeft() - self.geometry().topLeft()
-            self.move(bounded.topLeft() - frame_offset)
+        frame = self.frameGeometry()
+        client = self.geometry()
+        horizontal_frame_margin = max(0, frame.width() - client.width())
+        vertical_frame_margin = max(0, frame.height() - client.height())
+        if frame.width() > available.width() or frame.height() > available.height():
+            client_width = max(1, available.width() - horizontal_frame_margin)
+            client_height = max(1, available.height() - vertical_frame_margin)
+            self.resize(client_width, client_height)
+            frame = self.frameGeometry()
+        width = min(frame.width(), available.width())
+        height = min(frame.height(), available.height())
+        left = min(max(frame.left(), available.left()), available.right() - width + 1)
+        top = min(max(frame.top(), available.top()), available.bottom() - height + 1)
+        bounded_top_left = QRect(left, top, width, height).topLeft()
+        if frame.topLeft() != bounded_top_left:
+            self.move(bounded_top_left)
 
 
 def _format_next_attempt(value: datetime | None) -> str:

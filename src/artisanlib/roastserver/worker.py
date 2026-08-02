@@ -154,6 +154,7 @@ class WorkerConfiguration:
     automatic_upload: bool
     client_instance_uuid: UUID
     cache_limit_bytes: int
+    validation_id: str = field(default_factory=lambda: uuid4().hex)
     identity: ServerIdentity | None = None
     pending_connection: bool = False
     activation_id: str | None = None
@@ -612,11 +613,17 @@ class RoastServerWorker(QObject):
             if not self._cancelled():
                 self._emit_failure(request_id, _failure(FailureKind.KEYRING))
             return
+        if not self._credential_vault.is_current(transaction_id):
+            self._rollback_transaction(transaction_id)
+            return
         try:
             self._credentials.set(transaction.origin, transaction.candidate)
             readback = self._credentials.get(transaction.origin)
             if readback != transaction.candidate:
                 raise CredentialStoreError
+            if not self._credential_vault.is_current(transaction_id):
+                self._rollback_transaction(transaction_id)
+                return
             transaction.keyring_committed = True
         except CredentialStoreError:
             self._rollback_transaction(transaction_id)
@@ -688,6 +695,12 @@ class RoastServerWorker(QObject):
                 self._emit_failure(
                     request_id, _failure(FailureKind.INVALID_RESPONSE)
                 )
+            return
+        if (
+            not transaction.recovered
+            and not self._credential_vault.is_current(transaction_id)
+        ):
+            self._rollback_transaction(transaction_id)
             return
         self._credential = transaction.candidate
         self._authorized_target = (transaction.origin, transaction.identity)
@@ -1842,7 +1855,12 @@ def _valid_configuration(value: object) -> WorkerConfiguration | None:
     identity_value: object = value.identity
     pending_connection: object = value.pending_connection
     activation_id: object = value.activation_id
-    if type(pending_connection) is not bool:
+    validation_id: object = value.validation_id
+    if (
+        type(pending_connection) is not bool
+        or not isinstance(validation_id, str)
+        or _REQUEST_ID_RE.fullmatch(validation_id) is None
+    ):
         return None
     if activation_id is not None and (
         not isinstance(activation_id, str)

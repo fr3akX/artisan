@@ -864,6 +864,35 @@ def test_dialog_edit_invalidation_cancels_pending_opaque_transaction(
     assert controller_harness.secret_vault.size() == 0
 
 
+def test_cancel_connection_test_discards_exact_latest_request_and_late_result(
+    controller_harness: ControllerHarness,
+) -> None:
+    changed = QSignalSpy(controller_harness.controller.identityChanged)
+    request_id = controller_harness.controller.test_connection(
+        ORIGIN,
+        controller_harness.ephemeral_secret,
+    )
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.test_ids
+    )
+
+    controller_harness.controller.cancel_connection_test(request_id)
+
+    assert controller_harness.secret_vault.size() == 0
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.cancel_ids
+    )
+    controller_harness.relay.connection.emit(request_id, IDENTITY)
+    controller_harness.wait_until(
+        lambda: controller_harness.fake_worker.cancel_ids.count(request_id) >= 2
+    )
+    assert controller_harness.settings_store.load().identity is None
+    assert all(
+        list(changed[index]) != [IDENTITY] for index in range(len(changed))
+    )
+    assert controller_harness.credentials.set_calls == []
+
+
 def test_configuration_geometry_is_saved_only_through_controller(
     controller_harness: ControllerHarness,
 ) -> None:
@@ -903,6 +932,8 @@ def test_persisted_identity_never_proves_connection_before_worker_validation(
         configuration = harness.fake_worker.configure_values[-1]
         assert configuration.identity == IDENTITY
         assert configuration.automatic_upload
+        assert isinstance(getattr(configuration, 'validation_id', None), str)
+        assert len(configuration.validation_id) == 32
         with pytest.raises(ControllerError, match='Test the connection'):
             harness.controller.apply_options(
                 ORIGIN,
@@ -920,6 +951,45 @@ def test_persisted_identity_never_proves_connection_before_worker_validation(
             automatic_upload=True,
             cache_limit_bytes=64 * 1024 * 1024,
         )
+    finally:
+        harness.stop()
+
+
+def test_invalidation_rejects_stale_and_fresh_disabled_configuration_proof(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    def prepare(store: SettingsStore) -> None:
+        store.save_connection(ORIGIN, IDENTITY)
+        store.save_options(True, True, 64 * 1024 * 1024)
+
+    harness = ControllerHarness(tmp_path, qcoreapplication, prepare)
+    try:
+        startup = harness.fake_worker.configure_values[-1]
+        identities = QSignalSpy(harness.controller.identityChanged)
+
+        harness.controller.invalidate_connection_proof()
+        harness.wait_until(lambda: len(harness.fake_worker.configure_values) >= 2)
+        disabled = harness.fake_worker.configure_values[-1]
+        assert startup.validation_id != disabled.validation_id
+        assert not disabled.enabled and not disabled.automatic_upload
+
+        harness.relay.validated.emit(startup)
+        harness.relay.validated.emit(disabled)
+        for _ in range(10):
+            qcoreapplication.processEvents()
+
+        assert all(
+            list(identities[index]) != [IDENTITY]
+            for index in range(len(identities))
+        )
+        with pytest.raises(ControllerError, match='Test the connection'):
+            harness.controller.apply_options(
+                ORIGIN,
+                enabled=True,
+                automatic_upload=True,
+                cache_limit_bytes=64 * 1024 * 1024,
+            )
     finally:
         harness.stop()
 
@@ -2011,6 +2081,68 @@ def test_real_restart_at_every_credential_activation_cut_never_uploads(
     finally:
         assert controller.shutdown(2_000)
     assert recorder.upload_calls == 0
+
+
+def test_real_blocked_configuration_edit_rejects_stale_and_fresh_validation(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    settings = SettingsStore(
+        QSettings(str(tmp_path / 'blocked-validation.ini'), QSettings.Format.IniFormat)
+    )
+    settings.set_origin(ORIGIN)
+    settings.save_connection(ORIGIN, IDENTITY)
+    settings.save_options(True, True, 64 * 1024 * 1024)
+    credentials = FakeCredentialStore()
+    persisted_secret = secrets.token_urlsafe(32)
+    credentials.values[ORIGIN] = persisted_secret
+    recorder = SupersessionAuthenticationRecorder()
+    controller = RoastServerController(
+        settings=settings,
+        credentials=credentials,
+        data_root=tmp_path / 'blocked-validation-data',
+        client_factory=cast(ClientFactory, recorder),
+        profile_validator=lambda _path: None,
+        clock=lambda: NOW,
+    )
+    validated = QSignalSpy(controller._worker.configurationValidated)
+    identities = QSignalSpy(controller.identityChanged)
+    controller.start()
+    assert recorder.first_entered.wait(timeout=2)
+    try:
+        controller.invalidate_connection_proof()
+        recorder.release_first.set()
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: len(validated) >= 2,
+            'worker did not return stale and fresh configuration validations',
+        )
+        for _ in range(20):
+            qcoreapplication.processEvents()
+            time.sleep(0.001)
+
+        configurations = [
+            cast(WorkerConfiguration, validated[index][0])
+            for index in range(len(validated))
+        ]
+        assert len({configuration.validation_id for configuration in configurations}) >= 2
+        assert all(
+            list(identities[index]) != [IDENTITY]
+            for index in range(len(identities))
+        )
+        with pytest.raises(ControllerError, match='Test the connection'):
+            controller.apply_options(
+                ORIGIN,
+                enabled=True,
+                automatic_upload=True,
+                cache_limit_bytes=64 * 1024 * 1024,
+            )
+        assert not settings.load().automatic_upload
+        assert_secret_absent(persisted_secret, controller)
+        assert_secret_absent(persisted_secret, recorder)
+    finally:
+        recorder.release_first.set()
+        assert controller.shutdown(2_000)
 
 
 def test_real_blocked_worker_many_tests_only_authenticate_newest_credential(

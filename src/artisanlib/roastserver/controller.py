@@ -184,6 +184,8 @@ class RoastServerController(QObject):
         self._identity: ServerIdentity | None = None
         self._known_namespace = _settings_namespace(self._settings)
         self._proof: tuple[str, UUID] | None = None
+        self._latest_configuration_validation: str | None = None
+        self._authorized_startup_validation: str | None = None
         self._connection_tests: dict[str, str] = {}
         self._activation_previous: dict[str, ConnectorSettings] = {}
         self._active_connection_test: str | None = None
@@ -291,7 +293,7 @@ class RoastServerController(QObject):
             return
         self._started = True
         self._thread.start()
-        self._queue_configuration(self._configuration())
+        self._queue_configuration(self._configuration(), authorize_startup=True)
         self.settingsChanged.emit(self._settings)
         self.identityChanged.emit(self._identity)
 
@@ -399,8 +401,7 @@ class RoastServerController(QObject):
 
     def invalidate_connection_proof(self) -> None:
         self._require_command_state()
-        paused = self._configuration(enabled=False)
-        self._credential_vault.clear()
+        self._disallow_configuration_proof()
         self._cancel_connection_transactions()
         try:
             self._settings = self._settings_store.save_options(
@@ -413,7 +414,18 @@ class RoastServerController(QObject):
             raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
         self.settingsChanged.emit(self._settings)
         self._invalidate_identity()
-        self._queue_configuration(paused)
+        self._queue_configuration(self._configuration(enabled=False))
+
+    def cancel_connection_test(self, request_id: str) -> None:
+        self._require_command_state()
+        request_value: object = request_id
+        if not isinstance(request_value, str):
+            raise ControllerError(_INVALID_REQUEST_MESSAGE)
+        if request_id != self._active_connection_test:
+            return
+        self._credential_vault.clear()
+        self._cancel_connection_transaction(request_id)
+        self._queue_configuration(self._configuration(enabled=False))
 
     def save_configuration_geometry(self, geometry: QByteArray) -> None:
         self._require_command_state()
@@ -815,6 +827,12 @@ class RoastServerController(QObject):
     def _on_configuration_validated(self, value: object) -> None:
         if self._stop_requested or not isinstance(value, WorkerConfiguration):
             return
+        validation_id = value.validation_id
+        if (
+            validation_id != self._latest_configuration_validation
+            or validation_id != self._authorized_startup_validation
+        ):
+            return
         identity = self._settings.identity
         if (
             self._settings.pending_connection is not None
@@ -826,6 +844,7 @@ class RoastServerController(QObject):
             != namespace_for(self._settings.origin, identity.organization.id)
         ):
             return
+        self._authorized_startup_validation = None
         self._identity = identity
         self._proof = (self._settings.origin, identity.organization.id)
         self.identityChanged.emit(identity)
@@ -998,7 +1017,16 @@ class RoastServerController(QObject):
         self._ready_cache_paths[path] = source
         self.profileReady.emit(str(path), source)
 
-    def _queue_configuration(self, configuration: WorkerConfiguration) -> None:
+    def _queue_configuration(
+        self,
+        configuration: WorkerConfiguration,
+        *,
+        authorize_startup: bool = False,
+    ) -> None:
+        self._latest_configuration_validation = configuration.validation_id
+        self._authorized_startup_validation = (
+            configuration.validation_id if authorize_startup else None
+        )
         self._configureWorker.emit(configuration)
         self._queue_protected_paths(configuration.namespace)
 
@@ -1173,15 +1201,36 @@ class RoastServerController(QObject):
         self._activation_previous.clear()
         self._invalidate_archive_state()
 
+    def _disallow_configuration_proof(self) -> None:
+        self._latest_configuration_validation = None
+        self._authorized_startup_validation = None
+
+    def _cancel_connection_transaction(self, transaction_id: str) -> None:
+        if transaction_id != self._active_connection_test:
+            return
+        self._connection_tests.pop(transaction_id, None)
+        self._active_connection_test = None
+        previous = self._activation_previous.pop(transaction_id, None)
+        self._cancelConnectionWorker.emit(transaction_id)
+        if previous is None:
+            return
+        try:
+            self._settings = self._settings_store.restore_connection_state(previous)
+            self._known_namespace = _settings_namespace(self._settings)
+        except SettingsError:
+            self._settings_failure(transaction_id)
+            raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
+        self.settingsChanged.emit(self._settings)
+
     def _cancel_connection_transactions(self) -> None:
-        transactions = set(self._activation_previous)
-        if self._active_connection_test is not None:
-            transactions.add(self._active_connection_test)
-        for transaction_id in transactions:
+        self._credential_vault.clear()
+        active = self._active_connection_test
+        if active is not None:
+            self._cancel_connection_transaction(active)
+        for transaction_id in tuple(self._activation_previous):
+            self._activation_previous.pop(transaction_id, None)
             self._cancelConnectionWorker.emit(transaction_id)
         self._connection_tests.clear()
-        self._activation_previous.clear()
-        self._active_connection_test = None
 
     def _put_command(self, command: object) -> str:
         try:
