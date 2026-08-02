@@ -221,6 +221,18 @@ class OpaqueVault[T]:
             action()
             return True
 
+    def acquire_permit_if_current(
+        self,
+        request_id: str,
+        fence: ConfigurationFence,
+        generation: int,
+    ) -> ConfigurationPermit | None:
+        """Acquire an exact-generation permit while the request is latest."""
+        with self._lock:
+            if request_id != self._latest_id:
+                return None
+            return fence.acquire(generation)
+
     def contains(self, request_id: str) -> bool:
         with self._lock:
             return request_id in self._values
@@ -261,6 +273,7 @@ class WorkerConfiguration:
 class ConnectionTestRequest:
     origin: str
     credential: str = field(repr=False)
+    generation: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +339,7 @@ class _CredentialTransaction:
     candidate: str = field(repr=False)
     old_credential: str | None = field(repr=False)
     identity: ServerIdentity
+    generation: int
     keyring_committed: bool
     recovered: bool = False
     activation_emitted: bool = False
@@ -471,6 +485,21 @@ class RoastServerWorker(QObject):
             self._discard_namespace_stages(old_namespace)
         if self._cancelled():
             return
+        transaction = (
+            self._credential_transactions.get(configuration.activation_id)
+            if configuration.activation_id is not None
+            else None
+        )
+        if (
+            transaction is not None
+            and transaction.origin == configuration.origin
+            and transaction.identity == configuration.identity
+            and configuration.namespace
+            == namespace_for(
+                transaction.origin, transaction.identity.organization.id
+            )
+        ):
+            transaction.generation = configuration.generation
         self._configuration = configuration
         self._credential = None
         self._authorized_target = None
@@ -538,12 +567,18 @@ class RoastServerWorker(QObject):
             return
 
         try:
-            with self._client_factory(configuration.origin, credential) as client:
-                if self._cancelled() or self._reject_stale_configuration(configuration):
-                    return
+            permit = self._operation_permit(
+                configuration, 'authenticate_startup'
+            )
+            if permit is None:
+                self._reject_stale_configuration(configuration)
+                return
+            with permit, self._client_factory(
+                configuration.origin, credential
+            ) as client:
                 authenticated: object = client.test_connection()
-                if self._cancelled():
-                    return
+            if self._cancelled():
+                return
         except ApiFailure as error:
             if self._cancelled() or self._reject_stale_configuration(configuration):
                 return
@@ -603,6 +638,7 @@ class RoastServerWorker(QObject):
                 candidate=credential,
                 old_credential=None,
                 identity=authenticated,
+                generation=configuration.generation,
                 keyring_committed=True,
                 recovered=True,
             )
@@ -688,39 +724,81 @@ class RoastServerWorker(QObject):
             request = self._credential_vault.take_if_current(opaque_id)
             if request is None or self._cancelled():
                 return
-            self._make_credential_transaction_room()
             if not _valid_connection_request(request):
                 raise ValueError
+            configuration = self._configuration
+            if (
+                configuration is None
+                or configuration.generation != request.generation
+                or configuration.origin != request.origin
+                or not self._credential_vault.is_current(opaque_id)
+            ):
+                return
             candidate = request.credential
-            with self._client_factory(request.origin, candidate) as client:
-                if self._cancelled():
-                    return
-                identity = client.test_connection()
-                if self._cancelled():
-                    return
-            if not self._credential_vault.is_current(opaque_id):
+            hook = self._operation_hook
+            if hook is not None:
+                hook('authenticate_candidate')
+            permit = self._credential_vault.acquire_permit_if_current(
+                opaque_id,
+                self._configuration_fence,
+                request.generation,
+            )
+            if permit is None:
+                self._reject_stale_configuration(configuration)
                 return
-            if not isinstance(identity, ServerIdentity):
-                raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
-            old_credential = self._credentials.get(request.origin)
-            if self._cancelled() or not self._credential_vault.is_current(opaque_id):
+            with permit:
+                with self._client_factory(request.origin, candidate) as client:
+                    identity = client.test_connection()
+                if (
+                    self._cancelled()
+                    or self._configuration is not configuration
+                    or not self._configuration_fence.authorizes(
+                        request.generation
+                    )
+                    or not self._credential_vault.is_current(opaque_id)
+                ):
+                    return
+                if not isinstance(identity, ServerIdentity):
+                    raise _DeliveryFailure(
+                        _failure(FailureKind.INVALID_RESPONSE)
+                    )
+                old_credential = self._credentials.get(request.origin)
+            if (
+                self._cancelled()
+                or self._configuration is not configuration
+                or not self._configuration_fence.authorizes(request.generation)
+                or not self._credential_vault.is_current(opaque_id)
+            ):
                 return
+            self._make_credential_transaction_room()
             transaction = _CredentialTransaction(
                 origin=request.origin,
                 candidate=candidate,
                 old_credential=old_credential,
                 identity=identity,
+                generation=request.generation,
                 keyring_committed=False,
             )
             completed_transaction = transaction
+            retained = False
 
             def retain_and_emit() -> None:
+                nonlocal retained
+                if (
+                    self._configuration is not configuration
+                    or not self._configuration_fence.authorizes(
+                        completed_transaction.generation
+                    )
+                ):
+                    return
                 self._credential_transactions[request_id] = completed_transaction
+                retained = True
                 self.connectionTested.emit(request_id, identity)
 
-            if not self._credential_vault.run_if_current(
+            current = self._credential_vault.run_if_current(
                 opaque_id, retain_and_emit
-            ):
+            )
+            if not current or not retained:
                 completed_transaction.candidate = ''
                 completed_transaction.old_credential = None
             transaction = None
@@ -804,6 +882,7 @@ class RoastServerWorker(QObject):
             or configuration.activation_id != transaction_id
             or configuration.origin != transaction.origin
             or configuration.identity != transaction.identity
+            or configuration.generation != transaction.generation
             or configuration.namespace
             != namespace_for(transaction.origin, transaction.identity.organization.id)
         ):
@@ -818,21 +897,22 @@ class RoastServerWorker(QObject):
                 self._rollback_and_signal(transaction_id)
             return
         try:
-            readback = self._credentials.get(transaction.origin)
-            if readback != transaction.candidate:
-                raise CredentialStoreError
-            if self._reject_stale_configuration(configuration):
+            permit = self._operation_permit(
+                configuration, 'authenticate_activation'
+            )
+            if permit is None:
+                self._reject_stale_configuration(configuration)
                 if not self._interrupted():
                     self._rollback_and_signal(transaction_id)
                 return
-            with self._client_factory(
-                transaction.origin, transaction.candidate
-            ) as client:
-                if self._cancelled():
-                    return
-                authenticated = client.test_connection()
-                if self._cancelled():
-                    return
+            with permit:
+                readback = self._credentials.get(transaction.origin)
+                if readback != transaction.candidate:
+                    raise CredentialStoreError
+                with self._client_factory(
+                    transaction.origin, transaction.candidate
+                ) as client:
+                    authenticated = client.test_connection()
             if authenticated != transaction.identity:
                 raise _DeliveryFailure(
                     _failure(FailureKind.CREDENTIAL_REJECTED)
@@ -871,6 +951,7 @@ class RoastServerWorker(QObject):
         if (
             (not transaction.recovered
             and not self._credential_vault.is_current(transaction_id))
+            or transaction.generation != configuration.generation
             or self._reject_stale_configuration(configuration)
         ):
             if not self._interrupted():
@@ -2194,7 +2275,13 @@ def _valid_connection_request(value: object) -> bool:
     if not isinstance(value, ConnectionTestRequest):
         return False
     credential: object = value.credential
-    if not isinstance(credential, str) or credential == '':
+    generation: object = value.generation
+    if (
+        not isinstance(credential, str)
+        or credential == ''
+        or type(generation) is not int
+        or generation <= 0
+    ):
         return False
     origin: object = value.origin
     if not isinstance(origin, str):

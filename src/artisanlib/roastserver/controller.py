@@ -369,12 +369,25 @@ class RoastServerController(QObject):
             raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
         self.settingsChanged.emit(self._settings)
         self._invalidate_identity()
+        candidate_generation = self._configuration_fence.advance()
+        candidate_configuration = self._configuration(enabled=False)
+        if candidate_configuration.origin != canonical:
+            candidate_configuration = replace(
+                candidate_configuration,
+                origin=canonical,
+                namespace=None,
+                identity=None,
+                pending_connection=False,
+                activation_id=None,
+            )
         self._queue_configuration(
-            self._configuration(enabled=False), generation=generation
+            candidate_configuration, generation=candidate_generation
         )
         try:
             request_id = self._credential_vault.put_latest(
-                ConnectionTestRequest(canonical, candidate)
+                ConnectionTestRequest(
+                    canonical, candidate, candidate_generation
+                )
             )
         except Exception as error:
             raise ControllerError(_INVALID_REQUEST_MESSAGE) from error
@@ -899,10 +912,8 @@ class RoastServerController(QObject):
             and pending.origin == self._settings.origin
             and recovery.authenticated_identity == self._settings.identity
         )
-        first_candidate_absent = (
-            not recovery.credential_present and self._settings.identity is None
-        )
-        if not prior_matches and not first_candidate_absent:
+        target_credential_absent = not recovery.credential_present
+        if not prior_matches and not target_credential_absent:
             self.settingsChanged.emit(self._settings)
             self.identityChanged.emit(None)
             self._queue_configuration(self._configuration(enabled=False))

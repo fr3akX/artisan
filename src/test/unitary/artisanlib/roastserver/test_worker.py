@@ -877,8 +877,14 @@ class WorkerHarness:
         self.wait_until(lambda: len(self.queue_spy) > before)
 
     def request_connection_test(self, credential: str | None = None) -> str:
+        configuration = self.worker._configuration
+        assert configuration is not None
         request_id = self.secret_vault.put_latest(
-            ConnectionTestRequest(ORIGIN, credential or self.ephemeral_secret)
+            ConnectionTestRequest(
+                ORIGIN,
+                credential or self.ephemeral_secret,
+                configuration.generation,
+            )
         )
         self.bus.test_worker.emit(request_id)
         return request_id
@@ -924,7 +930,7 @@ def worker_harness(
 def test_opaque_vault_and_secret_request_repr_are_redacted() -> None:
     secret = secrets.token_urlsafe(32)
     vault: OpaqueVault[ConnectionTestRequest] = OpaqueVault()
-    request = ConnectionTestRequest(ORIGIN, secret)
+    request = ConnectionTestRequest(ORIGIN, secret, 1)
     request_id = vault.put(request)
 
     assert_secret_absent(secret, request)
@@ -941,8 +947,8 @@ def test_opaque_vault_latest_generation_replaces_and_fences_consumed_values() ->
     first_secret = secrets.token_urlsafe(32)
     second_secret = secrets.token_urlsafe(32)
     vault: OpaqueVault[ConnectionTestRequest] = OpaqueVault()
-    first = ConnectionTestRequest(ORIGIN, first_secret)
-    second = ConnectionTestRequest(ORIGIN, second_secret)
+    first = ConnectionTestRequest(ORIGIN, first_secret, 1)
+    second = ConnectionTestRequest(ORIGIN, second_secret, 2)
 
     first_id = vault.put_latest(first)
     assert vault.take_if_current(first_id) is first
@@ -998,7 +1004,7 @@ def test_direct_wrong_thread_candidate_slot_erases_secret_without_io(
     failed = QSignalSpy(worker_harness.worker.operationFailed)
     candidate = secrets.token_urlsafe(32)
     request_id = worker_harness.secret_vault.put_latest(
-        ConnectionTestRequest(ORIGIN, candidate)
+        ConnectionTestRequest(ORIGIN, candidate, 1)
     )
     client_calls = tuple(worker_harness.client.calls)
     credential_calls = tuple(worker_harness.credentials.get_calls)
@@ -1021,7 +1027,7 @@ def test_every_external_slot_rejects_direct_wrong_thread_use_without_io(
     failed = QSignalSpy(worker_harness.worker.operationFailed)
     candidate = secrets.token_urlsafe(32)
     candidate_id = worker_harness.secret_vault.put_latest(
-        ConnectionTestRequest(ORIGIN, candidate)
+        ConnectionTestRequest(ORIGIN, candidate, 1)
     )
     profile_id = worker_harness.profile_vault.put(
         SavedProfileRequest(
@@ -1351,6 +1357,150 @@ def test_revocation_while_blocked_before_each_permit_has_zero_boundary_side_effe
         else:
             assert api_call_count('get_roast') == get_count + 1
             assert api_call_count('download_revision') == download_count
+    finally:
+        blocker.release.set()
+        harness.stop()
+
+
+def test_revocation_before_startup_auth_permit_has_zero_http(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    blocker = PermitBoundaryBlocker()
+    harness = WorkerHarness(
+        tmp_path / 'authenticate-startup',
+        qcoreapplication,
+        operation_hook=blocker.block,
+    )
+    try:
+        blocker.select('authenticate_startup')
+        client_calls = tuple(harness.client.calls)
+        factory_calls = tuple(harness.client_factory.calls)
+        harness.bus.configure_worker.emit(
+            WorkerConfiguration(
+                origin=ORIGIN,
+                namespace=NAMESPACE,
+                enabled=True,
+                automatic_upload=True,
+                client_instance_uuid=CLIENT_UUID,
+                cache_limit_bytes=64 * 1024 * 1024,
+                generation=harness.configuration_fence.advance(),
+                identity=IDENTITY,
+            )
+        )
+        assert blocker.entered.wait(timeout=2)
+
+        harness.configuration_fence.revoke()
+        assert harness.configuration_fence.active_permits() == 0
+        blocker.release.set()
+        harness.wait_until(blocker.returned.is_set)
+
+        assert tuple(harness.client_factory.calls) == factory_calls
+        assert tuple(harness.client.calls) == client_calls
+        assert harness.worker._credential is None
+        assert harness.worker._authorized_target is None
+    finally:
+        blocker.release.set()
+        harness.stop()
+
+
+def test_cancel_before_candidate_auth_permit_has_zero_http_or_keyring(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    blocker = PermitBoundaryBlocker()
+    harness = WorkerHarness(
+        tmp_path / 'authenticate-candidate',
+        qcoreapplication,
+        operation_hook=blocker.block,
+    )
+    tested = QSignalSpy(harness.worker.connectionTested)
+    try:
+        blocker.select('authenticate_candidate')
+        client_calls = tuple(harness.client.calls)
+        factory_calls = tuple(harness.client_factory.calls)
+        credential_calls = tuple(harness.credentials.get_calls)
+        harness.request_connection_test(secrets.token_urlsafe(32))
+        assert blocker.entered.wait(timeout=2)
+
+        harness.secret_vault.clear()
+        assert harness.configuration_fence.active_permits() == 0
+        blocker.release.set()
+        harness.wait_until(blocker.returned.is_set)
+
+        assert tuple(harness.client_factory.calls) == factory_calls
+        assert tuple(harness.client.calls) == client_calls
+        assert tuple(harness.credentials.get_calls) == credential_calls
+        assert len(tested) == 0
+        assert harness.worker._credential_transactions == {}
+    finally:
+        blocker.release.set()
+        harness.stop()
+
+
+def test_revoke_before_final_auth_permit_has_zero_http_and_rolls_back(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    blocker = PermitBoundaryBlocker()
+    harness = WorkerHarness(
+        tmp_path / 'authenticate-activation',
+        qcoreapplication,
+        operation_hook=blocker.block,
+    )
+    activated = QSignalSpy(harness.worker.connectionActivated)
+    candidate = secrets.token_urlsafe(32)
+    old_digest = harness.credentials.stored_digest()
+    try:
+        transaction_id = harness.request_connection_test(candidate)
+        harness.wait_until(
+            lambda: transaction_id in harness.worker._credential_transactions
+        )
+        harness.bus.commit_worker.emit(transaction_id)
+        harness.wait_until(
+            lambda: harness.worker._credential_transactions[
+                transaction_id
+            ].keyring_committed
+        )
+        harness.bus.configure_worker.emit(
+            WorkerConfiguration(
+                origin=ORIGIN,
+                namespace=NAMESPACE,
+                enabled=False,
+                automatic_upload=False,
+                client_instance_uuid=CLIENT_UUID,
+                cache_limit_bytes=64 * 1024 * 1024,
+                generation=harness.configuration_fence.advance(),
+                identity=IDENTITY,
+                activation_id=transaction_id,
+            )
+        )
+        harness.wait_until(
+            lambda: harness.worker._configuration is not None
+            and harness.worker._configuration.activation_id == transaction_id
+        )
+        blocker.select('authenticate_activation')
+        client_calls = tuple(harness.client.calls)
+        factory_calls = tuple(harness.client_factory.calls)
+        credential_calls = tuple(harness.credentials.get_calls)
+        harness.bus.finalize_worker.emit(transaction_id)
+        assert blocker.entered.wait(timeout=2)
+        assert tuple(harness.credentials.get_calls) == credential_calls
+
+        harness.configuration_fence.revoke()
+        harness.secret_vault.clear()
+        assert harness.configuration_fence.active_permits() == 0
+        blocker.release.set()
+        harness.wait_until(
+            lambda: transaction_id not in harness.worker._credential_transactions
+        )
+
+        assert tuple(harness.client_factory.calls) == factory_calls
+        assert tuple(harness.client.calls) == client_calls
+        assert len(activated) == 0
+        assert harness.credentials.stored_digest() == old_digest
+        assert harness.worker._credential is None
+        assert harness.worker._authorized_target is None
     finally:
         blocker.release.set()
         harness.stop()
@@ -1870,8 +2020,14 @@ def test_ui_interruption_cancels_blocked_call_and_ignores_queued_backlog(
     worker_harness.request_connection_test(blocked_candidate)
     assert entered.wait(timeout=2)
 
+    configuration = worker_harness.worker._configuration
+    assert configuration is not None
     followup_connection = worker_harness.secret_vault.put_latest(
-        ConnectionTestRequest(ORIGIN, queued_candidate)
+        ConnectionTestRequest(
+            ORIGIN,
+            queued_candidate,
+            configuration.generation,
+        )
     )
     followup_profile = worker_harness.profile_vault.put(
         SavedProfileRequest(

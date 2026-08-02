@@ -224,6 +224,7 @@ class RestartAuthenticationRecorder:
         self._credential_a = credential_a
         self._credential_b = credential_b
         self._offline = offline
+        self.client_origins: list[str] = []
         self.authenticated_organizations: list[UUID | None] = []
         self.upload_calls = 0
 
@@ -231,7 +232,8 @@ class RestartAuthenticationRecorder:
     def __repr__(self) -> str:
         return '<RestartAuthenticationRecorder credentials=<redacted>>'
 
-    def __call__(self, _origin: str, credential: str) -> RestartAuthenticationClient:
+    def __call__(self, origin: str, credential: str) -> RestartAuthenticationClient:
+        self.client_origins.append(origin)
         if self._offline:
             identity = None
         elif credential == self._credential_a:
@@ -1256,7 +1258,7 @@ def test_new_test_and_every_stale_transaction_event_queue_cancellation(
     assert controller_harness.fake_worker.finalize_ids == []
 
 
-def test_pending_recovery_clear_failure_stays_on_prior_disabled_configuration(
+def test_cross_origin_pending_recovery_clear_failure_stays_paused(
     tmp_path: Path,
     qcoreapplication: QCoreApplication,
     monkeypatch: pytest.MonkeyPatch,
@@ -1264,7 +1266,7 @@ def test_pending_recovery_clear_failure_stays_on_prior_disabled_configuration(
     def prepare(store: SettingsStore) -> None:
         store.save_connection(ORIGIN, IDENTITY)
         store.save_options(True, False, 64 * 1024 * 1024)
-        store.save_pending_connection(ORIGIN, OTHER_IDENTITY)
+        store.save_pending_connection(OTHER_ORIGIN, OTHER_IDENTITY)
 
     harness = ControllerHarness(tmp_path, qcoreapplication, prepare)
     failed = QSignalSpy(harness.controller.operationFailed)
@@ -1282,7 +1284,7 @@ def test_pending_recovery_clear_failure_stays_on_prior_disabled_configuration(
         failure = public_failure(FailureKind.CREDENTIAL_REJECTED)
         harness.relay.recovery.emit(
             transaction_id,
-            PendingConnectionRecovery(IDENTITY, True, failure),
+            PendingConnectionRecovery(None, False, failure),
         )
         harness.wait_until(lambda: len(failed) > 0)
 
@@ -1294,7 +1296,7 @@ def test_pending_recovery_clear_failure_stays_on_prior_disabled_configuration(
         configuration = harness.fake_worker.configure_values[-1]
         assert configuration.identity == OTHER_IDENTITY
         assert configuration.namespace == namespace_for(
-            ORIGIN, OTHER_IDENTITY.organization.id
+            OTHER_ORIGIN, OTHER_IDENTITY.organization.id
         )
         assert configuration.pending_connection
         assert not configuration.enabled
@@ -2949,6 +2951,68 @@ def test_real_mid_http_supersession_discards_old_response_before_keyring(
         assert_secret_absent(newest_candidate, recorder)
     finally:
         recorder.release_first.set()
+        assert controller.shutdown(2_000)
+
+
+def test_real_restart_cross_origin_pre_keyring_cut_restores_active_disabled(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    settings = SettingsStore(
+        QSettings(str(tmp_path / 'cross-origin-cut.ini'), QSettings.Format.IniFormat)
+    )
+    settings.set_origin(ORIGIN)
+    settings.save_connection(ORIGIN, IDENTITY)
+    settings.save_options(True, True, 64 * 1024 * 1024)
+    settings.save_pending_connection(OTHER_ORIGIN, OTHER_IDENTITY)
+    credential_a = secrets.token_urlsafe(32)
+    credential_b = secrets.token_urlsafe(32)
+    credentials = FakeCredentialStore()
+    credentials.values[ORIGIN] = credential_a
+    recorder = RestartAuthenticationRecorder(credential_a, credential_b)
+    controller = RoastServerController(
+        settings=settings,
+        credentials=credentials,
+        data_root=tmp_path / 'cross-origin-cut-data',
+        client_factory=cast(ClientFactory, recorder),
+        profile_validator=lambda _path: None,
+        clock=lambda: NOW,
+    )
+    controller.start()
+    try:
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: settings.load().pending_connection is None,
+            'cross-origin pre-keyring restart did not clear its journal',
+        )
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: controller._identity == IDENTITY,
+            'prior active connection was not startup validated after recovery',
+        )
+
+        recovered = settings.load()
+        assert recovered.origin == ORIGIN
+        assert recovered.identity == IDENTITY
+        assert recovered.pending_connection is None
+        assert not recovered.enabled and not recovered.automatic_upload
+        controller.apply_options(
+            ORIGIN,
+            enabled=False,
+            automatic_upload=False,
+            cache_limit_bytes=64 * 1024 * 1024,
+        )
+        for _ in range(20):
+            qcoreapplication.processEvents()
+            time.sleep(0.001)
+        assert recorder.client_origins
+        assert set(recorder.client_origins) == {ORIGIN}
+        assert set(recorder.authenticated_organizations) == {ORGANIZATION_ID}
+        assert recorder.upload_calls == 0
+        assert any(call[0] == OTHER_ORIGIN for call in credentials.get_calls)
+        assert credentials.set_calls == []
+        assert credentials.delete_calls == []
+    finally:
         assert controller.shutdown(2_000)
 
 
