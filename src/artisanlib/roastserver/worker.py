@@ -27,7 +27,6 @@
 
 from __future__ import annotations
 
-import ast
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -35,7 +34,7 @@ import math
 from pathlib import Path
 import re
 import threading
-from typing import Final, TypeGuard, cast, override
+from typing import Final, TypeGuard, override
 from uuid import UUID, uuid4
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
@@ -124,6 +123,9 @@ class WorkerConfiguration:
     automatic_upload: bool
     client_instance_uuid: UUID
     cache_limit_bytes: int
+    identity: ServerIdentity | None = None
+    pending_connection: bool = False
+    activation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,8 +137,9 @@ class ConnectionTestRequest:
 @dataclass(frozen=True, slots=True)
 class SavedProfileRequest:
     namespace: Namespace
-    path: Path
-    profile: ProfileData | None = field(repr=False)
+    serialized_profile: bytes = field(repr=False)
+    profile: ProfileData = field(repr=False)
+    modified_at: datetime
     manual: bool
 
 
@@ -172,15 +175,34 @@ class PublishRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class ClearUnusedRequest:
+class ProtectedPathsRequest:
     namespace: Namespace
     open_paths: frozenset[Path]
+
+
+@dataclass(frozen=True, slots=True)
+class ClearUnusedRequest:
+    namespace: Namespace
 
 
 @dataclass(frozen=True, slots=True)
 class _PendingStage:
     namespace: Namespace
     request: PublishRequest
+
+
+@dataclass(slots=True, repr=False)
+class _CredentialTransaction:
+    origin: str
+    candidate: str = field(repr=False)
+    old_credential: str | None = field(repr=False)
+    identity: ServerIdentity
+    keyring_committed: bool
+    recovered: bool = False
+
+    @override
+    def __repr__(self) -> str:
+        return '<_CredentialTransaction credentials=<redacted>>'
 
 
 class _DeliveryFailure(RuntimeError):
@@ -190,11 +212,13 @@ class _DeliveryFailure(RuntimeError):
 
 
 type TimerFactory = Callable[[QObject], QTimer]
-type ProfileLoader = Callable[[Path], ProfileData]
 
 
 class RoastServerWorker(QObject):
     connectionTested = pyqtSignal(str, object)
+    credentialCommitted = pyqtSignal(str, object)
+    connectionActivated = pyqtSignal(str, object)
+    configurationValidated = pyqtSignal(object)
     credentialRemoved = pyqtSignal(str)
     operationFailed = pyqtSignal(str, object)
     queueChanged = pyqtSignal(object)
@@ -219,7 +243,6 @@ class RoastServerWorker(QObject):
         profile_vault: OpaqueVault[SavedProfileRequest],
         command_vault: OpaqueVault[object],
         timer_factory: TimerFactory | None = None,
-        profile_loader: ProfileLoader | None = None,
     ) -> None:
         super().__init__()
         self._outbox = outbox
@@ -231,10 +254,11 @@ class RoastServerWorker(QObject):
         self._profile_vault = profile_vault
         self._command_vault = command_vault
         self._timer_factory = timer_factory or QTimer
-        self._profile_loader = profile_loader or _load_saved_profile
         self._timer: QTimer | None = None
         self._configuration: WorkerConfiguration | None = None
         self._credential: str | None = None
+        self._authorized_target: tuple[str, ServerIdentity] | None = None
+        self._credential_transactions: dict[str, _CredentialTransaction] = {}
         self._pending_stages: dict[Path, _PendingStage] = {}
         self._open_cache_paths: frozenset[Path] = frozenset()
         self._stop_event = threading.Event()
@@ -249,6 +273,8 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot()
     def start(self) -> None:
+        if self._reject_wrong_thread('start', FailureKind.INVALID_RESPONSE):
+            return
         if self._started or self._stopped or self._interrupted():
             return
         self._started = True
@@ -281,6 +307,8 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot(object)
     def configure(self, value: object) -> None:
+        if self._reject_wrong_thread('configure', FailureKind.INVALID_RESPONSE):
+            return
         if self._cancelled():
             return
         configuration = _valid_configuration(value)
@@ -289,14 +317,19 @@ class RoastServerWorker(QObject):
             return
         previous = self._configuration
         old_namespace = previous.namespace if previous is not None else None
-        if old_namespace is not None and (
-            old_namespace != configuration.namespace or not configuration.enabled
+        if old_namespace != configuration.namespace:
+            self._open_cache_paths = frozenset()
+        if previous is not None and old_namespace is not None and (
+            old_namespace != configuration.namespace
+            or not configuration.enabled
+            or previous.identity != configuration.identity
         ):
             self._discard_namespace_stages(old_namespace)
         if self._cancelled():
             return
         self._configuration = configuration
         self._credential = None
+        self._authorized_target = None
         if not self._started or not self._outbox_open or self._stopped:
             return
         self._activate_configuration(previous)
@@ -308,28 +341,36 @@ class RoastServerWorker(QObject):
         if configuration is None:
             return
         old_namespace = previous.namespace if previous is not None else None
-        if old_namespace is not None and (
-            old_namespace != configuration.namespace or not configuration.enabled
+        if previous is not None and old_namespace is not None and (
+            old_namespace != configuration.namespace
+            or not configuration.enabled
+            or previous.identity != configuration.identity
         ):
             self._pause_namespace(old_namespace, 'connector_disabled')
         if self._cancelled():
             return
 
         namespace = configuration.namespace
-        if not configuration.enabled or namespace is None:
-            if namespace is not None:
-                self._pause_namespace(namespace, 'connector_disabled')
+        identity = configuration.identity
+        if namespace is None or identity is None:
             self.onlineChanged.emit(False)
             self._stop_timer()
             self._emit_aggregates(namespace)
             return
-
+        if configuration.activation_id is not None:
+            self._pause_namespace(namespace, 'connector_disabled')
+            self.onlineChanged.emit(False)
+            self._stop_timer()
+            self._emit_aggregates(namespace)
+            return
+        self._pause_namespace(namespace, 'credential_removed')
+        self._credential = None
+        self._authorized_target = None
         try:
             credential = self._credentials.get(configuration.origin)
         except CredentialStoreError:
             if self._cancelled():
                 return
-            self._pause_namespace(namespace, 'credential_removed')
             self.onlineChanged.emit(False)
             self._stop_timer()
             self._emit_failure('configure', _failure(FailureKind.KEYRING))
@@ -338,38 +379,128 @@ class RoastServerWorker(QObject):
         if self._cancelled():
             return
         if credential is None or credential == '':
-            self._pause_namespace(namespace, 'credential_removed')
             self.onlineChanged.emit(False)
             self._stop_timer()
             self._emit_aggregates(namespace)
             return
 
+        try:
+            with self._client_factory(configuration.origin, credential) as client:
+                if self._cancelled():
+                    return
+                authenticated: object = client.test_connection()
+                if self._cancelled():
+                    return
+        except ApiFailure as error:
+            if self._cancelled():
+                return
+            self.onlineChanged.emit(False)
+            self._emit_failure('configure', error.failure)
+            if error.failure.retryable:
+                self._schedule_authentication_retry()
+            else:
+                self._stop_timer()
+            self._emit_aggregates(namespace)
+            return
+        except Exception:  # pylint: disable=broad-exception-caught
+            if not self._cancelled():
+                self.onlineChanged.emit(False)
+                self._stop_timer()
+                self._emit_failure(
+                    'configure', _failure(FailureKind.INVALID_RESPONSE)
+                )
+                self._emit_aggregates(namespace)
+            return
+        if not isinstance(authenticated, ServerIdentity):
+            self.onlineChanged.emit(False)
+            self._stop_timer()
+            self._emit_failure('configure', _failure(FailureKind.INVALID_RESPONSE))
+            self._emit_aggregates(namespace)
+            return
+        if authenticated != identity:
+            self.onlineChanged.emit(False)
+            self._stop_timer()
+            self._emit_failure(
+                'configure', _failure(FailureKind.CREDENTIAL_REJECTED)
+            )
+            self._emit_aggregates(namespace)
+            return
+        if configuration.pending_connection:
+            transaction_id = uuid4().hex
+            self._credential_transactions[transaction_id] = _CredentialTransaction(
+                origin=configuration.origin,
+                candidate=credential,
+                old_credential=None,
+                identity=authenticated,
+                keyring_committed=True,
+                recovered=True,
+            )
+            self._stop_timer()
+            self.credentialCommitted.emit(transaction_id, authenticated)
+            self._emit_aggregates(namespace)
+            return
+
         self._credential = credential
+        self._authorized_target = (configuration.origin, authenticated)
+        self.configurationValidated.emit(configuration)
+        self._apply_authorized_configuration(configuration)
+
+    def _apply_authorized_configuration(
+        self, configuration: WorkerConfiguration
+    ) -> None:
+        namespace = configuration.namespace
+        if namespace is None or not self._configuration_is_authorized(configuration):
+            self._credential = None
+            self._authorized_target = None
+            self._stop_timer()
+            return
+        if not configuration.enabled:
+            self._pause_namespace(namespace, 'connector_disabled')
+            self._stop_timer()
+            self._emit_aggregates(namespace)
+            return
         try:
             self._outbox.resume_namespace(namespace, self._now())
         except (OutboxError, ValueError):
             self._credential = None
+            self._authorized_target = None
             self._emit_failure('configure', _failure(FailureKind.LOCAL_PROFILE))
             self._stop_timer()
         if self._cancelled():
             return
         self._emit_aggregates(namespace)
         if self._credential is not None:
+            self.onlineChanged.emit(True)
             self._schedule_next(namespace)
+
+    def _schedule_authentication_retry(self) -> None:
+        timer = self._timer
+        if timer is not None and not self._interrupted():
+            timer.start(5_000)
 
     @pyqtSlot(str)
     def test_connection(self, opaque_id: str) -> None:
         request_id = _public_request_id(opaque_id)
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.INVALID_RESPONSE,
+            erase=lambda: self._credential_vault.take(opaque_id),
+        ):
+            return
         request: ConnectionTestRequest | None = None
-        credential = ''
+        candidate = ''
+        old_credential: str | None = None
         try:
             request = self._credential_vault.take(opaque_id)
             if self._cancelled():
                 return
             if not _valid_connection_request(request):
                 raise ValueError
-            credential = request.credential
-            with self._client_factory(request.origin, credential) as client:
+            candidate = request.credential
+            old_credential = self._credentials.get(request.origin)
+            if self._cancelled():
+                return
+            with self._client_factory(request.origin, candidate) as client:
                 if self._cancelled():
                     return
                 identity = client.test_connection()
@@ -377,11 +508,13 @@ class RoastServerWorker(QObject):
                     return
             if not isinstance(identity, ServerIdentity):
                 raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
-            if self._cancelled():
-                return
-            self._credentials.set(request.origin, credential)
-            if self._cancelled():
-                return
+            self._credential_transactions[request_id] = _CredentialTransaction(
+                origin=request.origin,
+                candidate=candidate,
+                old_credential=old_credential,
+                identity=identity,
+                keyring_committed=False,
+            )
         except KeyError:
             if not self._cancelled():
                 self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
@@ -410,13 +543,159 @@ class RoastServerWorker(QObject):
             return
         finally:
             request = None
-            credential = ''
+            candidate = ''
+            old_credential = None
         if not self._cancelled():
             self.connectionTested.emit(request_id, identity)
 
     @pyqtSlot(str)
+    def commit_connection(self, transaction_id: str) -> None:
+        request_id = _public_request_id(transaction_id)
+        if self._reject_wrong_thread(request_id, FailureKind.KEYRING):
+            return
+        transaction = self._credential_transactions.get(transaction_id)
+        if self._cancelled() or transaction is None or transaction.keyring_committed:
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        try:
+            self._credentials.set(transaction.origin, transaction.candidate)
+            readback = self._credentials.get(transaction.origin)
+            if readback != transaction.candidate:
+                raise CredentialStoreError
+            transaction.keyring_committed = True
+        except CredentialStoreError:
+            self._rollback_transaction(transaction_id)
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        if not self._cancelled():
+            self.credentialCommitted.emit(request_id, transaction.identity)
+
+    @pyqtSlot(str)
+    def finalize_connection(self, transaction_id: str) -> None:
+        request_id = _public_request_id(transaction_id)
+        if self._reject_wrong_thread(request_id, FailureKind.KEYRING):
+            return
+        transaction = self._credential_transactions.get(transaction_id)
+        configuration = self._configuration
+        if (
+            self._cancelled()
+            or transaction is None
+            or not transaction.keyring_committed
+            or configuration is None
+            or configuration.activation_id != transaction_id
+            or configuration.origin != transaction.origin
+            or configuration.identity != transaction.identity
+            or configuration.namespace
+            != namespace_for(transaction.origin, transaction.identity.organization.id)
+        ):
+            if not self._cancelled():
+                self._rollback_transaction(transaction_id)
+                self._emit_failure(
+                    request_id, _failure(FailureKind.CREDENTIAL_REJECTED)
+                )
+            return
+        try:
+            readback = self._credentials.get(transaction.origin)
+            if readback != transaction.candidate:
+                raise CredentialStoreError
+            with self._client_factory(
+                transaction.origin, transaction.candidate
+            ) as client:
+                if self._cancelled():
+                    return
+                authenticated = client.test_connection()
+                if self._cancelled():
+                    return
+            if authenticated != transaction.identity:
+                raise _DeliveryFailure(
+                    _failure(FailureKind.CREDENTIAL_REJECTED)
+                )
+        except CredentialStoreError:
+            self._rollback_transaction(transaction_id)
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        except ApiFailure as error:
+            self._rollback_transaction(transaction_id)
+            if not self._cancelled():
+                self.onlineChanged.emit(False)
+                self._emit_failure(request_id, error.failure)
+            return
+        except _DeliveryFailure as error:
+            self._rollback_transaction(transaction_id)
+            if not self._cancelled():
+                self._emit_failure(request_id, error.failure)
+            return
+        except Exception:  # pylint: disable=broad-exception-caught
+            self._rollback_transaction(transaction_id)
+            if not self._cancelled():
+                self._emit_failure(
+                    request_id, _failure(FailureKind.INVALID_RESPONSE)
+                )
+            return
+        self._credential = transaction.candidate
+        self._authorized_target = (transaction.origin, transaction.identity)
+        identity = transaction.identity
+        self._credential_transactions.pop(transaction_id, None)
+        transaction.candidate = ''
+        transaction.old_credential = None
+        if not self._cancelled():
+            self.connectionActivated.emit(request_id, identity)
+
+    @pyqtSlot(str)
+    def rollback_connection(self, transaction_id: str) -> None:
+        request_id = _public_request_id(transaction_id)
+        if self._reject_wrong_thread(request_id, FailureKind.KEYRING):
+            return
+        if transaction_id not in self._credential_transactions:
+            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+            return
+        if not self._rollback_transaction(transaction_id):
+            self._emit_failure(request_id, _failure(FailureKind.KEYRING))
+
+    def _rollback_transaction(self, transaction_id: str) -> bool:
+        transaction = self._credential_transactions.pop(transaction_id, None)
+        if transaction is None:
+            return False
+        succeeded = True
+        try:
+            if transaction.keyring_committed and not transaction.recovered:
+                if transaction.old_credential is None:
+                    self._credentials.delete(transaction.origin)
+                    if self._credentials.get(transaction.origin) is not None:
+                        raise CredentialStoreError
+                else:
+                    self._credentials.set(
+                        transaction.origin, transaction.old_credential
+                    )
+                    if (
+                        self._credentials.get(transaction.origin)
+                        != transaction.old_credential
+                    ):
+                        raise CredentialStoreError
+        except CredentialStoreError:
+            succeeded = False
+        transaction.candidate = ''
+        transaction.old_credential = None
+        self._credential = None
+        self._authorized_target = None
+        configuration = self._configuration
+        if configuration is not None and configuration.namespace is not None:
+            self._pause_namespace(configuration.namespace, 'credential_removed')
+        self._stop_timer()
+        return succeeded
+
+    @pyqtSlot(str)
     def remove_credential(self, opaque_id: str) -> None:
         request_id = _public_request_id(opaque_id)
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.KEYRING,
+            erase=lambda: self._command_vault.take(opaque_id),
+        ):
+            return
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
@@ -451,6 +730,7 @@ class RoastServerWorker(QObject):
             return
         namespace = configuration.namespace
         self._credential = None
+        self._authorized_target = None
         if namespace is not None:
             self._discard_namespace_stages(namespace)
             self._pause_namespace(namespace, 'credential_removed')
@@ -462,45 +742,49 @@ class RoastServerWorker(QObject):
     @pyqtSlot(str)
     def enqueue_saved(self, opaque_id: str) -> None:
         request_id = _public_request_id(opaque_id)
-        try:
-            request = self._profile_vault.take(opaque_id)
-        except KeyError:
-            if not self._cancelled():
-                self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
-            return
-        if self._cancelled():
-            return
-        configuration = self._configuration
-        if (
-            not _valid_saved_request(request)
-            or configuration is None
-            or not configuration.enabled
-            or request.namespace != configuration.namespace
-            or (not request.manual and not configuration.automatic_upload)
-            or not self._outbox_open
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.LOCAL_PROFILE,
+            erase=lambda: self._profile_vault.take(opaque_id),
         ):
-            self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
             return
+        request: SavedProfileRequest | None = None
+        serialized_profile = b''
+        profile: ProfileData | None = None
+        namespace: Namespace | None = None
         snapshot: Snapshot | None = None
         try:
-            snapshot = self._outbox.snapshot_saved_file(request.namespace, request.path)
+            request = self._profile_vault.take(opaque_id)
             if self._cancelled():
                 return
-            profile = (
-                request.profile
-                if request.profile is not None
-                else self._profile_loader(snapshot.absolute_path)
+            configuration = self._configuration
+            if (
+                not _valid_saved_request(request)
+                or configuration is None
+                or not configuration.enabled
+                or request.namespace != configuration.namespace
+                or (not request.manual and not configuration.automatic_upload)
+                or not self._outbox_open
+            ):
+                self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
+                return
+            namespace = request.namespace
+            serialized_profile = request.serialized_profile
+            profile = request.profile
+            snapshot = self._outbox.snapshot_bytes(
+                namespace, serialized_profile, request.modified_at
             )
+            serialized_profile = b''
+            request = None
             if self._cancelled():
                 return
-            if not isinstance(profile, dict):
-                raise ValueError
             roast_uuid = _profile_roast_uuid(profile)
             metadata = project_profile(profile, snapshot.source_modified_at)
+            profile = None
             if self._cancelled():
                 return
             self._outbox.enqueue(
-                request.namespace,
+                namespace,
                 snapshot,
                 roast_uuid,
                 metadata,
@@ -511,28 +795,48 @@ class RoastServerWorker(QObject):
                 return
             if self._credential is None:
                 self._outbox.pause_namespace(
-                    request.namespace, self._now(), 'credential_removed'
+                    namespace, self._now(), 'credential_removed'
                 )
-        except (OutboxError, OSError, RecursionError, SyntaxError, TypeError, ValueError):
+        except KeyError:
+            if not self._cancelled():
+                self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
+        except (OutboxError, OSError, RecursionError, TypeError, ValueError):
             if not self._cancelled():
                 self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
         finally:
+            request = None
+            serialized_profile = b''
+            profile = None
             if snapshot is not None:
                 try:
                     self._outbox.discard_staged_snapshot(snapshot)
                 except OutboxError:
                     if not self._cancelled():
                         self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
-        if self._cancelled():
+        if self._cancelled() or namespace is None:
             return
-        self._emit_aggregates(request.namespace)
+        self._emit_aggregates(namespace)
         if self._credential is not None:
-            self._schedule_next(request.namespace)
+            self._schedule_next(namespace)
 
     @pyqtSlot()
     def process_queue_once(self) -> None:
+        if self._reject_wrong_thread('queue', FailureKind.INVALID_RESPONSE):
+            return
         configuration = self._configuration
         namespace = configuration.namespace if configuration is not None else None
+        if (
+            not self._stopped
+            and self._outbox_open
+            and configuration is not None
+            and configuration.identity is not None
+            and namespace is not None
+            and not self._configuration_is_authorized(configuration)
+        ):
+            self._credential = None
+            self._authorized_target = None
+            self._activate_configuration(configuration)
+            return
         if (
             self._stopped
             or not self._outbox_open
@@ -621,6 +925,7 @@ class RoastServerWorker(QObject):
                 if self._cancelled():
                     return
                 self._credential = None
+                self._authorized_target = None
                 self.onlineChanged.emit(False)
                 self._stop_timer()
             else:
@@ -649,7 +954,7 @@ class RoastServerWorker(QObject):
         self, configuration: WorkerConfiguration, job: Job
     ) -> None:
         credential = self._credential
-        if credential is None:
+        if credential is None or not self._configuration_is_authorized(configuration):
             raise _DeliveryFailure(_failure(FailureKind.CREDENTIAL_REJECTED))
         if (
             job.namespace != configuration.namespace
@@ -735,11 +1040,15 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot()
     def refresh(self) -> None:
+        if self._reject_wrong_thread('queue', FailureKind.INVALID_RESPONSE):
+            return
         if not self._cancelled():
             self._emit_aggregates(self._current_namespace())
 
     @pyqtSlot(str)
     def retry_job(self, job_id: str) -> None:
+        if self._reject_wrong_thread('queue', FailureKind.INVALID_RESPONSE):
+            return
         if self._cancelled():
             return
         namespace = self._current_namespace()
@@ -765,6 +1074,8 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot(str)
     def remove_job(self, job_id: str) -> None:
+        if self._reject_wrong_thread('queue', FailureKind.INVALID_RESPONSE):
+            return
         if self._cancelled():
             return
         namespace = self._current_namespace()
@@ -790,6 +1101,12 @@ class RoastServerWorker(QObject):
     @pyqtSlot(str)
     def browse(self, opaque_id: str) -> None:
         request_id = _public_request_id(opaque_id)
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.INVALID_RESPONSE,
+            erase=lambda: self._command_vault.take(opaque_id),
+        ):
+            return
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
@@ -806,7 +1123,12 @@ class RoastServerWorker(QObject):
         request = value
         credential = self._credential
         configuration = self._configuration
-        if credential is None or configuration is None or not configuration.enabled:
+        if (
+            credential is None
+            or configuration is None
+            or not configuration.enabled
+            or not self._configuration_is_authorized(configuration)
+        ):
             self._browse_fallback(request_id, request, _failure(FailureKind.OFFLINE))
             return
         try:
@@ -866,6 +1188,12 @@ class RoastServerWorker(QObject):
     @pyqtSlot(str)
     def open_online(self, opaque_id: str) -> None:
         request_id = _public_request_id(opaque_id)
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.INVALID_RESPONSE,
+            erase=lambda: self._command_vault.take(opaque_id),
+        ):
+            return
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
@@ -882,7 +1210,12 @@ class RoastServerWorker(QObject):
         request = value
         configuration = self._configuration
         credential = self._credential
-        if configuration is None or credential is None or not configuration.enabled:
+        if (
+            configuration is None
+            or credential is None
+            or not configuration.enabled
+            or not self._configuration_is_authorized(configuration)
+        ):
             self._emit_failure(request_id, _failure(FailureKind.OFFLINE))
             self.onlineChanged.emit(False)
             return
@@ -952,6 +1285,12 @@ class RoastServerWorker(QObject):
     @pyqtSlot(str)
     def open_cached(self, opaque_id: str) -> None:
         request_id = _public_request_id(opaque_id)
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.CACHE_CORRUPT,
+            erase=lambda: self._command_vault.take(opaque_id),
+        ):
+            return
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
@@ -977,6 +1316,12 @@ class RoastServerWorker(QObject):
     @pyqtSlot(str)
     def publish_staged(self, opaque_id: str) -> None:
         request_id = _public_request_id(opaque_id)
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.CACHE_CORRUPT,
+            erase=lambda: self._command_vault.take(opaque_id),
+        ):
+            return
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
@@ -1029,6 +1374,8 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot(str)
     def discard_staged(self, staged_path_text: str) -> None:
+        if self._reject_wrong_thread('discard', FailureKind.CACHE_CORRUPT):
+            return
         if self._cancelled():
             return
         matching = next(
@@ -1046,8 +1393,39 @@ class RoastServerWorker(QObject):
         self._emit_cache_stats(matching_operation='discard')
 
     @pyqtSlot(str)
+    def update_protected_paths(self, opaque_id: str) -> None:
+        request_id = _public_request_id(opaque_id)
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.CACHE_CORRUPT,
+            erase=lambda: self._command_vault.take(opaque_id),
+        ):
+            return
+        try:
+            value = self._command_vault.take(opaque_id)
+        except KeyError:
+            if not self._cancelled():
+                self._emit_failure(request_id, CACHE_FAILURE)
+            return
+        if self._cancelled() or not _valid_protected_paths_request(value):
+            if not self._cancelled():
+                self._emit_failure(request_id, CACHE_FAILURE)
+            return
+        configuration = self._configuration
+        if configuration is None or configuration.namespace != value.namespace:
+            self._emit_failure(request_id, CACHE_FAILURE)
+            return
+        self._open_cache_paths = value.open_paths
+
+    @pyqtSlot(str)
     def clear_unused(self, opaque_id: str) -> None:
         request_id = _public_request_id(opaque_id)
+        if self._reject_wrong_thread(
+            request_id,
+            FailureKind.CACHE_CORRUPT,
+            erase=lambda: self._command_vault.take(opaque_id),
+        ):
+            return
         try:
             value = self._command_vault.take(opaque_id)
         except KeyError:
@@ -1064,7 +1442,7 @@ class RoastServerWorker(QObject):
             self._emit_failure(request_id, CACHE_FAILURE)
             return
         try:
-            protected = request.open_paths | self._outbox.protected_paths(
+            protected = self._open_cache_paths | self._outbox.protected_paths(
                 request.namespace
             )
             if self._cancelled():
@@ -1075,7 +1453,6 @@ class RoastServerWorker(QObject):
                 self._emit_failure(request_id, CACHE_FAILURE)
             return
         if not self._cancelled():
-            self._open_cache_paths = request.open_paths
             self.cacheStatsChanged.emit(stats)
 
     def _prune_to_limit(self, operation: str, namespace: Namespace) -> None:
@@ -1129,6 +1506,7 @@ class RoastServerWorker(QObject):
         if error.status_code == 401 or error.failure.kind is FailureKind.CREDENTIAL_REJECTED:
             self._pause_namespace(namespace, 'credential_rejected')
             self._credential = None
+            self._authorized_target = None
             self._stop_timer()
         self.onlineChanged.emit(False)
         self._emit_failure(operation, error.failure)
@@ -1185,6 +1563,8 @@ class RoastServerWorker(QObject):
 
     @pyqtSlot()
     def stop(self) -> None:
+        if self._reject_wrong_thread('stop', FailureKind.INVALID_RESPONSE):
+            return
         if self._stopped:
             return
         self._stop_event.set()
@@ -1193,7 +1573,11 @@ class RoastServerWorker(QObject):
         self._credential_vault.clear()
         self._profile_vault.clear()
         self._command_vault.clear()
+        for transaction_id in tuple(self._credential_transactions):
+            self._rollback_transaction(transaction_id)
+        self._credential_transactions.clear()
         self._credential = None
+        self._authorized_target = None
         try:
             self._cache.close()
         except CacheError as error:
@@ -1223,6 +1607,22 @@ class RoastServerWorker(QObject):
         configuration = self._configuration
         return configuration.namespace if configuration is not None else None
 
+    def _configuration_is_authorized(
+        self, configuration: WorkerConfiguration
+    ) -> bool:
+        identity = configuration.identity
+        namespace = configuration.namespace
+        return (
+            self._credential is not None
+            and identity is not None
+            and namespace is not None
+            and not configuration.pending_connection
+            and configuration.activation_id is None
+            and namespace
+            == namespace_for(configuration.origin, identity.organization.id)
+            and self._authorized_target == (configuration.origin, identity)
+        )
+
     def _interrupted(self) -> bool:
         thread = self.thread()
         return self._stop_event.is_set() or (
@@ -1242,7 +1642,13 @@ class RoastServerWorker(QObject):
         return now.astimezone(UTC)
 
     def _schedule_next(self, namespace: Namespace) -> None:
-        if self._interrupted() or self._credential is None:
+        configuration = self._configuration
+        if (
+            self._interrupted()
+            or configuration is None
+            or configuration.namespace != namespace
+            or not self._configuration_is_authorized(configuration)
+        ):
             return
         try:
             due = self._outbox.next_due_at(namespace)
@@ -1268,6 +1674,23 @@ class RoastServerWorker(QObject):
     def _stop_timer(self) -> None:
         if self._timer is not None:
             self._timer.stop()
+
+    def _reject_wrong_thread(
+        self,
+        operation: str,
+        kind: FailureKind,
+        *,
+        erase: Callable[[], object] | None = None,
+    ) -> bool:
+        if QThread.currentThread() is self.thread():
+            return False
+        if erase is not None:
+            try:
+                erase()
+            except KeyError:
+                pass
+        self._emit_failure(operation, _failure(kind))
+        return True
 
     def _emit_failure(self, operation: str, failure: PublicFailure) -> None:
         safe_operation = (
@@ -1329,12 +1752,31 @@ def _valid_configuration(value: object) -> WorkerConfiguration | None:
     if origin != origin_value:
         return None
     namespace_value: object = value.namespace
-    if namespace_value is not None:
-        if not isinstance(namespace_value, Namespace):
+    identity_value: object = value.identity
+    pending_connection: object = value.pending_connection
+    activation_id: object = value.activation_id
+    if type(pending_connection) is not bool:
+        return None
+    if activation_id is not None and (
+        not isinstance(activation_id, str)
+        or _REQUEST_ID_RE.fullmatch(activation_id) is None
+    ):
+        return None
+    if namespace_value is None or identity_value is None:
+        if namespace_value is not None or identity_value is not None:
             return None
-        expected = namespace_for(origin, namespace_value.organization_id)
-        if namespace_value != expected:
+        if pending_connection or activation_id is not None:
             return None
+        return value
+    if not isinstance(namespace_value, Namespace) or not isinstance(
+        identity_value, ServerIdentity
+    ):
+        return None
+    expected = namespace_for(origin, identity_value.organization.id)
+    if namespace_value != expected:
+        return None
+    if pending_connection and activation_id is not None:
+        return None
     return value
 
 
@@ -1357,13 +1799,18 @@ def _valid_saved_request(value: object) -> TypeGuard[SavedProfileRequest]:
     if not isinstance(value, SavedProfileRequest):
         return False
     namespace: object = value.namespace
-    path: object = value.path
+    serialized_profile: object = value.serialized_profile
     profile: object = value.profile
+    modified_at: object = value.modified_at
     manual: object = value.manual
     return (
         isinstance(namespace, Namespace)
-        and isinstance(path, Path)
-        and (profile is None or isinstance(profile, dict))
+        and isinstance(serialized_profile, bytes)
+        and 1 <= len(serialized_profile) <= MAX_PROFILE_BYTES
+        and isinstance(profile, dict)
+        and isinstance(modified_at, datetime)
+        and modified_at.tzinfo is not None
+        and modified_at.utcoffset() is not None
         and type(manual) is bool
     )
 
@@ -1392,8 +1839,10 @@ def _valid_publish_request(value: object) -> TypeGuard[PublishRequest]:
     )
 
 
-def _valid_clear_request(value: object) -> TypeGuard[ClearUnusedRequest]:
-    if not isinstance(value, ClearUnusedRequest):
+def _valid_protected_paths_request(
+    value: object,
+) -> TypeGuard[ProtectedPathsRequest]:
+    if not isinstance(value, ProtectedPathsRequest):
         return False
     namespace: object = value.namespace
     open_paths: object = value.open_paths
@@ -1401,6 +1850,12 @@ def _valid_clear_request(value: object) -> TypeGuard[ClearUnusedRequest]:
         isinstance(namespace, Namespace)
         and isinstance(open_paths, frozenset)
         and all(isinstance(path, Path) for path in open_paths)
+    )
+
+
+def _valid_clear_request(value: object) -> TypeGuard[ClearUnusedRequest]:
+    return isinstance(value, ClearUnusedRequest) and isinstance(
+        value.namespace, Namespace
     )
 
 
@@ -1412,20 +1867,6 @@ def _profile_roast_uuid(profile: ProfileData) -> UUID:
         return UUID(value)
     except (AttributeError, TypeError, ValueError):
         raise ValueError('saved profile roast UUID is invalid') from None
-
-
-def _load_saved_profile(path: Path) -> ProfileData:
-    with path.open('rb') as source:
-        content = source.read(MAX_PROFILE_BYTES + 1)
-    if not content or len(content) > MAX_PROFILE_BYTES:
-        raise ValueError('saved profile size is invalid')
-    try:
-        value = ast.literal_eval(content.decode('utf-8'))
-    except (RecursionError, SyntaxError, ValueError):
-        raise ValueError('saved profile is invalid') from None
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
-        raise ValueError('saved profile is invalid')
-    return cast(ProfileData, value)
 
 
 def _upload_matches(upload: object, job: Job) -> bool:
@@ -1450,6 +1891,7 @@ __all__ = [
     'ConnectionTestRequest',
     'OnlineOpenRequest',
     'OpaqueVault',
+    'ProtectedPathsRequest',
     'PublishRequest',
     'RemoveCredentialRequest',
     'RoastServerWorker',

@@ -126,7 +126,7 @@ Implement each named helper directly above the tests in the owning test file (re
 - `opened_outbox(tmp_path)` creates private `outbox.sqlite3` and snapshot roots with an injected clock. `enqueue_fixture()` writes `PROFILE_BYTES`, snapshots it, projects `sample_profile()`, and enqueues under `NAMESPACE`; `NAMESPACE` is `namespace_for('https://example.test', UUID('22222222-2222-4222-8222-222222222222'))`, and `NOW` is aware UTC.
 - `staged_download` is a connector-generated temporary file containing `PROFILE_BYTES`; `DETAIL`/`RECEIPT` strictly match it. `cached_revision` publishes that fixture. `three_cached_revisions` publishes three distinct generated roast/revision/hash tuples with increasing download times.
 - `worker_harness` owns a real offscreen `QThread`, temporary real Outbox/CacheStore, fake credential store, fake API factory, both opaque vaults, a deterministic clock, and bounded `wait_for_signal()`/`run_one_queue_tick()` helpers. `api_failure(status)` maps through the production classifier rather than constructing arbitrary text.
-- `controller_harness` uses a fake worker object with recording slots/signals plus real opaque vaults, temporary INI `QSettings`, fake credential store, and fake profile validator. `PROFILE_PATH`/`PROFILE` are a regular temporary `.alog` and its detached in-memory saved dictionary.
+- `controller_harness` uses a fake worker object with recording slots/signals plus real opaque vaults, temporary INI `QSettings`, fake credential store, and fake profile validator. `PROFILE_BYTES`, `PROFILE`, and `MODIFIED` are the exact serializer-owned immutable bytes, detached in-memory saved dictionary, and aware timestamp for one revision.
 - Dialog fixtures use a signal-capable fake with exactly the controller signals/methods in Task 8. `IDENTITY`, `FAILED_JOB`, `SAFE_FAILURE`, online/cached pages, roast UUIDs, and `STALE_SERVER_SOURCE` are frozen production dataclasses, not mocks or dictionaries.
 - `save_window()` creates an `ApplicationWindow.__new__` object with only the existing save dependencies and a fake controller; `server_load_window` captures the active profile before each call and uses existing `test_main.py` Qt fixtures. `valid_profile()` is a detached profile accepted by `validateProfileDict()`.
 
@@ -217,6 +217,7 @@ class FailureKind(StrEnum):
     CHECKSUM_MISMATCH = 'checksum_mismatch'
     CACHE_CORRUPT = 'cache_corrupt'
     KEYRING = 'keyring'
+    SETTINGS = 'settings'
 
 FAILURE_MESSAGES: Final[dict[FailureKind, str]] = {
     FailureKind.OFFLINE: 'Offline / server unavailable.',
@@ -228,6 +229,7 @@ FAILURE_MESSAGES: Final[dict[FailureKind, str]] = {
     FailureKind.CHECKSUM_MISMATCH: 'Download checksum mismatch.',
     FailureKind.CACHE_CORRUPT: 'Cached copy corrupt or unavailable.',
     FailureKind.KEYRING: 'Operating-system keyring unavailable.',
+    FailureKind.SETTINGS: 'Roast Server settings could not be saved.',
 }
 
 @dataclass(frozen=True, slots=True)
@@ -616,10 +618,11 @@ git commit -m "feat(roastserver): project bounded roast metadata"
 - Create: `src/test/unitary/artisanlib/roastserver/test_outbox.py`
 
 **Interfaces:**
-- Consumes: connector-owned private root, `Namespace`, saved `.alog` path, `ProjectedMetadata`, client UUID, and an injected UTC clock.
+- Consumes: connector-owned private root, `Namespace`, exact saved `.alog` bytes (plus the legacy hardened path seam), aware source timestamp, `ProjectedMetadata`, client UUID, and an injected UTC clock.
 - Produces:
   - `Outbox.open() -> None`, `close() -> None`, `recover_expired_leases(now: datetime) -> int`
-  - `snapshot_saved_file(namespace: Namespace, source: Path) -> Snapshot`
+  - `snapshot_saved_file(namespace: Namespace, source: Path) -> Snapshot` (legacy/local hardening seam)
+  - `snapshot_bytes(namespace: Namespace, content: bytes, source_modified_at: datetime) -> Snapshot` (post-save integration path)
   - `enqueue(namespace: Namespace, snapshot: Snapshot, roast_uuid: UUID, metadata: ProjectedMetadata, client_uuid: UUID) -> EnqueueResult`
   - `lease_next(namespace: Namespace, now: datetime, lease_seconds: int = 60) -> Job | None`
   - `mark_complete(job_id: str, lease_token: str, now: datetime) -> None`
@@ -1103,7 +1106,8 @@ git commit -m "feat(roastserver): process archive work off UI thread"
   - `test_connection(origin: str, candidate: str) -> str`
   - `apply_options(origin: str, enabled: bool, automatic_upload: bool, cache_limit_bytes: int) -> None`
   - `remove_credential() -> None`
-  - `saved_profile(path: Path, profile: ProfileData) -> None`, `manual_upload(path: Path) -> None`
+  - `saved_profile(serialized_profile: bytes, profile: ProfileData, modified_at: datetime) -> None`
+  - `manual_upload(serialized_profile: bytes, profile: ProfileData, modified_at: datetime) -> None`
   - `refresh_queue() -> None`, `retry_job(job_id: str) -> None`, `remove_job(job_id: str) -> None`
   - `browse(filters: ArchiveFilters, refresh: bool = True) -> str`, `load_more() -> str | None`
   - `open_roast(roast_uuid: UUID) -> str`, `open_cached(cached: CachedRevision) -> str`
@@ -1131,13 +1135,15 @@ def test_candidate_credential_crosses_only_the_vault(controller_harness) -> None
 
 def test_saved_profile_returns_without_snapshot_or_http_on_ui_thread(controller_harness) -> None:
     started = time.monotonic()
-    controller_harness.controller.saved_profile(PROFILE_PATH, PROFILE)
+    controller_harness.controller.saved_profile(PROFILE_BYTES, PROFILE, MODIFIED)
     assert time.monotonic() - started < 0.05
     assert controller_harness.enqueue_vault.size() == 1
     assert controller_harness.client.calls == []
 ```
 
-Also test identity persistence only after worker success, keyring failure leaves old settings and auto off, origin/org namespace switch, `401` clears connected UI state but keeps credential, credential removal pauses work, disabled processing, immutable signal forwarding on main thread, validation-before-publication handshake, cached stale source, open-path protection, idempotent start, and shutdown ordering/wait timeout without terminate.
+Also test that persisted identity is never proof before worker-side keyring read plus exact `/auth/me`; startup offline authentication still permits exact-byte enqueue into the known namespace while remaining paused; origin/organization mismatch durably turns automatic upload off and causes zero upload; and candidate activation follows the crash-safe worker-secret sequence candidate test → verified pending public settings → keyring write/readback → active disabled settings sync/fresh exact readback → final `/auth/me` → proof. Cover live rollback of old keyring and prior disabled settings on each settings/final failure and real-QThread restarts at every crash cut with organization A/B jobs and zero upload. Test QSettings `AccessError`, `FormatError`, and fresh-readback mismatch, fixed failure text, and no processing.
+
+For save causality, block the real worker while two serializations write the same target path and call `saved_profile()` with each immutable exact `bytes`, detached `ProfileData`, and aware timestamp. Assert two distinct UUID/hash/snapshot/metadata rows and no UI path read/stat/hash. Also test keyring failure leaves old settings and auto off, origin/org namespace switch, `401` clears connected UI state but keeps credential, credential removal pauses work, disabled processing, immutable signal forwarding on main thread, validation-before-publication handshake, cached stale source, immediate protected-path updates on open/local transition and namespace round-trip, idempotent start, every external worker-slot affinity guard, and both normal and delayed production `stopped → deleteLater → quit` destruction with no live worker/timer/store handles.
 
 - [ ] **Step 2: Run controller tests and verify RED**
 
@@ -1173,7 +1179,9 @@ class RoastServerController(QObject):
     _stopWorker = pyqtSignal()
 ```
 
-Construct one `QThread` and one `RoastServerWorker`, connect commands with queued connections, then start only after all connections exist. `saved_profile(path, profile)` returns immediately when disabled/auto-off; otherwise transfer the save-local `ProfileData` object and path through the enqueue vault and emit only its ID. `manual_upload(path)` enqueues a request that deserializes the saved file in the worker. On `downloadStaged`, call the injected Artisan validator in the UI thread while the staged file is still hidden; on success vault a publish command, and on validator failure vault a `discard_staged` command before emitting `INVALID_RESPONSE`. Controller cancellation, opener exceptions, and vault failures must choose the same explicit discard command and must never unlink the path directly. Only after `cachePublished` or `cachedReady` emit `profileReady(str(path), source)`; after `ApplicationWindow.openRoastServerProfile()` reports success through `record_open_source()`, track the path in `_open_cache_paths`. `shutdown()` requests interruption, emits stop (which closes all remaining cache stages), calls `thread.quit()`, waits at most 15 seconds, and returns false with a fixed log message if still running.
+Construct one `QThread` and one `RoastServerWorker`, connect commands with explicit queued connections, move the worker, and only then start. A persisted public identity configures a known namespace but installs no controller proof and authorizes no lease: the worker pauses it, reads keyring, calls `/auth/me`, and resumes only after exact canonical origin and persisted identity match. Retry transient authentication with work paused; on mismatch emit only the fixed credential failure and persist automatic upload false. Candidate credentials remain in the redacted worker transaction with the old credential; Qt carries opaque IDs only. Persist and fresh-readback-check pending then active-disabled public settings at the defined phases, perform keyring write/readback and final `/auth/me` in worker affinity, rollback old keyring/prior disabled settings while alive, and recover every crash state paused.
+
+`saved_profile(serialized_profile, profile, modified_at)` returns immediately when disabled/auto-off; otherwise validate only `bytes` length `1..16 MiB`, detach `ProfileData`, canonicalize the aware timestamp, vault that immutable request, and emit only its ID. Manual upload receives the same serializer-owned triple. The worker calls `Outbox.snapshot_bytes()`, projects metadata from the matching profile/timestamp, enqueues, then clears byte/profile references. Neither controller path reads nor worker reopens a mutable source path. On `downloadStaged`, call the injected Artisan validator in the UI thread while the staged file is still hidden; on success vault a publish command, and on validator failure vault a `discard_staged` command before emitting `INVALID_RESPONSE`. Controller cancellation, opener exceptions, and vault failures must choose the same explicit discard command and must never unlink the path directly. Only after `cachePublished` or `cachedReady` emit `profileReady(str(path), source)`; after `ApplicationWindow.openRoastServerProfile()` reports success through `record_open_source()`, queue the immutable current protected set immediately. Queue the matching set after local transition and every namespace configuration; worker uses only its latest set for every publication prune and clear. `shutdown()` requests interruption, emits stop, and waits at most 15 seconds; worker `stopped` directly schedules `deleteLater` and thread quit after timer/stages/secrets/stores close, never using `terminate()`.
 
 - [ ] **Step 4: Run controller/worker tests GREEN**
 
@@ -1283,6 +1291,7 @@ git commit -m "feat(roastserver): add connector configuration dialog"
 
 **Interfaces:**
 - Consumes: `archivePageReady`, `operationFailed`, `onlineChanged`, `profileReady`; controller `browse(filters, refresh)`, `load_more()`, `open_roast(uuid)`, and `open_cached(cached)`.
+- Preserves the Task 8 save boundary unchanged: exact serializer-owned `bytes`, detached `ProfileData`, and aware modified timestamp; no browsing/open code may reintroduce pathname-based post-save snapshotting.
 - Produces `RoastTableModel`, `RoastServerBrowserDialog`, immutable `ArchivePageView(rows, next_cursor, online, retained_error)` and staged/cached open flow.
 
 - [ ] **Step 1: Add pagination, retained-error, offline, and open tests**
@@ -1348,7 +1357,7 @@ class ArchivePageView:
 
 `RoastTableModel` returns display strings only, joins label names without rich text, and exposes UUID/cached data through custom roles. `RoastServerBrowserDialog` is modeless, uses a single-shot 300 ms search timer, converts `QDate` filters to aware UTC inclusive bounds, retains the previous model on failure, and de-duplicates append pages by roast UUID. Connect vertical-scroll maximum proximity and the explicit translated `Load more` button to the same controller call.
 
-Complete worker/controller flow: online Open fetches detail, requires `current_revision`, streams into cache staging, and emits public receipt/detail/path; controller validates, commands atomic publish, then calls the opener with `stale=False`. On retryable online failure, worker validates an exact cached current revision if known and emits a fallback object; the browser asks with a fixed plain-text `QMessageBox` before `open_cached()`. Offline rows open only after cache revalidation and use `stale=True`.
+Complete worker/controller flow: online Open fetches detail, requires `current_revision`, streams into cache staging, and emits public receipt/detail/path; controller validates, commands atomic publish, then calls the opener with `stale=False`. On retryable online failure, worker validates an exact cached current revision if known and emits a fallback object; the browser asks with a fixed plain-text `QMessageBox` before `open_cached()`. Offline rows open only after cache revalidation and use `stale=True`. `record_open_source()` and local-save transitions immediately queue immutable protected-path updates; each configuration/namespace change follows its configure command with the matching current set. Worker publication pruning and explicit clear union only the latest set with outbox-owned snapshots, so a still-open current cache profile is never forgotten across namespace round trips.
 
 - [ ] **Step 4: Run all dialog/controller/worker tests GREEN**
 
@@ -1399,7 +1408,8 @@ def test_successful_save_notifies_connector_after_serialize(tmp_path: Path) -> N
         ordered.attach_mock(controller.saved_profile, 'saved_profile')
         assert window.fileSave(str(tmp_path / 'saved.alog'))
     assert [entry[0] for entry in ordered.mock_calls] == ['serialize', 'saved_profile']
-    controller.saved_profile.assert_called_once_with(tmp_path / 'saved.alog', window.profile)
+    controller.saved_profile.assert_called_once_with(
+        SERIALIZED_PROFILE, window.profile, SAVED_MODIFIED_AT)
 
 
 def test_failed_or_copy_save_does_not_auto_enqueue(tmp_path: Path) -> None:
@@ -1448,7 +1458,7 @@ self.roastServerConfigAction = QAction(
 
 Place server roasts/upload after Save As and before exports in File; place configuration before the UI-mode selector in Config. Slots create each modeless dialog once, then `show()`, `raise_()`, and `activateWindow()`. Manual upload requires non-viewer mode, a clean profile, non-null `curFile`, `.alog` suffix, and an existing regular file; otherwise show a fixed translated message.
 
-Immediately after successful `serialize()` in non-copy `fileSave()` and `automaticsave()`, call `controller.saved_profile(Path(filename), pf)`; do not alter serialization, plus hashing, registration, or save return behavior. In `main()`, after `settingsLoad()` and data paths are ready, create the controller with `<getDataDirectory()>/roastserver`, connect `profileReady` to `openRoastServerProfile`, and start it. In accepted `closeApp()`, call `shutdown(15_000)` before device teardown and continue shutdown after a fixed timeout message.
+Refactor only the save boundary so non-copy `fileSave()`, Save As, and `automaticsave()` compute the serialized `.alog` `bytes` exactly once, write exactly those bytes, and retain the matching aware saved/modified timestamp and detached post-save `ProfileData`. After the write succeeds, call `controller.saved_profile(serialized_profile, pf, modified_at)` with that exact triple; never ask the controller/worker to reopen the mutable pathname. Manual upload serializes the current clean saved profile through the same single-computation helper and passes the identical triple. Do not alter plus hashing, registration, or save return behavior, and do not enqueue failed/copy saves. In `main()`, after `settingsLoad()` and data paths are ready, create the controller with `<getDataDirectory()>/roastserver`, connect `profileReady` to `openRoastServerProfile`, and start it. In accepted `closeApp()`, call `shutdown(15_000)` before device teardown and continue shutdown after a fixed timeout message.
 
 - [ ] **Step 4: Run focused main and connector tests GREEN**
 

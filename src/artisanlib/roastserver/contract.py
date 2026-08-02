@@ -96,6 +96,7 @@ class FailureKind(StrEnum):
     CHECKSUM_MISMATCH = 'checksum_mismatch'
     CACHE_CORRUPT = 'cache_corrupt'
     KEYRING = 'keyring'
+    SETTINGS = 'settings'
 
 
 FAILURE_MESSAGES: Final[dict[FailureKind, str]] = {
@@ -108,6 +109,7 @@ FAILURE_MESSAGES: Final[dict[FailureKind, str]] = {
     FailureKind.CHECKSUM_MISMATCH: 'Download checksum mismatch.',
     FailureKind.CACHE_CORRUPT: 'Cached copy corrupt or unavailable.',
     FailureKind.KEYRING: 'Operating-system keyring unavailable.',
+    FailureKind.SETTINGS: 'Roast Server settings could not be saved.',
 }
 
 

@@ -27,14 +27,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from collections.abc import Callable
 import hashlib
-from typing import Final, Literal, Protocol, cast
+from typing import Final, Literal, Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from PyQt6.QtCore import QByteArray, QSettings
 
-from artisanlib.roastserver.contract import IdentityOrganization, IdentityUser, Namespace, ServerIdentity
+from artisanlib.roastserver.contract import (
+    IdentityOrganization,
+    IdentityUser,
+    Namespace,
+    ServerIdentity,
+)
 from artisanlib.roastserver.origin import SettingsError, canonical_origin
 
 KEYRING_SERVICE: Final[str] = 'org.artisan-scope.Artisan.RoastServer'
@@ -46,26 +52,9 @@ KEYRING_FAILURE_MESSAGE: Final[str] = (
     'The Roast Server credential could not be stored in the operating-system keyring. '
     'Verify that your system keyring is available and try again.'
 )
+SETTINGS_FAILURE_MESSAGE: Final[str] = 'Roast Server settings could not be saved.'
 
 _GROUP_NAME: Final[str] = 'RoastServer'
-_ALLOWED_GROUP_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        'origin',
-        'enabled',
-        'automaticUpload',
-        'clientInstanceUUID',
-        'identityUserID',
-        'identityUserEmail',
-        'identityUserNickname',
-        'identityOrganizationID',
-        'identityOrganizationName',
-        'identityOrganizationSlug',
-        'identityRole',
-        'cacheLimitBytes',
-        'configurationGeometry',
-        'browserGeometry',
-    }
-)
 _IDENTITY_KEYS: Final[tuple[str, ...]] = (
     'identityUserID',
     'identityUserEmail',
@@ -75,12 +64,41 @@ _IDENTITY_KEYS: Final[tuple[str, ...]] = (
     'identityOrganizationSlug',
     'identityRole',
 )
+_PENDING_IDENTITY_KEYS: Final[tuple[str, ...]] = (
+    'pendingIdentityUserID',
+    'pendingIdentityUserEmail',
+    'pendingIdentityUserNickname',
+    'pendingIdentityOrganizationID',
+    'pendingIdentityOrganizationName',
+    'pendingIdentityOrganizationSlug',
+    'pendingIdentityRole',
+)
+_PENDING_KEYS: Final[tuple[str, ...]] = ('pendingOrigin', *_PENDING_IDENTITY_KEYS)
+_ALLOWED_GROUP_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        'origin',
+        'enabled',
+        'automaticUpload',
+        'clientInstanceUUID',
+        *_IDENTITY_KEYS,
+        'cacheLimitBytes',
+        'configurationGeometry',
+        'browserGeometry',
+        *_PENDING_KEYS,
+    }
+)
 _IDENTITY_ROLE_VALUES: Final[frozenset[str]] = frozenset({'admin', 'member'})
 _VALID_BOOLEAN_STRINGS: Final[dict[str, bool]] = {'true': True, 'false': False}
 
 
 class CredentialStoreError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class PendingConnection:
+    origin: str
+    identity: ServerIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +111,7 @@ class ConnectorSettings:
     cache_limit_bytes: int
     configuration_geometry: QByteArray | None
     browser_geometry: QByteArray | None
+    pending_connection: PendingConnection | None
 
 
 class CredentialStore(Protocol):
@@ -103,7 +122,9 @@ class CredentialStore(Protocol):
 
 class _KeyringBackend(Protocol):
     def get_password(self, service_name: str, account_name: str) -> str | None: ...
-    def set_password(self, service_name: str, account_name: str, credential: str) -> None: ...
+    def set_password(
+        self, service_name: str, account_name: str, credential: str
+    ) -> None: ...
     def delete_password(self, service_name: str, account_name: str) -> None: ...
 
 
@@ -131,7 +152,7 @@ class SystemCredentialStore:
         try:
             self._backend.delete_password(KEYRING_SERVICE, account_name)
             return
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             pass
         try:
             if self._backend.get_password(KEYRING_SERVICE, account_name) is None:
@@ -142,8 +163,17 @@ class SystemCredentialStore:
 
 
 class SettingsStore:
-    def __init__(self, qsettings: QSettings) -> None:
+    def __init__(
+        self,
+        qsettings: QSettings,
+        *,
+        readback_factory: Callable[[], QSettings] | None = None,
+    ) -> None:
         self._qsettings = qsettings
+        self._readback_factory = readback_factory or self._new_readback
+
+    def _new_readback(self) -> QSettings:
+        return QSettings(self._qsettings.fileName(), self._qsettings.format())
 
     def load(self) -> ConnectorSettings:
         origin = self._load_origin()
@@ -155,81 +185,127 @@ class SettingsStore:
             client_instance_uuid=client_instance_uuid,
             identity=self._load_identity(),
             cache_limit_bytes=_bounded_cache_limit(self._value('cacheLimitBytes')),
-            configuration_geometry=_coerce_qbytearray(self._value('configurationGeometry')),
+            configuration_geometry=_coerce_qbytearray(
+                self._value('configurationGeometry')
+            ),
             browser_geometry=_coerce_qbytearray(self._value('browserGeometry')),
+            pending_connection=self._load_pending_connection(),
         )
         if loaded.automatic_upload and loaded.identity is None:
-            self._set_value('automaticUpload', False)
-            self._sync()
-            return ConnectorSettings(
-                origin=loaded.origin,
-                enabled=loaded.enabled,
-                automatic_upload=False,
-                client_instance_uuid=loaded.client_instance_uuid,
-                identity=None,
-                cache_limit_bytes=loaded.cache_limit_bytes,
-                configuration_geometry=loaded.configuration_geometry,
-                browser_geometry=loaded.browser_geometry,
-            )
+            loaded = replace(loaded, automatic_upload=False)
+        self._persist_security(loaded)
         return loaded
 
     def set_origin(self, origin: str) -> ConnectorSettings:
         canonical = canonical_origin(origin)
         current = self.load()
-        if canonical == current.origin:
+        if canonical == current.origin and current.pending_connection is None:
             return current
-        self._set_value('origin', canonical)
-        self._set_value('enabled', False)
-        self._set_value('automaticUpload', False)
-        self._clear_identity()
-        self._sync()
-        return ConnectorSettings(
+        target = replace(
+            current,
             origin=canonical,
             enabled=False,
             automatic_upload=False,
-            client_instance_uuid=current.client_instance_uuid,
             identity=None,
-            cache_limit_bytes=current.cache_limit_bytes,
-            configuration_geometry=current.configuration_geometry,
-            browser_geometry=current.browser_geometry,
+            pending_connection=None,
         )
+        self._persist_security(target)
+        return target
 
-    def save_connection(self, origin: str, identity: ServerIdentity) -> ConnectorSettings:
-        current = self.set_origin(origin)
-        self._set_identity(identity)
-        self._sync()
-        return ConnectorSettings(
-            origin=current.origin,
-            enabled=current.enabled,
-            automatic_upload=current.automatic_upload,
-            client_instance_uuid=current.client_instance_uuid,
+    def save_connection(
+        self, origin: str, identity: ServerIdentity
+    ) -> ConnectorSettings:
+        canonical = canonical_origin(origin)
+        current = self.load()
+        changed_origin = canonical != current.origin
+        target = replace(
+            current,
+            origin=canonical,
+            enabled=False if changed_origin else current.enabled,
+            automatic_upload=False if changed_origin else current.automatic_upload,
             identity=identity,
-            cache_limit_bytes=current.cache_limit_bytes,
-            configuration_geometry=current.configuration_geometry,
-            browser_geometry=current.browser_geometry,
+            pending_connection=None,
         )
+        self._persist_security(target)
+        return target
 
-    def save_options(self, enabled: bool, automatic_upload: bool, cache_limit_bytes: int) -> ConnectorSettings:
+    def save_pending_connection(
+        self, origin: str, identity: ServerIdentity
+    ) -> ConnectorSettings:
+        canonical = canonical_origin(origin)
+        current = self.load()
+        target = replace(
+            current,
+            automatic_upload=False,
+            pending_connection=PendingConnection(canonical, identity),
+        )
+        self._persist_security(target)
+        return target
+
+    def activate_pending_connection(
+        self, origin: str, identity: ServerIdentity
+    ) -> ConnectorSettings:
+        canonical = canonical_origin(origin)
+        current = self.load()
+        expected = PendingConnection(canonical, identity)
+        if current.pending_connection != expected:
+            raise SettingsError(SETTINGS_FAILURE_MESSAGE)
+        target = replace(
+            current,
+            origin=canonical,
+            enabled=False,
+            automatic_upload=False,
+            identity=identity,
+            pending_connection=None,
+        )
+        self._persist_security(target)
+        return target
+
+    def clear_pending_connection(self) -> ConnectorSettings:
+        current = self.load()
+        if current.pending_connection is None and not current.automatic_upload:
+            return current
+        target = replace(
+            current,
+            automatic_upload=False,
+            pending_connection=None,
+        )
+        self._persist_security(target)
+        return target
+
+    def restore_connection_state(
+        self, previous: ConnectorSettings
+    ) -> ConnectorSettings:
+        target = replace(
+            previous,
+            automatic_upload=False,
+            pending_connection=None,
+        )
+        self._persist_security(target)
+        return target
+
+    def save_options(
+        self, enabled: bool, automatic_upload: bool, cache_limit_bytes: int
+    ) -> ConnectorSettings:
         current = self.load()
         if automatic_upload and current.identity is None:
-            raise SettingsError('Automatic upload requires a confirmed identity for the current origin.')
+            raise SettingsError(
+                'Automatic upload requires a confirmed identity for the current origin.'
+            )
         bounded_cache_limit_bytes = _bounded_cache_limit(cache_limit_bytes)
-        self._set_value('enabled', enabled)
-        self._set_value('automaticUpload', automatic_upload)
-        self._set_value('cacheLimitBytes', bounded_cache_limit_bytes)
-        self._sync()
-        return ConnectorSettings(
-            origin=current.origin,
+        target = replace(
+            current,
             enabled=enabled,
             automatic_upload=automatic_upload,
-            client_instance_uuid=current.client_instance_uuid,
-            identity=current.identity,
             cache_limit_bytes=bounded_cache_limit_bytes,
-            configuration_geometry=current.configuration_geometry,
-            browser_geometry=current.browser_geometry,
+            pending_connection=None,
         )
+        self._persist_security(target)
+        return target
 
-    def save_geometry(self, configuration: QByteArray | None, browser: QByteArray | None) -> None:
+    def save_geometry(
+        self, configuration: QByteArray | None, browser: QByteArray | None
+    ) -> None:
         if configuration is None:
             self._remove('configurationGeometry')
         else:
@@ -239,6 +315,79 @@ class SettingsStore:
         else:
             self._set_value('browserGeometry', browser)
         self._sync()
+
+    def _persist_security(self, settings: ConnectorSettings) -> None:
+        self._set_value('origin', settings.origin)
+        self._set_value('enabled', settings.enabled)
+        self._set_value('automaticUpload', settings.automatic_upload)
+        self._set_value('clientInstanceUUID', str(settings.client_instance_uuid))
+        self._set_value('cacheLimitBytes', settings.cache_limit_bytes)
+        self._write_identity(_IDENTITY_KEYS, settings.identity)
+        pending = settings.pending_connection
+        if pending is None:
+            for key in _PENDING_KEYS:
+                self._remove(key)
+        else:
+            self._set_value('pendingOrigin', pending.origin)
+            self._write_identity(_PENDING_IDENTITY_KEYS, pending.identity)
+        self._qsettings.sync()
+        if self._qsettings.status() is not QSettings.Status.NoError:
+            self._fail_closed()
+        try:
+            readback = self._readback_factory()
+            readback.sync()
+        except Exception:  # pylint: disable=broad-exception-caught
+            self._fail_closed()
+        if readback.status() is not QSettings.Status.NoError:
+            self._fail_closed()
+        if self._security_readback(readback) != _security_tuple(settings):
+            self._fail_closed()
+
+    def _security_readback(self, readback: QSettings) -> tuple[object, ...] | None:
+        origin_value = self._value('origin', readback=readback)
+        if not isinstance(origin_value, str):
+            return None
+        try:
+            origin = canonical_origin(origin_value)
+            client_uuid = UUID(
+                _required_text(self._value('clientInstanceUUID', readback=readback))
+            )
+            identity = self._read_identity(_IDENTITY_KEYS, readback=readback)
+            pending = self._read_pending_connection(readback=readback)
+        except (TypeError, ValueError):
+            return None
+        enabled, enabled_valid = _coerce_bool(
+            self._value('enabled', readback=readback)
+        )
+        automatic, automatic_valid = _coerce_bool(
+            self._value('automaticUpload', readback=readback)
+        )
+        cache_value = self._value('cacheLimitBytes', readback=readback)
+        if (
+            not enabled_valid
+            or not automatic_valid
+            or isinstance(cache_value, bool)
+            or not isinstance(cache_value, int)
+        ):
+            return None
+        return (
+            origin,
+            enabled,
+            automatic,
+            client_uuid,
+            identity,
+            cache_value,
+            pending,
+        )
+
+    def _fail_closed(self) -> Never:
+        try:
+            self._set_value('enabled', False)
+            self._set_value('automaticUpload', False)
+            self._qsettings.sync()
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        raise SettingsError(SETTINGS_FAILURE_MESSAGE) from None
 
     def _load_origin(self) -> str:
         raw_origin = self._value('origin')
@@ -268,7 +417,9 @@ class SettingsStore:
             self._sync()
         return client_instance_uuid
 
-    def _load_security_bool(self, key: Literal['enabled', 'automaticUpload']) -> bool:
+    def _load_security_bool(
+        self, key: Literal['enabled', 'automaticUpload']
+    ) -> bool:
         value, valid = _coerce_bool(self._value(key))
         if valid:
             return value
@@ -277,54 +428,87 @@ class SettingsStore:
         return False
 
     def _load_identity(self) -> ServerIdentity | None:
-        values = {key: self._value(key) for key in _IDENTITY_KEYS}
-        if all(value is None for value in values.values()):
+        values = tuple(self._value(key) for key in _IDENTITY_KEYS)
+        if all(value is None for value in values):
             return None
         try:
-            user_id = UUID(_coerce_text(values['identityUserID'], default=''))
-            user_email = _required_text(values['identityUserEmail'])
-            user_nickname = _required_text(values['identityUserNickname'])
-            organization_id = UUID(_coerce_text(values['identityOrganizationID'], default=''))
-            organization_name = _required_text(values['identityOrganizationName'])
-            organization_slug = _required_text(values['identityOrganizationSlug'])
-            role = _required_text(values['identityRole'])
-        except (SettingsError, TypeError, ValueError):
-            self._clear_identity()
+            return _identity_from_values(values)
+        except (TypeError, ValueError):
+            self._clear_keys(_IDENTITY_KEYS)
             self._sync()
             return None
-        if role not in _IDENTITY_ROLE_VALUES:
-            self._clear_identity()
-            self._sync()
-            return None
-        return ServerIdentity(
-            user=IdentityUser(id=user_id, email=user_email, nickname=user_nickname),
-            organization=IdentityOrganization(id=organization_id, name=organization_name, slug=organization_slug),
-            role=cast(Literal['admin', 'member'], role),
-        )
 
-    def _set_identity(self, identity: ServerIdentity) -> None:
-        self._set_value('identityUserID', str(identity.user.id))
-        self._set_value('identityUserEmail', identity.user.email)
-        self._set_value('identityUserNickname', identity.user.nickname)
-        self._set_value('identityOrganizationID', str(identity.organization.id))
-        self._set_value('identityOrganizationName', identity.organization.name)
-        self._set_value('identityOrganizationSlug', identity.organization.slug)
-        self._set_value('identityRole', identity.role)
+    def _load_pending_connection(self) -> PendingConnection | None:
+        values = tuple(self._value(key) for key in _PENDING_KEYS)
+        if all(value is None for value in values):
+            return None
+        try:
+            pending = self._read_pending_connection()
+        except (TypeError, ValueError):
+            pending = None
+        if pending is None:
+            self._clear_keys(_PENDING_KEYS)
+            self._sync()
+        return pending
+
+    def _read_pending_connection(
+        self, *, readback: QSettings | None = None
+    ) -> PendingConnection | None:
+        origin_value = self._value('pendingOrigin', readback=readback)
+        identity_values = tuple(
+            self._value(key, readback=readback) for key in _PENDING_IDENTITY_KEYS
+        )
+        if origin_value is None and all(value is None for value in identity_values):
+            return None
+        origin = canonical_origin(_required_text(origin_value))
+        identity = _identity_from_values(identity_values)
+        return PendingConnection(origin, identity)
+
+    def _read_identity(
+        self,
+        keys: tuple[str, ...],
+        *,
+        readback: QSettings | None = None,
+    ) -> ServerIdentity | None:
+        values = tuple(self._value(key, readback=readback) for key in keys)
+        if all(value is None for value in values):
+            return None
+        return _identity_from_values(values)
+
+    def _write_identity(
+        self, keys: tuple[str, ...], identity: ServerIdentity | None
+    ) -> None:
+        if identity is None:
+            self._clear_keys(keys)
+            return
+        values: tuple[object, ...] = (
+            str(identity.user.id),
+            identity.user.email,
+            identity.user.nickname,
+            str(identity.organization.id),
+            identity.organization.name,
+            identity.organization.slug,
+            identity.role,
+        )
+        for key, value in zip(keys, values, strict=True):
+            self._set_value(key, value)
 
     def _repair_origin(self, origin: str) -> str:
         self._set_value('origin', origin)
         self._set_value('enabled', False)
         self._set_value('automaticUpload', False)
-        self._clear_identity()
+        self._clear_keys(_IDENTITY_KEYS)
+        self._clear_keys(_PENDING_KEYS)
         self._sync()
         return origin
 
-    def _clear_identity(self) -> None:
-        for key in _IDENTITY_KEYS:
+    def _clear_keys(self, keys: tuple[str, ...]) -> None:
+        for key in keys:
             self._remove(key)
 
-    def _value(self, key: str) -> object:
-        return self._qsettings.value(_full_key(key))
+    def _value(self, key: str, *, readback: QSettings | None = None) -> object:
+        backend = self._qsettings if readback is None else readback
+        return backend.value(_full_key(key))
 
     def _set_value(self, key: str, value: object) -> None:
         self._qsettings.setValue(_full_key(key), value)
@@ -334,18 +518,59 @@ class SettingsStore:
 
     def _sync(self) -> None:
         self._qsettings.sync()
+        if self._qsettings.status() is not QSettings.Status.NoError:
+            raise SettingsError(SETTINGS_FAILURE_MESSAGE) from None
 
 
 def namespace_for(origin: str, organization_id: UUID) -> Namespace:
     canonical = canonical_origin(origin)
     digest = hashlib.sha256(f'{canonical}\n{organization_id}'.encode()).hexdigest()
-    return Namespace(origin=canonical, organization_id=organization_id, key=f'namespace-sha256:{digest}')
+    return Namespace(
+        origin=canonical,
+        organization_id=organization_id,
+        key=f'namespace-sha256:{digest}',
+    )
 
 
 def credential_account(origin: str) -> str:
     canonical = canonical_origin(origin)
     digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
     return f'origin-sha256:{digest}'
+
+
+def _security_tuple(settings: ConnectorSettings) -> tuple[object, ...]:
+    return (
+        settings.origin,
+        settings.enabled,
+        settings.automatic_upload,
+        settings.client_instance_uuid,
+        settings.identity,
+        settings.cache_limit_bytes,
+        settings.pending_connection,
+    )
+
+
+def _identity_from_values(values: tuple[object, ...]) -> ServerIdentity:
+    if len(values) != 7:
+        raise SettingsError('Missing stored identity value.')
+    user_id = UUID(_required_text(values[0]))
+    user_email = _required_text(values[1])
+    user_nickname = _required_text(values[2])
+    organization_id = UUID(_required_text(values[3]))
+    organization_name = _required_text(values[4])
+    organization_slug = _required_text(values[5])
+    role = _required_text(values[6])
+    if role not in _IDENTITY_ROLE_VALUES:
+        raise SettingsError('Missing stored identity value.')
+    return ServerIdentity(
+        user=IdentityUser(id=user_id, email=user_email, nickname=user_nickname),
+        organization=IdentityOrganization(
+            id=organization_id,
+            name=organization_name,
+            slug=organization_slug,
+        ),
+        role=cast(Literal['admin', 'member'], role),
+    )
 
 
 def _bounded_cache_limit(value: object) -> int:
@@ -423,6 +648,8 @@ __all__ = [
     'KEYRING_SERVICE',
     'MAX_CACHE_LIMIT_BYTES',
     'MIN_CACHE_LIMIT_BYTES',
+    'PendingConnection',
+    'SETTINGS_FAILURE_MESSAGE',
     'SettingsError',
     'SettingsStore',
     'SystemCredentialStore',

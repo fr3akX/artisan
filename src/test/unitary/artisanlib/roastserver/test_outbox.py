@@ -24,6 +24,7 @@ import pytest
 from artisanlib.roastserver import outbox as outbox_module
 from artisanlib.roastserver.contract import (
     FAILURE_MESSAGES,
+    MAX_PROFILE_BYTES,
     FailureKind,
     Namespace,
     PublicFailure,
@@ -607,6 +608,50 @@ def test_snapshot_open_uses_no_follow_where_available(
     outbox.snapshot_saved_file(NAMESPACE, saved_profile)
     assert source_flags
     assert all(flags & no_follow for flags in source_flags)
+
+
+def test_snapshot_bytes_owns_exact_content_and_caller_timestamp(outbox: Outbox) -> None:
+    content = repr(
+        {'roastUUID': str(ROAST_UUID), 'title': 'serializer-owned revision'}
+    ).encode('utf-8')
+    modified_at = NOW + timedelta(microseconds=321)
+
+    snapshot = outbox.snapshot_bytes(NAMESPACE, content, modified_at)
+
+    assert snapshot.absolute_path.read_bytes() == content
+    assert snapshot.sha256 == hashlib.sha256(content).hexdigest()
+    assert snapshot.byte_count == len(content)
+    assert snapshot.source_modified_at == modified_at
+
+
+@pytest.mark.parametrize('content', [b'x', b'x' * MAX_PROFILE_BYTES])
+def test_snapshot_bytes_accepts_both_exact_content_bounds(
+    outbox: Outbox, content: bytes
+) -> None:
+    snapshot = outbox.snapshot_bytes(NAMESPACE, content, NOW)
+
+    assert snapshot.byte_count == len(content)
+    assert snapshot.absolute_path.read_bytes() == content
+
+
+@pytest.mark.parametrize('content', [b'', b'x' * (MAX_PROFILE_BYTES + 1)])
+def test_snapshot_bytes_rejects_content_outside_exact_bounds(
+    outbox: Outbox, content: bytes
+) -> None:
+    with pytest.raises(OutboxError, match='supported range'):
+        outbox.snapshot_bytes(NAMESPACE, content, NOW)
+
+
+@pytest.mark.parametrize(
+    'modified_at',
+    [datetime(2026, 8, 1), '2026-08-01'],  # noqa: DTZ001 - invalid input case
+)
+def test_snapshot_bytes_requires_aware_caller_timestamp(
+    outbox: Outbox, modified_at: object
+) -> None:
+    with pytest.raises((OutboxError, ValueError)):
+        outbox.snapshot_bytes(NAMESPACE, PROFILE_BYTES, cast(datetime, modified_at))
+
 
 
 def test_snapshot_is_exact_and_immune_to_source_edits(

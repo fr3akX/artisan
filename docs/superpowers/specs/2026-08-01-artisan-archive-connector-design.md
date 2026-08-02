@@ -102,12 +102,15 @@ QSettings stores only:
 - automatic-upload flag;
 - stable random client instance UUID;
 - most recently confirmed organization/user public identity;
+- a crash-recovery marker containing only a verified pending canonical origin and public identity while credential activation is incomplete;
 - bounded cache-size preference; and
 - non-secret dialog geometry.
 
-The credential uses a dedicated keyring service name and an account key derived from the canonical origin. Tokens never enter QSettings, SQLite, profile data, cache sidecars, exception strings, logs, or Qt signals.
+The credential uses a dedicated keyring service name and an account key derived from the canonical origin. Tokens and token hashes never enter QSettings, SQLite, profile data, cache sidecars, exception strings, logs, or Qt signals. Every security-relevant QSettings change is synchronized, checked for access/format status, and compared with an exact fresh read-back before it can affect processing; failure forces the in-process connector and automatic upload off with a fixed public error.
 
-A successful `/auth/me` response supplies canonical user and organization UUIDs, organization slug/name, nickname/email, and role. Outbox and cache records are namespaced by canonical server origin plus organization UUID. Changing server or organization cannot expose another namespace’s jobs or cached profiles.
+A successful `/auth/me` response supplies canonical user and organization UUIDs, organization slug/name, nickname/email, and role. Outbox and cache records are namespaced by canonical server origin plus organization UUID. Changing server or organization cannot expose another namespace’s jobs or cached profiles. Persisted public identity is never connection proof by itself: startup first pauses the namespace, reads the active credential in worker affinity, and validates `/auth/me` against the exact persisted canonical origin and identity before any lease or delivery. Offline/transient validation keeps enqueue available for the known active namespace but keeps delivery paused; an identity mismatch remains paused, reports the fixed credential failure, and durably disables automatic upload.
+
+Candidate credential activation is worker-secret two-phase. The worker tests the candidate without replacing keyring state and retains the candidate and old credential only in a redacted private transaction. The controller durably records the verified pending public identity, the worker writes and exactly reads back keyring, the controller durably promotes and exactly reads back disabled active public settings, and the worker performs a final `/auth/me` check before signaling proof. A live-process settings or final-validation failure restores the old keyring value and prior disabled public settings. A crash at any boundary restarts paused and must complete exact credential/identity validation before delivery; only opaque random transaction IDs cross Qt signals.
 
 ## URL and transport policy
 
@@ -127,16 +130,16 @@ A successful `/auth/me` response supplies canonical user and organization UUIDs,
 
 After successful serialization:
 
-1. Require a canonical roast UUID in the saved profile and a local `.alog` path.
-2. Open the saved path without following symlinks where supported and enforce the local 16 MiB profile ceiling.
-3. Read exact bytes, compute SHA-256, and confirm the file remains the same size/identity through the snapshot operation.
-4. Atomically publish an immutable content-addressed snapshot under the connector’s private application-data directory without replacing an existing inode.
+1. The Artisan serializer computes one immutable `bytes` value, writes exactly that value to the selected `.alog`, and captures the aware saved/modified timestamp used for that revision.
+2. Require a canonical roast UUID in the detached saved profile and enforce the immutable byte value at `1..16 MiB`; the post-save request carries the exact bytes, detached `ProfileData`, and timestamp, never a mutable source pathname.
+3. The UI controller performs only bounded length validation and detachment. It does not read, stat, or hash the path; worker affinity owns all snapshot, metadata, SQLite, and network work.
+4. The outbox hashes and atomically publishes those exact bytes as an immutable content-addressed snapshot under the connector’s private application-data directory without replacing an existing inode.
 5. While retaining the cross-process filesystem lock, durably insert a random, expiring, one-use staging owner for that namespace/SHA and return its token with the snapshot. Concurrent same-hash staging owners coexist.
-6. Build bounded compatible metadata from the in-memory saved profile.
+6. Build bounded compatible metadata from the detached saved profile and the exact caller-supplied timestamp.
 7. In one transaction, validate and consume exactly that unexpired staging token, then insert or resolve a SQLite job keyed by organization, roast UUID, and SHA-256.
 8. Use the deterministic idempotency key `archive-v1:<client-instance-uuid>:<roast-uuid>:<sha256>`.
 
-The queue owns the snapshot. Later edits to the original path cannot change queued bytes. Duplicate pending, completed, or idempotently acknowledged UUID/hash uploads do not create duplicate work.
+The queue owns the snapshot and the worker clears request byte/profile references after consumption. Later writes to the same original path cannot change, merge, or relabel queued revisions. Duplicate pending, completed, or idempotently acknowledged UUID/hash uploads do not create duplicate work.
 
 ### Delivery
 
@@ -169,7 +172,7 @@ The outbox uses schema version 2. Opening a version-1 database first fingerprint
 
 The SQLite database uses WAL mode, full synchronous commits, foreign keys, busy timeout, and `BEGIN IMMEDIATE` transitions. Tables store connector namespace, job/roast UUIDs, SHA-256, snapshot relative path/size, canonical duplicate-free JSON-object metadata, deterministic idempotency key, state (`pending`, `leased`, `retry_wait`, `paused`, `failed`, `complete`), attempts, next-attempt timestamp, lease expiry/token, allowlisted stable error code/message, and created/updated/completed timestamps.
 
-`snapshot_saved_file()` retains the cross-process filesystem lock through publication, file/directory durability, and staging-row commit. `enqueue()` atomically validates and consumes only its unexpired token. Startup expires abandoned stages and deletes a snapshot row/file only after proving that no job and no unexpired stage references it; unindexed publication-crash residue is then collected. Same-hash stages and jobs may share one immutable file without replacing its inode.
+`snapshot_bytes()` retains the cross-process filesystem lock through exact-byte publication, file/directory durability, and staging-row commit; the existing hardened `snapshot_saved_file()` seam follows the same ownership contract but is not used by post-save integration. `enqueue()` atomically validates and consumes only its unexpired token. Startup expires abandoned stages and deletes a snapshot row/file only after proving that no job and no unexpired stage references it; unindexed publication-crash residue is then collected. Same-hash stages and jobs may share one immutable file without replacing its inode.
 
 Every lease creates a unique token. Complete, retry, and fail require `(job_id, lease_token, now, ...)` and compare-and-swap only a currently leased row whose token matches and whose expiry is strictly after `now`; stale ownership yields the fixed `lease_lost` error. Recovery, namespace pause, and job removal invalidate the token. Before leasing, the indexed generated path, private read-only state, byte count, and SHA-256 are verified. Paths are generated internally and cannot escape the private root.
 
@@ -222,9 +225,9 @@ Metadata is deterministic JSON, finite, safe-integer bounded, NUL-free, and capp
 
 ## Qt lifecycle
 
-The controller is created after the main window and settings paths are ready. It owns one worker and one QThread. Startup opens/migrates the outbox, recovers leases, then starts processing only if enabled and credentialed. Shutdown requests interruption, wakes the worker, waits a bounded interval, explicitly discards every cache stage, closes the cache and SQLite, and never terminates a thread unsafely.
+The controller is created after the main window and settings paths are ready. It owns one worker and one QThread. Startup opens/migrates the outbox and recovers leases, but only resumes processing after worker-side keyring read and exact `/auth/me` validation of the persisted canonical origin and identity. Known-namespace offline saves may enqueue while this proof is absent and remain paused. Shutdown requests interruption, wakes the worker, waits a bounded interval, explicitly discards every cache stage, closes the cache and SQLite, and never terminates a thread unsafely. The production `stopped → deleteLater → quit` wiring destroys the worker and child timer in worker affinity after both stores close, including after a delayed bounded shutdown.
 
-Dialogs call controller methods; they do not perform HTTP or direct queue writes. Worker signals carry immutable public result objects without credentials or response bodies.
+Dialogs call controller methods; they do not perform HTTP or direct queue writes. Worker signals carry immutable public result objects without credentials, credential hashes, or response bodies. Every externally callable worker slot rejects direct wrong-thread use with a fixed failure before keyring, HTTP, cache, outbox, or filesystem I/O; opaque vault entries are safely consumed when rejection is needed to erase sensitive payloads.
 
 ## Security
 
@@ -251,6 +254,7 @@ The UI exposes fixed categories:
 - Local saved file changed or unavailable.
 - Download checksum mismatch.
 - Cached copy corrupt or unavailable.
+- Roast Server settings could not be saved.
 
 Safe server validation messages may be retained when they match the versioned error envelope and length/control-character bounds. Tokens, request bodies, profile contents, paths, tracebacks, and arbitrary proxy pages are never shown.
 
@@ -274,8 +278,11 @@ Safe server validation messages may be retained when they match the versioned er
 - Configuration validation, keyring failure, opt-in auto-upload, and connection-test transitions.
 - Queue-state rendering and retry/remove actions.
 - Cursor browsing, filter normalization, refresh failure with retained rows, offline cache view, and opening.
-- Worker signal/thread-affinity and shutdown tests.
-- Save/autosave/manual hooks remain non-blocking.
+- Worker signal/thread-affinity and production-wiring shutdown tests, including delayed stop and no surviving worker/timer/store handles.
+- Real-QThread restart tests at every pending-settings/keyring/active-settings/final-auth crash cut, with organization A/B jobs and zero upload before exact proof.
+- Save/autosave/manual hooks remain non-blocking; blocked-worker same-path saves preserve two distinct exact byte/UUID/metadata/timestamp revisions with no UI read/stat/hash.
+- Security QSettings access, format, and fresh-readback mismatch failures remain fail-closed.
+- Open-cache protected paths propagate immediately and remain current for publication pruning, clear, and namespace round trips.
 - Read-only server load excludes recent files and plus registration, clears `curFile`, and forces Save As.
 
 ### Coexistence

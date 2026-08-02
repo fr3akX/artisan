@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Generator
 from pathlib import Path
 import re
+from typing import cast
 from uuid import UUID
 
 from PyQt6.QtCore import QByteArray, QCoreApplication, QSettings
@@ -17,7 +18,9 @@ from artisanlib.roastserver.settings import (
     KEYRING_SERVICE,
     MAX_CACHE_LIMIT_BYTES,
     MIN_CACHE_LIMIT_BYTES,
+    SETTINGS_FAILURE_MESSAGE,
     CredentialStoreError,
+    PendingConnection,
     SettingsError,
     SettingsStore,
     SystemCredentialStore,
@@ -25,6 +28,37 @@ from artisanlib.roastserver.settings import (
     credential_account,
     namespace_for,
 )
+
+
+class FaultInjectingSettings:
+    def __init__(
+        self,
+        backend: QSettings,
+        *,
+        status: QSettings.Status = QSettings.Status.NoError,
+        mismatch_key: str | None = None,
+    ) -> None:
+        self.backend = backend
+        self.status_value = status
+        self.mismatch_key = mismatch_key
+
+    def value(self, key: str) -> object:
+        value = self.backend.value(key)
+        if key == self.mismatch_key and isinstance(value, bool):
+            return not value
+        return value
+
+    def setValue(self, key: str, value: object) -> None:  # noqa: N802
+        self.backend.setValue(key, value)
+
+    def remove(self, key: str) -> None:
+        self.backend.remove(key)
+
+    def sync(self) -> None:
+        self.backend.sync()
+
+    def status(self) -> QSettings.Status:
+        return self.status_value
 
 
 class FakeKeyring:
@@ -374,6 +408,105 @@ def test_set_origin_clears_identity_and_disables_when_origin_changes(
     assert not changed.enabled
     assert not changed.automatic_upload
     assert {key for key in qsettings.allKeys() if 'identity' in key} == set()
+
+
+def test_pending_connection_is_public_only_and_promotes_in_two_durable_phases(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+) -> None:
+    store = SettingsStore(qsettings)
+    previous = store.load()
+
+    pending = store.save_pending_connection('https://example.test', identity)
+
+    assert pending.origin == previous.origin
+    assert pending.identity is None
+    assert pending.pending_connection == PendingConnection(
+        'https://example.test', identity
+    )
+    assert not pending.automatic_upload
+    assert not any(
+        'token' in key.casefold() or 'credential' in key.casefold()
+        for key in qsettings.allKeys()
+    )
+
+    active = store.activate_pending_connection('https://example.test', identity)
+
+    assert active.origin == 'https://example.test'
+    assert active.identity == identity
+    assert active.pending_connection is None
+    assert not active.enabled
+    assert not active.automatic_upload
+
+
+@pytest.mark.parametrize(
+    'status',
+    [QSettings.Status.AccessError, QSettings.Status.FormatError],
+)
+def test_security_save_status_failure_is_fixed_and_fail_closed(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+    status: QSettings.Status,
+) -> None:
+    SettingsStore(qsettings).save_connection(DEFAULT_ORIGIN, identity)
+    faulty = FaultInjectingSettings(qsettings, status=status)
+
+    with pytest.raises(SettingsError) as raised:
+        SettingsStore(cast(QSettings, faulty)).save_options(
+            enabled=True,
+            automatic_upload=True,
+            cache_limit_bytes=DEFAULT_CACHE_LIMIT_BYTES,
+        )
+
+    assert raised.value.args == (SETTINGS_FAILURE_MESSAGE,)
+    assert raised.value.__cause__ is None
+    assert qsettings.value('RoastServer/automaticUpload') is False
+
+
+def test_security_save_exact_fresh_readback_mismatch_is_fixed_and_fail_closed(
+    qsettings: QSettings,
+    identity: ServerIdentity,
+) -> None:
+    SettingsStore(qsettings).save_connection(DEFAULT_ORIGIN, identity)
+    def mismatched_fresh_readback() -> QSettings:
+        fresh = QSettings(qsettings.fileName(), qsettings.format())
+        return cast(
+            QSettings,
+            FaultInjectingSettings(
+                fresh, mismatch_key='RoastServer/automaticUpload'
+            ),
+        )
+
+    with pytest.raises(SettingsError) as raised:
+        SettingsStore(
+            qsettings,
+            readback_factory=mismatched_fresh_readback,
+        ).save_options(
+            enabled=True,
+            automatic_upload=True,
+            cache_limit_bytes=DEFAULT_CACHE_LIMIT_BYTES,
+        )
+
+    assert raised.value.args == (SETTINGS_FAILURE_MESSAGE,)
+    assert qsettings.value('RoastServer/automaticUpload') is False
+
+
+def test_geometry_sync_failure_reports_only_fixed_settings_error(
+    qsettings: QSettings,
+) -> None:
+    faulty = FaultInjectingSettings(
+        qsettings,
+        status=QSettings.Status.AccessError,
+    )
+
+    with pytest.raises(SettingsError) as raised:
+        SettingsStore(cast(QSettings, faulty)).save_geometry(
+            QByteArray(b'configuration'),
+            None,
+        )
+
+    assert raised.value.args == (SETTINGS_FAILURE_MESSAGE,)
+    assert raised.value.__cause__ is None
 
 
 def test_save_geometry_removes_absent_values(qsettings: QSettings) -> None:

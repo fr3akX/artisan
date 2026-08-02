@@ -90,6 +90,8 @@ _PUBLIC_FAILURE_CODES: Final[frozenset[str]] = frozenset(
         'chart_unavailable',
         'client_closed',
         'connection_error',
+        'connector_disabled',
+        'credential_removed',
         'idempotency_conflict',
         'internal_error',
         'invalid_metadata',
@@ -151,6 +153,7 @@ _FAILURE_CODES_BY_KIND: Final[dict[FailureKind, frozenset[str]]] = {
     FailureKind.CHECKSUM_MISMATCH: frozenset({'checksum_mismatch'}),
     FailureKind.CACHE_CORRUPT: frozenset({'cache_corrupt'}),
     FailureKind.KEYRING: frozenset({'keyring'}),
+    FailureKind.SETTINGS: frozenset({'settings'}),
 }
 _PAUSE_CODES: Final[frozenset[str]] = frozenset(
     {'connector_disabled', 'credential_rejected', 'credential_removed'}
@@ -521,6 +524,115 @@ class Outbox:
             raise
         except (OSError, sqlite3.Error):
             raise OutboxError(_SNAPSHOT_STORAGE_ERROR) from None
+
+    def snapshot_bytes(
+        self,
+        namespace: Namespace,
+        content: bytes,
+        source_modified_at: datetime,
+    ) -> Snapshot:
+        content_value: object = content
+        if not isinstance(content_value, bytes):
+            raise ValueError('saved profile content must be immutable bytes')
+        if not 1 <= len(content_value) <= MAX_PROFILE_BYTES:
+            raise OutboxError('saved profile size is outside the supported range')
+        canonical_modified_at = datetime.fromisoformat(
+            _datetime_text(source_modified_at)
+        )
+        try:
+            with self._filesystem_lock():
+                return self._snapshot_bytes_locked(
+                    namespace, content_value, canonical_modified_at
+                )
+        except (OSError, sqlite3.Error):
+            raise OutboxError(_SNAPSHOT_STORAGE_ERROR) from None
+
+    def _snapshot_bytes_locked(
+        self,
+        namespace: Namespace,
+        content: bytes,
+        source_modified_at: datetime,
+    ) -> Snapshot:
+        namespace_key = _namespace_key(namespace)
+        destination_directory = self._snapshot_directory(namespace_key, None)
+        self._ensure_generated_directory(destination_directory)
+        temporary_path: Path | None = None
+        published_path: Path | None = None
+        published_created = False
+        try:
+            sha256, byte_count, temporary_path = self._write_bytes_to_temporary(
+                content, destination_directory
+            )
+            relative_path = _snapshot_relative_path(namespace_key, sha256)
+            final_path = self.root / relative_path
+            published_created = self._publish_temporary(
+                temporary_path, final_path, sha256, byte_count
+            )
+            temporary_path = None
+            published_path = final_path
+            token = uuid4().hex
+            created_at = self._clock()
+            created_text = _datetime_text(created_at)
+            expires_text = _datetime_text(
+                created_at + timedelta(seconds=_STAGING_SECONDS)
+            )
+            source_modified_text = _datetime_text(source_modified_at)
+            with self._transaction() as connection:
+                namespace_id = self._namespace_id(connection, namespace, create=True)
+                if namespace_id is None:
+                    raise OutboxError('namespace was not persisted')
+                connection.execute(
+                    '''INSERT OR IGNORE INTO snapshots
+                       (namespace_id, sha256, relative_path, byte_count, created_at)
+                       VALUES (?, ?, ?, ?, ?)''',
+                    (namespace_id, sha256, relative_path, byte_count, created_text),
+                )
+                row = connection.execute(
+                    '''SELECT relative_path, byte_count FROM snapshots
+                       WHERE namespace_id = ? AND sha256 = ?''',
+                    (namespace_id, sha256),
+                ).fetchone()
+                if (
+                    row is None
+                    or row['relative_path'] != relative_path
+                    or row['byte_count'] != byte_count
+                ):
+                    raise OutboxError('snapshot index conflicts with generated content')
+                connection.execute(
+                    '''INSERT INTO snapshot_staging
+                       (token, namespace_id, sha256, relative_path, byte_count,
+                        source_modified_at, created_at, expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (
+                        token,
+                        namespace_id,
+                        sha256,
+                        relative_path,
+                        byte_count,
+                        source_modified_text,
+                        created_text,
+                        expires_text,
+                    ),
+                )
+            return Snapshot(
+                namespace=namespace,
+                sha256=sha256,
+                relative_path=relative_path,
+                absolute_path=final_path,
+                byte_count=byte_count,
+                source_modified_at=source_modified_at,
+                staging_token=token,
+            )
+        except BaseException:
+            if published_created and published_path is not None:
+                self._discard_unowned_publication(namespace, published_path)
+            raise
+        finally:
+            if temporary_path is not None:
+                try:
+                    self._discard_temporary(temporary_path)
+                except OSError:
+                    pass
 
     def _snapshot_saved_file_locked(self, namespace: Namespace, source: Path) -> Snapshot:
         namespace_key = _namespace_key(namespace)
@@ -1688,6 +1800,43 @@ class Outbox:
             self._harden_directory(current)
             if created:
                 _fsync_directory(parent)
+
+    def _write_bytes_to_temporary(
+        self, content: bytes, directory: Path
+    ) -> tuple[str, int, Path]:
+        temporary_name = f'.snapshot-{uuid4().hex}.tmp'
+        temporary_path = directory / temporary_name
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        directory_fd = self._open_generated_directory(directory)
+        temporary_fd: int | None = None
+        try:
+            if _HAS_DIRECTORY_FDS:
+                temporary_fd = os.open(
+                    temporary_name, flags, 0o600, dir_fd=directory_fd
+                )
+            else:
+                temporary_fd = os.open(temporary_path, flags, 0o600)
+            _write_all(temporary_fd, content)
+            _fsync_descriptor(temporary_fd)
+        except BaseException:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+                temporary_fd = None
+            try:
+                if _HAS_DIRECTORY_FDS:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                else:
+                    _secure_unlink(temporary_path)
+                _fsync_directory(directory)
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+            os.close(directory_fd)
+        return hashlib.sha256(content).hexdigest(), len(content), temporary_path
 
     def _copy_to_temporary(self, source_fd: int, directory: Path) -> tuple[str, int, Path]:
         temporary_name = f'.snapshot-{uuid4().hex}.tmp'
