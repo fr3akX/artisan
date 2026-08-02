@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Final, Protocol, cast, override
 from uuid import UUID
 
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QByteArray, QObject, QThread, Qt, pyqtSignal, pyqtSlot
 
 from artisanlib.atypes import ProfileData
 from artisanlib.roastserver.api import ClientFactory
@@ -330,14 +330,7 @@ class RoastServerController(QObject):
         if not isinstance(candidate_value, str) or candidate_value == '':
             raise ControllerError(_INVALID_REQUEST_MESSAGE)
 
-        previous_transactions = set(self._activation_previous)
-        if self._active_connection_test is not None:
-            previous_transactions.add(self._active_connection_test)
-        for transaction_id in previous_transactions:
-            self._cancelConnectionWorker.emit(transaction_id)
-        self._connection_tests.clear()
-        self._activation_previous.clear()
-        self._active_connection_test = None
+        self._cancel_connection_transactions()
         try:
             self._settings = self._settings_store.save_options(
                 False,
@@ -403,6 +396,43 @@ class RoastServerController(QObject):
             raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
         self.settingsChanged.emit(self._settings)
         self._queue_configuration(self._configuration())
+
+    def invalidate_connection_proof(self) -> None:
+        self._require_command_state()
+        paused = self._configuration(enabled=False)
+        self._credential_vault.clear()
+        self._cancel_connection_transactions()
+        try:
+            self._settings = self._settings_store.save_options(
+                False,
+                False,
+                self._settings.cache_limit_bytes,
+            )
+        except SettingsError:
+            self._settings_failure('settings')
+            raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
+        self.settingsChanged.emit(self._settings)
+        self._invalidate_identity()
+        self._queue_configuration(paused)
+
+    def save_configuration_geometry(self, geometry: QByteArray) -> None:
+        self._require_command_state()
+        geometry_value: object = geometry
+        if not isinstance(geometry_value, QByteArray) or geometry_value.isEmpty():
+            raise ControllerError(_INVALID_REQUEST_MESSAGE)
+        detached = QByteArray(geometry_value)
+        try:
+            self._settings_store.save_geometry(
+                detached,
+                self._settings.browser_geometry,
+            )
+        except SettingsError:
+            self._settings_failure('geometry')
+            raise ControllerError(SETTINGS_FAILURE_MESSAGE) from None
+        self._settings = replace(
+            self._settings,
+            configuration_geometry=detached,
+        )
 
     def remove_credential(self) -> None:
         self._require_command_state()
@@ -1142,6 +1172,16 @@ class RoastServerController(QObject):
         self._credential_removals.clear()
         self._activation_previous.clear()
         self._invalidate_archive_state()
+
+    def _cancel_connection_transactions(self) -> None:
+        transactions = set(self._activation_previous)
+        if self._active_connection_test is not None:
+            transactions.add(self._active_connection_test)
+        for transaction_id in transactions:
+            self._cancelConnectionWorker.emit(transaction_id)
+        self._connection_tests.clear()
+        self._activation_previous.clear()
+        self._active_connection_test = None
 
     def _put_command(self, command: object) -> str:
         try:

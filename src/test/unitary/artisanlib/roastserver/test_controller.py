@@ -33,7 +33,7 @@ import time
 from typing import Any, IO, cast, override
 from uuid import UUID
 
-from PyQt6.QtCore import QCoreApplication, QObject, QSettings, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QByteArray, QCoreApplication, QObject, QSettings, QThread, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtTest import QSignalSpy
 import pytest
 
@@ -820,6 +820,60 @@ def controller_harness(
     harness = ControllerHarness(tmp_path, qcoreapplication)
     yield harness
     harness.stop()
+
+
+def test_dialog_edit_invalidation_revokes_controller_proof_and_pauses_work(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable(automatic_upload=True)
+    identity_changed = QSignalSpy(controller_harness.controller.identityChanged)
+    configurations_before = len(controller_harness.fake_worker.configure_values)
+
+    controller_harness.controller.invalidate_connection_proof()
+
+    controller_harness.wait_until(
+        lambda: len(controller_harness.fake_worker.configure_values)
+        > configurations_before
+    )
+    settings = controller_harness.settings_store.load()
+    configuration = controller_harness.fake_worker.configure_values[-1]
+    assert list(identity_changed[-1]) == [None]
+    assert not settings.enabled
+    assert not settings.automatic_upload
+    assert not configuration.enabled
+    assert not configuration.automatic_upload
+
+
+def test_dialog_edit_invalidation_cancels_pending_opaque_transaction(
+    controller_harness: ControllerHarness,
+) -> None:
+    request_id = controller_harness.controller.test_connection(
+        ORIGIN,
+        controller_harness.ephemeral_secret,
+    )
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.test_ids
+    )
+
+    controller_harness.controller.invalidate_connection_proof()
+
+    controller_harness.wait_until(
+        lambda: request_id in controller_harness.fake_worker.cancel_ids
+    )
+    assert controller_harness.secret_vault.size() == 0
+
+
+def test_configuration_geometry_is_saved_only_through_controller(
+    controller_harness: ControllerHarness,
+) -> None:
+    geometry = QByteArray(b'bounded-public-geometry')
+
+    controller_harness.controller.save_configuration_geometry(geometry)
+
+    saved = controller_harness.settings_store.load().configuration_geometry
+    assert saved == geometry
+    assert saved is not geometry
 
 
 def test_auto_upload_cannot_enable_before_confirmed_test(
