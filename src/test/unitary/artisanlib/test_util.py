@@ -16,6 +16,7 @@ Key Features:
 """
 
 from datetime import UTC, datetime
+import ctypes
 import os
 import stat
 import subprocess
@@ -28,6 +29,7 @@ import numpy as np
 from hypothesis import example, given, settings
 from pathlib import Path
 from collections.abc import Generator
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock
 
@@ -2270,7 +2272,8 @@ class TestSerialize:
         events: list[str] = []
         real_write = os.write
         real_fsync = os.fsync
-        real_replace = os.replace
+        from artisanlib import util as util_module
+        real_publish = util_module._move_serialization_entry_no_replace
 
         def recording_write(descriptor: int, value: bytes) -> int:
             events.append('write')
@@ -2280,24 +2283,27 @@ class TestSerialize:
             events.append('fsync')
             real_fsync(descriptor)
 
-        def recording_replace(
+        def recording_publish(
+            parent: Any,
             source: str,
             target: str,
-            **kwargs: Any,
         ) -> None:
-            events.append('replace')
-            real_replace(source, target, **kwargs)
+            events.append('publish')
+            real_publish(parent, source, target)
 
         monkeypatch.setattr('artisanlib.util.os.write', recording_write)
         monkeypatch.setattr('artisanlib.util.os.fsync', recording_fsync)
-        monkeypatch.setattr('artisanlib.util.os.replace', recording_replace)
+        monkeypatch.setattr(
+            'artisanlib.util._move_serialization_entry_no_replace',
+            recording_publish,
+        )
 
         serialize_with_timestamp(str(destination), {'value': 'ordered'})
 
         assert events[0] == 'write'
         assert events.count('fsync') == (1 if os.name == 'nt' else 2)
-        assert events.index('write') < events.index('replace')
-        assert events[-1] == ('replace' if os.name == 'nt' else 'fsync')
+        assert events.index('write') < events.index('publish')
+        assert events[-1] == ('publish' if os.name == 'nt' else 'fsync')
 
     @pytest.mark.parametrize('failure', ['write', 'file-sync', 'replace'])
     def test_serialize_with_timestamp_fails_closed_without_raw_paths(
@@ -2311,7 +2317,9 @@ class TestSerialize:
                 'artisanlib.util.os.write', Mock(side_effect=OSError(str(destination))))
         elif failure == 'replace':
             monkeypatch.setattr(
-                'artisanlib.util.os.replace', Mock(side_effect=OSError(str(destination))))
+                'artisanlib.util._exchange_serialization_entries',
+                Mock(side_effect=OSError(str(destination))),
+            )
         else:
             real_fsync = os.fsync
             calls = 0
@@ -2519,7 +2527,315 @@ class TestSerialize:
             transaction.rollback()
 
         assert destination.read_bytes() == b'concurrent replacement'
-        assert not list(tmp_path.glob('.artisan-*.tmp'))
+        retained_backups = list(tmp_path.glob('.artisan-*.tmp'))
+        if destination_exists:
+            assert len(retained_backups) == 1
+            assert retained_backups[0].read_bytes() == b'prior entry'
+        else:
+            assert retained_backups == []
+
+    @pytest.mark.darwin
+    @pytest.mark.linux
+    def test_posix_absent_publication_no_replace_preserves_final_gap_create(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'absent-publication-final-gap.alog'
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        real_move = util_module._move_serialization_entry_no_replace
+        calls = 0
+
+        def move_with_barrier(
+            parent: Any, source_name: str, destination_name: str
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                destination.write_bytes(b'concurrent create')
+            real_move(parent, source_name, destination_name)
+
+        monkeypatch.setattr(
+            util_module,
+            '_move_serialization_entry_no_replace',
+            move_with_barrier,
+        )
+
+        with pytest.raises(OSError, match='profile destination publication failed'):
+            transaction.serialize({'value': 'must not replace concurrent'})
+        transaction.rollback()
+
+        assert calls == 1
+        assert destination.read_bytes() == b'concurrent create'
+
+    @pytest.mark.darwin
+    @pytest.mark.linux
+    def test_posix_publication_exchange_captures_replacement_at_former_final_gap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'publication-final-gap.alog'
+        destination.write_bytes(b'expected prior entry')
+        attacker = tmp_path / 'publication-attacker.alog'
+        attacker.write_bytes(b'concurrent publication entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        real_exchange = util_module._exchange_serialization_entries
+        calls = 0
+
+        def exchange_with_barrier(
+            parent: Any, first_name: str, second_name: str
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                os.replace(attacker, destination)
+            real_exchange(parent, first_name, second_name)
+
+        monkeypatch.setattr(
+            util_module, '_exchange_serialization_entries', exchange_with_barrier)
+
+        with pytest.raises(OSError, match='profile destination publication failed'):
+            transaction.serialize({'value': 'must not replace concurrent'})
+        transaction.rollback()
+
+        assert calls == 2
+        assert destination.read_bytes() == b'concurrent publication entry'
+
+    @pytest.mark.darwin
+    @pytest.mark.linux
+    def test_posix_rollback_exchange_restores_replacement_at_former_final_gap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'rollback-final-gap.alog'
+        destination.write_bytes(b'expected prior entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        transaction.serialize({'value': 'published'})
+        attacker = tmp_path / 'rollback-attacker.alog'
+        attacker.write_bytes(b'concurrent rollback entry')
+        real_exchange = util_module._exchange_serialization_entries
+        calls = 0
+
+        def exchange_with_barrier(
+            parent: Any, first_name: str, second_name: str
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                os.replace(attacker, destination)
+            real_exchange(parent, first_name, second_name)
+
+        monkeypatch.setattr(
+            util_module, '_exchange_serialization_entries', exchange_with_barrier)
+
+        with pytest.raises(OSError, match='profile destination rollback failed'):
+            transaction.rollback()
+
+        assert calls == 2
+        assert destination.read_bytes() == b'concurrent rollback entry'
+        retained_backups = list(tmp_path.glob('.artisan-*.tmp'))
+        assert len(retained_backups) == 1
+        assert retained_backups[0].read_bytes() == b'expected prior entry'
+
+    @pytest.mark.darwin
+    @pytest.mark.linux
+    def test_posix_absent_rollback_quarantines_then_restores_final_gap_replace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'absent-rollback-final-gap.alog'
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        transaction.serialize({'value': 'published'})
+        attacker = tmp_path / 'absent-rollback-attacker.alog'
+        attacker.write_bytes(b'concurrent rollback entry')
+        real_move = util_module._move_serialization_entry_no_replace
+        calls = 0
+
+        def move_with_barrier(
+            parent: Any, source_name: str, destination_name: str
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                os.replace(attacker, destination)
+            real_move(parent, source_name, destination_name)
+
+        monkeypatch.setattr(
+            util_module,
+            '_move_serialization_entry_no_replace',
+            move_with_barrier,
+        )
+
+        with pytest.raises(OSError, match='profile destination rollback failed'):
+            transaction.rollback()
+
+        assert calls == 2
+        assert destination.read_bytes() == b'concurrent rollback entry'
+
+    @pytest.mark.skipif(os.name == 'nt', reason='requires POSIX entry mutation')
+    def test_destination_publication_validates_captured_content_not_only_inode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'publication-in-place.alog'
+        original = b'original entry'
+        concurrent = b'changed! entry'
+        assert len(original) == len(concurrent)
+        destination.write_bytes(original)
+        prior_times = (destination.stat().st_atime_ns, destination.stat().st_mtime_ns)
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+
+        def mutate_at_publication(_destination: Path) -> None:
+            destination.write_bytes(concurrent)
+            os.utime(destination, ns=prior_times)
+
+        monkeypatch.setattr(
+            util_module, '_serialization_prepublish_hook', mutate_at_publication)
+
+        with pytest.raises(OSError, match='profile destination publication failed'):
+            transaction.serialize({'value': 'must validate hash'})
+        transaction.rollback()
+
+        assert destination.read_bytes() == concurrent
+
+    @pytest.mark.skipif(os.name == 'nt', reason='requires POSIX entry mutation')
+    def test_destination_rollback_validates_published_content_not_only_inode(
+        self, tmp_path: Path
+    ) -> None:
+        destination = tmp_path / 'rollback-in-place.alog'
+        destination.write_bytes(b'prior entry')
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        published = transaction.serialize({'value': 'published'})
+        concurrent = b'X' * len(published.serialized_profile)
+        destination.write_bytes(concurrent)
+
+        with pytest.raises(OSError, match='profile destination rollback failed'):
+            transaction.rollback()
+
+        assert destination.read_bytes() == concurrent
+
+    def test_posix_native_rename_seams_use_platform_signatures_and_flags(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        class NativeFunction:
+            argtypes: list[object] | None = None
+            restype: object | None = None
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, ...]] = []
+
+            def __call__(self, *arguments: object) -> int:
+                self.calls.append(arguments)
+                return 0
+
+        linux_rename = NativeFunction()
+        monkeypatch.setattr(
+            util_module, '_serialization_posix_libc',
+            lambda: SimpleNamespace(renameat2=linux_rename),
+        )
+        monkeypatch.setattr(
+            util_module, '_serialization_posix_platform', lambda: 'linux')
+        parent = SimpleNamespace(descriptor=17, windows=False)
+
+        util_module._move_serialization_entry_no_replace(parent, 'one', 'two')
+        util_module._exchange_serialization_entries(parent, 'three', 'four')
+
+        assert linux_rename.calls == [
+            (17, b'one', 17, b'two', 1),
+            (17, b'three', 17, b'four', 2),
+        ]
+        assert linux_rename.argtypes == [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        assert linux_rename.restype is ctypes.c_int
+
+        mac_rename = NativeFunction()
+        monkeypatch.setattr(
+            util_module, '_serialization_posix_libc',
+            lambda: SimpleNamespace(renameatx_np=mac_rename),
+        )
+        monkeypatch.setattr(
+            util_module, '_serialization_posix_platform', lambda: 'darwin')
+
+        util_module._move_serialization_entry_no_replace(parent, 'five', 'six')
+        util_module._exchange_serialization_entries(parent, 'seven', 'eight')
+
+        assert mac_rename.calls == [
+            (17, b'five', 17, b'six', 0x4),
+            (17, b'seven', 17, b'eight', 0x2),
+        ]
+        assert mac_rename.argtypes == linux_rename.argtypes
+        assert mac_rename.restype is ctypes.c_int
+
+    def test_windows_existing_publication_uses_generated_replacefile_backup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from artisanlib import util as util_module
+
+        destination = tmp_path / 'windows-backup.alog'
+        destination.write_bytes(b'prior Windows entry')
+        replacements: list[tuple[Path, Path, Path]] = []
+
+        class Native:
+            @staticmethod
+            def open_readonly(path: Path, *, directory: bool = False) -> int:
+                flags = os.O_RDONLY
+                if directory:
+                    flags |= getattr(os, 'O_DIRECTORY', 0)
+                return os.open(path, flags)
+
+            @staticmethod
+            def canonical_path(_descriptor: int) -> Path:
+                return tmp_path
+
+            @staticmethod
+            def replace_with_backup(
+                replacement: Path, target: Path, backup: Path
+            ) -> None:
+                replacements.append((replacement, target, backup))
+                os.replace(target, backup)
+                os.replace(replacement, target)
+
+            @staticmethod
+            def flush_directory(_directory: Path) -> None:
+                return None
+
+            @staticmethod
+            def unlink(path: Path) -> None:
+                os.unlink(path)
+
+        monkeypatch.setattr(
+            util_module, '_serialization_is_windows', lambda: True)
+        monkeypatch.setattr(
+            util_module, '_serialization_windows_native', Native)
+
+        transaction = FileDestinationTransaction.begin(
+            str(destination), max_bytes=1024)
+        transaction.serialize({'value': 'replacement'})
+        assert len(replacements) == 1
+        replacement, target, backup = replacements[0]
+        assert replacement.parent == target.parent == backup.parent == tmp_path
+        assert target == destination
+        assert backup.name.startswith('.artisan-')
+        assert backup.exists()
+
+        transaction.commit()
+
+        assert not backup.exists()
+        assert destination.read_bytes() == b"{'value': 'replacement'}"
 
     def test_windows_transaction_uses_retained_canonical_parent_for_every_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2548,9 +2864,9 @@ class TestSerialize:
                 return canonical_parent
 
             @staticmethod
-            def replace(source: Path, target: Path) -> None:
-                events.append(('replace', source, target))
-                os.replace(source, target)
+            def move_no_replace(source: Path, target: Path) -> None:
+                events.append(('move-no-replace', source, target))
+                os.rename(source, target)
 
             @staticmethod
             def flush_directory(directory: Path) -> None:
@@ -2641,9 +2957,12 @@ class TestSerialize:
                 return tmp_path
 
             @staticmethod
-            def replace(source: Path, target: Path) -> None:
-                events.append('replace-write-through')
-                os.replace(source, target)
+            def replace_with_backup(
+                replacement: Path, target: Path, backup: Path
+            ) -> None:
+                events.append('replacefile-write-through')
+                os.replace(target, backup)
+                os.replace(replacement, target)
 
             @staticmethod
             def flush_directory(directory: Path) -> None:
@@ -2652,6 +2971,7 @@ class TestSerialize:
 
             @staticmethod
             def unlink(path: Path) -> None:
+                events.append('unlink-backup')
                 os.unlink(path)
 
         monkeypatch.setattr(
@@ -2666,7 +2986,12 @@ class TestSerialize:
         serialized = serialize(str(destination), {'value': 'windows'})
 
         assert destination.read_bytes() == serialized
-        assert events == ['replace-write-through', 'flush-directory']
+        assert events == [
+            'replacefile-write-through',
+            'flush-directory',
+            'unlink-backup',
+            'flush-directory',
+        ]
 
     def test_serialize_basic(self) -> None:
         """Test serialize writes object to file."""

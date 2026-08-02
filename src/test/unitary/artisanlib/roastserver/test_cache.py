@@ -1763,6 +1763,43 @@ def test_windows_replace_seam_is_write_through_and_replaces_atomically() -> None
     assert raised.value.errno == 5
 
 
+def test_windows_replacefile_seam_captures_backup_and_writes_through() -> None:
+    calls: list[tuple[object, ...]] = []
+    result = True
+    last_error = 0
+
+    def replace_file(*arguments: object) -> bool:
+        calls.append(arguments)
+        return result
+
+    layer = object.__new__(filesystem_module._WindowsNativeLayer)
+    layer._kernel32 = type(
+        'Kernel', (), {'ReplaceFileW': staticmethod(replace_file)})()
+    layer._ctypes = type(
+        'Ctypes', (), {'get_last_error': staticmethod(lambda: last_error)}
+    )()
+    replacement = Path('profile.part')
+    destination = Path('profile.alog')
+    backup = Path('.artisan-backup.alog')
+
+    layer.replace_with_backup(replacement, destination, backup)
+
+    assert calls == [(
+        os.fspath(destination),
+        os.fspath(replacement),
+        os.fspath(backup),
+        layer._REPLACEFILE_WRITE_THROUGH,
+        None,
+        None,
+    )]
+
+    result = False
+    last_error = 5
+    with pytest.raises(OSError) as raised:
+        layer.replace_with_backup(replacement, destination, backup)
+    assert raised.value.errno == 5
+
+
 def test_shared_windows_generated_replace_holds_verified_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

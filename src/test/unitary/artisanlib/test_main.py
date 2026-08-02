@@ -4850,8 +4850,9 @@ class TestRoastServerMainIntegration:
             adderror=Mock(),
         )
 
-        assert tgraphcanvas.reset(
-            canvas, redraw=False, soundOn=True, server_read_only=True)
+        with pytest.raises(RuntimeError, match='injected reset failure'):
+            tgraphcanvas.reset(
+                canvas, redraw=False, soundOn=True, server_read_only=True)
 
         canvas.checkSaved.assert_not_called()
         canvas.restoreExtraDeviceSettingsBackup.assert_not_called()
@@ -4862,8 +4863,51 @@ class TestRoastServerMainIntegration:
         aw.buttonSTARTSTOP.setText.assert_not_called()
         aw.setTimerColorSignal.emit.assert_not_called()
         aw.ntb.update.assert_not_called()
-        canvas.clearMeasurements.assert_called_once_with(
-            update_presentation=False)
+        canvas.clearMeasurements.assert_not_called()
+        canvas.adderror.assert_not_called()
+        assert canvas.errorlog == ['sentinel']
+
+    def test_canvas_server_clear_measurements_propagates_without_error_mutation(
+        self,
+    ) -> None:
+        from artisanlib.canvas import tgraphcanvas
+
+        class Semaphore:
+            acquired = False
+
+            @classmethod
+            def acquire(cls, _count: int) -> None:
+                cls.acquired = True
+
+            @classmethod
+            def available(cls) -> int:
+                return 0 if cls.acquired else 1
+
+            @classmethod
+            def release(cls, _count: int) -> None:
+                cls.acquired = False
+
+        class FailingTimeIndex(list[int]):
+            def __getitem__(self, _index: int) -> int:
+                raise RuntimeError('injected clear list failure')
+
+        canvas = SimpleNamespace(
+            profileDataSemaphore=Semaphore,
+            fileCleanSignal=Mock(),
+            rateofchange1=9.0,
+            rateofchange2=8.0,
+            timeindex=FailingTimeIndex([-1]),
+            errorlog=['sentinel'],
+            adderror=Mock(),
+        )
+
+        with pytest.raises(RuntimeError, match='injected clear list failure'):
+            tgraphcanvas.clearMeasurements(
+                canvas, update_presentation=False, server_read_only=True)
+
+        canvas.adderror.assert_not_called()
+        assert canvas.errorlog == ['sentinel']
+        assert not Semaphore.acquired
 
     def test_computed_profile_read_only_mode_does_not_update_bbp(self) -> None:
         window = ApplicationWindow.__new__(ApplicationWindow)
@@ -5413,7 +5457,10 @@ class TestRoastServerReadOnlyLoad:
 
     @pytest.mark.parametrize(
         'failure',
-        ['reset', 'apply', 'order', 'clear-lcd', 'redraw', 'phases', 'colors'],
+        [
+            'reset', 'reset-internal', 'apply', 'order', 'clear-lcd',
+            'redraw', 'phases', 'colors',
+        ],
     )
     def test_server_load_apply_and_redraw_failures_restore_full_snapshot(
         self, tmp_path: Path, failure: str
@@ -5429,10 +5476,12 @@ class TestRoastServerReadOnlyLoad:
         window.extracomport = ['sentinel-a', 'sentinel-b']
         window.extrabaudrate = [9600, 19200]
         window.qmc.bbpPrevRoast = {'sentinel': [failure]}
+        window.qmc.errorlog = ['sentinel error']
         exact_sentinels = copy.deepcopy((
             window.extracomport,
             window.extrabaudrate,
             window.qmc.bbpPrevRoast,
+            window.qmc.errorlog,
         ))
         window.setProfile.side_effect = [True, True]
         reset_calls = 0
@@ -5444,6 +5493,9 @@ class TestRoastServerReadOnlyLoad:
                 window.extracomport = ['mutated']
                 window.extrabaudrate = [1]
                 window.qmc.bbpPrevRoast = {'mutated': True}
+                window.qmc.errorlog = ['mutated error']
+                if failure == 'reset-internal':
+                    raise RuntimeError('injected Canvas reset failure')
                 return failure != 'reset'
             return True
 
@@ -5476,6 +5528,7 @@ class TestRoastServerReadOnlyLoad:
             window.extracomport,
             window.extrabaudrate,
             window.qmc.bbpPrevRoast,
+            window.qmc.errorlog,
         ) == exact_sentinels
         window.qmc.fileDirtySignal.emit.assert_called_once_with()
         window.roastserver_controller.record_open_source.assert_called_once()

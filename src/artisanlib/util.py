@@ -27,6 +27,8 @@
 
 import warnings
 import codecs
+import ctypes
+import hashlib
 import logging
 import platform
 import sys
@@ -1520,34 +1522,270 @@ def _serialization_prerollback_hook(_destination:Path) -> None:
     """Test seam immediately before the held-parent rollback CAS."""
 
 
-def _same_optional_entry(
-    before:os.stat_result|None,
-    after:os.stat_result|None,
+@dataclass(frozen=True, slots=True)
+class _SerializationEntryFingerprint:
+    device:int
+    inode:int
+    file_type:int
+    mode:int
+    size:int
+    mtime_ns:int
+    ctime_ns:int
+    sha256:str
+
+
+def _serialization_posix_libc() -> Any:
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def _serialization_posix_platform() -> str:
+    return sys.platform
+
+
+def _posix_atomic_serialization_rename(
+    parent:_SerializationParent,
+    source_name:str,
+    destination_name:str,
+    *,
+    exchange:bool,
+) -> None:
+    platform_name = _serialization_posix_platform()
+    libc = _serialization_posix_libc()
+    if platform_name.startswith('linux'):
+        native = getattr(libc, 'renameat2', None)
+        flag = 2 if exchange else 1
+    elif platform_name == 'darwin':
+        native = getattr(libc, 'renameatx_np', None)
+        flag = 0x2 if exchange else 0x4
+    else:
+        native = None
+        flag = 0
+    if native is None:
+        raise OSError(
+            getattr(errno, 'ENOTSUP', errno.EINVAL),
+            'safe atomic profile rename is unavailable',
+        )
+    native.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    native.restype = ctypes.c_int
+    if native(
+        parent.descriptor,
+        os.fsencode(source_name),
+        parent.descriptor,
+        os.fsencode(destination_name),
+        flag,
+    ) == 0:
+        return
+    error = ctypes.get_errno()
+    if not exchange and error == errno.EEXIST:
+        raise FileExistsError(error, 'profile destination already exists')
+    raise OSError(error, 'safe atomic profile rename failed')
+
+
+def _move_serialization_entry_no_replace(
+    parent:_SerializationParent,
+    source_name:str,
+    destination_name:str,
+) -> None:
+    if parent.windows:
+        _serialization_windows_native().move_no_replace(
+            parent.path / source_name, parent.path / destination_name)
+        return
+    _posix_atomic_serialization_rename(
+        parent, source_name, destination_name, exchange=False)
+
+
+def _exchange_serialization_entries(
+    parent:_SerializationParent,
+    first_name:str,
+    second_name:str,
+) -> None:
+    if parent.windows:
+        raise OSError(
+            getattr(errno, 'ENOTSUP', errno.EINVAL),
+            'safe atomic profile exchange is unavailable',
+        )
+    _posix_atomic_serialization_rename(
+        parent, first_name, second_name, exchange=True)
+
+
+def _new_serialization_entry_name(
+    parent:_SerializationParent,
+    suffix:str,
+) -> str:
+    for _ in range(32):
+        name = f'.artisan-{uuid4().hex}{suffix}'
+        if _serialization_entry_stat(parent, name) is None:
+            return name
+    raise OSError('profile serialization private entry could not be allocated')
+
+
+def _replace_serialization_entry_with_backup(
+    parent:_SerializationParent,
+    replacement_name:str,
+    destination_name:str,
+) -> str:
+    if not parent.windows:
+        _exchange_serialization_entries(
+            parent, replacement_name, destination_name)
+        return replacement_name
+    backup_name = _new_serialization_entry_name(parent, '.bak')
+    _serialization_windows_native().replace_with_backup(
+        parent.path / replacement_name,
+        parent.path / destination_name,
+        parent.path / backup_name,
+    )
+    return backup_name
+
+
+def _serialization_stat_matches_fingerprint(
+    entry_stat:os.stat_result,
+    fingerprint:_SerializationEntryFingerprint,
+    *,
+    include_ctime:bool,
 ) -> bool:
     return (
-        (before is None and after is None)
-        or (
-            before is not None
-            and after is not None
-            and _same_entry(before, after)
+        entry_stat.st_dev == fingerprint.device
+        and entry_stat.st_ino != 0
+        and entry_stat.st_ino == fingerprint.inode
+        and stat.S_IFMT(entry_stat.st_mode) == fingerprint.file_type
+        and stat.S_IMODE(entry_stat.st_mode) == fingerprint.mode
+        and entry_stat.st_size == fingerprint.size
+        and entry_stat.st_mtime_ns == fingerprint.mtime_ns
+        and (
+            not include_ctime
+            or entry_stat.st_ctime_ns == fingerprint.ctime_ns
         )
     )
 
 
-def _replace_serialization_entry(
+def _serialization_fingerprints_match(
+    expected:_SerializationEntryFingerprint,
+    actual:_SerializationEntryFingerprint,
+    *,
+    include_ctime:bool,
+) -> bool:
+    return (
+        expected.device == actual.device
+        and expected.inode != 0
+        and expected.inode == actual.inode
+        and expected.file_type == actual.file_type
+        and expected.mode == actual.mode
+        and expected.size == actual.size
+        and expected.mtime_ns == actual.mtime_ns
+        and (not include_ctime or expected.ctime_ns == actual.ctime_ns)
+        and expected.sha256 == actual.sha256
+    )
+
+
+def _serialization_entry_fingerprint(
     parent:_SerializationParent,
-    temporary_name:str,
-    destination_name:str,
+    name:str,
+    *,
+    max_bytes:int|None = None,
+) -> _SerializationEntryFingerprint:
+    entry_before = _serialization_entry_stat(parent, name)
+    if entry_before is None:
+        raise OSError('profile serialization entry is unavailable')
+    if max_bytes is not None and (
+        max_bytes < 0 or entry_before.st_size > max_bytes
+    ):
+        raise OSError('profile serialization entry is too large')
+    payload_hash = hashlib.sha256()
+    descriptor:int|None = None
+    try:
+        if stat.S_ISREG(entry_before.st_mode):
+            flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
+            flags |= getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+            descriptor = (
+                cast(int, _serialization_windows_native().open_readonly(
+                    parent.path / name))
+                if parent.windows
+                else os.open(name, flags, dir_fd=parent.descriptor)
+            )
+            descriptor_before = os.fstat(descriptor)
+            if not _same_entry(entry_before, descriptor_before):
+                raise OSError('profile serialization entry identity changed')
+            remaining = (
+                descriptor_before.st_size + 1
+                if max_bytes is None
+                else max_bytes + 1
+            )
+            byte_count = 0
+            while remaining > 0:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                byte_count += len(chunk)
+                remaining -= len(chunk)
+                payload_hash.update(chunk)
+            descriptor_after = os.fstat(descriptor)
+            if (
+                byte_count != descriptor_before.st_size
+                or not _same_entry(descriptor_before, descriptor_after)
+                or descriptor_before.st_mode != descriptor_after.st_mode
+                or descriptor_before.st_size != descriptor_after.st_size
+                or descriptor_before.st_mtime_ns != descriptor_after.st_mtime_ns
+                or descriptor_before.st_ctime_ns != descriptor_after.st_ctime_ns
+            ):
+                raise OSError('profile serialization entry changed while read')
+        elif stat.S_ISLNK(entry_before.st_mode):
+            target = (
+                os.readlink(parent.path / name)
+                if parent.windows
+                else os.readlink(name, dir_fd=parent.descriptor)
+            )
+            payload = os.fsencode(target)
+            if max_bytes is not None and len(payload) > max_bytes:
+                raise OSError('profile serialization entry is too large')
+            payload_hash.update(payload)
+        else:
+            raise OSError('profile serialization entry is invalid')
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    entry_after = _serialization_entry_stat(parent, name)
+    if (
+        entry_after is None
+        or entry_before.st_mode != entry_after.st_mode
+        or entry_before.st_dev != entry_after.st_dev
+        or entry_before.st_ino == 0
+        or entry_before.st_ino != entry_after.st_ino
+        or entry_before.st_size != entry_after.st_size
+        or entry_before.st_mtime_ns != entry_after.st_mtime_ns
+        or entry_before.st_ctime_ns != entry_after.st_ctime_ns
+    ):
+        raise OSError('profile serialization entry changed while hashed')
+    return _SerializationEntryFingerprint(
+        device=entry_after.st_dev,
+        inode=entry_after.st_ino,
+        file_type=stat.S_IFMT(entry_after.st_mode),
+        mode=stat.S_IMODE(entry_after.st_mode),
+        size=entry_after.st_size,
+        mtime_ns=entry_after.st_mtime_ns,
+        ctime_ns=entry_after.st_ctime_ns,
+        sha256=payload_hash.hexdigest(),
+    )
+
+
+def _set_serialization_entry_times(
+    parent:_SerializationParent,
+    name:str,
+    times:tuple[int, int],
 ) -> None:
     if parent.windows:
-        _serialization_windows_native().replace(
-            parent.path / temporary_name, parent.path / destination_name)
+        os.utime(parent.path / name, ns=times, follow_symlinks=False)
     else:
-        os.replace(
-            temporary_name,
-            destination_name,
-            src_dir_fd=parent.descriptor,
-            dst_dir_fd=parent.descriptor,
+        os.utime(
+            name,
+            ns=times,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
         )
 
 
@@ -1590,23 +1828,110 @@ def _write_serialization_bytes(descriptor:int, serialized:bytes) -> None:
         offset += written
 
 
+@dataclass(frozen=True, slots=True)
+class _SerializationPublication:
+    result:SerializationResult
+    published:_SerializationEntryFingerprint
+    backup_name:str|None
+
+
+def _captured_serialization_entry_matches(
+    entry_before:os.stat_result|None,
+    expected:_SerializationEntryFingerprint,
+    captured:_SerializationEntryFingerprint,
+) -> bool:
+    return (
+        entry_before is not None
+        and _serialization_stat_matches_fingerprint(
+            entry_before, expected, include_ctime=True)
+        and _serialization_fingerprints_match(
+            expected, captured, include_ctime=False)
+        # Atomic rename/exchange updates ctime on POSIX. The exact pre-operation
+        # ctime is checked above; the captured inode must carry that transition.
+        and captured.ctime_ns >= expected.ctime_ns
+    )
+
+
+class _SerializationRecoveryError(OSError):
+    def __init__(self, backup_name:str) -> None:
+        super().__init__('profile serialization recovery retained a backup')
+        self.backup_name = backup_name
+
+
+def _restore_existing_serialization_entry(
+    parent:_SerializationParent,
+    backup_name:str,
+    destination_name:str,
+    expected_outgoing:_SerializationEntryFingerprint,
+) -> None:
+    outgoing_name = _replace_serialization_entry_with_backup(
+        parent, backup_name, destination_name)
+    try:
+        captured = _serialization_entry_fingerprint(parent, outgoing_name)
+        if not _serialization_fingerprints_match(
+            expected_outgoing, captured, include_ctime=False
+        ):
+            restored_backup_name = _replace_serialization_entry_with_backup(
+                parent, outgoing_name, destination_name)
+            _sync_serialization_directory(parent)
+            raise _SerializationRecoveryError(restored_backup_name)
+        _unlink_serialization_entry(parent, outgoing_name)
+    finally:
+        _sync_serialization_directory(parent)
+
+
+def _remove_absent_serialization_publication(
+    parent:_SerializationParent,
+    destination_name:str,
+    published:_SerializationEntryFingerprint,
+) -> None:
+    quarantine_name = _new_serialization_entry_name(parent, '.quarantine')
+    _move_serialization_entry_no_replace(
+        parent, destination_name, quarantine_name)
+    try:
+        captured = _serialization_entry_fingerprint(parent, quarantine_name)
+        if not _serialization_fingerprints_match(
+            published, captured, include_ctime=False
+        ):
+            _move_serialization_entry_no_replace(
+                parent, quarantine_name, destination_name)
+            raise OSError('profile serialization ownership changed')
+        _unlink_serialization_entry(parent, quarantine_name)
+    except Exception:
+        if (
+            _serialization_entry_stat(parent, quarantine_name) is not None
+            and _serialization_entry_stat(parent, destination_name) is None
+        ):
+            try:
+                _move_serialization_entry_no_replace(
+                    parent, quarantine_name, destination_name)
+            except OSError:
+                pass
+        raise
+    finally:
+        _sync_serialization_directory(parent)
+
+
 def _publish_serialization_bytes(
     parent:_SerializationParent,
     destination_name:str,
     serialized:bytes,
     expected_entry:os.stat_result|None,
+    expected_fingerprint:_SerializationEntryFingerprint|None,
     *,
     restored_mode:int|None = None,
     restored_times:tuple[int, int]|None = None,
     prepublish_hook:bool = True,
-    on_published:Callable[[os.stat_result], None]|None = None,
-) -> SerializationResult:
+) -> _SerializationPublication:
     descriptor:int|None = None
     temporary_name:str|None = None
     temporary_path:Path|None = None
-    replaced = False
+    temporary_needs_cleanup = False
+    publication:_SerializationPublication|None = None
+    captured_backup_name:str|None = None
     try:
         descriptor, temporary_name, temporary_path = _open_serialization_temp(parent)
+        temporary_needs_cleanup = True
         selected_mode = restored_mode
         if (
             selected_mode is None
@@ -1632,40 +1957,121 @@ def _publish_serialization_bytes(
             temporary_stat.st_mtime, tz=datetime.UTC)
         os.close(descriptor)
         descriptor = None
-
-        temporary_path_stat = _serialization_entry_stat(parent, temporary_name)
-        if (
-            temporary_path_stat is None
-            or not _same_entry(temporary_stat, temporary_path_stat)
-        ):
+        temporary_fingerprint = _serialization_entry_fingerprint(
+            parent, temporary_name)
+        if not _same_entry(temporary_stat, cast(
+                os.stat_result,
+                _serialization_entry_stat(parent, temporary_name))):
             raise OSError('profile serialization temporary identity changed')
+
         destination = parent.path / destination_name
         if prepublish_hook:
             _serialization_prepublish_hook(destination)
-        destination_now = _serialization_entry_stat(parent, destination_name)
-        if not _same_optional_entry(expected_entry, destination_now):
-            raise OSError('profile serialization destination identity changed')
+        destination_before_capture = _serialization_entry_stat(
+            parent, destination_name)
+        if expected_fingerprint is None:
+            if expected_entry is not None:
+                raise OSError('profile serialization expected state is invalid')
+            _move_serialization_entry_no_replace(
+                parent, temporary_name, destination_name)
+            temporary_needs_cleanup = False
+            published = _serialization_entry_fingerprint(
+                parent, destination_name)
+            if not _serialization_fingerprints_match(
+                temporary_fingerprint, published, include_ctime=False
+            ):
+                _remove_absent_serialization_publication(
+                    parent, destination_name, temporary_fingerprint)
+                raise OSError('profile serialization publication changed')
+            try:
+                _sync_serialization_directory(parent)
+            except Exception:
+                _remove_absent_serialization_publication(
+                    parent, destination_name, temporary_fingerprint)
+                raise
+            publication = _SerializationPublication(
+                SerializationResult(serialized, modified_at), published, None)
+            return publication
 
-        _replace_serialization_entry(parent, temporary_name, destination_name)
-        replaced = True
-        if on_published is not None:
-            on_published(temporary_stat)
-        published_stat = _serialization_entry_stat(parent, destination_name)
-        if published_stat is None or not _same_entry(temporary_stat, published_stat):
-            raise OSError('profile serialization publication identity is uncertain')
-        _sync_serialization_directory(parent)
-        return SerializationResult(serialized, modified_at)
+        if expected_entry is None:
+            raise OSError('profile serialization expected state is invalid')
+        captured_backup_name = _replace_serialization_entry_with_backup(
+            parent, temporary_name, destination_name)
+        temporary_needs_cleanup = False
+        captured = _serialization_entry_fingerprint(
+            parent, captured_backup_name)
+        if not _captured_serialization_entry_matches(
+            destination_before_capture, expected_fingerprint, captured
+        ):
+            try:
+                _restore_existing_serialization_entry(
+                    parent,
+                    captured_backup_name,
+                    destination_name,
+                    temporary_fingerprint,
+                )
+                captured_backup_name = None
+            except _SerializationRecoveryError as recovery_error:
+                captured_backup_name = recovery_error.backup_name
+                raise
+            raise OSError('profile serialization destination changed')
+        _set_serialization_entry_times(
+            parent,
+            captured_backup_name,
+            (expected_entry.st_atime_ns, expected_entry.st_mtime_ns),
+        )
+        published = _serialization_entry_fingerprint(
+            parent, destination_name)
+        if not _serialization_fingerprints_match(
+            temporary_fingerprint, published, include_ctime=False
+        ):
+            try:
+                _restore_existing_serialization_entry(
+                    parent,
+                    captured_backup_name,
+                    destination_name,
+                    temporary_fingerprint,
+                )
+                captured_backup_name = None
+            except _SerializationRecoveryError as recovery_error:
+                captured_backup_name = recovery_error.backup_name
+                raise
+            raise OSError('profile serialization publication changed')
+        try:
+            _sync_serialization_directory(parent)
+        except Exception:
+            try:
+                _restore_existing_serialization_entry(
+                    parent,
+                    captured_backup_name,
+                    destination_name,
+                    temporary_fingerprint,
+                )
+                captured_backup_name = None
+            except _SerializationRecoveryError as recovery_error:
+                captured_backup_name = recovery_error.backup_name
+                raise
+            raise
+        publication = _SerializationPublication(
+            SerializationResult(serialized, modified_at),
+            published,
+            captured_backup_name,
+        )
+        return publication
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
-        if temporary_name is not None and not replaced:
+        if temporary_name is not None and temporary_needs_cleanup:
             try:
                 _unlink_serialization_entry(parent, temporary_name)
             except OSError:
                 pass
+        # A returned publication transfers exact backup ownership to its caller.
+        if publication is None and captured_backup_name is not None:
+            _log.error('profile serialization retained a recovery backup')
 
 
 def _atomic_write_bytes(
@@ -1675,24 +2081,22 @@ def _atomic_write_bytes(
     restored_mode:int|None = None,
     restored_times:tuple[int, int]|None = None,
 ) -> SerializationResult:
-    parent = _open_serialization_parent(destination.parent)
+    transaction = FileDestinationTransaction.begin(
+        os.fspath(destination), max_bytes=sys.maxsize)
     try:
-        destination_before = _serialization_entry_stat(parent, destination.name)
-        if destination_before is not None and not (
-            stat.S_ISREG(destination_before.st_mode)
-            or stat.S_ISLNK(destination_before.st_mode)
-        ):
-            raise OSError('profile serialization destination is invalid')
-        return _publish_serialization_bytes(
-            parent,
-            destination.name,
+        result = transaction._serialize_bytes(  # pylint: disable=protected-access
             serialized,
-            destination_before,
             restored_mode=restored_mode,
             restored_times=restored_times,
         )
-    finally:
-        parent.close()
+        transaction.commit()
+        return result
+    except Exception:
+        try:
+            transaction.rollback()
+        except OSError:
+            pass
+        raise
 
 
 def serialize_with_timestamp(filename:str, obj:dict[str, Any]) -> SerializationResult:
@@ -1715,7 +2119,9 @@ class FileDestinationTransaction:
     symlink_target:str|None
     _parent:_SerializationParent
     _prior_entry:os.stat_result|None
-    _published_entry:os.stat_result|None = None
+    _prior_fingerprint:_SerializationEntryFingerprint|None
+    _published_fingerprint:_SerializationEntryFingerprint|None = None
+    _backup_name:str|None = None
     _active:bool = True
 
     @classmethod
@@ -1727,7 +2133,6 @@ class FileDestinationTransaction:
     ) -> 'FileDestinationTransaction':
         destination = Path(os.path.abspath(os.fspath(filename)))
         parent:_SerializationParent|None = None
-        descriptor:int|None = None
         try:
             parent = _open_serialization_parent(destination.parent)
             canonical_destination = parent.path / destination.name
@@ -1735,198 +2140,168 @@ class FileDestinationTransaction:
             if entry_stat is None:
                 return cls(
                     canonical_destination, False, None, None, None, None,
-                    None, parent, None)
-            mode = stat.S_IMODE(entry_stat.st_mode)
+                    None, parent, None, None)
+            if not (
+                stat.S_ISREG(entry_stat.st_mode)
+                or stat.S_ISLNK(entry_stat.st_mode)
+            ):
+                raise OSError('profile destination snapshot is invalid')
+            fingerprint = _serialization_entry_fingerprint(
+                parent, destination.name, max_bytes=max_bytes)
+            target = None
             if stat.S_ISLNK(entry_stat.st_mode):
                 target = (
                     os.readlink(canonical_destination)
                     if parent.windows
                     else os.readlink(destination.name, dir_fd=parent.descriptor)
                 )
-                return cls(
-                    canonical_destination,
-                    True,
-                    None,
-                    mode,
-                    entry_stat.st_atime_ns,
-                    entry_stat.st_mtime_ns,
-                    target,
-                    parent,
-                    entry_stat,
-                )
-            if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_size > max_bytes:
-                raise OSError('profile destination snapshot is invalid')
-            flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
-            flags |= getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
-            descriptor = (
-                cast(int, _serialization_windows_native().open_readonly(
-                    canonical_destination))
-                if parent.windows
-                else os.open(destination.name, flags, dir_fd=parent.descriptor)
-            )
-            descriptor_before = os.fstat(descriptor)
-            if not _same_entry(entry_stat, descriptor_before):
-                raise OSError('profile destination identity changed')
-            chunks:list[bytes] = []
-            remaining = max_bytes + 1
-            while remaining > 0:
-                chunk = os.read(descriptor, min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            content = b''.join(chunks)
-            descriptor_after = os.fstat(descriptor)
-            current_entry = _serialization_entry_stat(parent, destination.name)
-            if (
-                len(content) > max_bytes
-                or len(content) != descriptor_before.st_size
-                or not _same_entry(descriptor_before, descriptor_after)
-                or not _same_optional_entry(entry_stat, current_entry)
-                or descriptor_before.st_size != descriptor_after.st_size
-                or descriptor_before.st_mtime_ns != descriptor_after.st_mtime_ns
-                or descriptor_before.st_ctime_ns != descriptor_after.st_ctime_ns
-            ):
-                raise OSError('profile destination changed while snapshotted')
             return cls(
                 canonical_destination,
                 True,
-                content,
-                stat.S_IMODE(descriptor_before.st_mode),
-                descriptor_before.st_atime_ns,
-                descriptor_before.st_mtime_ns,
                 None,
+                stat.S_IMODE(entry_stat.st_mode),
+                entry_stat.st_atime_ns,
+                entry_stat.st_mtime_ns,
+                target,
                 parent,
                 entry_stat,
+                fingerprint,
             )
         except Exception:
             if parent is not None:
                 parent.close()
             raise OSError('profile destination transaction failed') from None
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
 
     def serialize(self, obj:dict[str, Any]) -> SerializationResult:
-        if not self._active or self._published_entry is not None:
+        return self._serialize_bytes(serialize_bytes(obj))
+
+    def _serialize_bytes(
+        self,
+        serialized:bytes,
+        *,
+        restored_mode:int|None = None,
+        restored_times:tuple[int, int]|None = None,
+    ) -> SerializationResult:
+        if not self._active or self._published_fingerprint is not None:
             raise OSError('profile destination publication failed')
-        serialized = serialize_bytes(obj)
         try:
-            return _publish_serialization_bytes(
+            publication = _publish_serialization_bytes(
                 self._parent,
                 self.destination.name,
                 serialized,
                 self._prior_entry,
-                on_published=self._record_published_entry,
+                self._prior_fingerprint,
+                restored_mode=restored_mode,
+                restored_times=restored_times,
             )
+            self._published_fingerprint = publication.published
+            self._backup_name = publication.backup_name
+            return publication.result
         except Exception:
             raise OSError('profile destination publication failed') from None
 
-    def _record_published_entry(self, entry:os.stat_result) -> None:
-        self._published_entry = entry
-
     def commit(self) -> None:
-        if not self._active or self._published_entry is None:
+        if not self._active or self._published_fingerprint is None:
             raise OSError('profile destination commit failed')
-        current = _serialization_entry_stat(
-            self._parent, self.destination.name)
-        if current is None or not _same_entry(self._published_entry, current):
-            raise OSError('profile destination commit failed')
-        self._finish()
+        try:
+            current = _serialization_entry_fingerprint(
+                self._parent, self.destination.name)
+            if not _serialization_fingerprints_match(
+                self._published_fingerprint, current, include_ctime=True
+            ):
+                raise OSError('profile destination ownership changed')
+            if self._backup_name is not None:
+                _unlink_serialization_entry(self._parent, self._backup_name)
+                self._backup_name = None
+                _sync_serialization_directory(self._parent)
+            self._finish()
+        except Exception:
+            raise OSError('profile destination commit failed') from None
 
     def rollback(self) -> None:
         if not self._active:
             return
+        if self._published_fingerprint is None:
+            self._finish()
+            return
         try:
-            if self._published_entry is None:
-                self._finish()
-                return
             _serialization_prerollback_hook(self.destination)
-            current = _serialization_entry_stat(
+            current_before_capture = _serialization_entry_stat(
                 self._parent, self.destination.name)
-            if current is None or not _same_entry(self._published_entry, current):
-                raise OSError('profile destination ownership changed')
             if not self.existed:
-                _unlink_serialization_entry(self._parent, self.destination.name)
-                _sync_serialization_directory(self._parent)
-                if (
-                    _serialization_entry_stat(
-                        self._parent, self.destination.name
-                    ) is not None
-                ):
-                    raise OSError('profile destination ownership changed')
-            elif self.symlink_target is not None:
-                self._restore_symlink()
+                self._rollback_absent(current_before_capture)
             else:
-                if (
-                    self.content is None
-                    or self.mode is None
-                    or self.atime_ns is None
-                    or self.mtime_ns is None
-                ):
-                    raise OSError('profile destination rollback state is invalid')
-                _publish_serialization_bytes(
-                    self._parent,
-                    self.destination.name,
-                    self.content,
-                    self._published_entry,
-                    restored_mode=self.mode,
-                    restored_times=(self.atime_ns, self.mtime_ns),
-                    prepublish_hook=False,
-                )
+                self._rollback_existing(current_before_capture)
             self._finish()
         except Exception:
-            self._finish()
+            if self._active:
+                self._finish(preserve_backup=self._backup_name is not None)
             raise OSError('profile destination rollback failed') from None
 
-    def _restore_symlink(self) -> None:
-        if (
-            self.symlink_target is None
-            or self.atime_ns is None
-            or self.mtime_ns is None
+    def _rollback_absent(
+        self,
+        current_before_capture:os.stat_result|None,
+    ) -> None:
+        published = cast(
+            _SerializationEntryFingerprint, self._published_fingerprint)
+        quarantine_name = _new_serialization_entry_name(
+            self._parent, '.quarantine')
+        _move_serialization_entry_no_replace(
+            self._parent, self.destination.name, quarantine_name)
+        captured = _serialization_entry_fingerprint(
+            self._parent, quarantine_name)
+        if not (
+            current_before_capture is not None
+            and _serialization_stat_matches_fingerprint(
+                current_before_capture, published, include_ctime=True)
+            and _serialization_fingerprints_match(
+                published, captured, include_ctime=False)
+            and captured.ctime_ns >= published.ctime_ns
         ):
+            _move_serialization_entry_no_replace(
+                self._parent, quarantine_name, self.destination.name)
+            _sync_serialization_directory(self._parent)
+            raise OSError('profile destination ownership changed')
+        _unlink_serialization_entry(self._parent, quarantine_name)
+        _sync_serialization_directory(self._parent)
+
+    def _rollback_existing(
+        self,
+        current_before_capture:os.stat_result|None,
+    ) -> None:
+        backup_name = self._backup_name
+        published = self._published_fingerprint
+        if backup_name is None or published is None:
             raise OSError('profile destination rollback state is invalid')
-        temporary_name = f'.artisan-{uuid4().hex}.tmp'
-        temporary_path = self._parent.path / temporary_name
-        replaced = False
+        outgoing_name = _replace_serialization_entry_with_backup(
+            self._parent, backup_name, self.destination.name)
+        self._backup_name = None
         try:
-            if self._parent.windows:
-                os.symlink(self.symlink_target, temporary_path)
-            else:
-                os.symlink(
-                    self.symlink_target,
-                    temporary_name,
-                    dir_fd=self._parent.descriptor,
-                )
-            current = _serialization_entry_stat(
-                self._parent, self.destination.name)
-            published_entry = self._published_entry
-            if (
-                current is None
-                or published_entry is None
-                or not _same_entry(published_entry, current)
+            captured = _serialization_entry_fingerprint(
+                self._parent, outgoing_name)
+            if not (
+                current_before_capture is not None
+                and _serialization_stat_matches_fingerprint(
+                    current_before_capture, published, include_ctime=True)
+                and _serialization_fingerprints_match(
+                    published, captured, include_ctime=False)
+                and captured.ctime_ns >= published.ctime_ns
             ):
                 raise OSError('profile destination ownership changed')
-            _replace_serialization_entry(
-                self._parent, temporary_name, self.destination.name)
-            replaced = True
-            os.utime(
-                self.destination,
-                ns=(self.atime_ns, self.mtime_ns),
-                follow_symlinks=False,
-            )
+        except Exception:
+            self._backup_name = _replace_serialization_entry_with_backup(
+                self._parent, outgoing_name, self.destination.name)
             _sync_serialization_directory(self._parent)
-        finally:
-            if not replaced:
-                try:
-                    _unlink_serialization_entry(self._parent, temporary_name)
-                except OSError:
-                    pass
+            raise
+        _unlink_serialization_entry(self._parent, outgoing_name)
+        _sync_serialization_directory(self._parent)
 
-    def _finish(self) -> None:
+    def _finish(self, *, preserve_backup:bool = False) -> None:
         if self._active:
             self.content = None
             self.symlink_target = None
+            if not preserve_backup:
+                self._backup_name = None
             self._active = False
             self._parent.close()
 

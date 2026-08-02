@@ -7916,6 +7916,7 @@ class tgraphcanvas(QObject):
         andLCDs:bool = True,
         *,
         update_presentation:bool = True,
+        server_read_only:bool = False,
     ) -> None:
         try:
             #### lock shared resources #####
@@ -7956,6 +7957,8 @@ class tgraphcanvas(QObject):
                     self.clearLCDs()
 
         except Exception as ex: # pylint: disable=broad-except
+            if server_read_only:
+                raise
             _log.exception(ex)
             _, _, exc_tb = sys.exc_info()
             self.adderror((QApplication.translate('Error Message','Exception:') + ' clearMeasurements() {0}').format(str(ex)),getattr(exc_tb, 'tb_lineno', '?'))
@@ -8174,7 +8177,7 @@ class tgraphcanvas(QObject):
             self.roastdate = QDateTime.currentDateTime()
             self.roastepoch = QDateTime.currentDateTime().toSecsSinceEpoch()
             self.roasttzoffset = libtime.timezone
-            if not self.flagon: # just if the RESET button is manually pressed we clear the error log
+            if not self.flagon and not server_read_only: # just if the RESET button is manually pressed we clear the error log
                 self.errorlog = []
                 self.aw.seriallog = []
 
@@ -8329,6 +8332,8 @@ class tgraphcanvas(QObject):
                 self.togglecrosslines()
 
         except Exception as ex: # pylint: disable=broad-except
+            if server_read_only:
+                raise
             _log.exception(ex)
             _, _, exc_tb = sys.exc_info()
             self.adderror((QApplication.translate('Error Message','Exception:') + ' reset() {0}').format(str(ex)),getattr(exc_tb, 'tb_lineno', '?'))
@@ -8338,7 +8343,10 @@ class tgraphcanvas(QObject):
 
         # now clear all measurements and redraw
 
-        self.clearMeasurements(update_presentation=not server_read_only)
+        self.clearMeasurements(
+            update_presentation=not server_read_only,
+            server_read_only=server_read_only,
+        )
         if not server_read_only:
             #clear PhasesLCDs
             self.aw.updatePhasesLCDs()

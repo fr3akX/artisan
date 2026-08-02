@@ -112,6 +112,10 @@ class _WindowsNativeApi(Protocol):
 
     def replace(self, source: Path, destination: Path) -> None: ...
 
+    def replace_with_backup(
+        self, replacement: Path, destination: Path, backup: Path
+    ) -> None: ...
+
     def move_no_replace(self, source: Path, destination: Path) -> None: ...
 
     def unlink(self, path: Path) -> None: ...
@@ -164,6 +168,7 @@ class _WindowsNativeLayer:
     _FILE_DISPOSITION_INFO_CLASS = 4
     _MOVEFILE_REPLACE_EXISTING = 0x1
     _MOVEFILE_WRITE_THROUGH = 0x8
+    _REPLACEFILE_WRITE_THROUGH = 0x1
     _FILE_NAME_NORMALIZED = 0x0
     _VOLUME_NAME_GUID = 0x1
 
@@ -221,6 +226,18 @@ class _WindowsNativeLayer:
         self._set_prototype(
             self._kernel32.MoveFileExW,
             [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD],
+            wintypes.BOOL,
+        )
+        self._set_prototype(
+            self._kernel32.ReplaceFileW,
+            [
+                wintypes.LPCWSTR,
+                wintypes.LPCWSTR,
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.LPVOID,
+            ],
             wintypes.BOOL,
         )
         self._set_prototype(
@@ -741,6 +758,25 @@ class _WindowsNativeLayer:
         ):
             raise OSError(
                 self._ctypes.get_last_error(), 'Windows write-through replacement failed'
+            )
+
+    def replace_with_backup(
+        self,
+        replacement: Path,
+        destination: Path,
+        backup: Path,
+    ) -> None:
+        if not self._kernel32.ReplaceFileW(
+            os.fspath(destination),
+            os.fspath(replacement),
+            os.fspath(backup),
+            self._REPLACEFILE_WRITE_THROUGH,
+            None,
+            None,
+        ):
+            raise OSError(
+                self._ctypes.get_last_error(),
+                'Windows write-through replacement with backup failed',
             )
 
     def unlink(self, path: Path) -> None:
