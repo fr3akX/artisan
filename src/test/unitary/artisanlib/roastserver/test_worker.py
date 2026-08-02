@@ -830,7 +830,7 @@ class WorkerHarness:
         self.wait_until(lambda: len(self.queue_spy) > before)
 
     def request_connection_test(self, credential: str | None = None) -> str:
-        request_id = self.secret_vault.put(
+        request_id = self.secret_vault.put_latest(
             ConnectionTestRequest(ORIGIN, credential or self.ephemeral_secret)
         )
         self.bus.test_worker.emit(request_id)
@@ -890,12 +890,40 @@ def test_opaque_vault_and_secret_request_repr_are_redacted() -> None:
         vault.take(request_id)
 
 
+def test_opaque_vault_latest_generation_replaces_and_fences_consumed_values() -> None:
+    first_secret = secrets.token_urlsafe(32)
+    second_secret = secrets.token_urlsafe(32)
+    vault: OpaqueVault[ConnectionTestRequest] = OpaqueVault()
+    first = ConnectionTestRequest(ORIGIN, first_secret)
+    second = ConnectionTestRequest(ORIGIN, second_secret)
+
+    first_id = vault.put_latest(first)
+    assert vault.take_if_current(first_id) is first
+    assert vault.is_current(first_id)
+
+    second_id = vault.put_latest(second)
+    assert not vault.is_current(first_id)
+    assert vault.take_if_current(first_id) is None
+    assert not vault.run_if_current(first_id, lambda: pytest.fail('stale action ran'))
+    assert vault.size() == 1
+    assert vault.take_if_current(second_id) is second
+    assert vault.is_current(second_id)
+    completed: list[str] = []
+    assert vault.run_if_current(second_id, lambda: completed.append(second_id))
+    assert completed == [second_id]
+
+    vault.clear()
+    assert not vault.is_current(second_id)
+    assert_secret_absent(first_secret, vault)
+    assert_secret_absent(second_secret, vault)
+
+
 def test_direct_wrong_thread_candidate_slot_erases_secret_without_io(
     worker_harness: WorkerHarness,
 ) -> None:
     failed = QSignalSpy(worker_harness.worker.operationFailed)
     candidate = secrets.token_urlsafe(32)
-    request_id = worker_harness.secret_vault.put(
+    request_id = worker_harness.secret_vault.put_latest(
         ConnectionTestRequest(ORIGIN, candidate)
     )
     client_calls = tuple(worker_harness.client.calls)
@@ -918,7 +946,7 @@ def test_every_external_slot_rejects_direct_wrong_thread_use_without_io(
 ) -> None:
     failed = QSignalSpy(worker_harness.worker.operationFailed)
     candidate = secrets.token_urlsafe(32)
-    candidate_id = worker_harness.secret_vault.put(
+    candidate_id = worker_harness.secret_vault.put_latest(
         ConnectionTestRequest(ORIGIN, candidate)
     )
     profile_id = worker_harness.profile_vault.put(
@@ -1353,7 +1381,7 @@ def test_ui_interruption_cancels_blocked_call_and_ignores_queued_backlog(
     worker_harness.request_connection_test(blocked_candidate)
     assert entered.wait(timeout=2)
 
-    followup_connection = worker_harness.secret_vault.put(
+    followup_connection = worker_harness.secret_vault.put_latest(
         ConnectionTestRequest(ORIGIN, queued_candidate)
     )
     followup_profile = worker_harness.profile_vault.put(

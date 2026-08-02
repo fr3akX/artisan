@@ -322,6 +322,78 @@ class DigestAuthenticationClient:
         return IDENTITY
 
 
+class SupersessionAuthenticationRecorder:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._factory_calls = 0
+        self.first_entered = threading.Event()
+        self.release_first = threading.Event()
+        self.http_digests: list[str] = []
+        self.tested_ids: list[str] = []
+
+    @override
+    def __repr__(self) -> str:
+        return '<SupersessionAuthenticationRecorder credentials=<redacted>>'
+
+    def __call__(
+        self, _origin: str, credential: str
+    ) -> SupersessionAuthenticationClient:
+        digest = hashlib.sha256(credential.encode('utf-8')).hexdigest()
+        with self._condition:
+            block = self._factory_calls == 0
+            self._factory_calls += 1
+        return SupersessionAuthenticationClient(self, digest, block)
+
+    def record_http(self, digest: str, block: bool) -> None:
+        with self._condition:
+            self.http_digests.append(digest)
+            self._condition.notify_all()
+        if block:
+            self.first_entered.set()
+            if not self.release_first.wait(timeout=5):
+                raise RuntimeError('blocked supersession authentication timed out')
+
+    def record_tested(self, request_id: str, _identity: object) -> None:
+        with self._condition:
+            self.tested_ids.append(request_id)
+            self._condition.notify_all()
+
+    def wait_for_tested(self, count: int, timeout: float = 2) -> None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while len(self.tested_ids) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._condition.wait(remaining):
+                    raise AssertionError('worker did not complete current authentication')
+
+
+class SupersessionAuthenticationClient:
+    def __init__(
+        self,
+        recorder: SupersessionAuthenticationRecorder,
+        digest: str,
+        block: bool,
+    ) -> None:
+        self._recorder = recorder
+        self._digest = digest
+        self._block = block
+
+    def __enter__(self) -> SupersessionAuthenticationClient:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        return None
+
+    def test_connection(self) -> ServerIdentity:
+        self._recorder.record_http(self._digest, self._block)
+        return IDENTITY
+
+
 class BlockingAuthenticationClient:
     def __init__(self) -> None:
         self.entered = threading.Event()
@@ -1711,6 +1783,12 @@ def test_shutdown_timeout_is_bounded_and_worker_can_finish_later(
     elapsed = time.monotonic() - started
     assert elapsed < 0.5
     assert controller_harness.controller.worker_thread_running
+    assert controller_harness.secret_vault.size() == 0
+    assert controller_harness.profile_vault.size() == 0
+    assert controller_harness.command_vault.size() == 0
+    assert_secret_absent(
+        controller_harness.ephemeral_secret, controller_harness.controller
+    )
 
     worker.test_release.set()
     controller_harness.wait_until(lambda: worker.stop_count == 1)
@@ -1881,7 +1959,7 @@ def test_real_restart_at_every_credential_activation_cut_never_uploads(
     assert recorder.upload_calls == 0
 
 
-def test_real_delayed_ui_many_tests_keep_only_newest_secret_and_commit(
+def test_real_blocked_worker_many_tests_only_authenticate_newest_credential(
     tmp_path: Path,
     qcoreapplication: QCoreApplication,
 ) -> None:
@@ -1890,11 +1968,109 @@ def test_real_delayed_ui_many_tests_keep_only_newest_secret_and_commit(
     )
     settings.set_origin(ORIGIN)
     credentials = FakeCredentialStore()
+    persisted_secret = secrets.token_urlsafe(32)
+    credentials.values[ORIGIN] = persisted_secret
     recorder = DigestAuthenticationRecorder()
+    outboxes: list[BlockingOpenOutbox] = []
+
+    class BlockingOpenOutbox(RecordingOutbox):
+        def __init__(self, root: Path, clock: Callable[[], datetime]) -> None:
+            super().__init__(root, clock)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        @override
+        def open(self) -> None:
+            self.entered.set()
+            if not self.release.wait(timeout=5):
+                raise RuntimeError('blocked worker startup timed out')
+            super().open()
+
+    def outbox_factory(root: Path, clock: Callable[[], datetime]) -> RecordingOutbox:
+        outbox = BlockingOpenOutbox(root, clock)
+        outboxes.append(outbox)
+        return outbox
+
     controller = RoastServerController(
         settings=settings,
         credentials=credentials,
         data_root=tmp_path / 'delayed-tests-data',
+        client_factory=cast(ClientFactory, recorder),
+        profile_validator=lambda _path: None,
+        outbox_factory=outbox_factory,
+        clock=lambda: NOW,
+    )
+    direct_connect = cast(
+        Callable[[Callable[[str, object], None], Qt.ConnectionType], object],
+        controller._worker.connectionTested.connect,
+    )
+    direct_connect(recorder.record_tested, Qt.ConnectionType.DirectConnection)
+    controller.start()
+    assert outboxes[0].entered.wait(timeout=2)
+    candidates = [secrets.token_urlsafe(32) for _ in range(10)]
+    candidate_digests = [
+        hashlib.sha256(candidate.encode('utf-8')).hexdigest()
+        for candidate in candidates
+    ]
+    request_ids: list[str] = []
+    try:
+        for candidate in candidates:
+            request_ids.append(controller.test_connection(ORIGIN, candidate))
+
+        assert controller._credential_vault.size() == 1
+        assert all(
+            not controller._credential_vault.contains(request_id)
+            for request_id in request_ids[:-1]
+        )
+        assert controller._credential_vault.contains(request_ids[-1])
+        assert controller._worker._credential_transactions == {}
+
+        outboxes[0].release.set()
+        recorder.wait_for_tests(1)
+        assert recorder.tested_ids == [request_ids[-1]]
+        assert recorder.digests == [candidate_digests[-1]]
+        assert controller._credential_vault.size() == 0
+        assert tuple(controller._worker._credential_transactions) == (
+            request_ids[-1],
+        )
+        assert len(credentials.get_calls) == 1
+        assert credentials.set_calls == []
+        assert credentials.delete_calls == []
+        assert credentials.values[ORIGIN] == persisted_secret
+
+        _wait_for_qt(
+            qcoreapplication,
+            lambda: settings.load().identity == IDENTITY,
+            'newest blocked-worker transaction did not activate',
+        )
+        assert controller._worker._credential_transactions == {}
+        assert [call[1] for call in credentials.set_calls] == [candidate_digests[-1]]
+        assert credentials.delete_calls == []
+        assert recorder.digests == [candidate_digests[-1], candidate_digests[-1]]
+        for candidate in candidates:
+            assert_secret_absent(candidate, controller)
+            assert_secret_absent(candidate, recorder)
+    finally:
+        outboxes[0].release.set()
+        assert controller.shutdown(2_000)
+
+
+def test_real_mid_http_supersession_discards_old_response_before_keyring(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+) -> None:
+    settings = SettingsStore(
+        QSettings(str(tmp_path / 'mid-http.ini'), QSettings.Format.IniFormat)
+    )
+    settings.set_origin(ORIGIN)
+    credentials = FakeCredentialStore()
+    persisted_secret = secrets.token_urlsafe(32)
+    credentials.values[ORIGIN] = persisted_secret
+    recorder = SupersessionAuthenticationRecorder()
+    controller = RoastServerController(
+        settings=settings,
+        credentials=credentials,
+        data_root=tmp_path / 'mid-http-data',
         client_factory=cast(ClientFactory, recorder),
         profile_validator=lambda _path: None,
         clock=lambda: NOW,
@@ -1905,37 +2081,45 @@ def test_real_delayed_ui_many_tests_keep_only_newest_secret_and_commit(
     )
     direct_connect(recorder.record_tested, Qt.ConnectionType.DirectConnection)
     controller.start()
-    candidates = [secrets.token_urlsafe(32) for _ in range(10)]
-    request_ids: list[str] = []
+    first_candidate = secrets.token_urlsafe(32)
+    newest_candidate = secrets.token_urlsafe(32)
+    first_digest = hashlib.sha256(first_candidate.encode('utf-8')).hexdigest()
+    newest_digest = hashlib.sha256(newest_candidate.encode('utf-8')).hexdigest()
     try:
-        for index, candidate in enumerate(candidates, start=1):
-            request_ids.append(controller.test_connection(ORIGIN, candidate))
-            recorder.wait_for_tests(index)
+        first_id = controller.test_connection(ORIGIN, first_candidate)
+        assert recorder.first_entered.wait(timeout=2)
+        assert credentials.get_calls == []
 
-        assert controller._credential_vault.size() == 0
-        assert tuple(controller._worker._credential_transactions) == (
-            request_ids[-1],
-        )
+        newest_id = controller.test_connection(ORIGIN, newest_candidate)
+        assert controller._credential_vault.size() == 1
+        assert not controller._credential_vault.contains(first_id)
+        assert controller._credential_vault.contains(newest_id)
+        recorder.release_first.set()
+        recorder.wait_for_tested(1)
+
+        assert recorder.http_digests == [first_digest, newest_digest]
+        assert recorder.tested_ids == [newest_id]
+        assert tuple(controller._worker._credential_transactions) == (newest_id,)
+        assert len(credentials.get_calls) == 1
         assert credentials.set_calls == []
+        assert credentials.delete_calls == []
+        assert credentials.values[ORIGIN] == persisted_secret
 
         _wait_for_qt(
             qcoreapplication,
             lambda: settings.load().identity == IDENTITY,
-            'newest delayed-UI transaction did not activate',
+            'newest mid-HTTP transaction did not activate',
         )
-        assert controller._credential_vault.size() == 0
         assert controller._worker._credential_transactions == {}
-        assert [call[1] for call in credentials.set_calls] == [
-            hashlib.sha256(candidates[-1].encode('utf-8')).hexdigest()
-        ]
-        assert recorder.digests == [
-            hashlib.sha256(candidate.encode('utf-8')).hexdigest()
-            for candidate in candidates
-        ] + [hashlib.sha256(candidates[-1].encode('utf-8')).hexdigest()]
-        for candidate in candidates:
-            assert_secret_absent(candidate, controller)
-            assert_secret_absent(candidate, recorder)
+        assert [call[1] for call in credentials.set_calls] == [newest_digest]
+        assert credentials.delete_calls == []
+        assert recorder.http_digests == [first_digest, newest_digest, newest_digest]
+        assert_secret_absent(first_candidate, controller)
+        assert_secret_absent(newest_candidate, controller)
+        assert_secret_absent(first_candidate, recorder)
+        assert_secret_absent(newest_candidate, recorder)
     finally:
+        recorder.release_first.set()
         assert controller.shutdown(2_000)
 
 

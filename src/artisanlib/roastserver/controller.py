@@ -311,6 +311,9 @@ class RoastServerController(QObject):
         if not self._stop_requested:
             self._stop_requested = True
             self._invalidate_requests()
+            self._credential_vault.clear()
+            self._profile_vault.clear()
+            self._command_vault.clear()
             self._thread.requestInterruption()
             self._stopWorker.emit()
         stopped = self._thread.wait(timeout_ms)
@@ -348,7 +351,7 @@ class RoastServerController(QObject):
         self._invalidate_identity()
         self._queue_configuration(self._configuration(enabled=False))
         try:
-            request_id = self._credential_vault.put(
+            request_id = self._credential_vault.put_latest(
                 ConnectionTestRequest(canonical, candidate)
             )
         except Exception as error:

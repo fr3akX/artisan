@@ -88,6 +88,7 @@ class OpaqueVault[T]:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._values: dict[str, T] = {}
+        self._latest_id: str | None = None
 
     @override
     def __repr__(self) -> str:
@@ -99,9 +100,37 @@ class OpaqueVault[T]:
             self._values[request_id] = value
         return request_id
 
+    def put_latest(self, value: T) -> str:
+        """Replace the latest-only value and advance its generation."""
+        request_id = uuid4().hex
+        with self._lock:
+            self._values.clear()
+            self._values[request_id] = value
+            self._latest_id = request_id
+        return request_id
+
     def take(self, request_id: str) -> T:
         with self._lock:
             return self._values.pop(request_id)
+
+    def take_if_current(self, request_id: str) -> T | None:
+        """Take a latest-only value only while its generation is current."""
+        with self._lock:
+            if request_id != self._latest_id:
+                return None
+            return self._values.pop(request_id, None)
+
+    def is_current(self, request_id: str) -> bool:
+        with self._lock:
+            return request_id == self._latest_id
+
+    def run_if_current(self, request_id: str, action: Callable[[], None]) -> bool:
+        """Linearize a non-blocking completion against latest replacement."""
+        with self._lock:
+            if request_id != self._latest_id:
+                return False
+            action()
+            return True
 
     def contains(self, request_id: str) -> bool:
         with self._lock:
@@ -114,6 +143,7 @@ class OpaqueVault[T]:
     def clear(self) -> None:
         with self._lock:
             self._values.clear()
+            self._latest_id = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,55 +531,66 @@ class RoastServerWorker(QObject):
         request: ConnectionTestRequest | None = None
         candidate = ''
         old_credential: str | None = None
+        transaction: _CredentialTransaction | None = None
         try:
-            self._make_credential_transaction_room()
-            request = self._credential_vault.take(opaque_id)
-            if self._cancelled():
+            request = self._credential_vault.take_if_current(opaque_id)
+            if request is None or self._cancelled():
                 return
+            self._make_credential_transaction_room()
             if not _valid_connection_request(request):
                 raise ValueError
             candidate = request.credential
-            old_credential = self._credentials.get(request.origin)
-            if self._cancelled():
-                return
             with self._client_factory(request.origin, candidate) as client:
                 if self._cancelled():
                     return
                 identity = client.test_connection()
                 if self._cancelled():
                     return
+            if not self._credential_vault.is_current(opaque_id):
+                return
             if not isinstance(identity, ServerIdentity):
                 raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
-            self._credential_transactions[request_id] = _CredentialTransaction(
+            old_credential = self._credentials.get(request.origin)
+            if self._cancelled() or not self._credential_vault.is_current(opaque_id):
+                return
+            transaction = _CredentialTransaction(
                 origin=request.origin,
                 candidate=candidate,
                 old_credential=old_credential,
                 identity=identity,
                 keyring_committed=False,
             )
-        except KeyError:
-            if not self._cancelled():
-                self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
-            return
+            completed_transaction = transaction
+
+            def retain_and_emit() -> None:
+                self._credential_transactions[request_id] = completed_transaction
+                self.connectionTested.emit(request_id, identity)
+
+            if not self._credential_vault.run_if_current(
+                opaque_id, retain_and_emit
+            ):
+                completed_transaction.candidate = ''
+                completed_transaction.old_credential = None
+            transaction = None
         except CredentialStoreError:
-            if not self._cancelled():
+            if not self._cancelled() and self._credential_vault.is_current(opaque_id):
                 self._emit_failure(request_id, _failure(FailureKind.KEYRING))
             return
         except ApiFailure as error:
-            if not self._cancelled():
+            if not self._cancelled() and self._credential_vault.is_current(opaque_id):
                 self.onlineChanged.emit(False)
                 self._emit_failure(request_id, error.failure)
             return
         except _DeliveryFailure as error:
-            if not self._cancelled():
+            if not self._cancelled() and self._credential_vault.is_current(opaque_id):
                 self._emit_failure(request_id, error.failure)
             return
         except (TypeError, ValueError):
-            if not self._cancelled():
+            if not self._cancelled() and self._credential_vault.is_current(opaque_id):
                 self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
             return
         except Exception:  # pylint: disable=broad-exception-caught
-            if not self._cancelled():
+            if not self._cancelled() and self._credential_vault.is_current(opaque_id):
                 self.onlineChanged.emit(False)
                 self._emit_failure(request_id, _failure(FailureKind.INVALID_RESPONSE))
             return
@@ -557,8 +598,9 @@ class RoastServerWorker(QObject):
             request = None
             candidate = ''
             old_credential = None
-        if not self._cancelled():
-            self.connectionTested.emit(request_id, identity)
+            if transaction is not None:
+                transaction.candidate = ''
+                transaction.old_credential = None
 
     @pyqtSlot(str)
     def commit_connection(self, transaction_id: str) -> None:
