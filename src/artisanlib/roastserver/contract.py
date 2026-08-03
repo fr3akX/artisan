@@ -971,9 +971,11 @@ def parse_aroast_ack(value: object) -> AroastAck:
             roast_id=_parse_hex_uuid(result_mapping['roast_id']),
             modified_at=_parse_aware_datetime(result_mapping['modified_at']),
         ),
-        rlimit=_parse_safe_int(mapping['rlimit'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
+        rlimit=_parse_safe_int(mapping['rlimit'], minimum=-1, maximum=POSTGRESQL_INTEGER_MAX),
         rusage=_parse_safe_int(mapping['rusage'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
-        rremaining=_parse_safe_int(mapping['rremaining'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
+        rremaining=_parse_safe_int(
+            mapping['rremaining'], minimum=-1, maximum=POSTGRESQL_INTEGER_MAX
+        ),
     )
 
 

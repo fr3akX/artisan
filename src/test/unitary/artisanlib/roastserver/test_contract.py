@@ -717,6 +717,18 @@ def test_aroast_ack_accepts_bounded_compatibility_result_fields() -> None:
     assert ack.result.roast_id == ROAST_UUID
 
 
+def test_aroast_ack_accepts_unlimited_limit_and_remaining_sentinels() -> None:
+    payload = valid_aroast_ack_payload()
+    payload['rlimit'] = -1
+    payload['rremaining'] = -1
+
+    ack = parse_aroast_ack(payload)
+
+    assert ack.rlimit == -1
+    assert ack.rusage == 5
+    assert ack.rremaining == -1
+
+
 def test_aroast_ack_requires_success_matching_uuid_and_safe_counters() -> None:
     ack = parse_aroast_ack(valid_aroast_ack_payload())
     assert ack.success is True
