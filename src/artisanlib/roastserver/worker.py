@@ -1330,6 +1330,12 @@ class RoastServerWorker(QObject):
             self._stop_timer()
             return
         except ApiFailure as error:
+            _log.error(
+                'Roast Server delivery API failure: kind=%s code=%s status=%s',
+                error.failure.kind.value,
+                error.failure.code,
+                'none' if error.status_code is None else error.status_code,
+            )
             failure = _persistence_failure(error.failure)
             retry_after = error.retry_after_seconds
             status_code = error.status_code

@@ -2301,6 +2301,27 @@ def test_permanent_server_and_local_failures_use_exact_lease_token(
     assert worker_harness.outbox.counts(NAMESPACE).failed == 1
 
 
+def test_api_delivery_failure_logs_only_fixed_diagnostics(
+    worker_harness: WorkerHarness, caplog: pytest.LogCaptureFixture
+) -> None:
+    worker_harness.enqueue_saved_profile()
+    worker_harness.client.failure_method = 'upload_revision'
+    worker_harness.client.failure = ApiFailure(
+        public_failure(FailureKind.INVALID_RESPONSE, retryable=False),
+        None,
+        None,
+    )
+
+    with caplog.at_level(logging.ERROR, logger='artisanlib.roastserver.worker'):
+        worker_harness.run_one_queue_tick()
+
+    assert caplog.messages == [
+        'Roast Server delivery API failure: kind=invalid_response '
+        'code=invalid_response status=none'
+    ]
+    assert worker_harness.outbox.counts(NAMESPACE).failed == 1
+
+
 def test_unexpected_delivery_failure_logs_only_exception_type(
     worker_harness: WorkerHarness, caplog: pytest.LogCaptureFixture
 ) -> None:
