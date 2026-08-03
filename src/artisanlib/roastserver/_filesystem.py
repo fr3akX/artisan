@@ -571,14 +571,22 @@ class _WindowsNativeLayer:
         finally:
             self._close(cast(int, token.value))
 
+    @staticmethod
+    def _is_directory(attributes: int) -> bool:
+        return bool(attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+
+    @staticmethod
+    def _private_acl_sddl(sid: str, *, directory: bool) -> str:
+        ace_flags = 'OICI' if directory else ''
+        return f'D:P(A;{ace_flags};FA;;;{sid})'
+
     def _security_descriptor(
         self, sid: str, *, directory: bool
     ) -> tuple[Any, Any]:
         ctypes = self._ctypes
         descriptor = ctypes.c_void_p()
         size = self._wintypes.DWORD()
-        ace_flags = 'OICI' if directory else ''
-        sddl = f'D:P(A;{ace_flags};FA;;;{sid})'
+        sddl = self._private_acl_sddl(sid, directory=directory)
         if not self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl,
             self._SDDL_REVISION_1,
@@ -635,9 +643,7 @@ class _WindowsNativeLayer:
         descriptor: Any = None
         try:
             sid = self._current_user_sid_string()
-            directory = bool(
-                self._attributes(final) & stat.FILE_ATTRIBUTE_DIRECTORY
-            )
+            directory = self._is_directory(self._attributes(final))
             descriptor, dacl = self._security_descriptor(
                 sid, directory=directory
             )
@@ -745,7 +751,7 @@ class _WindowsNativeLayer:
             ):
                 raise self._error()
             attributes = self._attributes(final)
-            directory = bool(attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+            directory = self._is_directory(attributes)
             expected_flags = (
                 self._OBJECT_INHERIT_ACE | self._CONTAINER_INHERIT_ACE
                 if directory

@@ -194,9 +194,9 @@ git commit -m "fix(roastserver): accept normalized Windows file ACLs"
 Run from `src/`:
 
 ```bash
-pytest test/unitary/artisanlib/roastserver \
-  test/unitary/artisanlib/test_main_roastserver.py \
-  test/unitary/artisanlib/test_canvas_roastserver.py -q
+pytest test/unitary/artisanlib/roastserver -q
+pytest test/unitary/artisanlib/test_main.py \
+  test/unitary/artisanlib/test_canvas.py -k roastserver -q
 ```
 
 Expected: all Linux-applicable tests pass and native Windows tests skip.

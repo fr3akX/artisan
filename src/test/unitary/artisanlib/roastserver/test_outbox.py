@@ -2082,6 +2082,21 @@ def _windows_acl_layer(
     return layer, expected_sid
 
 
+def test_windows_private_acl_selects_exact_sddl_by_object_type() -> None:
+    layer_type = outbox_module._WindowsNativeLayer
+    sid = 'S-1-5-21'
+
+    assert not layer_type._is_directory(0)
+    assert layer_type._is_directory(stat.FILE_ATTRIBUTE_DIRECTORY)
+    assert not layer_type._is_directory(stat.FILE_ATTRIBUTE_READONLY)
+    assert layer_type._private_acl_sddl(sid, directory=False) == (
+        'D:P(A;;FA;;;S-1-5-21)'
+    )
+    assert layer_type._private_acl_sddl(sid, directory=True) == (
+        'D:P(A;OICI;FA;;;S-1-5-21)'
+    )
+
+
 def test_windows_private_acl_parser_requires_exact_valid_sid_ace() -> None:
     assert ctypes.sizeof(outbox_module._WindowsAceHeader) == 4
     assert outbox_module._WindowsAccessAllowedAce.SidStart.offset == 8
