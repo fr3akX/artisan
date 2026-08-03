@@ -571,11 +571,14 @@ class _WindowsNativeLayer:
         finally:
             self._close(cast(int, token.value))
 
-    def _security_descriptor(self, sid: str) -> tuple[Any, Any]:
+    def _security_descriptor(
+        self, sid: str, *, directory: bool
+    ) -> tuple[Any, Any]:
         ctypes = self._ctypes
         descriptor = ctypes.c_void_p()
         size = self._wintypes.DWORD()
-        sddl = f'D:P(A;OICI;FA;;;{sid})'
+        ace_flags = 'OICI' if directory else ''
+        sddl = f'D:P(A;{ace_flags};FA;;;{sid})'
         if not self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl,
             self._SDDL_REVISION_1,
@@ -632,7 +635,12 @@ class _WindowsNativeLayer:
         descriptor: Any = None
         try:
             sid = self._current_user_sid_string()
-            descriptor, dacl = self._security_descriptor(sid)
+            directory = bool(
+                self._attributes(final) & stat.FILE_ATTRIBUTE_DIRECTORY
+            )
+            descriptor, dacl = self._security_descriptor(
+                sid, directory=directory
+            )
             result = self._advapi32.SetSecurityInfo(
                 final,
                 self._SE_FILE_OBJECT,
@@ -653,7 +661,12 @@ class _WindowsNativeLayer:
         self.verify_private_permissions(path, mode)
 
     def _verify_private_dacl(
-        self, dacl: Any, expected_sid: Any, *, protected: bool
+        self,
+        dacl: Any,
+        expected_sid: Any,
+        *,
+        protected: bool,
+        expected_flags: int,
     ) -> None:
         if not protected:
             raise OSError(errno.EACCES, 'Windows ACL is not protected')
@@ -675,11 +688,10 @@ class _WindowsNativeLayer:
         header = self._ctypes.cast(
             ace_pointer, self._ctypes.POINTER(_WindowsAceHeader)
         ).contents
-        intended_flags = self._OBJECT_INHERIT_ACE | self._CONTAINER_INHERIT_ACE
         sid_offset = _WindowsAccessAllowedAce.SidStart.offset
         if (
             header.AceType != self._ACCESS_ALLOWED_ACE_TYPE
-            or header.AceFlags != intended_flags
+            or header.AceFlags != expected_flags
             or header.AceSize < sid_offset + 8
             or header.AceSize % self._ctypes.sizeof(_WindowsDword) != 0
         ):
@@ -732,10 +744,20 @@ class _WindowsNativeLayer:
                 self._ctypes.byref(revision),
             ):
                 raise self._error()
-            self._verify_private_dacl(
-                dacl, expected_sid, protected=bool(control.value & 0x1000)
+            attributes = self._attributes(final)
+            directory = bool(attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+            expected_flags = (
+                self._OBJECT_INHERIT_ACE | self._CONTAINER_INHERIT_ACE
+                if directory
+                else 0
             )
-            readonly = bool(self._attributes(final) & self._FILE_ATTRIBUTE_READONLY)
+            self._verify_private_dacl(
+                dacl,
+                expected_sid,
+                protected=bool(control.value & 0x1000),
+                expected_flags=expected_flags,
+            )
+            readonly = bool(attributes & self._FILE_ATTRIBUTE_READONLY)
             if readonly != (mode == 0o400):
                 raise OSError(errno.EACCES, 'Windows readonly state is invalid')
         finally:
