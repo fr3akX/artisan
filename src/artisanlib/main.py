@@ -14088,11 +14088,40 @@ class ApplicationWindow(QMainWindow):
             'TP_time_B_loaded',
             'AUCbackground',
             'analysisresultsstr',
-            'l_annotations_dict',
-            'l_background_annotations',
         ):
             state[name] = copyd.deepcopy(getattr(self.qmc, name))
         return state
+
+    def snapshotRoastServerAnnotationPositions(
+        self,
+    ) -> tuple[
+        dict[int,tuple[tuple[float,float],tuple[float,float]]],
+        dict[int,tuple[float,float]],
+    ]:
+        annotation_positions = copyd.deepcopy(self.qmc.l_annotations_pos_dict)
+        annotations_by_event = cast(  # type: ignore[redundant-cast]
+            'dict[int,list[Annotation]]', self.qmc.l_annotations_dict
+        )
+        for event_id, annotations in annotations_by_event.items():
+            if len(annotations) != 2:
+                raise TypeError('Roast Server annotation snapshot is invalid')
+            temperature_position = cast(  # type: ignore[redundant-cast]
+                'tuple[float,float]', annotations[0].xyann)
+            time_position = cast(  # type: ignore[redundant-cast]
+                'tuple[float,float]', annotations[1].xyann)
+            annotation_positions[event_id] = (
+                (float(temperature_position[0]), float(temperature_position[1])),
+                (float(time_position[0]), float(time_position[1])),
+            )
+        flag_positions = copyd.deepcopy(self.qmc.l_event_flags_pos_dict)
+        flag_annotations = cast(  # type: ignore[redundant-cast]
+            'dict[int,Annotation]', self.qmc.l_event_flags_dict
+        )
+        for event_id, annotation in flag_annotations.items():
+            position = cast(  # type: ignore[redundant-cast]
+                'tuple[float,float]', annotation.xyann)
+            flag_positions[event_id] = (float(position[0]), float(position[1]))
+        return annotation_positions, flag_positions
 
     def snapshotRoastServerExactAttributes(self) -> dict[str,Any]:
         window_state:dict[str,Any] = {}
@@ -14138,7 +14167,7 @@ class ApplicationWindow(QMainWindow):
             'extratimex', 'flavoraspect', 'flavorlabels', 'flavors',
             'flavors_total_correction', 'flavorstartangle', 'greens_temp',
             'ground_color', 'heavyFC_flag', 'l_annotations_pos_dict',
-            'l_event_flags_pos_dict', 'legend', 'legendloc_pos',
+            'l_event_flags_pos_dict', 'legendloc_pos',
             'lightCut_flag', 'lowFC_flag', 'moisture_greens',
             'moisture_roasted', 'oily_flag', 'operator', 'organization',
             'phases', 'plus_blend_label', 'plus_blend_spec',
@@ -14171,8 +14200,7 @@ class ApplicationWindow(QMainWindow):
             'preheatenergies', 'presssure_percents', 'ratingunits', 'rsfile',
             'sourcetypes', 'statisticstimes', 'roastepoch', 'roasttzoffset',
             'zoom_follow', 'ystep_down', 'ystep_up', 'analysisresultsstr',
-            'autoChargeIdx', 'autoDropIdx', 'l_annotations_dict',
-            'l_event_flags_dict', 'l_timeline', 'TPalarmtimeindex',
+            'autoChargeIdx', 'autoDropIdx', 'TPalarmtimeindex',
             # transient and derived state cleared by canvas.reset()
             'BTprojection_temp', 'BTprojection_tx', 'DeltaBTprojection_temp',
             'DeltaBTprojection_tx', 'DeltaETprojection_temp',
@@ -14184,7 +14212,7 @@ class ApplicationWindow(QMainWindow):
             'ctimex1', 'ctimex2', 'currentpidsv', 'currentx', 'currenty',
             'delta1', 'delta2', 'designerflag', 'designertemp1init',
             'designertemp2init', 'dutycycle', 'dutycycleTX', 'errorlog',
-            'indexpoint', 'l_annotations', 'program_t3', 'program_t4',
+            'indexpoint', 'program_t3', 'program_t4',
             'program_t5', 'program_t6', 'program_t7', 'program_t8',
             'program_t9', 'program_t10', 'rateofchange1', 'rateofchange2',
             'replayedBackgroundEvents', 'stemp1', 'stemp2', 'tstemp1',
@@ -14193,6 +14221,10 @@ class ApplicationWindow(QMainWindow):
             'workingline',
         ):
             qmc_state[name] = copyd.deepcopy(getattr(self.qmc, name))
+        (
+            qmc_state['l_annotations_pos_dict'],
+            qmc_state['l_event_flags_pos_dict'],
+        ) = self.snapshotRoastServerAnnotationPositions()
         pid_state = {
             name: copyd.deepcopy(getattr(self.pidcontrol, name))
             for name in (
@@ -14219,7 +14251,7 @@ class ApplicationWindow(QMainWindow):
             name: copyd.deepcopy(getattr(self.qmc, name))
             for name in (
                 'startofx', 'endofx', 'ylimit', 'ylimit_min', 'zlimit',
-                'zlimit_min', 'legendloc_pos', 'legend',
+                'zlimit_min', 'legendloc_pos',
             )
         }
         plus_state = {
