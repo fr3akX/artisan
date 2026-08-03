@@ -119,7 +119,7 @@ import tempfile
 from pathlib import Path
 from collections.abc import Generator
 from typing import Any
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import ANY, MagicMock, Mock, call, patch
 from uuid import UUID
 
 import numpy as np
@@ -5268,9 +5268,6 @@ class TestRoastServerReadOnlyLoad:
         window.MaxRecentFiles = 20
         window.roastServerRecentFiles = Mock(return_value=[])
         window.roastServerWriteRecentFiles = Mock()
-        window.roastServerPlusPath = Mock(return_value=None)
-        window.roastServerSetPlusPath = Mock(return_value=True)
-        window.roastServerRestorePlusPath = Mock(return_value=True)
         window.refreshRoastServerActions = Mock()
         window.getProfile.return_value = copy.deepcopy(previous)
         window.qmc.fileCleanSignal.emit.side_effect = lambda: setattr(
@@ -5918,9 +5915,6 @@ class TestRoastServerReadOnlySaveTransition:
         window.refreshRoastServerActions = Mock()
         window.roastServerRecentFiles = Mock(return_value=['previous.alog'])
         window.roastServerWriteRecentFiles = Mock()
-        window.roastServerPlusPath = Mock(return_value='previous-plus.alog')
-        window.roastServerSetPlusPath = Mock(return_value=True)
-        window.roastServerRestorePlusPath = Mock(return_value=True)
         window.ArtisanSaveFileDialog.return_value = str(destination)
         return window, controller, cache_file, destination
 
@@ -5933,8 +5927,10 @@ class TestRoastServerReadOnlySaveTransition:
         window.fileSave_current_action()
 
         window.ArtisanSaveFileDialog.assert_called_once()
-        window.roastServerSetPlusPath.assert_called_once_with(
-            ROASTSERVER_PROFILE['roastUUID'], str(destination))
+        window.plusAddPath.assert_called_once_with(
+            ANY, str(destination))
+        assert window.plusAddPath.call_args.args[0]['roastUUID'] == (
+            ROASTSERVER_PROFILE['roastUUID'])
         controller.record_local_save.assert_called_once_with(
             destination,
             expected=controller.current_protection_token.return_value,
@@ -5998,7 +5994,7 @@ class TestRoastServerReadOnlySaveTransition:
 
     @pytest.mark.parametrize(
         'failure', [
-            'clean', 'title', 'qsettings', 'register', 'refresh', 'release',
+            'clean', 'title', 'qsettings', 'refresh', 'release',
         ])
     @pytest.mark.parametrize('destination_exists', [False, True])
     def test_every_post_write_failure_restores_exact_destination_transaction(
@@ -6026,8 +6022,6 @@ class TestRoastServerReadOnlySaveTransition:
             window.updateWindowTitle.side_effect = OSError('title failed')
         elif failure == 'qsettings':
             window.roastServerWriteRecentFiles.side_effect = OSError('settings failed')
-        elif failure == 'register':
-            window.roastServerSetPlusPath.return_value = False
         elif failure == 'refresh':
             window.refreshRoastServerActions.side_effect = OSError('refresh failed')
         elif failure == 'release':
@@ -6045,6 +6039,7 @@ class TestRoastServerReadOnlySaveTransition:
             assert not destination.exists()
         assert window.roastserver_open_source is not None
         assert controller.current_protection_token.return_value is token
+        window.plusAddPath.assert_not_called()
         controller.saved_profile.assert_not_called()
 
     @pytest.mark.parametrize('destination_exists', [False, True])
@@ -6131,7 +6126,7 @@ class TestRoastServerReadOnlySaveTransition:
             for call in window.qmc.adderror.call_args_list
         )
 
-    @pytest.mark.parametrize('failure', ['qsettings', 'register', 'release'])
+    @pytest.mark.parametrize('failure', ['qsettings', 'release'])
     def test_precommit_failure_never_runs_or_leaves_auxiliary_export(
         self, tmp_path: Path, failure: str
     ) -> None:
@@ -6143,37 +6138,70 @@ class TestRoastServerReadOnlySaveTransition:
         window.autosave.side_effect = lambda *_args: auxiliary.write_bytes(b'residue')
         if failure == 'qsettings':
             window.roastServerWriteRecentFiles.side_effect = OSError('settings failed')
-        elif failure == 'register':
-            window.roastServerSetPlusPath.return_value = False
         else:
             controller.record_local_save.return_value = False
 
         assert not window.fileSave(None)
 
         window.autosave.assert_not_called()
+        window.plusAddPath.assert_not_called()
         assert not auxiliary.exists()
         assert not destination.exists()
 
-    def test_server_save_as_releases_expected_token_as_final_fallible_commit(
+    def test_server_save_as_registers_only_after_transaction_commit(
         self, tmp_path: Path
     ) -> None:
         window, controller, _cache_file, destination = self.source_window(tmp_path)
         token = object()
         controller.current_protection_token.return_value = token
         controller.record_local_save.return_value = token
-        ordered = Mock()
-        ordered.attach_mock(window.updateWindowTitle, 'title')
-        ordered.attach_mock(window.roastServerWriteRecentFiles, 'settings')
-        ordered.attach_mock(window.roastServerSetPlusPath, 'register')
-        ordered.attach_mock(window.refreshRoastServerActions, 'refresh')
-        ordered.attach_mock(controller.record_local_save, 'release')
+        ordered: list[str] = []
+        window.updateWindowTitle.side_effect = lambda: ordered.append('title')
+        window.roastServerWriteRecentFiles.side_effect = (
+            lambda _files: ordered.append('settings'))
+        window.refreshRoastServerActions.side_effect = (
+            lambda: ordered.append('refresh'))
+
+        def release(_path: Path, *, expected: object) -> object:
+            ordered.append('release')
+            assert expected is token
+            return token
+
+        controller.record_local_save.side_effect = release
+        window.plusAddPath.side_effect = (
+            lambda _profile, _path: ordered.append('register'))
+        real_commit = main_module.FileDestinationTransaction.commit
+
+        def commit(transaction: FileDestinationTransaction) -> None:
+            real_commit(transaction)
+            ordered.append('commit')
+
+        with patch.object(
+            main_module.FileDestinationTransaction, 'commit', commit
+        ):
+            assert window.fileSave(None)
+
+        assert ordered == [
+            'title', 'settings', 'refresh', 'release', 'commit', 'register']
+        controller.record_local_save.assert_called_once_with(
+            destination, expected=token)
+
+    def test_final_plus_registration_failure_keeps_committed_save(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, _cache_file, destination = self.source_window(tmp_path)
+        destination.write_bytes(b'prior destination')
+        window.plusAddPath.side_effect = OSError('plus registration failed')
 
         assert window.fileSave(None)
 
-        names = [call[0] for call in ordered.mock_calls]
-        assert names[-1] == 'release'
-        controller.record_local_save.assert_called_once_with(
-            destination, expected=token)
+        window.plusAddPath.assert_called_once()
+        assert destination.read_bytes() != b'prior destination'
+        assert window.roastserver_open_source is None
+        assert window.curFile == str(destination)
+        controller.restore_protection.assert_not_called()
+        controller.saved_profile.assert_called_once()
+        window.sendmessage.assert_called_once_with('Profile saved')
 
     def test_reentrant_save_as_transition_never_releases_wrong_token(
         self, tmp_path: Path
@@ -6215,9 +6243,8 @@ class TestRoastServerReadOnlySaveTransition:
         controller.saved_profile.assert_not_called()
         assert (cache_file.read_bytes(), cache_file.stat().st_mtime_ns) == before
 
-    @pytest.mark.parametrize('failure', ['qsettings', 'plus-register'])
-    def test_server_save_as_compensates_actual_recent_and_plus_sentinels(
-        self, tmp_path: Path, failure: str
+    def test_server_save_as_compensates_actual_recent_sentinel_before_registration(
+        self, tmp_path: Path
     ) -> None:
         window, controller, _cache_file, destination = self.source_window(tmp_path)
         source = window.roastserver_open_source
@@ -6226,29 +6253,19 @@ class TestRoastServerReadOnlySaveTransition:
         controller.current_protection_token.return_value = protection_token
         controller.record_local_save.return_value = protection_token
         controller.restore_protection.return_value = True
-        uuid_value = ROASTSERVER_PROFILE['roastUUID']
-        register_state: dict[str, str] = {uuid_value: 'previous-plus.alog'}
-        fail_register_verify = failure == 'plus-register'
+        register_state = {'path': 'previous-plus.alog'}
 
-        def register_get(roast_uuid: str) -> str | None:
-            nonlocal fail_register_verify
-            if fail_register_verify and register_state.get(roast_uuid) == str(destination):
-                fail_register_verify = False
-                raise OSError('register verification failed')
-            return register_state.get(roast_uuid)
+        def register(_profile: dict[str, Any], path: str) -> None:
+            register_state['path'] = path
 
-        def register_add(roast_uuid: str, path: str) -> None:
-            register_state[roast_uuid] = path
-
-        def register_remove(roast_uuid: str) -> None:
-            register_state.pop(roast_uuid, None)
+        window.plusAddPath.side_effect = register
 
         class SentinelSettings:
             class Status:
                 NoError = 0
 
             recent = ['previous-recent.alog']
-            fail_sync = failure == 'qsettings'
+            fail_sync = True
 
             def value(self, _key: str) -> list[str]:
                 return self.recent[:]
@@ -6268,23 +6285,15 @@ class TestRoastServerReadOnlySaveTransition:
         window.roastServerRecentFiles = ApplicationWindow.roastServerRecentFiles
         window.roastServerWriteRecentFiles = (
             ApplicationWindow.roastServerWriteRecentFiles.__get__(window))
-        window.roastServerPlusPath = ApplicationWindow.roastServerPlusPath
-        window.roastServerSetPlusPath = ApplicationWindow.roastServerSetPlusPath
-        window.roastServerRestorePlusPath = ApplicationWindow.roastServerRestorePlusPath
 
         with patch.object(main_module, 'QSettings', SentinelSettings), patch.object(
-            main_module.plus.register, 'getPath', side_effect=register_get
-        ), patch.object(
-            main_module.plus.register, 'addPath', side_effect=register_add
-        ), patch.object(
-            main_module.plus.register, 'removePath', side_effect=register_remove
-        ), patch.object(
             main_module.plus.controller, 'updateSyncRecordHashAndSync'
         ) as plus_sync:
             assert not window.fileSave(None)
 
         assert SentinelSettings.recent == ['previous-recent.alog']
-        assert register_state == {uuid_value: 'previous-plus.alog'}
+        assert register_state == {'path': 'previous-plus.alog'}
+        window.plusAddPath.assert_not_called()
         assert window.roastserver_open_source == source
         assert window.curFile is None
         controller.restore_protection.assert_not_called()

@@ -296,7 +296,7 @@ def dialog(
     qapp: QApplication,
     controller: FakeController,
     settings: ConnectorSettings,
-) -> Generator[RoastServerConfigDialog, None, None]:
+) -> Generator[RoastServerConfigDialog]:
     value = RoastServerConfigDialog(controller, settings)
     value.show()
     qapp.processEvents()
@@ -1126,7 +1126,7 @@ def browser(
     qapp: QApplication,
     browser_controller: FakeBrowserController,
     settings: ConnectorSettings,
-) -> Generator[RoastServerBrowserDialog, None, None]:
+) -> Generator[RoastServerBrowserDialog]:
     value = RoastServerBrowserDialog(browser_controller, settings)
     value.show()
     qapp.processEvents()

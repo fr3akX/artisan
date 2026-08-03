@@ -956,7 +956,7 @@ class ControllerHarness:
 
 
 @pytest.fixture(scope='module')
-def qcoreapplication() -> Generator[QCoreApplication, None, None]:
+def qcoreapplication() -> Generator[QCoreApplication]:
     app = QCoreApplication.instance()
     if app is None:
         app = QCoreApplication([])
@@ -966,7 +966,7 @@ def qcoreapplication() -> Generator[QCoreApplication, None, None]:
 @pytest.fixture
 def controller_harness(
     tmp_path: Path, qcoreapplication: QCoreApplication
-) -> Generator[ControllerHarness, None, None]:
+) -> Generator[ControllerHarness]:
     harness = ControllerHarness(tmp_path, qcoreapplication)
     yield harness
     harness.stop()

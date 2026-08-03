@@ -18368,25 +18368,6 @@ class ApplicationWindow(QMainWindow):
         ).encode()).hexdigest()
 
     @staticmethod
-    def roastServerPlusPath(roast_uuid:str) -> str|None:
-        return plus.register.getPath(roast_uuid)
-
-    @staticmethod
-    def roastServerSetPlusPath(roast_uuid:str, path:str) -> bool:
-        plus.register.addPath(roast_uuid, path)
-        return plus.register.getPath(roast_uuid) == path
-
-    @staticmethod
-    def roastServerRestorePlusPath(
-        roast_uuid:str, previous_path:str|None
-    ) -> bool:
-        if previous_path is None:
-            plus.register.removePath(roast_uuid)
-        else:
-            plus.register.addPath(roast_uuid, previous_path)
-        return plus.register.getPath(roast_uuid) == previous_path
-
-    @staticmethod
     def roastServerRecentFiles() -> list[str]:
         return toStringList(QSettings().value('recentFileList'))
 
@@ -18464,13 +18445,10 @@ class ApplicationWindow(QMainWindow):
         if expected_token is None:
             raise RuntimeError('Roast Server cache protection ownership changed')
         previous_recent:list[str]|None = None
-        previous_plus_path:str|None = None
-        roast_uuid:str|None = None
         destination_state:FileDestinationTransaction|None = None
         serialization_result:SerializationResult
         detached_profile:ProfileData
         recent_attempted = False
-        register_attempted = False
         protection_released = False
         with controller.protection_guard(expected_token):
             try:
@@ -18483,8 +18461,6 @@ class ApplicationWindow(QMainWindow):
                 uuid_value = profile.get(plus.config.uuid_tag)
                 if not isinstance(uuid_value, str) or not uuid_value:
                     raise RuntimeError('Roast Server profile UUID is invalid')
-                roast_uuid = uuid_value
-                previous_plus_path = self.roastServerPlusPath(roast_uuid)
                 from artisanlib.roastserver.contract import MAX_PROFILE_BYTES
                 destination_state = FileDestinationTransaction.begin(
                     filename, max_bytes=MAX_PROFILE_BYTES)
@@ -18506,9 +18482,6 @@ class ApplicationWindow(QMainWindow):
                 del recent[self.MaxRecentFiles:]
                 recent_attempted = True
                 self.roastServerWriteRecentFiles(recent)
-                register_attempted = True
-                if not self.roastServerSetPlusPath(roast_uuid, filename):
-                    raise RuntimeError('artisan.plus profile registration failed')
                 self.refreshRoastServerActions()
 
                 try:
@@ -18534,13 +18507,6 @@ class ApplicationWindow(QMainWindow):
                             _log.error('Roast Server protection rollback failed')
                     except Exception as error: # pylint: disable=broad-except
                         _log.exception(error)
-                if register_attempted and roast_uuid is not None:
-                    try:
-                        if not self.roastServerRestorePlusPath(
-                                roast_uuid, previous_plus_path):
-                            _log.error('artisan.plus registration rollback failed')
-                    except Exception as error: # pylint: disable=broad-except
-                        _log.exception(error)
                 if recent_attempted and previous_recent is not None:
                     try:
                         self.roastServerWriteRecentFiles(previous_recent)
@@ -18553,8 +18519,12 @@ class ApplicationWindow(QMainWindow):
                         _log.exception(error)
                 raise
 
-        # The main save is committed. Auxiliary formats are intentionally
-        # best-effort and no exception below may roll the .alog transaction back.
+        # The main save is committed. Registration and auxiliary work follow
+        # ordinary save best-effort semantics and cannot roll the .alog back.
+        try:
+            self.plusAddPath(cast(dict[str,Any], detached_profile), filename)
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
         try:
             if self.qmc.autosaveimage and not self.qmc.flagon:
                 if QFileInfo(filename).suffix() == 'alog':

@@ -647,7 +647,7 @@ def test_timestamps_reject_non_backend_variants(timestamp: str) -> None:
         b'<html>proxy secret</html>',
         b'{"error":{"code":"bad_request","code":"duplicate","message":"Server said no.","details":null}}',
         b'{"error":{"code":"bad_request","message":"line\\nsecret","details":null}}',
-        '{"error":{"code":"bad_request","message":"bad\u0085news","details":null}}'.encode('utf-8'),
+        '{"error":{"code":"bad_request","message":"bad\u0085news","details":null}}'.encode(),
         b'{"error":{"code":"bad_request","message":"\\ud800","details":null}}',
         b'\x80',
     ),

@@ -128,7 +128,6 @@ tmp_path = Path(sys.argv[1])
 connected = sys.argv[2] == 'connected'
 plus_status_action = Mock()
 plus_uuid_register = Mock()
-plus_uuid_remove = Mock()
 plus_uuid_lookup = Mock(return_value='existing-plus.alog')
 plus_sync = Mock()
 plus_sync_hash = Mock(return_value='existing-sync-hash')
@@ -140,7 +139,6 @@ plus.config.token = plus_token_before
 plus.config.app_window = plus_app_window_before
 plus.config.status_action = plus_status_action
 plus.register.addPath = plus_uuid_register
-plus.register.removePath = plus_uuid_remove
 plus.register.getPath = plus_uuid_lookup
 plus.sync.sync = plus_sync
 plus.controller.updateSyncRecordHashAndSync = plus_sync_hash
@@ -205,7 +203,6 @@ assert observed['worker'] is connector_worker
 plus_status_action.setEnabled.assert_not_called()
 plus_status_action.setIcon.assert_not_called()
 plus_uuid_register.assert_not_called()
-plus_uuid_remove.assert_not_called()
 plus_uuid_lookup.assert_not_called()
 plus_sync.assert_not_called()
 plus_sync_hash.assert_not_called()

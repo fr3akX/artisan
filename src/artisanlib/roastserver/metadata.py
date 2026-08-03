@@ -175,8 +175,8 @@ class ProjectedMetadata:
     revision_json: bytes
 
 
-def project_profile(profile: ProfileData, modified: datetime) -> ProjectedMetadata:
-    modified_text = _aware_datetime_text(modified)
+def project_profile(profile: ProfileData, modified_at: datetime) -> ProjectedMetadata:
+    modified_text = _aware_datetime_text(modified_at)
     roast_id = _uuid_hex(profile.get('roastUUID'))
     roast_at, roast_timezone_offset_seconds = _roast_datetime_parts(profile)
     mode = _temperature_unit(profile.get('mode'))

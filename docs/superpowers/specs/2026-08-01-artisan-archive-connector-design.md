@@ -1,7 +1,7 @@
 # Artisan Archive Connector Design
 
-**Date:** 2026-08-01  
-**Status:** Approved  
+**Date:** 2026-08-01
+**Status:** Approved
 **Slice:** Phase 4 of the Artisan Roast Server MVP
 
 ## Purpose

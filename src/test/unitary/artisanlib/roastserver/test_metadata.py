@@ -164,6 +164,12 @@ def _aroast(profile: ProfileData) -> dict[str, object]:
     return payload
 
 
+def test_project_profile_accepts_documented_modified_at_keyword() -> None:
+    projected = project_profile(minimal_profile(), modified_at=MODIFIED)
+
+    assert json.loads(projected.aroast_json)['modified_at'] == MODIFIED.isoformat()
+
+
 def minimal_profile() -> ProfileData:
     return cast(
         ProfileData,

@@ -89,7 +89,7 @@ def saved_profile(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def outbox(tmp_path: Path) -> Generator[Outbox, None, None]:
+def outbox(tmp_path: Path) -> Generator[Outbox]:
     result = opened_outbox(tmp_path / 'connector')
     try:
         yield result
@@ -1369,7 +1369,7 @@ def test_discard_holds_process_lock_through_unlink_before_same_hash_republishes(
     original_unlink = first._unlink_generated_snapshot
 
     @contextmanager
-    def tracked_first_lock() -> Generator[None, None, None]:
+    def tracked_first_lock() -> Generator[None]:
         nonlocal first_lock_held
         with original_first_lock():
             first_lock_held = True
@@ -1379,7 +1379,7 @@ def test_discard_holds_process_lock_through_unlink_before_same_hash_republishes(
                 first_lock_held = False
 
     @contextmanager
-    def observed_second_lock() -> Generator[None, None, None]:
+    def observed_second_lock() -> Generator[None]:
         second_lock_attempted.set()
         with original_second_lock():
             second_acquired_after_unlink.append(unlink_finished.is_set())

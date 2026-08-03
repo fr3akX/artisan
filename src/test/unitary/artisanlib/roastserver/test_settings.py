@@ -87,7 +87,7 @@ class FakeKeyring:
 
 
 @pytest.fixture(scope='session', autouse=True)
-def qcoreapplication() -> Generator[QCoreApplication, None, None]:
+def qcoreapplication() -> Generator[QCoreApplication]:
     app = QCoreApplication.instance()
     if app is None:
         app = QCoreApplication([])
@@ -95,7 +95,7 @@ def qcoreapplication() -> Generator[QCoreApplication, None, None]:
 
 
 @pytest.fixture
-def qsettings(tmp_path: Path) -> Generator[QSettings, None, None]:
+def qsettings(tmp_path: Path) -> Generator[QSettings]:
     qsettings = QSettings(str(tmp_path / 'roastserver.ini'), QSettings.Format.IniFormat)
     qsettings.clear()
     qsettings.sync()

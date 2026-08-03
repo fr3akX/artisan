@@ -636,7 +636,21 @@ class CommandBus(QObject):
     clear_worker = pyqtSignal(str)
     tick_worker = pyqtSignal()
     probe_worker = pyqtSignal()
+    complete_worker = pyqtSignal()
     stop_worker = pyqtSignal()
+
+
+class WorkerCompletionProbe(QObject):
+    completed = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.thread_ids: list[int] = []
+
+    @pyqtSlot()
+    def complete(self) -> None:
+        self.thread_ids.append(int(QThread.currentThreadId()))
+        self.completed.emit()
 
 
 class StockTimerProbe(QObject):
@@ -730,6 +744,8 @@ class WorkerHarness:
         self.thread = QThread()
         self.bus = CommandBus()
         self._queue_spy: QSignalSpy | None = None
+        self.completion_probe = WorkerCompletionProbe()
+        self._completion_spy = QSignalSpy(self.completion_probe.completed)
         self.configuration_calls: tuple[tuple[object, ...], ...] = ()
         self.worker = RoastServerWorker(
             outbox=self.outbox,
@@ -745,6 +761,7 @@ class WorkerHarness:
             operation_hook=operation_hook,
         )
         self.worker.moveToThread(self.thread)
+        self.completion_probe.moveToThread(self.thread)
         self.bus.configure_worker.connect(self.worker.configure)
         self.bus.test_worker.connect(self.worker.test_connection)
         self.bus.commit_worker.connect(self.worker.commit_connection)
@@ -767,7 +784,9 @@ class WorkerHarness:
         self.bus.protect_worker.connect(self.worker.update_protected_paths)
         self.bus.clear_worker.connect(self.worker.clear_unused)
         self.bus.tick_worker.connect(self.worker.process_queue_once)
+        self.bus.complete_worker.connect(self.completion_probe.complete)
         self.bus.stop_worker.connect(self.worker.stop)
+        self.worker.stopped.connect(self.completion_probe.deleteLater)
         self.worker.stopped.connect(self.worker.deleteLater)
         self.worker.destroyed.connect(self.thread.quit)
         self.thread.started.connect(self.worker.start)
@@ -882,6 +901,12 @@ class WorkerHarness:
         self.bus.tick_worker.emit()
         self.wait_until(lambda: len(self.queue_spy) > before)
 
+    def wait_for_worker_completion(self) -> None:
+        before = len(self._completion_spy)
+        self.bus.complete_worker.emit()
+        self.wait_until(lambda: len(self._completion_spy) > before)
+        assert self.completion_probe.thread_ids[-1] == self.worker_thread_id
+
     def request_connection_test(self, credential: str | None = None) -> str:
         configuration = self.worker._configuration
         assert configuration is not None
@@ -917,7 +942,7 @@ class WorkerHarness:
 
 
 @pytest.fixture(scope='module')
-def qcoreapplication() -> Generator[QCoreApplication, None, None]:
+def qcoreapplication() -> Generator[QCoreApplication]:
     app = QCoreApplication.instance()
     if app is None:
         app = QCoreApplication([])
@@ -927,7 +952,7 @@ def qcoreapplication() -> Generator[QCoreApplication, None, None]:
 @pytest.fixture
 def worker_harness(
     tmp_path: Path, qcoreapplication: QCoreApplication
-) -> Generator[WorkerHarness, None, None]:
+) -> Generator[WorkerHarness]:
     harness = WorkerHarness(tmp_path, qcoreapplication)
     yield harness
     harness.stop()
@@ -1336,10 +1361,8 @@ def test_revocation_while_blocked_before_each_permit_has_zero_boundary_side_effe
         revoked_generation = harness.configuration_fence.revoke()
         assert harness.configuration_fence.active_permits() == 0
         blocker.release.set()
-        harness.wait_until(blocker.returned.is_set)
-        for _ in range(20):
-            qcoreapplication.processEvents()
-            time.sleep(0.001)
+        harness.wait_for_worker_completion()
+        assert blocker.returned.is_set()
 
         assert harness.configuration_fence.is_current(revoked_generation)
         if operation == 'install_authorization':
@@ -1399,7 +1422,8 @@ def test_revocation_before_startup_auth_permit_has_zero_http(
         harness.configuration_fence.revoke()
         assert harness.configuration_fence.active_permits() == 0
         blocker.release.set()
-        harness.wait_until(blocker.returned.is_set)
+        harness.wait_for_worker_completion()
+        assert blocker.returned.is_set()
 
         assert tuple(harness.client_factory.calls) == factory_calls
         assert tuple(harness.client.calls) == client_calls
@@ -1432,7 +1456,8 @@ def test_cancel_before_candidate_auth_permit_has_zero_http_or_keyring(
         harness.secret_vault.clear()
         assert harness.configuration_fence.active_permits() == 0
         blocker.release.set()
-        harness.wait_until(blocker.returned.is_set)
+        harness.wait_for_worker_completion()
+        assert blocker.returned.is_set()
 
         assert tuple(harness.client_factory.calls) == factory_calls
         assert tuple(harness.client.calls) == client_calls
