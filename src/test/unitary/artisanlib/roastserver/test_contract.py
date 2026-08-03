@@ -698,6 +698,25 @@ def test_error_parser_accepts_exact_multibyte_limit_and_rejects_501_code_points(
     assert parse_error_envelope(too_long) is None
 
 
+def test_aroast_ack_accepts_bounded_compatibility_result_fields() -> None:
+    payload = valid_aroast_ack_payload()
+    result = payload['result']
+    assert isinstance(result, dict)
+    result.update(
+        {
+            'label': 'Archive Fixture Batch',
+            'amount': 1.23,
+            'end_weight_est': False,
+            'coffee': {'hr_id': 'coffee-1', 'label': 'Ethiopia Worka'},
+        }
+    )
+
+    ack = parse_aroast_ack(payload)
+
+    assert ack.success is True
+    assert ack.result.roast_id == ROAST_UUID
+
+
 def test_aroast_ack_requires_success_matching_uuid_and_safe_counters() -> None:
     ack = parse_aroast_ack(valid_aroast_ack_payload())
     assert ack.success is True

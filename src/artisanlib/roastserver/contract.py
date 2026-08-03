@@ -301,6 +301,18 @@ def _exact_object(value: object, keys: frozenset[str]) -> dict[str, object]:
     return cast(dict[str, object], mapping)
 
 
+def _object_with_required_keys(
+    value: object, keys: frozenset[str]
+) -> dict[str, object]:
+    _validate_json_graph(value, reject_string_controls=False)
+    if not isinstance(value, dict):
+        _fail()
+    mapping = cast(dict[str, object], value)
+    if not keys.issubset(mapping):
+        _fail()
+    return mapping
+
+
 def _has_prohibited_string_code_point(text: str, *, reject_controls: bool) -> bool:
     for char in text:
         code_point = ord(char)
@@ -950,7 +962,9 @@ def parse_aroast_ack(value: object) -> AroastAck:
     mapping = _exact_object(value, frozenset({'success', 'result', 'rlimit', 'rusage', 'rremaining'}))
     if mapping['success'] is not True:
         _fail()
-    result_mapping = _exact_object(mapping['result'], frozenset({'roast_id', 'modified_at'}))
+    result_mapping = _object_with_required_keys(
+        mapping['result'], frozenset({'roast_id', 'modified_at'})
+    )
     return AroastAck(
         success=True,
         result=AroastResult(
