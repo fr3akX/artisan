@@ -12,7 +12,8 @@ import stat
 import subprocess
 import sys
 import threading
-from typing import Any, BinaryIO
+from types import SimpleNamespace
+from typing import Any, BinaryIO, cast
 from uuid import UUID
 
 import pytest
@@ -1507,6 +1508,44 @@ def test_cache_error_redacts_os_paths_controls_and_server_strings(
     assert raised.value.__cause__ is None
     assert '/private' not in repr(raised.value)
     assert 'server-name' not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    ('changed_field', 'accepted'),
+    (('st_ctime_ns', True), ('st_mtime_ns', False)),
+)
+def test_windows_cache_entry_comparison_ignores_only_ctime_discrepancy(
+    cache: CacheStore,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str,
+    accepted: bool,
+) -> None:
+    original_entry_stat = filesystem_module.generated_entry_stat
+
+    def shifted_entry_stat(root: Path, path: Path) -> os.stat_result:
+        value = original_entry_stat(root, path)
+        fields = {
+            'st_dev': value.st_dev,
+            'st_ino': value.st_ino,
+            'st_size': value.st_size,
+            'st_mtime_ns': value.st_mtime_ns,
+            'st_ctime_ns': value.st_ctime_ns,
+        }
+        fields[changed_field] += 1
+        return cast(os.stat_result, SimpleNamespace(**fields))
+
+    monkeypatch.setattr(cache_module, '_ENTRY_CTIME_RELIABLE', False, raising=False)
+    monkeypatch.setattr(
+        filesystem_module, 'generated_entry_stat', shifted_entry_stat
+    )
+    staged = stage_bytes(cache, NAMESPACE, PROFILE_BYTES)
+
+    if accepted:
+        cached = cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
+        assert cache.validate(cached) == cached
+    else:
+        with pytest.raises(CacheError):
+            cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
 
 
 def test_cache_copy_failure_logs_fixed_subphase(

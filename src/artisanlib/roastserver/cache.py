@@ -82,6 +82,7 @@ _log = logging.getLogger(__name__)
 
 _SCHEMA_VERSION: Final[int] = 1
 _COPY_CHUNK_BYTES: Final[int] = 1024 * 1024
+_ENTRY_CTIME_RELIABLE: bool = os.name != 'nt'
 _LOCK_NAME: Final[str] = '.cache.lock'
 _NAMESPACE_KEY_RE: Final[re.Pattern[str]] = re.compile(r'^namespace-sha256:([0-9a-f]{64})$')
 _NAMESPACE_DIRECTORY_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{64}$')
@@ -782,7 +783,7 @@ class CacheStore:
                     raise CacheError
                 phase = 'verify_source_entry'
                 entry = secure_filesystem.generated_entry_stat(self.root, staged_path)
-                if _file_identity(after) != _file_identity(entry):
+                if not _same_file_entry(after, entry):
                     raise CacheError
                 phase = 'flush_copy'
                 _fsync_descriptor(destination)
@@ -908,7 +909,7 @@ class CacheStore:
             if _file_identity(before) != _file_identity(after):
                 raise CacheError
             entry = secure_filesystem.generated_entry_stat(self.root, path)
-            if _file_identity(after) != _file_identity(entry):
+            if not _same_file_entry(after, entry):
                 raise CacheError
         finally:
             os.close(descriptor)
@@ -935,7 +936,7 @@ class CacheStore:
             if _file_identity(before) != _file_identity(after):
                 raise CacheError
             entry = secure_filesystem.generated_entry_stat(self.root, path)
-            if _file_identity(after) != _file_identity(entry):
+            if not _same_file_entry(after, entry):
                 raise CacheError
         finally:
             os.close(descriptor)
@@ -1550,6 +1551,23 @@ def _sha256(value: object) -> str:
 
 def _file_identity(value: os.stat_result) -> _FileIdentity:
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+def _same_file_entry(opened: os.stat_result, entry: os.stat_result) -> bool:
+    stable = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_mtime_ns,
+    ) == (
+        entry.st_dev,
+        entry.st_ino,
+        entry.st_size,
+        entry.st_mtime_ns,
+    )
+    return stable and (
+        not _ENTRY_CTIME_RELIABLE or opened.st_ctime_ns == entry.st_ctime_ns
+    )
 
 
 def _read_chunk(descriptor: int) -> bytes:
