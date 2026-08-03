@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import inspect
@@ -8,6 +9,8 @@ import json
 import secrets
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Buffer, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
@@ -22,8 +25,10 @@ from requests.adapters import HTTPAdapter
 from requests.structures import CaseInsensitiveDict
 from urllib3._collections import HTTPHeaderDict
 
+import artisanlib.roastserver.api as roastserver_api
 from artisanlib.roastserver.api import ApiFailure, DownloadReceipt, RoastServerClient
 from artisanlib.roastserver.contract import (
+    FAILURE_MESSAGES,
     ArchiveFilters,
     FailureKind,
     MAX_JSON_BYTES,
@@ -419,10 +424,22 @@ def real_client(
     return client, session, adapter, credential
 
 
-def multipart_profile(call: AdapterCall) -> bytes:
+def multipart_body(call: AdapterCall) -> bytes:
     body = call.request.body
+    if isinstance(body, bytes):
+        return body
+    assert hasattr(body, 'read') and hasattr(body, 'seek') and hasattr(body, 'tell')
+    position = body.tell()
+    body.seek(0)
+    value = body.read()
+    body.seek(position)
+    assert isinstance(value, bytes)
+    return value
+
+
+def multipart_profile(call: AdapterCall) -> bytes:
+    body = multipart_body(call)
     content_type = call.request.headers.get('Content-Type', '')
-    assert isinstance(body, bytes)
     assert content_type.startswith('multipart/form-data; boundary=')
     boundary = content_type.removeprefix('multipart/form-data; boundary=').encode('ascii')
     for part in body.split(b'--' + boundary):
@@ -525,6 +542,104 @@ class NonTruncatableDestination(io.BytesIO):
     @override
     def truncate(self, size: int | None = None, /) -> int:
         raise OSError('truncate unsupported')
+
+
+class RecordingWriteDestination(io.BytesIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_sizes: list[int] = []
+        self.flush_calls = 0
+
+    @override
+    def write(self, data: Buffer, /) -> int:
+        self.write_sizes.append(len(data))
+        return super().write(data)
+
+    @override
+    def flush(self) -> None:
+        self.flush_calls += 1
+        super().flush()
+
+
+class SlowDripResponse(FakeResponse):
+    def __init__(
+        self,
+        body: bytes,
+        delay_seconds: float,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(
+            200,
+            [bytes((value,)) for value in body],
+            headers
+            if headers is not None
+            else {
+                'Content-Type': 'application/json',
+                'Content-Length': str(len(body)),
+            },
+        )
+        self._delay_seconds = delay_seconds
+        self._closed_event = threading.Event()
+        self.close_calls = 0
+
+    @override
+    def iter_content(
+        self,
+        chunk_size: int | None = 1,
+        decode_unicode: bool = False,
+    ) -> Iterator[bytes]:
+        assert decode_unicode is False
+        self.requested_chunk_size = chunk_size
+        for chunk in self._chunks:
+            assert isinstance(chunk, bytes)
+            if self._closed_event.wait(self._delay_seconds):
+                return
+            yield chunk
+
+    @override
+    def close(self) -> None:
+        self.close_calls += 1
+        self._closed_event.set()
+        super().close()
+
+
+class DeadlineBlockingAdapter(HTTPAdapter):
+    def __init__(self, *, consume_upload: bool) -> None:
+        super().__init__(max_retries=0)
+        self.consume_upload = consume_upload
+        self.calls: list[requests.PreparedRequest] = []
+        self.close_calls = 0
+        self.body_started = threading.Event()
+        self._closed_event = threading.Event()
+
+    @override
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        stream: bool = False,
+        timeout: object = None,
+        verify: object = True,
+        cert: object = None,
+        proxies: Mapping[str, str] | None = None,
+    ) -> requests.Response:
+        del stream, timeout, verify, cert, proxies
+        self.calls.append(request)
+        if self.consume_upload:
+            body = request.body
+            if not hasattr(body, 'read'):
+                raise AssertionError('upload body is not deadline-guarded')
+            chunk = body.read(7)
+            assert isinstance(chunk, bytes) and chunk
+            self.body_started.set()
+        if not self._closed_event.wait(0.75):
+            raise AssertionError('deadline did not close the adapter')
+        raise requests.ConnectionError('released blocked transport diagnostic')
+
+    @override
+    def close(self) -> None:
+        self.close_calls += 1
+        self._closed_event.set()
+        super().close()
 
 
 type ClientFactory = Callable[
@@ -771,16 +886,17 @@ def test_upload_multipart_has_exact_fields_and_validates_current_hash_success(
     call = session.calls[0]
     assert call.method == 'POST'
     assert call.url == f'https://example.test/api/v1/roasts/{ROAST_UUID.hex}/revisions'
-    assert isinstance(call.data, bytes)
-    assert call.data.count(b'Content-Disposition: form-data; name=') == 4
-    assert b'name="sha256"' in call.data
-    assert SHA256.encode() in call.data
-    assert b'name="idempotency_key"' in call.data
-    assert IDEMPOTENCY_KEY.encode() in call.data
-    assert b'name="metadata"' in call.data
-    assert b'{"machine":"Test Drum"}' in call.data
-    assert b'name="profile"' in call.data
-    assert f'filename="{ROAST_UUID.hex}.alog"'.encode() in call.data
+    body = multipart_body(call)
+    assert call.headers['Content-Length'] == str(len(body))
+    assert body.count(b'Content-Disposition: form-data; name=') == 4
+    assert b'name="sha256"' in body
+    assert SHA256.encode() in body
+    assert b'name="idempotency_key"' in body
+    assert IDEMPOTENCY_KEY.encode() in body
+    assert b'name="metadata"' in body
+    assert b'{"machine":"Test Drum"}' in body
+    assert b'name="profile"' in body
+    assert f'filename="{ROAST_UUID.hex}.alog"'.encode() in body
     assert multipart_profile(call) == PROFILE_BYTES
     assert call.headers['Content-Type'].startswith('multipart/form-data; boundary=')
     assert snapshot.closed is False
@@ -951,6 +1067,7 @@ def test_download_validates_headers_then_streams_and_hashes_to_caller_destinatio
         filename=f'{ROAST_UUID.hex}-r1.alog',
     )
     assert destination.getvalue() == PROFILE_BYTES
+    assert destination.tell() == 0
     assert destination.closed is False
     assert response.closed_by_client is True
     assert response.requested_chunk_size == 64 * 1024
@@ -1123,9 +1240,9 @@ def test_http_status_retry_and_pause_classification(
 ) -> None:
     body: dict[str, object] = {
         'error': {
-            'code': 'safe_server_code',
-            'message': 'Safe server message.',
-            'details': None,
+            'code': 'server_controlled_code',
+            'message': '<b>Server-controlled diagnostic.</b>',
+            'details': {'private': 'infrastructure detail'},
         }
     }
     client, _session = client_factory(json_response(status_code, body))
@@ -1135,9 +1252,42 @@ def test_http_status_retry_and_pause_classification(
 
     assert raised.value.failure.kind is kind
     assert raised.value.failure.retryable is retryable
-    assert raised.value.failure.code == 'safe_server_code'
-    assert raised.value.failure.message == 'Safe server message.'
+    assert raised.value.failure.code == kind.value
+    assert raised.value.failure.message == FAILURE_MESSAGES[kind]
     assert raised.value.status_code == status_code
+    rendered = f'{raised.value!s}\n{raised.value!r}\n{raised.value.failure!r}'
+    assert 'server_controlled' not in rendered
+    assert '<b>' not in rendered
+    assert 'infrastructure' not in rendered
+
+
+def test_server_error_envelope_never_retains_transformed_credentials_or_details() -> None:
+    credential = secrets.token_urlsafe(48)
+    transformed = (
+        base64.urlsafe_b64encode(credential.encode()).decode(),
+        hashlib.sha256(credential.encode()).hexdigest(),
+        ''.join(f'&#{ord(char)};' for char in credential[:8]),
+    )
+    body = {
+        'error': {
+            'code': transformed[0],
+            'message': f'{transformed[1]} <img src=x> {transformed[2]}',
+            'details': {'diagnostic': transformed},
+        }
+    }
+    client = RoastServerClient('https://example.test', credential)
+    adapter = RecordingAdapter(credential, (json_response(400, body),))
+    _install_test_adapter(client, adapter)
+
+    with pytest.raises(ApiFailure) as raised:
+        client.test_connection()
+
+    assert raised.value.failure.code == FailureKind.PROFILE_REJECTED.value
+    assert raised.value.failure.message == FAILURE_MESSAGES[FailureKind.PROFILE_REJECTED]
+    rendered = f'{raised.value!s}\n{raised.value!r}\n{raised.value.failure!r}'
+    assert all(value not in rendered for value in transformed)
+    assert '<img' not in rendered
+    assert 'diagnostic' not in rendered
 
 
 @pytest.mark.parametrize(
@@ -1455,6 +1605,106 @@ def test_real_session_redirect_is_one_adapter_call_and_response_is_closed() -> N
     assert adapter.responses[0].raw.closed
 
 
+def test_operation_deadline_aborts_slow_drip_and_permanently_closes_client(
+    monkeypatch: pytest.MonkeyPatch,
+    client_factory: ClientFactory,
+) -> None:
+    monkeypatch.setattr(roastserver_api, 'OPERATION_DEADLINE_SECONDS', 0.08)
+    body = json.dumps(valid_identity_payload(), separators=(',', ':')).encode()
+    response = SlowDripResponse(body, 0.03)
+    client, recording_adapter = client_factory(response)
+
+    started = time.monotonic()
+    with pytest.raises(ApiFailure) as raised:
+        client.test_connection()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.4
+    assert raised.value.failure.kind is FailureKind.OFFLINE
+    assert raised.value.failure.code == 'timeout'
+    assert raised.value.failure.message == FAILURE_MESSAGES[FailureKind.OFFLINE]
+    assert raised.value.failure.retryable is True
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert response.closed_by_client is True
+    assert response.close_calls >= 1
+    assert len(recording_adapter.calls) == 1
+    assert vars(client)['_closed'] is True
+    assert vars(client)['_credential'] == ''
+    assert vars(client)['_session'] is None
+
+    with pytest.raises(ApiFailure) as closed:
+        client.test_connection()
+    assert closed.value.failure.code == 'client_closed'
+    assert not any(
+        thread.name == 'RoastServerDeadlineWatchdog' and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+def test_download_deadline_rolls_back_streamed_prefix_and_closes_response(
+    monkeypatch: pytest.MonkeyPatch,
+    client_factory: ClientFactory,
+) -> None:
+    monkeypatch.setattr(roastserver_api, 'OPERATION_DEADLINE_SECONDS', 0.08)
+    response = SlowDripResponse(PROFILE_BYTES, 0.03, download_headers())
+    client, adapter = client_factory(response)
+    destination = io.BytesIO()
+
+    started = time.monotonic()
+    with pytest.raises(ApiFailure) as raised:
+        client.download_revision(detail_for_download(), destination)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.4
+    assert raised.value.failure.code == 'timeout'
+    assert raised.value.failure.message == FAILURE_MESSAGES[FailureKind.OFFLINE]
+    assert destination.getvalue() == b''
+    assert destination.tell() == 0
+    assert response.closed_by_client is True
+    assert response.close_calls >= 1
+    assert len(adapter.calls) == 1
+    assert vars(client)['_closed'] is True
+
+
+@pytest.mark.parametrize('operation', ('headers', 'upload'))
+def test_operation_deadline_closes_adapter_to_release_blocked_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    monkeypatch.setattr(roastserver_api, 'OPERATION_DEADLINE_SECONDS', 0.08)
+    client = RoastServerClient('https://example.test', secrets.token_urlsafe(32))
+    adapter = DeadlineBlockingAdapter(consume_upload=operation == 'upload')
+    _install_test_adapter(client, adapter)
+
+    started = time.monotonic()
+    with pytest.raises(ApiFailure) as raised:
+        if operation == 'upload':
+            client.upload_revision(
+                ROAST_UUID,
+                SHA256,
+                IDEMPOTENCY_KEY,
+                b'{}',
+                io.BytesIO(PROFILE_BYTES),
+            )
+        else:
+            client.test_connection()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.4
+    assert raised.value.failure.kind is FailureKind.OFFLINE
+    assert raised.value.failure.code == 'timeout'
+    assert raised.value.failure.message == FAILURE_MESSAGES[FailureKind.OFFLINE]
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert len(adapter.calls) == 1
+    assert adapter.close_calls == 1
+    assert adapter.body_started.is_set() is (operation == 'upload')
+    assert vars(client)['_closed'] is True
+    assert vars(client)['_credential'] == ''
+    assert vars(client)['_session'] is None
+
+
 def test_upload_freezes_one_bounded_caller_read_before_real_multipart_preparation() -> None:
     snapshot = MutatingSnapshot()
     client, _session, adapter, _credential = real_client(
@@ -1473,13 +1723,13 @@ def test_upload_freezes_one_bounded_caller_read_before_real_multipart_preparatio
     assert snapshot.read_calls == 1
     call = adapter.calls[0]
     assert multipart_profile(call) == PROFILE_BYTES
-    assert isinstance(call.request.body, bytes)
-    assert len(call.request.body) <= MAX_PROFILE_BYTES + MAX_METADATA_BYTES + 4096
-    assert call.request.body.count(b'Content-Disposition: form-data; name=') == 4
-    assert b'name="sha256"' in call.request.body
-    assert b'name="idempotency_key"' in call.request.body
-    assert b'name="metadata"' in call.request.body
-    assert b'name="profile"' in call.request.body
+    body = multipart_body(call)
+    assert len(body) <= MAX_PROFILE_BYTES + MAX_METADATA_BYTES + 4096
+    assert body.count(b'Content-Disposition: form-data; name=') == 4
+    assert b'name="sha256"' in body
+    assert b'name="idempotency_key"' in body
+    assert b'name="metadata"' in body
+    assert b'name="profile"' in body
     assert call.timeout == (4.0, 10.0)
     assert call.verify is True
     assert call.stream is True
@@ -1783,6 +2033,23 @@ def test_real_download_rejects_duplicate_checksum_header_as_invalid_framing() ->
     assert adapter.responses[0].raw.headers.getlist('X-Content-SHA256') == [SHA256, SHA256]
     assert destination.getvalue() == b''
     assert adapter.responses[0].raw.closed
+
+
+def test_download_writes_each_response_chunk_directly_then_flushes_and_rewinds(
+    client_factory: ClientFactory,
+) -> None:
+    chunks = [PROFILE_BYTES[:5], PROFILE_BYTES[5:17], PROFILE_BYTES[17:]]
+    response = raw_response(200, b'', download_headers(), chunks=chunks)
+    client, _session = client_factory(response)
+    destination = RecordingWriteDestination()
+
+    receipt = client.download_revision(detail_for_download(), destination)
+
+    assert receipt.byte_count == len(PROFILE_BYTES)
+    assert destination.getvalue() == PROFILE_BYTES
+    assert destination.write_sizes == [len(chunk) for chunk in chunks]
+    assert destination.flush_calls == 1
+    assert destination.tell() == 0
 
 
 def test_download_midstream_transport_failure_leaves_empty_rewound_destination(

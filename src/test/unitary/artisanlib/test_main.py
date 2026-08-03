@@ -4155,8 +4155,8 @@ class TestRoastServerMainIntegration:
         assert [call[0] for call in ordered.mock_calls] == [
             'serialize', 'saved_profile']
 
-    @pytest.mark.parametrize('failure', ['serialize', 'timestamp', 'post-save'])
-    def test_roastserver_autosave_failure_never_notifies(
+    @pytest.mark.parametrize('failure', ['serialize', 'timestamp'])
+    def test_roastserver_autosave_serialization_failure_never_notifies(
         self, tmp_path: Path, failure: str
     ) -> None:
         window, controller, _profile = roastserver_save_window()
@@ -4166,13 +4166,7 @@ class TestRoastServerMainIntegration:
         window.generateFilename.return_value = f'{failure}.alog'
         old_directory = os.getcwd()
 
-        if failure == 'post-save':
-            window.setCurrentFile.side_effect = OSError('post-save failed')
-            context = patch(
-                'artisanlib.main.serialize_with_timestamp',
-                wraps=util_serialize_with_timestamp,
-            )
-        elif failure == 'timestamp':
+        if failure == 'timestamp':
             context = patch(
                 'artisanlib.util.os.fstat',
                 side_effect=OSError('timestamp failed'),
@@ -4187,6 +4181,46 @@ class TestRoastServerMainIntegration:
 
         controller.saved_profile.assert_not_called()
         assert os.getcwd() == old_directory
+
+    @pytest.mark.parametrize('failure', ['post-save', 'plus-status', 'image-export'])
+    def test_roastserver_autosave_independent_failures_never_suppress_or_duplicate_queue(
+        self, tmp_path: Path, failure: str
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        window.qmc.autosaveflag = True
+        window.qmc.autosavepath = str(tmp_path)
+        window.qmc.autosaveaddtorecentfilesflag = True
+        window.generateFilename.return_value = f'{failure}.alog'
+        if failure == 'post-save':
+            window.setCurrentFile.side_effect = OSError('post-save failed')
+        elif failure == 'plus-status':
+            window.updatePlusStatus.side_effect = RuntimeError('plus status failed')
+        else:
+            window.qmc.autosaveimage = True
+            window.qmc.autosavealsopath = ''
+            window.autosave.side_effect = RuntimeError('image export failed')
+        ordered = Mock()
+        ordered.attach_mock(controller.saved_profile, 'saved_profile')
+        ordered.attach_mock(window.updatePlusStatus, 'update_plus_status')
+        ordered.attach_mock(window.autosave, 'image_export')
+
+        with patch(
+            'artisanlib.main.serialize_with_timestamp',
+            wraps=util_serialize_with_timestamp,
+        ):
+            assert window.automaticsave() == f'{failure}.alog'
+
+        controller.saved_profile.assert_called_once()
+        serialized, detached, modified_at = controller.saved_profile.call_args.args
+        assert serialized == repr(profile).encode('utf-8')
+        assert detached == profile
+        assert detached is not profile
+        assert modified_at.tzinfo is UTC
+        assert ordered.mock_calls[0] == call.saved_profile(
+            serialized, detached, modified_at)
+        expected_clean_calls = 0 if failure == 'post-save' else 1
+        assert window.qmc.fileCleanSignal.emit.call_count == expected_clean_calls
+        assert (tmp_path / f'{failure}.alog').read_bytes() == serialized
 
     def test_roastserver_save_plus_calls_remain_unchanged(self, tmp_path: Path) -> None:
         window, _controller, profile = roastserver_save_window()

@@ -44,7 +44,7 @@ All API calls are relative to the canonical origin and include `Authorization: B
 
 A revision object has exactly `revision_number`, `sha256`, `byte_size`, `parser_version`, `parse_state`, `parse_diagnostic_code`, `parse_diagnostic_message`, `uploaded_at`, `metadata`, and `reparse_recommended`. A roast list item has exactly `roast_uuid`, `state`, `roast_at`, `title`, `batch_prefix`, `batch_number`, `batch_position`, `operator`, `machine`, `machine_setup`, `temperature_unit`, `duration_seconds`, `green_weight_kg`, `roasted_weight_kg`, `revision_count`, `updated_at`, and `labels`; each label has exactly `label_uuid`, `name`, `color`, and `archived`.
 
-Errors are accepted only from the exact envelope `{"error":{"code":str,"message":str,"details":value}}`. Display `message` only when code, length, UTF-8, NUL, and control-character checks pass; otherwise use the fixed connector category text. `401` pauses for credentials, `429` and `5xx` retry, other `4xx` fail permanently, and `3xx` is always an invalid-response failure.
+Server error bodies are untrusted and their `code`, `message`, and `details` fields are always discarded by the client. Status and operation context map only to allowlisted local codes and `FAILURE_MESSAGES[kind]`. `401` pauses for credentials, `429` and `5xx` retry, other `4xx` fail permanently, and `3xx` is always an invalid-response failure.
 
 ## Known baseline that must not be attributed to this connector
 
@@ -84,8 +84,8 @@ Current baseline: the combined selection reports `1 failed, 657 passed, 1 skippe
 - `src/test/unitary/artisanlib/roastserver/test_outbox.py`
 - `src/test/unitary/artisanlib/roastserver/test_cache.py`
 - `src/test/unitary/artisanlib/roastserver/test_worker.py`
-- `src/test/unitary/artisanlib/roastserver/test_controller.py`
-- `src/test/unitary/artisanlib/roastserver/test_dialogs.py`
+- `src/test/unitary/artisanlib/roastserver/test_roastserver_controller.py`
+- `src/test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py`
 - `src/test/unitary/artisanlib/roastserver/test_coexistence.py`
 
 ### Modify
@@ -468,6 +468,7 @@ Expected: import fails because `api.py` is absent.
 ```python
 CONNECT_TIMEOUT_SECONDS: Final[float] = 4.0
 READ_TIMEOUT_SECONDS: Final[float] = 10.0
+OPERATION_DEADLINE_SECONDS: Final[float] = 12.0
 MAX_RETRY_AFTER_SECONDS: Final[int] = 3600
 
 @dataclass(frozen=True, slots=True)
@@ -487,7 +488,7 @@ class RoastServerClient:
         self._session.trust_env = False
 ```
 
-Route every endpoint through `_request(method, path, *, params=None, data=None, files=None, json_bytes=None, stream=False)`, always passing `verify=True`, `allow_redirects=False`, `(4.0, 10.0)`, `Cache-Control: no-store`, an Artisan version user agent, and the authorization header assembled only at call time. Read JSON through `_bounded_body(response, MAX_JSON_BYTES)` before parsing. Stream download chunks directly into the injected binary destination while enforcing 16 MiB and hashing; remove/close ownership remains the caller's responsibility. Never include request headers, bodies, response bodies, arbitrary exception text, or local paths in `ApiFailure`.
+Route every endpoint through one request path, always passing `verify=True`, `allow_redirects=False`, `(4.0, 10.0)`, `Cache-Control: no-store`, an Artisan version user agent, and the authorization header assembled only at call time. Start one 12-second monotonic absolute deadline before request/upload preparation and retain it through the complete response read. A secret-free watchdog closes the current response/raw object and owned session/adapters on expiry, after which the client is permanently closed; preparation, upload-body reads, and response chunks also check the same deadline. Read JSON through the bounded response loop before parsing. Stream download chunks directly into the injected empty binary destination while enforcing 16 MiB and hashing; truncate/rewind or close it on failure. Never include request headers, bodies, response bodies, server error fields, arbitrary exception text, or local paths in `ApiFailure`.
 
 - [ ] **Step 4: Run API and network-guard tests GREEN**
 
@@ -1097,7 +1098,7 @@ git commit -m "feat(roastserver): process archive work off UI thread"
 
 **Files:**
 - Create: `src/artisanlib/roastserver/controller.py`
-- Create: `src/test/unitary/artisanlib/roastserver/test_controller.py`
+- Create: `src/test/unitary/artisanlib/roastserver/test_roastserver_controller.py`
 
 **Interfaces:**
 - Consumes: `SettingsStore`, `CredentialStore`, data root, injected client factory, `profile_validator: Callable[[Path], None]`, worker/vaults, and an `ApplicationWindow` connection to `profileReady`.
@@ -1150,7 +1151,7 @@ For save causality, block the real worker while two serializations write the sam
 ```bash
 cd src
 QT_QPA_PLATFORM=offscreen .venv/bin/pytest \
-  test/unitary/artisanlib/roastserver/test_controller.py -v
+  test/unitary/artisanlib/roastserver/test_roastserver_controller.py -v
 ```
 
 Expected: import fails because `controller.py` is absent.
@@ -1190,7 +1191,7 @@ A persisted public identity configures a known namespace but installs no control
 ```bash
 cd src
 QT_QPA_PLATFORM=offscreen .venv/bin/pytest \
-  test/unitary/artisanlib/roastserver/test_controller.py \
+  test/unitary/artisanlib/roastserver/test_roastserver_controller.py \
   test/unitary/artisanlib/roastserver/test_worker.py -v
 ```
 
@@ -1200,7 +1201,7 @@ Expected: all pass and every UI-facing `QSignalSpy` callback observes the main t
 
 ```bash
 git add src/artisanlib/roastserver/controller.py \
-  src/test/unitary/artisanlib/roastserver/test_controller.py
+  src/test/unitary/artisanlib/roastserver/test_roastserver_controller.py
 git commit -m "feat(roastserver): add connector lifecycle controller"
 ```
 
@@ -1210,7 +1211,7 @@ git commit -m "feat(roastserver): add connector lifecycle controller"
 
 **Files:**
 - Create: `src/artisanlib/roastserver/dialogs.py`
-- Create: `src/test/unitary/artisanlib/roastserver/test_dialogs.py`
+- Create: `src/test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py`
 
 **Interfaces:**
 - Consumes: only `RoastServerController` public methods/signals and frozen settings/identity/queue/cache/failure objects.
@@ -1252,7 +1253,7 @@ Cover invalid URL, keyring fixed action text, origin change re-locking auto uplo
 ```bash
 cd src
 QT_QPA_PLATFORM=offscreen .venv/bin/pytest \
-  test/unitary/artisanlib/roastserver/test_dialogs.py -k 'config or failed or credential' -v
+  test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py -k 'config or failed or credential' -v
 ```
 
 Expected: import fails because `dialogs.py` is absent.
@@ -1266,7 +1267,7 @@ Use `QApplication.translate('RoastServer', text)` for all labels and fixed messa
 ```bash
 cd src
 QT_QPA_PLATFORM=offscreen .venv/bin/pytest \
-  test/unitary/artisanlib/roastserver/test_dialogs.py -k 'config or failed or credential' -v
+  test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py -k 'config or failed or credential' -v
 ```
 
 Expected: selected tests pass offscreen without a keyring daemon or HTTP.
@@ -1275,7 +1276,7 @@ Expected: selected tests pass offscreen without a keyring daemon or HTTP.
 
 ```bash
 git add src/artisanlib/roastserver/dialogs.py \
-  src/test/unitary/artisanlib/roastserver/test_dialogs.py
+  src/test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py
 git commit -m "feat(roastserver): add connector configuration dialog"
 ```
 
@@ -1287,8 +1288,8 @@ git commit -m "feat(roastserver): add connector configuration dialog"
 - Modify: `src/artisanlib/roastserver/dialogs.py`
 - Modify: `src/artisanlib/roastserver/controller.py`
 - Modify: `src/artisanlib/roastserver/worker.py`
-- Test: `src/test/unitary/artisanlib/roastserver/test_dialogs.py`
-- Test: `src/test/unitary/artisanlib/roastserver/test_controller.py`
+- Test: `src/test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py`
+- Test: `src/test/unitary/artisanlib/roastserver/test_roastserver_controller.py`
 - Test: `src/test/unitary/artisanlib/roastserver/test_worker.py`
 
 **Interfaces:**
@@ -1332,8 +1333,8 @@ Cover search trim/200-char cap and debounce, state/machine filters, UTC start/en
 ```bash
 cd src
 QT_QPA_PLATFORM=offscreen .venv/bin/pytest \
-  test/unitary/artisanlib/roastserver/test_dialogs.py -k 'browser or page or offline or open' \
-  test/unitary/artisanlib/roastserver/test_controller.py -k 'download or cached or profile' \
+  test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py -k 'browser or page or offline or open' \
+  test/unitary/artisanlib/roastserver/test_roastserver_controller.py -k 'download or cached or profile' \
   test/unitary/artisanlib/roastserver/test_worker.py -k 'browse or download or cached' -v
 ```
 
@@ -1366,8 +1367,8 @@ Complete worker/controller flow: online Open fetches detail, requires `current_r
 ```bash
 cd src
 QT_QPA_PLATFORM=offscreen .venv/bin/pytest \
-  test/unitary/artisanlib/roastserver/test_dialogs.py \
-  test/unitary/artisanlib/roastserver/test_controller.py \
+  test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py \
+  test/unitary/artisanlib/roastserver/test_roastserver_controller.py \
   test/unitary/artisanlib/roastserver/test_worker.py -v
 ```
 
@@ -1379,8 +1380,8 @@ Expected: all pass with no external request and no active-profile callback on an
 git add src/artisanlib/roastserver/dialogs.py \
   src/artisanlib/roastserver/controller.py \
   src/artisanlib/roastserver/worker.py \
-  src/test/unitary/artisanlib/roastserver/test_dialogs.py \
-  src/test/unitary/artisanlib/roastserver/test_controller.py \
+  src/test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py \
+  src/test/unitary/artisanlib/roastserver/test_roastserver_controller.py \
   src/test/unitary/artisanlib/roastserver/test_worker.py
 git commit -m "feat(roastserver): browse and verify archived profiles"
 ```

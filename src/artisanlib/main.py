@@ -13515,9 +13515,6 @@ class ApplicationWindow(QMainWindow):
     # returns filename on success, None otherwise
     def automaticsave(self, interactive:bool = True) -> str|None:
         filename:str|None = None
-        detached_profile:ProfileData|None = None
-        serialized_profile:bytes|None = None
-        saved_modified_at:datetime.datetime|None = None
         try:
             if self.qmc.autosaveflag:
                 if self.qmc.autosavepath == '':
@@ -13536,7 +13533,6 @@ class ApplicationWindow(QMainWindow):
                 filename_path = os.path.join(self.qmc.autosavepath,filename)
                 oldDir = QDir.currentPath()
                 res = QDir.setCurrent(self.qmc.autosavepath)
-                post_save_succeeded = False
                 try:
                     if res:
                         #write
@@ -13545,9 +13541,10 @@ class ApplicationWindow(QMainWindow):
                         self.plusAddPath(cast(dict[str, Any], pf), filename_path)
                         serialization_result = serialize_with_timestamp(
                             filename_path, cast(dict[str, Any], pf))
-                        detached_profile = copyd.deepcopy(pf)
-                        serialized_profile = serialization_result.serialized_profile
-                        saved_modified_at = serialization_result.modified_at
+                        self.notifyRoastServerSavedProfile(
+                            serialization_result.serialized_profile,
+                            copyd.deepcopy(pf),
+                            serialization_result.modified_at)
                         self.sendmessage(QApplication.translate('Message','Profile {0} saved in: {1}').format(filename,self.qmc.autosavepath))
                         self.setCurrentFile(filename_path,self.qmc.autosaveaddtorecentfilesflag)
                         self.qmc.fileCleanSignal.emit()
@@ -13555,13 +13552,12 @@ class ApplicationWindow(QMainWindow):
                         self.sendmessage(QApplication.translate('Message','Autosave path does not exist. Autosave failed.'))
                 finally:
                     #restore dirs
-                    post_save_succeeded = QDir.setCurrent(oldDir)
+                    QDir.setCurrent(oldDir)
                 # file might be autosaved but not uploaded to plus yet (no DROP registered). This needs to be indicated by a red plus icon
                 try:
                     self.updatePlusStatus()
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
-                    post_save_succeeded = False
                 # autosave "other" (eg. PDF) even if autosavepath is empty
                 if self.qmc.autosaveimage and not self.qmc.flagon:
                     if self.qmc.autosavealsopath != '':
@@ -13573,15 +13569,6 @@ class ApplicationWindow(QMainWindow):
                     if other_filename_path.endswith('.alog'):
                         other_filename_path = other_filename_path[0:-5]
                     self.autosave(other_filename_path)
-                if (
-                    res
-                    and post_save_succeeded
-                    and detached_profile is not None
-                    and serialized_profile is not None
-                    and saved_modified_at is not None
-                ):
-                    self.notifyRoastServerSavedProfile(
-                        serialized_profile, detached_profile, saved_modified_at)
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
             _, _, exc_tb = sys.exc_info()

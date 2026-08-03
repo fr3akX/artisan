@@ -124,8 +124,9 @@ Application shutdown never starts an unacknowledged cross-store rollback. It fir
 - Environment proxy inheritance is disabled for connector sessions.
 - Redirects are disabled for every authenticated request.
 - A redirect response is an error; credentials and bodies are never forwarded.
+- Every operation has a 12-second monotonic absolute deadline covering preparation, upload, headers, and the complete response read; expiry closes the response and owned transport and permanently closes that client instance.
 - Responses are size-bounded before JSON/profile parsing.
-- Server error envelopes are parsed into fixed safe codes/messages; arbitrary HTML and infrastructure text are not displayed.
+- Server error code, message, and details fields are discarded; status and operation context map only to allowlisted local codes and fixed connector messages, so arbitrary HTML and infrastructure text cannot cross the boundary.
 - `401` clears the connected state and pauses work without deleting the keyring entry automatically.
 
 ## Upload data flow
@@ -262,7 +263,7 @@ The UI exposes fixed categories:
 - Cached copy corrupt or unavailable.
 - Roast Server settings could not be saved.
 
-Safe server validation messages may be retained when they match the versioned error envelope and length/control-character bounds. Tokens, request bodies, profile contents, paths, tracebacks, and arbitrary proxy pages are never shown.
+Server-provided error codes, messages, and details are never retained. Tokens, request bodies, profile contents, paths, tracebacks, arbitrary server diagnostics, and proxy pages are never shown.
 
 ## Testing
 
