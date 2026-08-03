@@ -227,6 +227,11 @@ from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, en
         eventtime2string, toDim, signature_message, rec_int_to_float, smooth_list)
 
 from artisanlib.qtsingleapplication import QtSingleApplication
+from artisanlib.santoker_warmup import (
+    SantokerWarmupController,
+    WarmupResult,
+)
+from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
 
 
@@ -1446,6 +1451,11 @@ class ApplicationWindow(QMainWindow):
     pidToggleSignal = pyqtSignal()
     notificationsSetEnabledSignal = pyqtSignal(bool)
     santokerSendMessageSignal = pyqtSignal(bytes,int)
+    santokerWarmupStateSignal = pyqtSignal(object)
+    santokerWarmupTargetSignal = pyqtSignal(float)
+    santokerWarmupReadySignal = pyqtSignal(bool)
+    santokerWarmupButtonStateSignal = pyqtSignal(bool)
+    santokerWarmupControlsRefreshSignal = pyqtSignal()
     kaleidoSendMessageSignal = pyqtSignal(str,str)
     kaleidoSendMessageAwaitSignal = pyqtSignal(str,str,int,int)
     orbiterSendMessageSignal = pyqtSignal(bytes,bytes,bytes,int)
@@ -1483,7 +1493,7 @@ class ApplicationWindow(QMainWindow):
         'userprofilepath', 'printer', 'main_widget', 'defaultdpi', 'dpi', 'qmc', 'HottopControlActive', 'AsyncSamplingTimer', 'wheeldialog',
         'simulator', 'simulatorpath', 'comparator', 'eventsbuttonflag', 'minieventsflags', 'seriallogflag',
         'seriallog', 'ser', 'modbus', 'extraMODBUStemps', 'extraMODBUStx', 's7', 'extraS7tx', 'ws', 'extraser', 'extracomport', 'extrabaudrate',
-        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerEventFlags', 'santoker', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
+        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerWarmup', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
         'mugmaHost','mugmaPort', 'mugma', 'mugma_default_host', 'shelly_3EMPro_host', 'shelly_PlusPlug_host',
         'kaleido_default_host', 'kaleidoHost', 'kaleidoPort', 'kaleidoSerial', 'kaleidoPID', 'kaleido', 'kaleidoEventFlags', 'colorTrack_mean_window_size', 'colorTrack_median_window_size', 'ikawa',
         'lcdpaletteB', 'lcdpaletteF', 'extraeventsbuttonsflags', 'extraeventslabels', 'extraeventbuttoncolor', 'extraeventsactionstrings',
@@ -1509,7 +1519,7 @@ class ApplicationWindow(QMainWindow):
         'saveAsSettingsAction', 'resetAction', 'messagelabel', 'button_font_size_pt', 'button_font_size', 'button_font_size_small', 'button_font_size_small_selected',
         'button_font_size_tiny', 'button_font_size_micro',
         'pushbuttonstyles_simulator', 'pushbuttonstyles', 'standard_button_tiny_height', 'standard_button_small_height', 'standard_button_height',
-        'buttonONOFF', 'buttonSTARTSTOP', 'buttonFCs', 'buttonFCe', 'buttonSCs', 'buttonSCe', 'buttonRESET', 'buttonCHARGE', 'buttonDROP',
+        'buttonONOFF', 'santokerWarmupControls', 'buttonSTARTSTOP', 'buttonFCs', 'buttonFCe', 'buttonSCs', 'buttonSCe', 'buttonRESET', 'buttonCHARGE', 'buttonDROP',
         'buttonCONTROL', 'buttonEVENT', 'buttonSVp5', 'buttonSVp10', 'buttonSVp20', 'buttonSVm20', 'buttonSVm10', 'buttonSVm5', 'buttonDRY',
         'buttonCOOL', 'lcd1', 'lcd2', 'lcd3', 'lcd4', 'lcd5',
         'lcd6', 'lcd7', 'label2', 'label3', 'label4', 'label5', 'label6', 'label7', 'extraLCD1', 'extraLCD2', 'extraLCDlabel1', 'extraLCDlabel2',
@@ -1851,8 +1861,10 @@ class ApplicationWindow(QMainWindow):
         #    santokerSerial and santokerBLE should never be True at the same time (BLE will have preceedence)
         self.santokerSerial:bool = False # if True connection is via the main serial port
         self.santokerBLE:bool = False # if True connection is via the main serial port
+        self.santokerWarmup:bool = False # if True compact Santoker warm-up controls are shown in the top bar
         self.santokerEventFlags:list[bool] = [False, False, False, False, False, False, False ] # CHARGE, DRY, FCs, FCe, SCs, SCe, DROP
         self.santoker:Santoker|None = None # holds the Santoker instance created on connect; reset to None on disconnect
+        self.santokerWarmupController:SantokerWarmupController = SantokerWarmupController()
 
         # Santoker R
         self.santokerR:SantokerR|None = None # holds the Santoker R instance created on connect; reset to None on disconnect
@@ -3244,6 +3256,17 @@ class ApplicationWindow(QMainWindow):
         if self.app.artisanviewerMode:
             self.buttonONOFF.setVisible(False)
 
+        self.santokerWarmupControls: SantokerWarmupControls = SantokerWarmupControls()
+        self.santokerWarmupControls.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.santokerWarmupControls.setStyleSheet(self.pushbuttonstyles['OFF'])
+        self.santokerWarmupControls.button.setStyleSheet(self.pushbuttonstyles['OFF'])
+        self.santokerWarmupControls.setGraphicsEffect(self.makeShadow())
+        self.santokerWarmupControls.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.santokerWarmupControls.setCompactHeight(self.standard_button_height)
+        self.santokerWarmupControls.enabledChanged.connect(self.setSantokerWarmup)
+        self.santokerWarmupControls.targetChanged.connect(self.santokerWarmupTargetEdited)
+        self.santokerWarmupControls.hide()
+
         #create START/STOP buttons
         self.buttonSTARTSTOP: QPushButton = QPushButton(QApplication.translate('Button', 'START'))
         self.buttonSTARTSTOP.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -3962,6 +3985,7 @@ class ApplicationWindow(QMainWindow):
         self.level1layout.addSpacing(10)
         self.level1layout.addWidget(self.buttonONOFF)
         self.level1layout.addSpacing(10)
+        self.level1layout.addWidget(self.santokerWarmupControls)
         self.level1layout.addWidget(self.buttonSTARTSTOP)
         self.level1layout.addSpacing(15)
         self.level1layout.addWidget(self.buttonCONTROL)
@@ -4321,6 +4345,11 @@ class ApplicationWindow(QMainWindow):
         self.pidToggleSignal.connect(self.pidToggle)
         self.notificationsSetEnabledSignal.connect(self.notificationsSetEnabled)
         self.santokerSendMessageSignal.connect(self.santokerSendMessage)
+        self.santokerWarmupStateSignal.connect(self.santokerWarmupStateChanged)
+        self.santokerWarmupTargetSignal.connect(self.santokerWarmupTargetChanged)
+        self.santokerWarmupReadySignal.connect(self.santokerWarmupReadyChanged)
+        self.santokerWarmupButtonStateSignal.connect(self.setSantokerWarmupButtonState, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
+        self.santokerWarmupControlsRefreshSignal.connect(self.refreshSantokerWarmupControls)
         self.kaleidoSendMessageSignal.connect(self.kaleidoSendMessage)
         self.kaleidoSendMessageAwaitSignal.connect(self.kaleidoSendMessageAwait)
         self.orbiterSendMessageSignal.connect(self.orbiterSendMessage)
@@ -6043,6 +6072,7 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot(bool)
     def openMachineSettings(self, _checked:bool = False) -> None:
         action = self.sender()
+        restore_machine_selection:Callable[[], None]|None = None
         try:
             if action and isinstance(action, QAction) and hasattr(action,'data') and hasattr(action,'text'):
                 label = (action.text() if action.data()[1] == '' else f'{action.data()[1]} {action.text()}')
@@ -6072,6 +6102,28 @@ class ApplicationWindow(QMainWindow):
                     org_roastersize = self.qmc.roastersize
                     org_roasterheating_setup = self.qmc.roasterheating_setup
                     org_roasterheating = self.qmc.roasterheating
+                    org_santoker_warmup = self.santokerWarmup
+
+                    def restore_selection() -> None:
+                        self.qmc.etypes = org_etypes
+                        self.qmc.device = org_device
+                        self.qmc.machinesetup = org_machinesetup
+                        self.modbus.host = org_modbus_host
+                        self.s7.host = org_s7_host
+                        self.ws.host = org_ws_host
+                        self.kaleidoHost = org_kaleido_host
+                        self.mugmaHost = org_mugma_host
+                        self.ser.comport = org_comport
+                        self.modbus.comport = org_modbus_comport
+                        self.qmc.roastersize_setup = org_roastersize_setup
+                        self.qmc.last_batchsize = org_last_batchsize
+                        self.qmc.roastersize = org_roastersize
+                        self.qmc.roasterheating_setup = org_roasterheating_setup
+                        self.qmc.roasterheating = org_roasterheating
+                        self.santokerWarmup = org_santoker_warmup
+                        self.updateSantokerWarmupControls()
+
+                    restore_machine_selection = restore_selection
                     # reset roaster_setup_default to ensure we do not offer a default from a previously loaded machine setup
                     self.qmc.roastersize_setup_default = 0
                     self.qmc.roasterheating_setup_default = 0
@@ -6312,22 +6364,7 @@ class ApplicationWindow(QMainWindow):
                             res = False
                     if not res:
                         # reset
-                        self.qmc.etypes= org_etypes
-                        self.qmc.device = org_device
-                        self.qmc.machinesetup = org_machinesetup
-                        self.modbus.host = org_modbus_host
-                        self.s7.host = org_s7_host
-                        self.ws.host = org_ws_host
-                        self.kaleidoHost = org_kaleido_host
-                        self.mugmaHost = org_mugma_host
-                        self.ser.comport = org_comport
-                        self.modbus.comport = org_modbus_comport
-                        self.qmc.roastersize_setup = org_roastersize_setup
-                        self.qmc.last_batchsize = org_last_batchsize
-                        self.qmc.roastersize = org_roastersize
-                        self.qmc.roasterheating_setup = org_roasterheating_setup
-                        self.qmc.roasterheating = org_roasterheating
-                        #
+                        restore_machine_selection()
                         self.sendmessage(QApplication.translate('Message','Action canceled'))
                     else:
                         # setup not canceled, we establish the last_batchsize
@@ -6337,6 +6374,11 @@ class ApplicationWindow(QMainWindow):
                 self.qmc.redraw(False,False)
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
+            if restore_machine_selection is not None:
+                try:
+                    restore_machine_selection()
+                except Exception as restore_error: # pylint: disable=broad-except
+                    _log.exception(restore_error)
 
     def populateThemeMenu(self) -> None:
         self.themeMenu.clear()
@@ -9022,6 +9064,9 @@ class ApplicationWindow(QMainWindow):
             self.slider3.blockSignals(False)
             self.slider4.blockSignals(False)
 
+    def initializeSantokerWarmupSlider(self) -> None:
+        self.updateSantokerWarmupControls()
+
     # creates a drop shadow effect
     def makeShadow(self, strong:bool = False) -> QGraphicsDropShadowEffect:
         shadow = QGraphicsDropShadowEffect(self)
@@ -9587,6 +9632,8 @@ class ApplicationWindow(QMainWindow):
                     ##  button(b): sets current button to pressed if b to True and normal else
                     ##  button(): toggles state of current button
                     ##  sleep(s) : sleep for s seconds, s a float
+                    ##  santokerWarmupTemp(<value>) : set Santoker warm-up target to slider-mode value (C/F); protocol stays Celsius
+                    ##  santokerWarmup(<enabled>) : switch Santoker warm-up before CHARGE; does not send Machine ON
                     ##  santoker(<target>,<value>) : the byte <target> indicates where <value> of type integer should be written to
                     ##  kaleido(<target>,<value>) : the <target> string indicates where <value> of type string should be written to
                     ##  shellyrelay(n,b) : switches Shelly plug number <n> ON if b is true or 1, and OFF otherwise
@@ -9767,6 +9814,20 @@ class ApplicationWindow(QMainWindow):
                                     if isinstance(cs_aa,(float,int)):
                                         # cmd has format "sleep(xx.yy)"
                                         libtime.sleep(cs_aa)
+
+                                ##  santokerWarmupTemp(<value>) : set Santoker warm-up target to slider-mode value (C/F); protocol stays Celsius
+                                elif c.startswith('santokerWarmupTemp'):
+                                    args = c[len('santokerWarmupTemp'):]
+                                    if args.startswith('(') and args.endswith(')'):
+                                        warmup_target_value = float(eval(args[1:-1][:eval_limit]))  # pylint: disable=eval-used
+                                        self.setSantokerWarmupTarget(warmup_target_value)
+
+                                ##  santokerWarmup(<enabled>) : switch Santoker warm-up before CHARGE; does not send Machine ON
+                                elif c.startswith('santokerWarmup'):
+                                    args = c[len('santokerWarmup'):]
+                                    if args.startswith('(') and args.endswith(')'):
+                                        enabled = bool(eval(args[1:-1][:eval_limit]))  # pylint: disable=eval-used
+                                        self.setSantokerWarmup(enabled)
 
                                 ##  santoker(<target>,<value>) : the <target> hex string indicates where <value> of type integer should be written to
                                 elif c.startswith('santoker'):
@@ -12146,6 +12207,36 @@ class ApplicationWindow(QMainWindow):
             self.showControls(False)
         else:
             self.hideControls(False)
+        self.updateSantokerWarmupControls()
+
+    def updateSantokerWarmupControls(self) -> None:
+        visible = (
+            bool(self.santokerWarmup)
+            and not self.app.artisanviewerMode
+            and (self.qmc.flagon or self.qmc.flagstart)
+        )
+        unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
+        target = self.santokerWarmupController.target_for_display(unit)
+        self.santokerWarmupControls.configureTarget(unit, target)
+
+        ready = False
+        pre_charge = (
+            self.qmc.timeindex[0] == -1
+            and not self.santokerWarmupController.is_charge_latched()
+        )
+        warmup_enabled = False
+        if self.santoker is not None:
+            ready = self.santoker.isHeaderReady()
+            warmup_enabled = pre_charge and self.santoker.getWarmup() is True
+        safe_to_start = visible and ready and pre_charge
+
+        self.santokerWarmupControls.setVisible(visible)
+        self.santokerWarmupControls.setState(warmup_enabled)
+        self.santokerWarmupControls.button.setEnabled(safe_to_start)
+        self.santokerWarmupControls.target.setEnabled(visible)
+        style = self.pushbuttonstyles['ON' if warmup_enabled else 'OFF']
+        self.santokerWarmupControls.setStyleSheet(style)
+        self.santokerWarmupControls.button.setStyleSheet(style)
 
     @pyqtSlot()
     @pyqtSlot(bool)
@@ -19189,6 +19280,122 @@ class ApplicationWindow(QMainWindow):
                 self.notificationManager.disableNotifications()
                 self.notificationManager.hideNotifications()
 
+    @pyqtSlot()
+    def refreshSantokerWarmupControls(self) -> None:
+        controls = getattr(self, 'santokerWarmupControls', None)
+        if controls is not None:
+            ApplicationWindow.updateSantokerWarmupControls(self)
+
+    @pyqtSlot(bool)
+    def santokerWarmupReadyChanged(self, _ready:bool) -> None:
+        if bool(getattr(self, 'santokerWarmup', False)):
+            ApplicationWindow.refreshSantokerWarmupControls(self)
+
+    @pyqtSlot(bool)
+    def setSantokerWarmupButtonState(self, enabled:bool) -> None:
+        controls = getattr(self, 'santokerWarmupControls', None)
+        if controls is not None:
+            controls.setState(enabled)
+            style = self.pushbuttonstyles['ON' if enabled else 'OFF']
+            controls.setStyleSheet(style)
+            controls.button.setStyleSheet(style)
+
+    def runSantokerWarmupCharge(self, action:Callable[[], None]) -> None:
+        try:
+            if bool(getattr(self, 'santokerWarmup', False)):
+                with self.santokerWarmupController.serialized():
+                    action()
+            else:
+                action()
+        finally:
+            ApplicationWindow.refreshSantokerWarmupControls(self)
+
+    @pyqtSlot(float)
+    def santokerWarmupTargetChanged(self, temp_c:float) -> None:
+        if not bool(getattr(self, 'santokerWarmup', False)):
+            return
+        self.santokerWarmupController.accept_reported_target(temp_c)
+        controls = getattr(self, 'santokerWarmupControls', None)
+        if controls is not None:
+            unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
+            controls.configureTarget(
+                unit,
+                self.santokerWarmupController.target_for_display(unit),
+            )
+
+    @pyqtSlot(object)
+    def santokerWarmupStateChanged(self, state:object) -> None:
+        if not bool(getattr(self, 'santokerWarmup', False)):
+            return
+        if state is None:
+            ApplicationWindow.setSantokerWarmupButtonState(self, False)
+            return
+        if not isinstance(state, bool):
+            return
+        unsafe = self.santokerWarmupController.reconcile_reported_state(
+            state,
+            self.qmc.timeindex[0],
+            self.santoker,
+        )
+        ApplicationWindow.setSantokerWarmupButtonState(self, False if unsafe else state)
+        if unsafe:
+            self.sendmessage(QApplication.translate(
+                'Message',
+                'Santoker warm-up reported ON after CHARGE; sending OFF',
+            ))
+
+    def reportSantokerWarmupResult(self, result:WarmupResult) -> None:
+        messages = {
+            WarmupResult.NO_CONNECTION: QApplication.translate(
+                'Message', 'Santoker roaster is not connected'
+            ),
+            WarmupResult.NOT_READY: QApplication.translate(
+                'Message', 'Waiting for Santoker roaster data'
+            ),
+            WarmupResult.AFTER_CHARGE: QApplication.translate(
+                'Message', 'Santoker warm-up is only available before CHARGE'
+            ),
+            WarmupResult.OUT_OF_RANGE: QApplication.translate(
+                'Message', 'Santoker warm-up target must be between 100 and 300°C'
+            ),
+        }
+        if result in messages:
+            self.sendmessage(messages[result])
+
+    @pyqtSlot(int)
+    def santokerWarmupTargetEdited(self, display_temp:int) -> None:
+        ApplicationWindow.setSantokerWarmupTarget(self, float(display_temp))
+
+    def setSantokerWarmupTarget(self, display_temp:float) -> bool:
+        unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
+        active_device = (
+            self.santoker
+            if self.santoker is not None and self.santoker.getWarmup() is True
+            else None
+        )
+        result = self.santokerWarmupController.set_target(
+            display_temp,
+            unit,
+            active_device,
+        )
+        self.reportSantokerWarmupResult(result)
+        controls = getattr(self, 'santokerWarmupControls', None)
+        if controls is not None:
+            self.santokerWarmupControlsRefreshSignal.emit()
+        return result is WarmupResult.OK
+
+    def setSantokerWarmup(self, enabled:bool) -> bool:
+        with self.santokerWarmupController.serialized():
+            result = self.santokerWarmupController.set_enabled(
+                enabled,
+                self.qmc.timeindex[0],
+                self.santoker,
+            )
+            self.reportSantokerWarmupResult(result)
+            accepted = result is WarmupResult.OK
+            self.santokerWarmupButtonStateSignal.emit(enabled if accepted else False)
+            return accepted
+
     @pyqtSlot(bytes,int)
     def santokerSendMessage(self, target:bytes, value:int) -> None:
         if self.santoker is not None:
@@ -19292,6 +19499,16 @@ class ApplicationWindow(QMainWindow):
                 'AxisPosition','PhasesPosition', 'BatchPosition', 'SamplingPosition', 'autosaveGeometry', 'PIDPosition',
                 'DesignerPosition','PIDLCDGeometry','ScaleLCDGeometry', 'MainSplitter', 'StatisticsGeometry']:
             settings.remove(s)
+
+    def loadSantokerWarmupCapability(self, settings:QSettings, *, theme:bool) -> None:
+        if not theme:
+            self.santokerWarmup = toBool(settings.value('santokerWarmup', False))
+
+    def saveSantokerWarmupCapability(self, settings:QSettings,
+            default_settings:dict[str, Any]|None, *, read_defaults:bool) -> None:
+        ApplicationWindow.settingsSetValue(
+            settings, default_settings, 'santokerWarmup', self.santokerWarmup, read_defaults
+        )
 
     #loads the settings at the start of application. See the oppposite closeEventSettings()
     def settingsLoad(self, filename:str|None = None, theme:bool = False, machine:bool = False, redraw:bool = True) -> bool: # pyright: ignore [reportGeneralTypeIssues] # Code is too complex to analyze; reduce complexity by refactoring into subroutines or reducing
@@ -19572,6 +19789,7 @@ class ApplicationWindow(QMainWindow):
             self.santokerPort = toInt(settings.value('santokerPort',self.santokerPort))
             self.santokerSerial = toBool(settings.value('santokerSerial',self.santokerSerial))
             self.santokerBLE = toBool(settings.value('santokerBLE',self.santokerBLE))
+            self.loadSantokerWarmupCapability(settings, theme=theme)
             if settings.contains('santokerEventFlags'):
                 self.santokerEventFlags = [toBool(x) for x in toList(settings.value('santokerEventFlags',self.santokerEventFlags))]
             self.kaleidoHost = toString(settings.value('kaleidoHost',self.kaleidoHost))
@@ -20637,6 +20855,7 @@ class ApplicationWindow(QMainWindow):
             self.qmc.mode_tempsliders = ('F' if str(settings.value('ModeTempSliders',self.qmc.mode_tempsliders)) == 'F' else 'C')
             settings.endGroup()
             self.qmc.adjustTempSliders() # adjust min/max slider limits of temperature sliders to correspond to the current temp mode
+            self.initializeSantokerWarmupSlider()
 #--- END GROUP Sliders
 
 #--- BEGIN GROUP Quantifiers
@@ -21653,6 +21872,9 @@ class ApplicationWindow(QMainWindow):
             self.settingsSetValue(settings, default_settings, 'santokerPort',self.santokerPort, read_defaults)
             self.settingsSetValue(settings, default_settings, 'santokerSerial',self.santokerSerial, read_defaults)
             self.settingsSetValue(settings, default_settings, 'santokerBLE',self.santokerBLE, read_defaults)
+            self.saveSantokerWarmupCapability(
+                settings, default_settings, read_defaults=read_defaults
+            )
             self.settingsSetValue(settings, default_settings, 'santokerEventFlags',self.santokerEventFlags, read_defaults)
             self.settingsSetValue(settings, default_settings, 'kaleidoHost',self.kaleidoHost, read_defaults)
             self.settingsSetValue(settings, default_settings, 'kaleidoPort',self.kaleidoPort, read_defaults)

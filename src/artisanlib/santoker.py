@@ -120,6 +120,11 @@ class Santoker(AsyncComm):
     POWER:Final[bytes] = b'\xFA'
     AIR:Final[bytes] = b'\xCA'
     DRUM:Final[bytes] = b'\xC0'
+    WARMUP:Final[bytes] = b'\x7E'
+    WARMUP_TEMP:Final[bytes] = b'\x7F'
+    MIN_WARMUP_TEMP_C:Final[float] = 100.0
+    MAX_WARMUP_TEMP_C:Final[float] = 300.0
+    DEFAULT_WARMUP_TEMP_C:Final[float] = 190.0
     #
     CHARGE:Final = b'\x80'
     DRY:Final = b'\x81'
@@ -133,9 +138,11 @@ class Santoker(AsyncComm):
     BT_CALIB = b'\x87'
     ET_CALIB = b'\x88'
 
-    __slots__ = [ 'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler', '_board', '_bt', '_et',
-                    '_bt_ror', '_et_ror', '_ir',
-                    '_power', '_air', '_drum', '_CHARGE', '_DRY', '_FCs', '_SCs', '_DROP', '_connect_using_ble', '_ble_client' ]
+    __slots__ = [ 'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler', '_warmup_handler', '_warmup_temp_handler',
+                    '_ready_handler', '_board', '_bt', '_et', '_bt_ror', '_et_ror', '_ir',
+                    '_power', '_air', '_drum', '_CHARGE', '_DRY', '_FCs', '_SCs', '_DROP',
+                    '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
+                    '_connect_using_ble', '_ble_client' ]
 
     def __init__(self, host:str = '127.0.0.1', port:int = 8080, serial:'SerialSettings|None' = None,
                 connect_using_ble:bool = False,
@@ -145,9 +152,18 @@ class Santoker(AsyncComm):
                 dry_handler:Callable[[], None]|None = None,
                 fcs_handler:Callable[[], None]|None = None,
                 scs_handler:Callable[[], None]|None = None,
-                drop_handler:Callable[[], None]|None = None) -> None:
+                drop_handler:Callable[[], None]|None = None,
+                warmup_handler:Callable[[bool | None], None]|None = None,
+                warmup_temp_handler:Callable[[float], None]|None = None,
+                warmup_target: float = DEFAULT_WARMUP_TEMP_C,
+                ready_handler:Callable[[bool], None]|None = None) -> None:
 
-        super().__init__(host, port, serial, connected_handler, disconnected_handler)
+        def on_disconnected() -> None:
+            self.resetProtocolState()
+            if disconnected_handler is not None:
+                disconnected_handler()
+
+        super().__init__(host, port, serial, connected_handler, on_disconnected)
 
         self.HEADER:bytes = (self.HEADER_BT if connect_using_ble else self.HEADER_WIFI)
 
@@ -159,6 +175,16 @@ class Santoker(AsyncComm):
         self._fcs_handler:Callable[[], None]|None = fcs_handler
         self._scs_handler:Callable[[], None]|None = scs_handler
         self._drop_handler:Callable[[], None]|None = drop_handler
+        self._warmup_handler:Callable[[bool | None], None]|None = warmup_handler
+        self._warmup_temp_handler:Callable[[float], None]|None = warmup_temp_handler
+        self._ready_handler:Callable[[bool], None]|None = ready_handler
+
+        self._header_ready:bool = False
+        self._warmup:bool | None = None
+        self._warmup_target:float = self.DEFAULT_WARMUP_TEMP_C
+        self._reported_warmup_target:float | None = None
+        if self.MIN_WARMUP_TEMP_C <= warmup_target <= self.MAX_WARMUP_TEMP_C:
+            self._warmup_target = warmup_target
 
         # current readings
         self._board:float = -1  # board temperature in °C
@@ -179,7 +205,7 @@ class Santoker(AsyncComm):
         self._DROP:bool = False
 
         self._ble_client:SantokerCube_BLE|None = \
-                (SantokerCube_BLE(self.read_msg, connected_handler, disconnected_handler) if self._connect_using_ble else None)
+                (SantokerCube_BLE(self.read_msg, connected_handler, on_disconnected) if self._connect_using_ble else None)
 
 
     # external API to access machine state
@@ -202,6 +228,51 @@ class Santoker(AsyncComm):
         return self._air
     def getDrum(self) -> int:
         return self._drum
+    def isHeaderReady(self) -> bool:
+        return self._header_ready
+    def getWarmup(self) -> bool | None:
+        return self._warmup
+    def getWarmupTarget(self) -> float:
+        return self._warmup_target
+
+    def _setHeaderReady(self, ready: bool) -> None:
+        if ready != self._header_ready:
+            self._header_ready = ready
+            if self._ready_handler is not None:
+                try:
+                    self._ready_handler(ready)
+                except Exception as e: # pylint: disable=broad-except
+                    _log.exception(e)
+
+    def _setWarmupState(self, enabled: bool | None) -> None:
+        if enabled != self._warmup:
+            self._warmup = enabled
+            if self._warmup_handler is not None:
+                try:
+                    self._warmup_handler(enabled)
+                except Exception as e: # pylint: disable=broad-except
+                    _log.exception(e)
+
+    def setWarmupTarget(self, temp_c: float) -> bool:
+        if not self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
+            return False
+        self._warmup_target = temp_c
+        if self._warmup is True:
+            if not self._header_ready:
+                return False
+            self.send_msg(self.WARMUP_TEMP, int(round(temp_c * 10)))
+        return True
+
+    def setWarmup(self, enabled: bool) -> bool:
+        if not self._header_ready:
+            return False
+        if enabled:
+            self.send_msg(self.WARMUP_TEMP, int(round(self._warmup_target * 10)))
+            self.send_msg(self.WARMUP, 1)
+        else:
+            self.send_msg(self.WARMUP, 0)
+        self._setWarmupState(enabled)
+        return True
 
     def resetReadings(self) -> None:
         self._board = -1
@@ -213,6 +284,11 @@ class Santoker(AsyncComm):
         self._power = -1
         self._air = -1
         self._drum = -1
+
+    def resetProtocolState(self) -> None:
+        self._setHeaderReady(False)
+        self._reported_warmup_target = None
+        self._setWarmupState(None)
 
     # message decoder
 
@@ -298,6 +374,27 @@ class Santoker(AsyncComm):
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
             self._DROP = b
+        elif target == self.WARMUP:
+            if value in {0, 1}:
+                self._setWarmupState(bool(value))
+            elif self._logging:
+                _log.debug('invalid warm-up state: %s', value)
+        elif target == self.WARMUP_TEMP:
+            temp_c = value / 10.0
+            if self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
+                changed = (
+                    temp_c != self._reported_warmup_target
+                    or temp_c != self._warmup_target
+                )
+                self._reported_warmup_target = temp_c
+                self._warmup_target = temp_c
+                if changed and self._warmup_temp_handler is not None:
+                    try:
+                        self._warmup_temp_handler(temp_c)
+                    except Exception as e: # pylint: disable=broad-except
+                        _log.exception(e)
+            elif self._logging:
+                _log.debug('invalid warm-up target: %s', temp_c)
 #        elif self._logging and target in {self.MIN_POWER, self.MAX_POWER, self.BT_CALIB, self.ET_CALIB}:
 #            _log.debug('unsupported data target %s', target)
 #        elif self._logging:
@@ -321,9 +418,9 @@ class Santoker(AsyncComm):
         # so we adjust to the header we receive and use that on sending our messages as well
         snd_header_byte = await stream.readexactly(1)
         if snd_header_byte == self.HEADER_BT[1:2]:
-            self.HEADER = self.HEADER_BT
+            candidate_header = self.HEADER_BT
         elif snd_header_byte == self.HEADER_WIFI[1:2]:
-            self.HEADER = self.HEADER_WIFI
+            candidate_header = self.HEADER_WIFI
         else:
             return
         # read the data target (BT, ET,..)
@@ -351,6 +448,8 @@ class Santoker(AsyncComm):
         if tail != self.TAIL:
             return
         # full message decoded
+        self.HEADER = candidate_header
+        self._setHeaderReady(True)
         self.register_reading(target, data)
 
     # send message interface
@@ -383,6 +482,7 @@ class Santoker(AsyncComm):
 
     @override
     def stop(self) -> None:
+        self.resetProtocolState()
         if self._connect_using_ble and hasattr(self, '_ble_client') and self._ble_client is not None:
             self._ble_client.stop()
             #del self._ble_client # on this level the released object should be automatically collected by the GC
