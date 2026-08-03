@@ -8345,10 +8345,13 @@ class tgraphcanvas(QObject):
 
         # now clear all measurements and redraw
 
-        self.clearMeasurements(
-            update_presentation=not server_read_only,
-            server_read_only=server_read_only,
-        )
+        if server_read_only:
+            self.clearMeasurements(
+                update_presentation=False,
+                server_read_only=True,
+            )
+        else:
+            self.clearMeasurements()
         if not server_read_only:
             #clear PhasesLCDs
             self.aw.updatePhasesLCDs()
