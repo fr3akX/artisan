@@ -746,39 +746,53 @@ class CacheStore:
         expected_sha256: str,
         expected_byte_count: int,
     ) -> None:
-        source = secure_filesystem.open_generated_file(self.root, staged_path)
+        phase = 'open_source'
         try:
-            before = os.fstat(source)
-            if not stat.S_ISREG(before.st_mode):
-                raise CacheError
-            if (before.st_dev, before.st_ino) != expected_identity:
-                raise CacheError
-            secure_filesystem.verify_private_permissions(staged_path, 0o600)
-            digest = hashlib.sha256()
-            byte_count = 0
-            while True:
-                chunk = _read_chunk(source)
-                if not chunk:
-                    break
-                byte_count += len(chunk)
-                if byte_count > MAX_PROFILE_BYTES:
+            source = secure_filesystem.open_generated_file(self.root, staged_path)
+            try:
+                phase = 'stat_source'
+                before = os.fstat(source)
+                if not stat.S_ISREG(before.st_mode):
                     raise CacheError
-                digest.update(chunk)
-                secure_filesystem.write_all(destination, chunk)
-            if byte_count < 1 or byte_count != expected_byte_count:
-                raise CacheError
-            if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
-                raise CacheError
-            after = os.fstat(source)
-            if _file_identity(before) != _file_identity(after):
-                raise CacheError
-            entry = secure_filesystem.generated_entry_stat(self.root, staged_path)
-            if _file_identity(after) != _file_identity(entry):
-                raise CacheError
-            _fsync_descriptor(destination)
-            secure_filesystem.set_private_permissions(copy_path, 0o600)
-        finally:
-            os.close(source)
+                phase = 'verify_source_identity'
+                if (before.st_dev, before.st_ino) != expected_identity:
+                    raise CacheError
+                phase = 'verify_source_permissions'
+                secure_filesystem.verify_private_permissions(staged_path, 0o600)
+                digest = hashlib.sha256()
+                byte_count = 0
+                phase = 'copy_bytes'
+                while True:
+                    chunk = _read_chunk(source)
+                    if not chunk:
+                        break
+                    byte_count += len(chunk)
+                    if byte_count > MAX_PROFILE_BYTES:
+                        raise CacheError
+                    digest.update(chunk)
+                    secure_filesystem.write_all(destination, chunk)
+                phase = 'verify_content'
+                if byte_count < 1 or byte_count != expected_byte_count:
+                    raise CacheError
+                if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+                    raise CacheError
+                phase = 'verify_source_stability'
+                after = os.fstat(source)
+                if _file_identity(before) != _file_identity(after):
+                    raise CacheError
+                phase = 'verify_source_entry'
+                entry = secure_filesystem.generated_entry_stat(self.root, staged_path)
+                if _file_identity(after) != _file_identity(entry):
+                    raise CacheError
+                phase = 'flush_copy'
+                _fsync_descriptor(destination)
+                phase = 'set_copy_permissions'
+                secure_filesystem.set_private_permissions(copy_path, 0o600)
+            finally:
+                os.close(source)
+        except (CacheError, OSError, secure_filesystem.FilesystemError):
+            _log.error('Roast Server cache copy failure: phase=%s', phase)
+            raise
 
     @staticmethod
     def _write_temporary(path: Path, descriptor: int, content: bytes) -> None:

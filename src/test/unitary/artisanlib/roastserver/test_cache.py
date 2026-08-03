@@ -1509,6 +1509,36 @@ def test_cache_error_redacts_os_paths_controls_and_server_strings(
     assert 'server-name' not in repr(raised.value)
 
 
+def test_cache_copy_failure_logs_fixed_subphase(
+    cache: CacheStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    staged = stage_bytes(cache, NAMESPACE, PROFILE_BYTES)
+    original_verify = filesystem_module.verify_private_permissions
+
+    def fail_stage_permissions(path: Path, mode: int) -> None:
+        if path == staged:
+            raise filesystem_module.FilesystemError('/private/customer/profile')
+        original_verify(path, mode)
+
+    monkeypatch.setattr(
+        filesystem_module, 'verify_private_permissions', fail_stage_permissions
+    )
+    caplog.set_level(logging.ERROR, logger='artisanlib.roastserver.cache')
+
+    with pytest.raises(CacheError):
+        cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
+
+    assert caplog.messages == [
+        'Roast Server cache copy failure: phase=verify_source_permissions',
+        'Roast Server cache publication failure: phase=copy_profile '
+        'cleanup=ok release=ok',
+    ]
+    assert '/private' not in caplog.text
+    assert 'customer' not in caplog.text
+
+
 def test_portable_windows_seam_runs_complete_cache_publish_validate_and_remove_flow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
