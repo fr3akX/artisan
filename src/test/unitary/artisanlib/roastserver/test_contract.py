@@ -424,6 +424,19 @@ def test_detail_accepts_state_matrix_canonicalizes_metadata_and_detaches_source(
     assert failed.current_revision.parse_state == 'failed'
 
 
+def test_detail_accepts_distinct_current_and_revision_metadata() -> None:
+    detail = parse_roast_detail(
+        valid_roast_detail_payload(
+            current_metadata={'source': 'desktop'},
+            revision_metadata={'source': 'profile'},
+        )
+    )
+
+    assert detail.current_revision is not None
+    assert detail.current_metadata == (('source', 'desktop'),)
+    assert detail.current_revision.metadata == (('source', 'profile'),)
+
+
 def test_frozen_json_tags_arrays_without_changing_object_tuple_contract() -> None:
     payload = valid_roast_detail_payload(
         current_metadata=ambiguous_container_metadata(),
@@ -562,6 +575,22 @@ def test_roast_page_accepts_fractional_duration_seconds() -> None:
     page = parse_roast_page(payload)
 
     assert page.items[0].duration_seconds == pytest.approx(621.357)
+
+
+@pytest.mark.parametrize(
+    'field', ('title', 'batch_prefix', 'operator', 'machine', 'machine_setup')
+)
+def test_roast_page_accepts_empty_optional_text_fields(field: str) -> None:
+    payload = valid_roast_page_payload()
+    items = payload['items']
+    assert isinstance(items, list)
+    item = items[0]
+    assert isinstance(item, dict)
+    item[field] = ''
+
+    page = parse_roast_page(payload)
+
+    assert getattr(page.items[0], field) == ''
 
 
 def test_numeric_fields_reject_bool_unsafe_integer_nonfinite_and_overflow() -> None:

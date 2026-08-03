@@ -345,11 +345,17 @@ def _parse_optional_string(
     value: object,
     *,
     max_length: int | None = None,
+    allow_empty: bool = False,
     reject_controls: bool = False,
 ) -> str | None:
     if value is None:
         return None
-    return _parse_required_string(value, max_length=max_length, reject_controls=reject_controls)
+    return _parse_required_string(
+        value,
+        allow_empty=allow_empty,
+        max_length=max_length,
+        reject_controls=reject_controls,
+    )
 
 
 def _parse_bool(value: object) -> bool:
@@ -775,13 +781,13 @@ def _parse_roast_summary(value: object) -> RoastSummary:
         roast_uuid=_parse_hex_uuid(mapping['roast_uuid']),
         state=state,
         roast_at=_parse_aware_datetime(mapping['roast_at']),
-        title=_parse_optional_string(mapping['title']),
-        batch_prefix=_parse_optional_string(mapping['batch_prefix']),
+        title=_parse_optional_string(mapping['title'], allow_empty=True),
+        batch_prefix=_parse_optional_string(mapping['batch_prefix'], allow_empty=True),
         batch_number=_parse_optional_int(mapping['batch_number'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
         batch_position=_parse_optional_int(mapping['batch_position'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
-        operator=_parse_optional_string(mapping['operator']),
-        machine=_parse_optional_string(mapping['machine']),
-        machine_setup=_parse_optional_string(mapping['machine_setup']),
+        operator=_parse_optional_string(mapping['operator'], allow_empty=True),
+        machine=_parse_optional_string(mapping['machine'], allow_empty=True),
+        machine_setup=_parse_optional_string(mapping['machine_setup'], allow_empty=True),
         temperature_unit=_parse_temperature_unit(mapping['temperature_unit']),
         duration_seconds=_parse_optional_float(
             mapping['duration_seconds'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX
@@ -913,8 +919,6 @@ def parse_roast_detail(value: object) -> RoastDetail:
         if current_revision.revision_number != summary.revision_count:
             _fail()
         if current_revision.parse_state != expected_revision_state:
-            _fail()
-        if current_revision.metadata != current_metadata:
             _fail()
     return RoastDetail(
         roast_uuid=summary.roast_uuid,
