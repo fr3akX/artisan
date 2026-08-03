@@ -551,6 +551,19 @@ def test_revision_upload_rejects_awaiting_state_bad_revision_state_and_each_cont
         parse_revision_upload(payload)
 
 
+def test_roast_page_accepts_fractional_duration_seconds() -> None:
+    payload = valid_roast_page_payload()
+    items = payload['items']
+    assert isinstance(items, list)
+    item = items[0]
+    assert isinstance(item, dict)
+    item['duration_seconds'] = 621.357
+
+    page = parse_roast_page(payload)
+
+    assert page.items[0].duration_seconds == pytest.approx(621.357)
+
+
 def test_numeric_fields_reject_bool_unsafe_integer_nonfinite_and_overflow() -> None:
     payload = valid_roast_page_payload()
     items = payload['items']

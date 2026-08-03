@@ -202,7 +202,7 @@ class RoastSummary:
     machine: str | None
     machine_setup: str | None
     temperature_unit: Literal['C', 'F'] | None
-    duration_seconds: int | None
+    duration_seconds: float | None
     green_weight_kg: float | None
     roasted_weight_kg: float | None
     revision_count: int
@@ -236,7 +236,7 @@ class RoastDetail:
     machine: str | None
     machine_setup: str | None
     temperature_unit: Literal['C', 'F'] | None
-    duration_seconds: int | None
+    duration_seconds: float | None
     green_weight_kg: float | None
     roasted_weight_kg: float | None
     revision_count: int
@@ -374,7 +374,12 @@ def _parse_optional_int(value: object, *, minimum: int | None = None, maximum: i
     return _parse_safe_int(value, minimum=minimum, maximum=maximum)
 
 
-def _parse_optional_float(value: object) -> float | None:
+def _parse_optional_float(
+    value: object,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -388,7 +393,11 @@ def _parse_optional_float(value: object) -> float | None:
             raise ContractError from exc
     else:
         number = value
-    if not math.isfinite(number):
+    if (
+        not math.isfinite(number)
+        or (minimum is not None and number < minimum)
+        or (maximum is not None and number > maximum)
+    ):
         _fail()
     return number
 
@@ -774,7 +783,9 @@ def _parse_roast_summary(value: object) -> RoastSummary:
         machine=_parse_optional_string(mapping['machine']),
         machine_setup=_parse_optional_string(mapping['machine_setup']),
         temperature_unit=_parse_temperature_unit(mapping['temperature_unit']),
-        duration_seconds=_parse_optional_int(mapping['duration_seconds'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
+        duration_seconds=_parse_optional_float(
+            mapping['duration_seconds'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX
+        ),
         green_weight_kg=_parse_optional_float(mapping['green_weight_kg']),
         roasted_weight_kg=_parse_optional_float(mapping['roasted_weight_kg']),
         revision_count=revision_count,
