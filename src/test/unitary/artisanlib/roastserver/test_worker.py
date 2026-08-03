@@ -25,6 +25,7 @@ import ast
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime, timedelta
 import hashlib
+import logging
 import math
 from pathlib import Path
 import secrets
@@ -2297,6 +2298,24 @@ def test_permanent_server_and_local_failures_use_exact_lease_token(
     assert leased.lease_token is not None
     assert failed[:3] == (leased.id, leased.lease_token, worker_harness.clock.now)
     assert failed[3] == failure.failure
+    assert worker_harness.outbox.counts(NAMESPACE).failed == 1
+
+
+def test_unexpected_delivery_failure_logs_only_exception_type(
+    worker_harness: WorkerHarness, caplog: pytest.LogCaptureFixture
+) -> None:
+    worker_harness.enqueue_saved_profile()
+    worker_harness.client.failure_method = 'upload_revision'
+    secret_detail = 'private-profile-diagnostic'
+    worker_harness.client.failure = RuntimeError(secret_detail)
+
+    with caplog.at_level(logging.ERROR, logger='artisanlib.roastserver.worker'):
+        worker_harness.run_one_queue_tick()
+
+    assert caplog.messages == [
+        'Unexpected Roast Server delivery failure: RuntimeError'
+    ]
+    assert secret_detail not in caplog.text
     assert worker_harness.outbox.counts(NAMESPACE).failed == 1
 
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import logging
 import math
 from pathlib import Path
 import re
@@ -79,6 +80,8 @@ from artisanlib.roastserver.settings import (
     CredentialStoreError,
     namespace_for,
 )
+
+_log = logging.getLogger(__name__)
 
 _REQUEST_ID_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
 _MAX_TIMER_MILLISECONDS: Final[int] = 2_147_483_647
@@ -1334,7 +1337,11 @@ class RoastServerWorker(QObject):
             failure = error.failure
         except OSError:
             failure = _failure(FailureKind.LOCAL_PROFILE)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            _log.error(
+                'Unexpected Roast Server delivery failure: %s',
+                type(error).__name__,
+            )
             failure = _failure(FailureKind.INVALID_RESPONSE)
 
         if self._interrupted():
