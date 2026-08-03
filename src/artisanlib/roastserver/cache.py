@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -76,6 +77,8 @@ from artisanlib.roastserver.contract import (
 
 if TYPE_CHECKING:
     from artisanlib.roastserver.api import DownloadReceipt
+
+_log = logging.getLogger(__name__)
 
 _SCHEMA_VERSION: Final[int] = 1
 _COPY_CHUNK_BYTES: Final[int] = 1024 * 1024
@@ -603,16 +606,19 @@ class CacheStore:
         published_sidecar_identity: tuple[int, int] | None = None
         result: CachedRevision | None = None
         operation_error: BaseException | None = None
+        phase = 'close_stage'
         try:
             if not stage.output.closed:
                 stage.output.flush()
                 stage.output.close()
+            phase = 'create_copy'
             copy_descriptor = secure_filesystem.create_generated_file(
                 self.root, copy_path, 0o600
             )
             copy_stat = os.fstat(copy_descriptor)
             copy_identity = (copy_stat.st_dev, copy_stat.st_ino)
             try:
+                phase = 'copy_profile'
                 self._copy_and_verify_staged(
                     staged_path,
                     stage.identity,
@@ -623,17 +629,21 @@ class CacheStore:
                 )
             finally:
                 os.close(copy_descriptor)
+            phase = 'check_existing'
             profile_exists = os.path.lexists(destination)
             sidecar_exists = os.path.lexists(sidecar_path)
             if profile_exists or sidecar_exists:
                 if not profile_exists or not sidecar_exists:
                     raise CacheError
+                phase = 'load_existing'
                 existing = self._load_pair(namespace, destination, sidecar_path)
                 if existing.roast != roast or existing.revision != revision:
                     raise CacheError
                 result = existing
             else:
+                phase = 'encode_sidecar'
                 sidecar_bytes = _sidecar_bytes(namespace, roast, revision, downloaded_at)
+                phase = 'create_sidecar'
                 sidecar_descriptor = secure_filesystem.create_generated_file(
                     self.root, sidecar_temporary_path, 0o600
                 )
@@ -643,15 +653,18 @@ class CacheStore:
                     sidecar_temporary_stat.st_ino,
                 )
                 try:
+                    phase = 'write_sidecar'
                     self._write_temporary(
                         sidecar_temporary_path, sidecar_descriptor, sidecar_bytes
                     )
                 finally:
                     os.close(sidecar_descriptor)
                 published_profile_identity = copy_identity
+                phase = 'publish_profile'
                 _replace_generated(self.root, copy_path, destination)
                 secure_filesystem.set_private_permissions(destination, 0o600)
                 published_sidecar_identity = sidecar_temporary_identity
+                phase = 'publish_sidecar'
                 _replace_generated(self.root, sidecar_temporary_path, sidecar_path)
                 secure_filesystem.set_private_permissions(sidecar_path, 0o600)
                 expected = CachedRevision(
@@ -662,6 +675,7 @@ class CacheStore:
                     sidecar_path=sidecar_path,
                     downloaded_at=downloaded_at,
                 )
+                phase = 'verify_published'
                 result = self._load_pair(
                     namespace, destination, sidecar_path, expected=expected
                 )
@@ -699,6 +713,12 @@ class CacheStore:
         ):
             cleanup_failed = True
         if operation_error is not None or cleanup_failed or release_failed:
+            _log.error(
+                'Roast Server cache publication failure: phase=%s cleanup=%s release=%s',
+                phase if operation_error is not None else 'cleanup',
+                'failed' if cleanup_failed else 'ok',
+                'failed' if release_failed else 'ok',
+            )
             if operation_error is not None and not isinstance(
                 operation_error,
                 (

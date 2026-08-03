@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import errno
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import stat
@@ -1484,7 +1485,9 @@ def test_replace_generated_closes_source_descriptor_when_destination_open_fails(
 
 
 def test_cache_error_redacts_os_paths_controls_and_server_strings(
-    cache: CacheStore, monkeypatch: pytest.MonkeyPatch
+    cache: CacheStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     staged = stage_bytes(cache, NAMESPACE, PROFILE_BYTES)
 
@@ -1492,8 +1495,13 @@ def test_cache_error_redacts_os_paths_controls_and_server_strings(
         raise OSError('/private/customer/server-name\ncontrol')
 
     monkeypatch.setattr(cache_module, '_replace_generated', fail_replace)
+    caplog.set_level(logging.ERROR, logger='artisanlib.roastserver.cache')
     with pytest.raises(CacheError) as raised:
         cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
+    assert caplog.messages == [
+        'Roast Server cache publication failure: phase=publish_profile '
+        'cleanup=ok release=ok'
+    ]
     assert raised.value.failure == cache_module.CACHE_FAILURE
     assert str(raised.value) == FAILURE_MESSAGES[FailureKind.CACHE_CORRUPT]
     assert raised.value.__cause__ is None
