@@ -1,0 +1,103 @@
+name: Windows PR installer
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  windows-installer:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      BUILD_PYINSTALLER: 'True'
+      PYQT: '6'
+      PYUIC: pyuic6.exe
+      VC_REDIST: https://aka.ms/vc14/vc_redist.x64.exe
+
+    steps:
+      - name: Check out pull request head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.14.6
+          cache: pip
+          cache-dependency-path: src/requirements.txt
+
+      - name: Configure Windows build environment
+        shell: pwsh
+        run: |
+          $pythonPath = Split-Path (Get-Command python).Source
+          $pin = Select-String `
+            -Path src\requirements.txt `
+            -Pattern "pyinstaller==([\d.]+).*platform_system='Windows'" |
+            Select-Object -First 1
+          if ($null -eq $pin) {
+            throw 'Windows PyInstaller version is not pinned'
+          }
+          $pyinstallerVersion = $pin.Matches[0].Groups[1].Value
+          "PYTHON_PATH=$pythonPath" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYINSTALLER_VER=$pyinstallerVersion" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "QT_TRANSL=$pythonPath\Lib\site-packages\PyQt6\Qt6\translations" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Ensure NSIS is installed
+        shell: pwsh
+        run: |
+          $nsis32 = Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          $nsis64 = Test-Path "$env:ProgramFiles\NSIS\makensis.exe"
+          if (-not ($nsis32 -or $nsis64)) {
+            choco install nsis --no-progress --yes
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+
+      - name: Install Windows build dependencies
+        shell: cmd
+        env:
+          APPVEYOR: 'True'
+        run: .ci\install-win.bat
+
+      - name: Set build revision and unsigned PR signature
+        working-directory: src
+        shell: pwsh
+        run: |
+          $year = (Get-Date).Year
+          (Get-Content version-metadata.yml) |
+            ForEach-Object { $_ -replace 'yyyy', $year } |
+            Set-Content version-metadata.yml -Encoding ascii
+          $revision = (git rev-parse --verify --short HEAD).Trim()
+          (Get-Content artisanlib\__init__.py) |
+            ForEach-Object { $_ -replace "__revision__ = '.*'", "__revision__ = '$revision'" } |
+            Set-Content artisanlib\__init__.py -Encoding ascii
+          python generate_signature.py
+
+      - name: Build Windows installer
+        working-directory: src
+        shell: cmd
+        env:
+          APPVEYOR: 'True'
+        run: build-win3-pi.bat
+
+      - name: Upload unsigned Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: artisan-windows-pr-${{ github.event.number }}-${{ github.event.pull_request.head.sha }}
+          path: src/artisan-win*setup.exe
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
