@@ -3956,6 +3956,21 @@ class InventoryChargeSemaphore:
         self.release_calls += 1
 
 
+class InventoryChargeCurve:
+    def __init__(self, x_values: list[float], y_values: list[float]) -> None:
+        self.data = (list(x_values), list(y_values))
+        self.fail_next_update = False
+
+    def get_data(self) -> tuple[list[float], list[float]]:
+        return self.data
+
+    def set_data(self, x_values: list[float], y_values: list[float]) -> None:
+        self.data = (list(x_values), list(y_values))
+        if self.fail_next_update:
+            self.fail_next_update = False
+            raise RuntimeError('injected curve update failure')
+
+
 def coordinator_inventory_charge_canvas(window: ApplicationWindow) -> SimpleNamespace:
     window.ntb = MagicMock()
     window.ntb._nav_stack.return_value = False
@@ -3970,6 +3985,7 @@ def coordinator_inventory_charge_canvas(window: ApplicationWindow) -> SimpleName
     window.santokerWarmupController = MagicMock()
     window.updateSantokerWarmupControls = Mock()
     window.onMarkMoveToNext = Mock()
+    window.openPropertiesSignal = MagicMock()
     window.sendmessage = Mock()  # type: ignore[method-assign]
     canvas = SimpleNamespace(
         aw=window,
@@ -5081,6 +5097,121 @@ class TestRoastServerMainIntegration:
                 assert store.counts(link.namespace).pending == 1
                 assert enqueue.call_count == 1
                 assert wake_calls == [None]
+        finally:
+            store.close()
+
+    def test_inventory_charge_coordinator_manual_append_failure_retries_exactly(
+        self, tmp_path: Path
+    ) -> None:
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        reservation_uuid = UUID('44444444-4444-4444-8444-444444444444')
+        uuid_values = iter((roast_uuid, reservation_uuid))
+        wake_calls: list[None] = []
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    lot_id=link.lot_id,
+                    name=link.lot_name,
+                    origin='Ethiopia',
+                    varietals=('Heirloom',),
+                    processing_method='washed',
+                    crop_year=2026,
+                    on_hand_grams=2_000,
+                    reserved_grams=0,
+                    available_grams=2_000,
+                    unresolved_conflict_count=0,
+                ),
+            ),
+            now,
+        )
+        context = InventoryContext(
+            origin=link.namespace.origin,
+            namespace=link.namespace,
+            enabled=True,
+            previously_authenticated=True,
+            client_instance_uuid=UUID(
+                '55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: next(uuid_values),
+            wake=lambda: wake_calls.append(None),
+        )
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        canvas = coordinator_inventory_charge_canvas(window)
+        window.roastserver_controller = coordinator_controller(
+            coordinator, context)
+        window.eventactionx = Mock()
+        canvas.device = 18
+        canvas.ETcurve = True
+        canvas.BTcurve = True
+        canvas.roastpropertiesAutoOpenFlag = True
+        canvas.l_temp1 = InventoryChargeCurve(canvas.timex, canvas.temp1)
+        canvas.l_temp2 = InventoryChargeCurve(canvas.timex, canvas.temp2)
+        canvas.l_temp2.fail_next_update = True
+        canvas.drawmanual = lambda et, bt, tx: tgraphcanvas.drawmanual(
+            canvas, et, bt, tx)
+        window.ser = MagicMock()
+        window.ser.NONE.return_value = (1.0, 101.0, 91.0)
+        profile_before = (
+            list(canvas.timex), list(canvas.temp1), list(canvas.temp2))
+        curves_before = (canvas.l_temp1.data, canvas.l_temp2.data)
+        enqueue_reserve = store.enqueue_reserve
+
+        def checked_enqueue(*args: Any, **kwargs: Any) -> Any:
+            assert canvas.timeindex[0] == -1
+            return enqueue_reserve(*args, **kwargs)
+
+        try:
+            with patch.object(
+                store, 'enqueue_reserve', side_effect=checked_enqueue
+            ) as enqueue:
+                tgraphcanvas._markCharge(canvas)
+
+                state = store.roast_state(link.namespace, roast_uuid)
+                assert state is not None
+                assert state.reservation_uuid == reservation_uuid
+                assert store.counts(link.namespace).pending == 1
+                assert enqueue.call_count == 1
+                assert wake_calls == [None]
+                assert canvas.roastUUID == roast_uuid.hex
+                assert canvas.timeindex[0] == -1
+                assert (canvas.timex, canvas.temp1, canvas.temp2) == profile_before
+                assert (canvas.l_temp1.data, canvas.l_temp2.data) == curves_before
+                window.buttonCHARGE.setFlat.assert_not_called()
+                window.buttonCHARGE.stopAnimation.assert_not_called()
+                window.santokerWarmupController.mark_charge.assert_not_called()
+                window.eventactionx.assert_not_called()
+                window.sendmessage.assert_not_called()
+                window.openPropertiesSignal.emit.assert_not_called()
+                canvas.timealign.assert_not_called()
+
+                tgraphcanvas._markCharge(canvas)
+
+                repeated_state = store.roast_state(link.namespace, roast_uuid)
+                assert repeated_state is not None
+                assert repeated_state.reservation_uuid == reservation_uuid
+                assert store.counts(link.namespace).pending == 1
+                assert enqueue.call_count == 1
+                assert wake_calls == [None]
+                assert canvas.roastUUID == roast_uuid.hex
+                assert canvas.timeindex[0] == 1
+                assert canvas.timex == [0.0, 1.0]
+                assert canvas.temp1 == [100.0, 101.0]
+                assert canvas.temp2 == [90.0, 91.0]
+                window.buttonCHARGE.setFlat.assert_called_once_with(True)
+                window.buttonCHARGE.stopAnimation.assert_called_once_with()
+                window.santokerWarmupController.mark_charge.assert_called_once_with()
+                window.eventactionx.assert_called_once_with(0, '')
+                window.openPropertiesSignal.emit.assert_called_once_with()
+                assert canvas.timealign.call_count == 1
         finally:
             store.close()
 

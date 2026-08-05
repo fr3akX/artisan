@@ -34,6 +34,7 @@ from artisanlib import __release_sponsor_url__
 
 #import gc
 import time as libtime
+from copy import copy
 import os
 import sys  # @UnusedImport
 import ast
@@ -14419,6 +14420,7 @@ class tgraphcanvas(QObject):
         except Exception: # pylint: disable=broad-except
             pass
         removed = False
+        charge_marked = False
         semaphore_acquired = False
         try:
             prepared_inventory_charge = None
@@ -14462,10 +14464,25 @@ class tgraphcanvas(QObject):
                     elif not self.aw.buttonCHARGE.isFlat():
                         _log.debug('EVENT: CHARGE')
                         manual_charge_values = None
+                        manual_array_snapshots = None
+                        manual_curve_snapshots:list[tuple[Line2D,Any,Any]] = []
                         if self.device == 18 and self.aw.simulator is None: #manual mode
                             tx,et,bt = self.aw.ser.NONE()
                             if bt != 1 and et != -1:  #cancel
+                                if not len(self.timex) == len(self.temp1) == len(self.temp2):
+                                    _log.error('manual CHARGE arrays have incompatible lengths')
+                                    return
                                 manual_charge_values = (tx,et,bt)
+                                manual_array_snapshots = (
+                                    list(self.timex), list(self.temp1), list(self.temp2))
+                                if self.ETcurve and self.l_temp1 is not None:
+                                    curve_x,curve_y = self.l_temp1.get_data()
+                                    manual_curve_snapshots.append((
+                                        self.l_temp1, copy(curve_x), copy(curve_y)))
+                                if self.BTcurve and self.l_temp2 is not None:
+                                    curve_x,curve_y = self.l_temp2.get_data()
+                                    manual_curve_snapshots.append((
+                                        self.l_temp2, copy(curve_x), copy(curve_y)))
                                 charge_idx = len(self.timex)
                             else:
                                 return
@@ -14491,20 +14508,37 @@ class tgraphcanvas(QObject):
                             prepared_inventory_charge)
                         if inventory_roast_uuid is None:
                             return
-                        if manual_charge_values is not None:
-                            tx,et,bt = manual_charge_values
-                            projected_charge_idx = charge_idx
-                            self.drawmanual(et,bt,tx)
-                            charge_idx = len(self.timex)-1
-                            if (
-                                charge_idx != projected_charge_idx
-                                or len(self.temp1) <= charge_idx
-                                or len(self.temp2) <= charge_idx
-                            ):
-                                raise ValueError('manual CHARGE sample was not appended')
                         if inventory_roast_uuid:
                             self.roastUUID = inventory_roast_uuid
+                        if manual_charge_values is not None:
+                            if manual_array_snapshots is None:
+                                raise ValueError('manual CHARGE snapshots are missing')
+                            tx,et,bt = manual_charge_values
+                            projected_charge_idx = charge_idx
+                            try:
+                                self.drawmanual(et,bt,tx)
+                                charge_idx = len(self.timex)-1
+                                if not (
+                                    charge_idx == projected_charge_idx
+                                    and len(self.timex) == projected_charge_idx + 1
+                                    and len(self.temp1) == projected_charge_idx + 1
+                                    and len(self.temp2) == projected_charge_idx + 1
+                                ):
+                                    raise ValueError('manual CHARGE sample was not appended')
+                            except Exception: # pylint: disable=broad-except
+                                timex_snapshot,temp1_snapshot,temp2_snapshot = (
+                                    manual_array_snapshots)
+                                self.timex[:] = timex_snapshot
+                                self.temp1[:] = temp1_snapshot
+                                self.temp2[:] = temp2_snapshot
+                                for curve,curve_x,curve_y in manual_curve_snapshots:
+                                    try:
+                                        curve.set_data(curve_x,curve_y)
+                                    except Exception as restore_error: # pylint: disable=broad-except
+                                        _log.exception(restore_error)
+                                raise
                         self.timeindex[0] = charge_idx
+                        charge_marked = True
                         self.aw.santokerWarmupController.mark_charge()
                         self.aw.updateSantokerWarmupControls()
                         if ((self.device != 18 or self.aw.simulator is not None) and
@@ -14564,6 +14598,8 @@ class tgraphcanvas(QObject):
                                     # we don't take another lock in EventRecordAction as we already hold that lock!
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
+                    if not charge_marked and not removed:
+                        return
             else:
                 message = QApplication.translate('Message','CHARGE: Scope is not recording')
                 self.aw.sendmessage(message)

@@ -1184,6 +1184,9 @@ class ChargeCurve:
     def __init__(self, x_values: list[float], y_values: list[float]) -> None:
         self.data = (list(x_values), list(y_values))
 
+    def get_data(self) -> tuple[list[float], list[float]]:
+        return self.data
+
     def set_data(self, x_values: list[float], y_values: list[float]) -> None:
         self.data = (list(x_values), list(y_values))
 
@@ -1312,6 +1315,28 @@ class TestInventoryCharge:
         assert canvas.timeindex[0] == -1
         canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
 
+    def test_inventory_charge_manual_array_precondition_blocks_before_commit(
+        self,
+    ) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.temp1 = []
+        canvas.aw.ser.NONE.return_value = (1.0, 101.0, 91.0)
+
+        tgraphcanvas._markCharge(canvas)
+
+        assert canvas.timex == [0.0]
+        assert canvas.temp1 == []
+        assert canvas.temp2 == [90.0]
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID is None
+        canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
+        assert canvas.profileDataSemaphore.release_calls == 1
+        canvas.aw.buttonCHARGE.setFlat.assert_not_called()
+        canvas.aw.buttonCHARGE.stopAnimation.assert_not_called()
+        canvas.aw.eventactionx.assert_not_called()
+        canvas.aw.openPropertiesSignal.emit.assert_not_called()
+
     def test_inventory_charge_commit_failure_leaves_event_unmarked(self) -> None:
         canvas = inventory_charge_canvas()
         canvas.aw.commitRoastServerInventoryCharge.return_value = None
@@ -1375,6 +1400,37 @@ class TestInventoryCharge:
         assert canvas.l_temp1.data == (canvas.timex, canvas.temp1)
         assert canvas.l_temp2.data == (canvas.timex, canvas.temp2)
         assert canvas.profileDataSemaphore.release_calls == 1
+
+    def test_inventory_charge_manual_postcondition_failure_rolls_back_and_links(
+        self,
+    ) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.ETcurve = True
+        canvas.BTcurve = True
+        canvas.l_temp1 = ChargeCurve(canvas.timex, canvas.temp1)
+        canvas.l_temp2 = ChargeCurve(canvas.timex, canvas.temp2)
+        profile_before = (
+            list(canvas.timex), list(canvas.temp1), list(canvas.temp2))
+        curves_before = (canvas.l_temp1.data, canvas.l_temp2.data)
+
+        def invalid_drawmanual(et: float, bt: float, tx: float) -> None:
+            tgraphcanvas.drawmanual(canvas, et, bt, tx)
+            canvas.timex.append(tx + 1)
+
+        canvas.drawmanual = invalid_drawmanual
+        canvas.aw.ser.NONE.return_value = (1.0, 101.0, 91.0)
+
+        tgraphcanvas._markCharge(canvas)
+
+        assert (canvas.timex, canvas.temp1, canvas.temp2) == profile_before
+        assert (canvas.l_temp1.data, canvas.l_temp2.data) == curves_before
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID == '33333333333343338333333333333333'
+        canvas.aw.buttonCHARGE.setFlat.assert_not_called()
+        canvas.aw.buttonCHARGE.stopAnimation.assert_not_called()
+        canvas.aw.eventactionx.assert_not_called()
+        canvas.aw.openPropertiesSignal.emit.assert_not_called()
 
     def test_inventory_charge_undo_and_remark_reuse_roast_uuid_and_link(self) -> None:
         canvas = inventory_charge_canvas()
