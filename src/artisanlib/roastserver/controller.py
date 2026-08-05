@@ -508,15 +508,19 @@ class RoastServerController(QObject):
             client_instance_uuid=self._settings.client_instance_uuid,
         )
 
-    def inventory_lots(self) -> tuple[BeanLot, ...]:
+    def inventory_cache_snapshot(self) -> LotCacheSnapshot | None:
         self._require_ui_thread()
         namespace = self.inventory_context().namespace
         if namespace is None:
-            return ()
+            return None
         try:
-            return self._inventory_store.cached_lots(namespace)
+            return self._inventory_store.cache_snapshot(namespace)
         except InventoryStoreError:
             raise ControllerError('inventory_storage_failed') from None
+
+    def inventory_lots(self) -> tuple[BeanLot, ...]:
+        snapshot = self.inventory_cache_snapshot()
+        return () if snapshot is None else snapshot.lots
 
     def refresh_inventory_lots(self) -> str:
         self._require_command_state()

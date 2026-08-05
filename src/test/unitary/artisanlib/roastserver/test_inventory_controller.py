@@ -382,7 +382,8 @@ def test_inventory_controller_exposes_binding_facade_and_factories() -> None:
     assert 'inventory_store_factory' in signature.parameters
     assert 'inventory_coordinator_factory' in signature.parameters
     for member in (
-        'inventory_context', 'inventory_lots', 'refresh_inventory_lots',
+        'inventory_context', 'inventory_cache_snapshot', 'inventory_lots',
+        'refresh_inventory_lots',
         'inventory_lot_locked', 'prepare_inventory_charge', 'commit_inventory_charge',
         'finalize_inventory_profile', 'release_inventory_roast',
         'resolve_interrupted_inventory', 'retry_inventory_command',
@@ -427,6 +428,21 @@ def test_context_offline_queueing_facade_and_queued_wake(harness: Harness) -> No
     assert [call[0] for call in harness.coordinator.calls] == [
         'prepare', 'commit', 'finalize', 'release'
     ]
+
+
+def test_inventory_cache_snapshot_is_atomic_for_current_namespace_or_none(
+    harness: Harness,
+) -> None:
+    harness.start()
+    expected = LotCacheSnapshot(NAMESPACE, (LOT,), NOW)
+    assert harness.controller.inventory_cache_snapshot() == expected
+    assert harness.controller.inventory_lots() == expected.lots
+
+    harness.controller.apply_options(
+        OTHER_ORIGIN, False, False, 64 * 1024 * 1024
+    )
+    assert harness.controller.inventory_cache_snapshot() is None
+    assert harness.controller.inventory_lots() == ()
 
 
 def test_inventory_lot_lock_facade_short_circuits_without_link_and_delegates(

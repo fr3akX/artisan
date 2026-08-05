@@ -33,6 +33,7 @@ import math
 import platform
 import logging
 from collections.abc import Callable
+from datetime import datetime
 from typing import override, Final, cast, Any, TYPE_CHECKING
 from uuid import UUID
 
@@ -566,6 +567,7 @@ class editGraphDlg(ArtisanResizeablDialog):
     _inventory_link:InventoryProfileLink|None
     _inventory_selection_staged:bool
     _inventory_lots:tuple[BeanLot, ...]
+    _inventory_cached_at:datetime|None
     _inventory_refresh_request:str|None
     _inventory_signals_connected:bool
     _inventory_status_override:str|None
@@ -2057,6 +2059,7 @@ class editGraphDlg(ArtisanResizeablDialog):
         self._inventory_link = original_link
         self._inventory_selection_staged = False
         self._inventory_lots = ()
+        self._inventory_cached_at = None
         self._inventory_refresh_request = None
         self._inventory_signals_connected = False
         self._inventory_status_override = None
@@ -2103,11 +2106,7 @@ class editGraphDlg(ArtisanResizeablDialog):
 
         controller = self.aw.roastserver_controller
         if controller is not None:
-            try:
-                self._inventory_lots = controller.inventory_lots()
-            except RuntimeError:
-                self._inventory_status_override = QApplication.translate(
-                    'RoastServerInventory', 'Inventory is unavailable.')
+            self._readInventoryCacheSnapshot()
             controller.inventoryLotsChanged.connect(self._inventoryLotsChanged)
             controller.operationFailed.connect(self._inventoryOperationFailed)
             controller.onlineChanged.connect(self._inventoryOnlineChanged)
@@ -2115,6 +2114,22 @@ class editGraphDlg(ArtisanResizeablDialog):
             controller.identityChanged.connect(self._inventoryContextChanged)
             self._inventory_signals_connected = True
         self.updateInventoryLotRow()
+
+    def _readInventoryCacheSnapshot(self) -> bool:
+        controller = self.aw.roastserver_controller
+        if controller is None:
+            self._inventory_lots = ()
+            self._inventory_cached_at = None
+            return True
+        try:
+            snapshot = controller.inventory_cache_snapshot()
+        except RuntimeError:
+            self._inventory_status_override = QApplication.translate(
+                'RoastServerInventory', 'Inventory is unavailable.')
+            return False
+        self._inventory_lots = () if snapshot is None else snapshot.lots
+        self._inventory_cached_at = None if snapshot is None else snapshot.refreshed_at
+        return True
 
     def _inventoryNamespace(self) -> Namespace|None:
         controller = self.aw.roastserver_controller
@@ -2197,6 +2212,16 @@ class editGraphDlg(ArtisanResizeablDialog):
                 status = ' '.join(warnings)
         if self._inventory_status_override is not None:
             status = self._inventory_status_override
+        if controller is not None:
+            if self._inventory_cached_at is None:
+                cached_status = QApplication.translate(
+                    'RoastServerInventory', 'Cached inventory timestamp is unavailable.')
+            else:
+                cached_status = QApplication.translate(
+                    'RoastServerInventory', 'Cached inventory from {timestamp}.').format(
+                        timestamp=self._inventory_cached_at.astimezone().strftime(
+                            '%Y-%m-%d %H:%M'))
+            status = f'{status} {cached_status}'.strip()
         self.inventoryLotNameLabel.setText(name)
         self.inventoryLotBalanceLabel.setText(balance)
         self.inventoryLotStatusLabel.setText(status)
@@ -2278,10 +2303,10 @@ class editGraphDlg(ArtisanResizeablDialog):
     def _inventoryLotsChanged(self, value:object) -> None:
         if not isinstance(value, tuple) or not all(isinstance(lot, BeanLot) for lot in value):
             return
-        self._inventory_lots = value
         self._inventory_refresh_request = None
-        self._inventory_status_override = QApplication.translate(
-            'RoastServerInventory', 'Inventory refreshed.')
+        if self._readInventoryCacheSnapshot():
+            self._inventory_status_override = QApplication.translate(
+                'RoastServerInventory', 'Inventory refreshed.')
         self.updateInventoryLotRow()
 
     @pyqtSlot(str, object)
@@ -2315,12 +2340,7 @@ class editGraphDlg(ArtisanResizeablDialog):
             self._inventory_status_override = QApplication.translate(
                 'RoastServerInventory',
                 'The staged inventory lot was cleared because the server organization changed.')
-        controller = self.aw.roastserver_controller
-        if controller is not None:
-            try:
-                self._inventory_lots = controller.inventory_lots()
-            except RuntimeError:
-                self._inventory_lots = ()
+        self._readInventoryCacheSnapshot()
         self._inventory_refresh_request = None
         self.updateInventoryLotRow()
 

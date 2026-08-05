@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Final, Protocol, cast, override
+from typing import Final, Protocol, override
 from uuid import UUID
 
 from PyQt6.QtCore import (
@@ -58,6 +58,7 @@ from PyQt6.QtWidgets import (
 
 from artisanlib.roastserver.contract import PublicFailure
 from artisanlib.roastserver.inventory_contract import BeanLot
+from artisanlib.roastserver.inventory_store import LotCacheSnapshot
 from artisanlib.util import render_weight
 
 _ROOT_INDEX: Final[QModelIndex] = QModelIndex()
@@ -78,6 +79,7 @@ class InventoryLotDialogController(Protocol):
     operationFailed: _Signal
     onlineChanged: _Signal
 
+    def inventory_cache_snapshot(self) -> LotCacheSnapshot | None: ...
     def inventory_lots(self) -> tuple[BeanLot, ...]: ...
     def refresh_inventory_lots(self) -> str: ...
 
@@ -240,12 +242,12 @@ class InventoryLotDialog(QDialog):
         controller: InventoryLotDialogController,
         *,
         selected_lot_id: UUID | None = None,
-        cached_at: datetime | None = None,
         online: bool = False,
     ) -> None:
         super().__init__(parent)
         self._controller = controller
-        self._cached_at = cached_at
+        snapshot = controller.inventory_cache_snapshot()
+        self._cached_at = None if snapshot is None else snapshot.refreshed_at
         self._online = online
         self._pending_refresh: str | None = None
         self._signals_connected = False
@@ -255,7 +257,9 @@ class InventoryLotDialog(QDialog):
         self.setModal(True)
         self.setWindowTitle(_tr('Choose inventory lot'))
 
-        self.model = BeanLotTableModel(controller.inventory_lots(), self)
+        self.model = BeanLotTableModel(
+            () if snapshot is None else snapshot.lots, self
+        )
         self.proxyModel = _BeanLotFilterModel(self)
         self.proxyModel.setSourceModel(self.model)
         self.proxyModel.setSortCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
@@ -401,22 +405,13 @@ class InventoryLotDialog(QDialog):
         selected = self._selected_lot()
         if selected is not None:
             selected_id = selected.lot_id
-        self.model.replace_lots(cast(tuple[BeanLot, ...], value))
-        self._cached_at = datetime.now().astimezone()
-        was_refreshing = self._pending_refresh is not None
+        snapshot = self._controller.inventory_cache_snapshot()
+        self.model.replace_lots(() if snapshot is None else snapshot.lots)
+        self._cached_at = None if snapshot is None else snapshot.refreshed_at
         self._pending_refresh = None
         self.refreshButton.setEnabled(True)
         self._select_lot(selected_id)
-        if was_refreshing:
-            refreshed = _tr('Inventory refreshed at {timestamp}.').format(
-                timestamp=self._format_timestamp(self._cached_at)
-            )
-            self.statusLabel.setText(
-                refreshed if self._online else _tr('Offline. {cached}').format(
-                    cached=refreshed)
-            )
-        else:
-            self._update_status()
+        self._update_status()
 
     @pyqtSlot(str, object)
     def _operation_failed(self, operation: str, value: object) -> None:

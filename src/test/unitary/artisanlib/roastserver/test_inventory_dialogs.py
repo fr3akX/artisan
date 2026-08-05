@@ -35,6 +35,7 @@ from artisanlib.roast_properties import editGraphDlg
 from artisanlib.roastserver.contract import FailureKind, Namespace, PublicFailure
 from artisanlib.roastserver.inventory_contract import BeanLot, InventoryProfileLink
 from artisanlib.roastserver.inventory_dialogs import BeanLotTableModel, InventoryLotDialog
+from artisanlib.roastserver.inventory_store import LotCacheSnapshot
 from artisanlib.roastserver.settings import namespace_for
 
 
@@ -58,6 +59,14 @@ LOT = BeanLot(
     1_600,
     0,
 )
+CACHED_AT = datetime(2026, 8, 5, 12, 30, tzinfo=UTC)
+UPDATED_AT = datetime(2026, 8, 5, 13, 45, tzinfo=UTC)
+
+
+def rendered_timestamp(value: datetime) -> str:
+    return value.astimezone().strftime('%Y-%m-%d %H:%M')
+
+
 WARNING_LOT = BeanLot(
     UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
     'Kenya AA',
@@ -84,10 +93,17 @@ class FakeController(QObject):
         self.lots = lots
         self.refreshes: list[str] = []
         self.namespace: Namespace | None = NAMESPACE
+        self.cached_at: datetime | None = CACHED_AT
         self.locked = False
 
+    def inventory_cache_snapshot(self) -> LotCacheSnapshot | None:
+        if self.namespace is None:
+            return None
+        return LotCacheSnapshot(self.namespace, self.lots, self.cached_at)
+
     def inventory_lots(self) -> tuple[BeanLot, ...]:
-        return self.lots
+        snapshot = self.inventory_cache_snapshot()
+        return () if snapshot is None else snapshot.lots
 
     def refresh_inventory_lots(self) -> str:
         request_id = f'refresh-{len(self.refreshes)}'
@@ -138,7 +154,7 @@ def test_model_has_fixed_columns_renders_weights_and_warns_without_mutating() ->
 
 def test_dialog_searches_all_descriptive_fields_case_insensitively() -> None:
     controller = FakeController()
-    dialog = InventoryLotDialog(None, controller, cached_at=datetime(2026, 8, 5, 12, 30, tzinfo=UTC))
+    dialog = InventoryLotDialog(None, controller)
     try:
         for search, expected in (
             ('GUATEMALA', LOT),
@@ -155,16 +171,11 @@ def test_dialog_searches_all_descriptive_fields_case_insensitively() -> None:
         dialog.close()
 
 
-def test_dialog_refresh_retains_cache_on_failure_and_updates_on_success() -> None:
+def test_dialog_reads_persisted_timestamp_and_refresh_retains_or_updates_cache() -> None:
     controller = FakeController((LOT,))
-    dialog = InventoryLotDialog(
-        None,
-        controller,
-        cached_at=datetime(2026, 8, 5, 12, 30, tzinfo=UTC),
-        online=False,
-    )
+    dialog = InventoryLotDialog(None, controller, online=False)
     try:
-        assert '2026' in dialog.statusLabel.text()
+        assert rendered_timestamp(CACHED_AT) in dialog.statusLabel.text()
         assert 'offline' in dialog.statusLabel.text().lower()
         dialog.refresh()
         request_id = controller.refreshes[-1]
@@ -176,13 +187,16 @@ def test_dialog_refresh_retains_cache_on_failure_and_updates_on_success() -> Non
         assert dialog.model.lots == (LOT,)
         assert dialog.refreshButton.isEnabled()
         assert 'Connection failed.' in dialog.statusLabel.text()
+        assert rendered_timestamp(CACHED_AT) in dialog.statusLabel.text()
 
         dialog.refresh()
         controller.lots = (WARNING_LOT,)
+        controller.cached_at = UPDATED_AT
         controller.inventoryLotsChanged.emit(controller.lots)
         assert dialog.model.lots == (WARNING_LOT,)
         assert dialog.refreshButton.isEnabled()
-        assert 'refreshed' in dialog.statusLabel.text().lower()
+        assert rendered_timestamp(UPDATED_AT) in dialog.statusLabel.text()
+        assert rendered_timestamp(CACHED_AT) not in dialog.statusLabel.text()
     finally:
         dialog.close()
 
@@ -290,9 +304,13 @@ def test_roast_properties_cancel_lock_and_context_change_rules() -> None:
     try:
         assert dialog.inventoryLotNameLabel.text() == LOT.name
         assert 'unavailable' in dialog.inventoryLotStatusLabel.text().lower()
+        assert rendered_timestamp(CACHED_AT) in dialog.inventoryLotStatusLabel.text()
         assert not dialog.inventoryLotChooseButton.isEnabled()
         assert not dialog.inventoryLotClearButton.isEnabled()
         assert dialog.inventoryLotRefreshButton.isEnabled()
+        controller.cached_at = UPDATED_AT
+        controller.inventoryLotsChanged.emit(controller.lots)
+        assert rendered_timestamp(UPDATED_AT) in dialog.inventoryLotStatusLabel.text()
         dialog.cleanUpInventoryLotSelection()
         assert qmc.roastServerInventoryOrigin == OTHER_NAMESPACE.origin
         assert qmc.roastServerBeanLotUUID == LOT.lot_id.hex
