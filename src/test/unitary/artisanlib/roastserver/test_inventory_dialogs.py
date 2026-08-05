@@ -109,6 +109,7 @@ class FakeController(QObject):
         self.cached_at: datetime | None = CACHED_AT
         self.snapshot_error = False
         self.locked = False
+        self.lock_calls: list[tuple[InventoryProfileLink | None, UUID | None, bool]] = []
         self.inventoryRefreshFinished.connect(self._refresh_finished)
         self.operationFailed.connect(self._refresh_failed)
         self.settingsChanged.connect(self._context_changed)
@@ -156,8 +157,8 @@ class FakeController(QObject):
         roast_uuid: UUID | None,
         profile_has_charge: bool,
     ) -> bool:
-        del link, roast_uuid, profile_has_charge
-        return self.locked
+        self.lock_calls.append((link, roast_uuid, profile_has_charge))
+        return link is not None and self.locked
 
 
 def test_model_has_fixed_columns_renders_weights_and_warns_without_mutating() -> None:
@@ -397,6 +398,8 @@ def _full_roast_properties_dialog(
     controller: FakeController | None,
     *,
     charged: bool = False,
+    link: InventoryProfileLink | None = None,
+    roast_uuid: UUID | None = None,
 ) -> tuple[editGraphDlg, QWidget, MagicMock, MagicMock]:
     for name in ('init', 'update', 'clearStockCaches'):
         monkeypatch.setattr(roast_properties.plus.stock, name, MagicMock())
@@ -453,11 +456,13 @@ def _full_roast_properties_dialog(
         'roastbatchprefix': '',
         'batchcounter': 0,
         'palette': {'title': '#000000', 'canvas': '#ffffff'},
-        'roastUUID': None,
-        'roastServerInventoryOrigin': None,
-        'roastServerInventoryOrganizationUUID': None,
-        'roastServerBeanLotUUID': None,
-        'roastServerBeanLotName': None,
+        'roastUUID': None if roast_uuid is None else roast_uuid.hex,
+        'roastServerInventoryOrigin': (
+            None if link is None else link.namespace.origin),
+        'roastServerInventoryOrganizationUUID': (
+            None if link is None else link.namespace.organization_id.hex),
+        'roastServerBeanLotUUID': None if link is None else link.lot_id.hex,
+        'roastServerBeanLotName': None if link is None else link.lot_name,
         'plus_default_store': None,
         'plus_custom_blend': None,
         'plus_store': 'plus-store',
@@ -583,7 +588,10 @@ def test_production_roast_properties_constructor_plus_and_close_parity(
     charged_baseline = _inventory_receiver_counts(charged_controller)
     charged_dialog, _charged_parent, _aw, _qmc = _full_roast_properties_dialog(
         monkeypatch, charged_controller, charged=True)
+    assert charged_controller.lock_calls == []
     assert not charged_dialog.inventoryLotChooseButton.isEnabled()
+    assert not charged_dialog.inventoryLotClearButton.isEnabled()
+    assert charged_dialog.inventoryLotRefreshButton.isEnabled()
     charged_cancel = charged_dialog.dialogbuttons.button(
         QDialogButtonBox.StandardButton.Cancel)
     assert charged_cancel is not None
@@ -592,10 +600,21 @@ def test_production_roast_properties_constructor_plus_and_close_parity(
 
     locked_controller = FakeController((LOT,))
     locked_controller.locked = True
+    locked_link = InventoryProfileLink(NAMESPACE, LOT.lot_id, LOT.name)
+    locked_roast_uuid = UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
     locked_baseline = _inventory_receiver_counts(locked_controller)
     locked_dialog, _locked_parent, _aw, _qmc = _full_roast_properties_dialog(
-        monkeypatch, locked_controller)
+        monkeypatch,
+        locked_controller,
+        link=locked_link,
+        roast_uuid=locked_roast_uuid,
+    )
+    assert locked_controller.lock_calls == [
+        (locked_link, locked_roast_uuid, False)
+    ]
     assert not locked_dialog.inventoryLotChooseButton.isEnabled()
+    assert not locked_dialog.inventoryLotClearButton.isEnabled()
+    assert locked_dialog.inventoryLotRefreshButton.isEnabled()
     locked_cancel = locked_dialog.dialogbuttons.button(
         QDialogButtonBox.StandardButton.Cancel)
     assert locked_cancel is not None
