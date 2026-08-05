@@ -22,8 +22,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import inspect
 from typing import cast, override
 from uuid import UUID
 
@@ -31,24 +33,42 @@ from PyQt6.QtCore import QCoreApplication, QObject, QTimer
 from PyQt6.QtTest import QSignalSpy
 import pytest
 
-from artisanlib.roastserver.api import ClientFactory
+from artisanlib.roastserver.api import ApiFailure, ClientFactory
 from artisanlib.roastserver.cache import CacheStore
 from artisanlib.roastserver.contract import (
     IdentityOrganization,
     IdentityUser,
+    FAILURE_MESSAGES,
+    FailureKind,
     Namespace,
+    PublicFailure,
     ServerIdentity,
 )
+from artisanlib.roastserver.inventory_contract import (
+    BeanLot,
+    BeanLotPage,
+    InventoryBalance,
+    InventoryCommandRequest,
+    InventoryConflict,
+    InventoryMutationResult,
+    InventoryReservation,
+)
 from artisanlib.roastserver.inventory_store import (
+    FailedInventoryCommand,
     InventoryCommand,
+    InventoryQueueCounts,
+    InventoryRoastState,
     InventoryStore,
     InventoryStoreError,
+    InterruptedReservation,
+    LotCacheSnapshot,
 )
 from artisanlib.roastserver.outbox import Job, Outbox, QueueCounts
 from artisanlib.roastserver.settings import CredentialStore, namespace_for
 from artisanlib.roastserver.worker import (
     ConfigurationFence,
     ConnectionTestRequest,
+    InventoryRefreshRequest,
     OpaqueVault,
     RoastServerWorker,
     SavedProfileRequest,
@@ -154,6 +174,20 @@ class FakeInventoryStore:
         self.resume_calls.append((namespace, now))
         return 0
 
+    def counts(self, _namespace: Namespace) -> InventoryQueueCounts:
+        return InventoryQueueCounts(0, 0, 0, 0, 0)
+
+    def failed_commands(
+        self, _namespace: Namespace
+    ) -> tuple[FailedInventoryCommand, ...]:
+        return ()
+
+    def interrupted_reservations(self) -> tuple[InterruptedReservation, ...]:
+        return ()
+
+    def cache_snapshot(self, namespace: Namespace) -> LotCacheSnapshot:
+        return LotCacheSnapshot(namespace, (), None)
+
     def close(self) -> None:
         self.log.append('inventory.close')
         if self.close_error:
@@ -216,6 +250,7 @@ class RecordingWorker(RoastServerWorker):
         inventory_delivery: bool = True,
     ) -> None:
         self.queue_classes_delivered: list[str] = []
+        self.inventory_delivery = inventory_delivery
         super().__init__(
             outbox=cast(Outbox, outbox),
             inventory_store=cast(InventoryStore, inventory_store),
@@ -229,9 +264,6 @@ class RecordingWorker(RoastServerWorker):
             configuration_fence=fence,
             timer_factory=timer_factory,
             operation_hook=operation_hook,
-            _inventory_delivery=(
-                self._record_inventory_delivery if inventory_delivery else None
-            ),
         )
 
     @override
@@ -239,10 +271,13 @@ class RecordingWorker(RoastServerWorker):
         self.queue_classes_delivered.append('profile')
         self._schedule_next(job.namespace)
 
-    def _record_inventory_delivery(
-        self, _configuration: WorkerConfiguration, _command: InventoryCommand
+    @override
+    def _deliver_inventory_command(
+        self, configuration: WorkerConfiguration, command: InventoryCommand
     ) -> None:
-        self.queue_classes_delivered.append('inventory')
+        del configuration, command
+        if self.inventory_delivery:
+            self.queue_classes_delivered.append('inventory')
 
 
 def profile_job(namespace: Namespace, now: datetime) -> Job:
@@ -290,6 +325,237 @@ def inventory_command(namespace: Namespace, now: datetime) -> InventoryCommand:
         created_at=now,
         updated_at=now,
     )
+
+
+def inventory_roast_state() -> InventoryRoastState:
+    return InventoryRoastState(
+        namespace=NAMESPACE,
+        roast_uuid=ROAST_UUID,
+        lot_id=LOT_ID,
+        lot_name='Test lot',
+        reservation_uuid=RESERVATION_UUID,
+        server_reservation_uuid=None,
+        planned_grams=1_000,
+        actual_grams=None,
+        lifecycle='reserve_queued',
+        terminal_intent=None,
+        reserve_occurred_at=NOW,
+        finalize_occurred_at=None,
+        release_occurred_at=None,
+        server_state=None,
+        balance=None,
+        conflict_id=None,
+        error_code=None,
+        error_message=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def bean_lot(lot_id: UUID = LOT_ID, name: str = 'Test lot') -> BeanLot:
+    return BeanLot(lot_id, name, None, (), None, None, 2_000, 0, 2_000, 0)
+
+
+def mutation_result(*, conflict: bool = False) -> InventoryMutationResult:
+    server_reservation_uuid = UUID('77777777-7777-4777-8777-777777777777')
+    conflict_id = UUID('88888888-8888-4888-8888-888888888888')
+    inventory_conflict = (
+        InventoryConflict(
+            conflict_id,
+            LOT_ID,
+            UUID('99999999-9999-4999-8999-999999999999'),
+            ROAST_UUID,
+            server_reservation_uuid,
+            'reservation',
+            -100,
+            'open',
+            None,
+            None,
+            None,
+            NOW,
+        )
+        if conflict
+        else None
+    )
+    return InventoryMutationResult(
+        InventoryReservation(
+            server_reservation_uuid,
+            RESERVATION_UUID,
+            LOT_ID,
+            ROAST_UUID,
+            CLIENT_UUID,
+            'reserved',
+            1_000,
+            None,
+            NOW,
+            None,
+            NOW,
+            NOW,
+            conflict_id if conflict else None,
+        ),
+        InventoryBalance(LOT_ID, 2_000, 1_000, 1_000, int(conflict)),
+        inventory_conflict,
+        False,
+    )
+
+
+class DeliveryInventoryStore(FakeInventoryStore):
+    def __init__(self, log: list[str]) -> None:
+        super().__init__(log)
+        self.due = NOW
+        self.command_value = inventory_command(NAMESPACE, NOW)
+        self.roast = inventory_roast_state()
+        self.transitions: list[tuple[str, object]] = []
+        self.replacements: list[tuple[BeanLot, ...]] = []
+        self.snapshot = LotCacheSnapshot(NAMESPACE, (bean_lot(),), NOW)
+        self.retry_same_calls: list[str] = []
+
+    @override
+    def lease_next(
+        self, namespace: Namespace, now: datetime, _lease_seconds: int
+    ) -> InventoryCommand | None:
+        self.lease_calls.append(now)
+        self.due = None
+        return self.command_value
+
+    def roast_state(
+        self, _namespace: Namespace, _roast_uuid: UUID
+    ) -> InventoryRoastState:
+        return self.roast
+
+    def mark_complete(
+        self,
+        _command_id: str,
+        _lease_token: str,
+        result: InventoryMutationResult,
+        _now: datetime,
+    ) -> InventoryRoastState:
+        self.transitions.append(('complete', result))
+        self.command_value = replace(
+            self.command_value,
+            state='complete',
+            lease_token=None,
+            lease_expires_at=None,
+        )
+        self.roast = replace(
+            self.roast,
+            lifecycle='reserved',
+            server_reservation_uuid=result.reservation.reservation_id,
+            server_state='reserved',
+            balance=result.balance,
+            conflict_id=(
+                None if result.conflict is None else result.conflict.conflict_id
+            ),
+        )
+        return self.roast
+
+    def mark_retry(
+        self,
+        _command_id: str,
+        _lease_token: str,
+        _now: datetime,
+        next_attempt_at: datetime,
+        failure: PublicFailure,
+    ) -> None:
+        self.transitions.append(('retry', (next_attempt_at, failure)))
+
+    def mark_paused(
+        self,
+        _command_id: str,
+        _lease_token: str,
+        _now: datetime,
+        failure: PublicFailure,
+    ) -> None:
+        self.transitions.append(('paused', failure))
+
+    def mark_failed(
+        self,
+        _command_id: str,
+        _lease_token: str,
+        _now: datetime,
+        failure: PublicFailure,
+    ) -> None:
+        self.transitions.append(('failed', failure))
+
+    def replace_lots(
+        self, namespace: Namespace, lots: tuple[BeanLot, ...], refreshed_at: datetime
+    ) -> None:
+        self.replacements.append(lots)
+        self.snapshot = LotCacheSnapshot(namespace, lots, refreshed_at)
+
+    @override
+    def cache_snapshot(self, namespace: Namespace) -> LotCacheSnapshot:
+        assert namespace == NAMESPACE
+        return self.snapshot
+
+    @override
+    def counts(self, _namespace: Namespace) -> InventoryQueueCounts:
+        return InventoryQueueCounts(0, 0, 0, 0, 1)
+
+    @override
+    def failed_commands(
+        self, _namespace: Namespace
+    ) -> tuple[FailedInventoryCommand, ...]:
+        if self.command_value.state != 'failed':
+            return ()
+        return (
+            FailedInventoryCommand(
+                self.command_value.id,
+                NAMESPACE,
+                ROAST_UUID,
+                LOT_ID,
+                RESERVATION_UUID,
+                'reserve',
+                1,
+                'invalid_request',
+                'Invalid request',
+                NOW,
+            ),
+        )
+
+    def retry_same(self, command_id: str, _now: datetime) -> None:
+        self.retry_same_calls.append(command_id)
+        self.command_value = replace(self.command_value, state='pending')
+
+
+class FakeInventoryClient:
+    def __init__(
+        self,
+        *,
+        result: object | None = None,
+        failure: ApiFailure | None = None,
+        pages: list[BeanLotPage] | None = None,
+        on_execute: Callable[[], None] | None = None,
+    ) -> None:
+        self.result = result
+        self.failure = failure
+        self.pages = [] if pages is None else pages
+        self.on_execute = on_execute
+        self.requests: list[object] = []
+        self.cursors: list[str | None] = []
+
+    def __enter__(self) -> FakeInventoryClient:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        pass
+
+    def execute_inventory_command(self, request: object) -> object:
+        self.requests.append(request)
+        if self.on_execute is not None:
+            self.on_execute()
+        if self.failure is not None:
+            raise self.failure
+        return self.result
+
+    def list_inventory_lots(
+        self, cursor: str | None = None, limit: int = 100
+    ) -> BeanLotPage:
+        assert limit == 100
+        self.cursors.append(cursor)
+        if self.failure is not None:
+            raise self.failure
+        return self.pages.pop(0)
 
 
 @pytest.fixture(scope='module')
@@ -355,6 +621,352 @@ def make_worker(
     worker._credential = 'test-only'
     worker._authorized_target = (ORIGIN, IDENTITY)
     return worker, outbox, inventory, cache, timers[0], fence, log
+
+
+def make_delivery_worker(
+    client: FakeInventoryClient,
+) -> tuple[
+    RoastServerWorker,
+    DeliveryInventoryStore,
+    FakeOutbox,
+    ConfigurationFence,
+    OpaqueVault[object],
+]:
+    log: list[str] = []
+    outbox = FakeOutbox(log)
+    inventory = DeliveryInventoryStore(log)
+    cache = FakeCache(log)
+    fence = ConfigurationFence()
+    command_vault = OpaqueVault[object]()
+    worker = RoastServerWorker(
+        outbox=cast(Outbox, outbox),
+        inventory_store=cast(InventoryStore, inventory),
+        cache=cast(CacheStore, cache),
+        credentials=cast(CredentialStore, FakeCredentials()),
+        client_factory=cast(ClientFactory, lambda _origin, _credential: client),
+        clock=lambda: NOW,
+        credential_vault=OpaqueVault[ConnectionTestRequest](),
+        profile_vault=OpaqueVault[SavedProfileRequest](),
+        command_vault=command_vault,
+        configuration_fence=fence,
+        timer_factory=FakeTimer,
+    )
+    worker.start()
+    generation = fence.advance()
+    configuration = WorkerConfiguration(
+        origin=ORIGIN,
+        namespace=NAMESPACE,
+        enabled=True,
+        automatic_upload=True,
+        client_instance_uuid=CLIENT_UUID,
+        cache_limit_bytes=64 * 1024 * 1024,
+        generation=generation,
+        identity=IDENTITY,
+    )
+    worker._configuration = configuration
+    worker._credential = 'test-only'
+    worker._authorized_target = (ORIGIN, IDENTITY)
+    return worker, inventory, outbox, fence, command_vault
+
+
+def test_task7_inventory_worker_surface_replaces_temporary_delivery_callback() -> None:
+    parameters = inspect.signature(RoastServerWorker.__init__).parameters
+
+    assert '_inventory_delivery' not in parameters
+    assert hasattr(RoastServerWorker, 'inventoryLotsChanged')
+    assert hasattr(RoastServerWorker, 'inventoryQueueChanged')
+    assert hasattr(RoastServerWorker, 'inventoryFailedChanged')
+    assert hasattr(RoastServerWorker, 'inventoryReservationChanged')
+    assert hasattr(RoastServerWorker, 'inventoryRecoveryChanged')
+    assert hasattr(RoastServerWorker, 'refresh_inventory')
+    assert hasattr(RoastServerWorker, 'retry_inventory_command')
+
+
+def test_delivery_completes_atomically_with_exact_stored_bytes_and_signals() -> None:
+    result = mutation_result()
+    client = FakeInventoryClient(result=result)
+    worker, inventory, _outbox, _fence, _vault = make_delivery_worker(client)
+    reservations = QSignalSpy(worker.inventoryReservationChanged)
+
+    worker.process_queue_once()
+
+    assert inventory.transitions == [('complete', result)]
+    assert len(client.requests) == 1
+    request = cast(InventoryCommandRequest, client.requests[0])
+    assert request.request_json == b'{}'
+    assert request.idempotency_key == 'inventory-test'
+    assert len(reservations) == 1
+    worker.stop()
+
+
+def test_revoked_mutation_response_cannot_commit() -> None:
+    client = FakeInventoryClient(result=mutation_result())
+    worker, inventory, _outbox, fence, _vault = make_delivery_worker(client)
+
+    def revoke() -> None:
+        fence.revoke()
+
+    client.on_execute = revoke
+    worker.process_queue_once()
+
+    assert inventory.command_value.state == 'leased'
+    assert inventory.transitions == []
+    worker.stop()
+
+
+@pytest.mark.parametrize(
+    ('failure', 'transition', 'expected_code'),
+    [
+        (
+            ApiFailure(
+                PublicFailure(
+                    FailureKind.RATE_LIMITED,
+                    'rate_limited',
+                    FAILURE_MESSAGES[FailureKind.RATE_LIMITED],
+                    True,
+                ),
+                429,
+                45,
+            ),
+            'retry',
+            'rate_limited',
+        ),
+        (
+            ApiFailure(
+                PublicFailure(
+                    FailureKind.INVENTORY_REJECTED,
+                    'invalid_request',
+                    'Invalid request',
+                    False,
+                ),
+                422,
+                None,
+            ),
+            'failed',
+            'invalid_request',
+        ),
+        (
+            ApiFailure(
+                PublicFailure(
+                    FailureKind.INVENTORY_UNSUPPORTED,
+                    'inventory_unsupported',
+                    FAILURE_MESSAGES[FailureKind.INVENTORY_UNSUPPORTED],
+                    False,
+                ),
+                404,
+                None,
+            ),
+            'paused',
+            'inventory_unsupported',
+        ),
+    ],
+)
+def test_delivery_classifies_retry_terminal_and_unsupported_failures(
+    failure: ApiFailure, transition: str, expected_code: str
+) -> None:
+    client = FakeInventoryClient(failure=failure)
+    worker, inventory, outbox, _fence, _vault = make_delivery_worker(client)
+
+    worker.process_queue_once()
+
+    assert inventory.transitions[0][0] == transition
+    transition_value = inventory.transitions[0][1]
+    if transition == 'retry':
+        retry_at, persisted = cast(
+            tuple[datetime, PublicFailure], transition_value
+        )
+        assert retry_at == NOW + timedelta(seconds=45)
+    else:
+        persisted = cast(PublicFailure, transition_value)
+    assert persisted.code == expected_code
+    if transition == 'paused':
+        assert outbox.pause_calls == []
+        assert inventory.pause_calls[-1][2] == 'inventory_unsupported'
+    worker.stop()
+
+
+def test_credential_failure_pauses_both_queues_and_clears_authorization() -> None:
+    failure = ApiFailure(
+        PublicFailure(
+            FailureKind.CREDENTIAL_REJECTED,
+            'credential_rejected',
+            FAILURE_MESSAGES[FailureKind.CREDENTIAL_REJECTED],
+            False,
+        ),
+        403,
+        None,
+    )
+    worker, inventory, outbox, _fence, _vault = make_delivery_worker(
+        FakeInventoryClient(failure=failure)
+    )
+
+    worker.process_queue_once()
+
+    assert inventory.transitions[0][0] == 'paused'
+    assert outbox.pause_calls[-1][2] == 'credential_rejected'
+    assert inventory.pause_calls[-1][2] == 'credential_rejected'
+    assert worker._credential is None
+    worker.stop()
+
+
+def test_malformed_success_is_terminal_and_successful_conflict_is_prominent() -> None:
+    worker, inventory, _outbox, _fence, _vault = make_delivery_worker(
+        FakeInventoryClient(result=object())
+    )
+    failures = QSignalSpy(worker.operationFailed)
+
+    worker.process_queue_once()
+
+    assert inventory.transitions[0][0] == 'failed'
+    assert cast(PublicFailure, inventory.transitions[0][1]).code == 'invalid_response'
+    worker.stop()
+
+    worker, inventory, _outbox, _fence, _vault = make_delivery_worker(
+        FakeInventoryClient(result=mutation_result(conflict=True))
+    )
+    failures = QSignalSpy(worker.operationFailed)
+    worker.process_queue_once()
+    assert inventory.transitions[0][0] == 'complete'
+    assert failures[-1][1].kind is FailureKind.INVENTORY_CONFLICT
+    worker.stop()
+
+
+def test_refresh_publishes_only_complete_multi_page_snapshot() -> None:
+    second_id = UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    client = FakeInventoryClient(
+        pages=[
+            BeanLotPage((bean_lot(),), 'next'),
+            BeanLotPage((bean_lot(second_id, 'Second'),), None),
+        ]
+    )
+    worker, inventory, _outbox, _fence, vault = make_delivery_worker(client)
+    lots_changed = QSignalSpy(worker.inventoryLotsChanged)
+    generation = cast(WorkerConfiguration, worker._configuration).generation
+    request_id = vault.put(InventoryRefreshRequest(NAMESPACE, generation))
+
+    worker.refresh_inventory(request_id)
+
+    assert client.cursors == [None, 'next']
+    assert inventory.replacements == [
+        (bean_lot(), bean_lot(second_id, 'Second'))
+    ]
+    assert any(
+        cast(LotCacheSnapshot, lots_changed[index][0]).lots
+        == inventory.replacements[0]
+        for index in range(len(lots_changed))
+    )
+    worker.stop()
+
+
+@pytest.mark.parametrize(
+    'pages',
+    [
+        [BeanLotPage((bean_lot(),), 'more'), BeanLotPage((bean_lot(),), None)],
+        [
+            BeanLotPage((), f'cursor-{index}')
+            for index in range(1, 101)
+        ],
+        [
+            BeanLotPage(
+                tuple(
+                    bean_lot(UUID(int=index), f'Lot {index}')
+                    for index in range(1, 10_002)
+                ),
+                None,
+            )
+        ],
+    ],
+    ids=['duplicate-lot', 'page-101', 'lot-10001'],
+)
+def test_refresh_bounds_retain_old_cache(pages: list[BeanLotPage]) -> None:
+    client = FakeInventoryClient(pages=pages)
+    worker, inventory, _outbox, _fence, vault = make_delivery_worker(client)
+    old_snapshot = inventory.snapshot
+    generation = cast(WorkerConfiguration, worker._configuration).generation
+
+    worker.refresh_inventory(
+        vault.put(InventoryRefreshRequest(NAMESPACE, generation))
+    )
+
+    assert inventory.replacements == []
+    assert inventory.snapshot == old_snapshot
+    worker.stop()
+
+
+def test_refresh_partial_api_error_retains_old_cache() -> None:
+    failure = ApiFailure(
+        PublicFailure(
+            FailureKind.OFFLINE,
+            'connection_error',
+            FAILURE_MESSAGES[FailureKind.OFFLINE],
+            True,
+        ),
+        None,
+        None,
+    )
+    class PartialErrorClient(FakeInventoryClient):
+        @override
+        def list_inventory_lots(
+            self, cursor: str | None = None, limit: int = 100
+        ) -> BeanLotPage:
+            if cursor is not None:
+                raise failure
+            return super().list_inventory_lots(cursor, limit)
+
+    client = PartialErrorClient(
+        pages=[BeanLotPage((bean_lot(),), 'more')]
+    )
+    worker, inventory, _outbox, _fence, vault = make_delivery_worker(client)
+    generation = cast(WorkerConfiguration, worker._configuration).generation
+
+    worker.refresh_inventory(
+        vault.put(InventoryRefreshRequest(NAMESPACE, generation))
+    )
+
+    assert inventory.replacements == []
+    worker.stop()
+
+
+def test_refresh_cycle_retains_old_cache_and_wake_emits_all_aggregates() -> None:
+    client = FakeInventoryClient(
+        pages=[
+            BeanLotPage((bean_lot(),), 'repeat'),
+            BeanLotPage((), 'repeat'),
+        ]
+    )
+    worker, inventory, _outbox, _fence, vault = make_delivery_worker(client)
+    queue_changed = QSignalSpy(worker.inventoryQueueChanged)
+    failed_changed = QSignalSpy(worker.inventoryFailedChanged)
+    recovery_changed = QSignalSpy(worker.inventoryRecoveryChanged)
+    old_snapshot = inventory.snapshot
+    generation = cast(WorkerConfiguration, worker._configuration).generation
+
+    worker.refresh_inventory(
+        vault.put(InventoryRefreshRequest(NAMESPACE, generation))
+    )
+    worker.wake_inventory()
+
+    assert inventory.replacements == []
+    assert inventory.snapshot == old_snapshot
+    assert queue_changed
+    assert failed_changed
+    assert recovery_changed
+    worker.stop()
+
+
+def test_manual_retry_preserves_command_bytes_and_idempotency_key() -> None:
+    worker, inventory, _outbox, _fence, _vault = make_delivery_worker(
+        FakeInventoryClient(result=mutation_result())
+    )
+    original = inventory.command_value
+    inventory.command_value = replace(original, state='failed')
+
+    worker.retry_inventory_command(original.id)
+
+    assert inventory.retry_same_calls == [original.id]
+    assert inventory.command_value.request_json == original.request_json
+    assert inventory.command_value.idempotency_key == original.idempotency_key
+    worker.stop()
 
 
 def test_startup_and_shutdown_order_closes_both_stores_before_stopped() -> None:
@@ -475,15 +1087,13 @@ def test_pause_and_resume_apply_to_profile_and_inventory_with_same_time_and_reas
     worker.stop()
 
 
-def test_unwired_inventory_dispatch_never_leases_or_mutates_commands() -> None:
-    worker, outbox, inventory, _cache, _timer, _fence, _log = make_worker(
-        inventory_delivery=False
-    )
+def test_inventory_dispatch_uses_contained_internal_delivery_path() -> None:
+    worker, outbox, inventory, _cache, _timer, _fence, _log = make_worker()
     outbox.due = None
     inventory.due = NOW
 
     worker.process_queue_once()
 
-    assert inventory.lease_calls == []
-    assert worker.queue_classes_delivered == []
+    assert len(inventory.lease_calls) == 1
+    assert worker.queue_classes_delivered == ['inventory']
     worker.stop()
