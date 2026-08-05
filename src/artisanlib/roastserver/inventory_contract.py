@@ -51,7 +51,6 @@ from artisanlib.roastserver.contract import (
     parse_error_envelope,
 )
 from artisanlib.roastserver.origin import SettingsError, canonical_origin
-from artisanlib.roastserver.settings import namespace_for
 
 MAX_INVENTORY_CURSOR_CHARS: Final[int] = 4096
 MAX_INVENTORY_PAGES: Final[int] = 100
@@ -656,6 +655,8 @@ def parse_inventory_error(status: int, value: object) -> PublicFailure | None:
 
 
 def parse_profile_link(value: Mapping[str, object]) -> InventoryProfileLink | None:
+    from artisanlib.roastserver.settings import namespace_for
+
     raw_values = tuple(value.get(key) for key in _PROFILE_LINK_KEYS)
     if all(item is None for item in raw_values):
         return None
@@ -684,6 +685,8 @@ def parse_profile_link(value: Mapping[str, object]) -> InventoryProfileLink | No
 
 
 def profile_link_fields(link: InventoryProfileLink) -> dict[str, str]:
+    from artisanlib.roastserver.settings import namespace_for
+
     if not isinstance(link, InventoryProfileLink):
         raise ValueError('invalid inventory profile link')
     expected_namespace = namespace_for(
