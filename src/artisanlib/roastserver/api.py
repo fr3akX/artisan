@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import hashlib
 import hmac
@@ -60,6 +60,7 @@ from artisanlib.roastserver.contract import (
     MAX_JSON_BYTES,
     MAX_METADATA_BYTES,
     MAX_PROFILE_BYTES,
+    POSTGRESQL_INTEGER_MAX,
     PublicFailure,
     RevisionUpload,
     RoastDetail,
@@ -1567,21 +1568,53 @@ def _finish_profile_destination(
 def _validate_inventory_command_request(request: object) -> None:
     from artisanlib.roastserver.inventory_contract import InventoryCommandRequest
 
+    if type(request) is not InventoryCommandRequest:
+        raise ValueError('invalid inventory command request')
+    operation: object = request.operation
+    reservation_uuid: object = request.reservation_uuid
+    roast_uuid: object = request.roast_uuid
+    lot_id: object = request.lot_id
+    request_json: object = request.request_json
+    idempotency_key: object = request.idempotency_key
+    occurred_at: object = request.occurred_at
+    client_instance_uuid: object = request.client_instance_uuid
+    planned_grams: object = request.planned_grams
+    requested_actual_grams: object = request.requested_actual_grams
     if (
-        not isinstance(request, InventoryCommandRequest)
-        or request.operation not in {'reserve', 'finalize', 'release'}
+        type(operation) is not str
+        or operation not in {'reserve', 'finalize', 'release'}
+        or type(reservation_uuid) is not UUID
+        or type(client_instance_uuid) is not UUID
+        or type(roast_uuid) is not UUID
+        or type(lot_id) is not UUID
+        or type(planned_grams) is not int
+        or not 1 <= planned_grams <= POSTGRESQL_INTEGER_MAX
+        or type(request_json) is not bytes
+        or not 1 <= len(request_json) <= MAX_JSON_BYTES
+        or type(idempotency_key) is not str
+        or not isinstance(occurred_at, datetime)
+        or occurred_at.tzinfo is None
     ):
         raise ValueError('invalid inventory command request')
-    _require_bounded_bytes(
-        request.request_json,
-        maximum=MAX_JSON_BYTES,
-        name='inventory command JSON',
-    )
+    try:
+        utc_offset = occurred_at.utcoffset()
+    except (OverflowError, ValueError):
+        raise ValueError('invalid inventory command request') from None
+    if utc_offset != timedelta(0):
+        raise ValueError('invalid inventory command request')
+    if operation == 'finalize':
+        if requested_actual_grams is not None and (
+            type(requested_actual_grams) is not int
+            or not 1 <= requested_actual_grams <= POSTGRESQL_INTEGER_MAX
+        ):
+            raise ValueError('invalid inventory command request')
+    elif requested_actual_grams is not None:
+        raise ValueError('invalid inventory command request')
     expected_idempotency_key = (
-        f'inventory-v1:{request.client_instance_uuid.hex}:'
-        f'{request.reservation_uuid.hex}:{request.operation}'
+        f'inventory-v1:{client_instance_uuid.hex}:'
+        f'{reservation_uuid.hex}:{operation}'
     )
-    if request.idempotency_key != expected_idempotency_key:
+    if idempotency_key != expected_idempotency_key:
         raise ValueError('invalid inventory command request')
 
 

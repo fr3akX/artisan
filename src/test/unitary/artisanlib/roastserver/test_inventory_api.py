@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta, timezone
 import json
 import secrets
 import socket
@@ -16,10 +16,16 @@ from requests.adapters import HTTPAdapter
 from requests.structures import CaseInsensitiveDict
 
 from artisanlib.roastserver.api import ApiFailure, RoastServerClient
-from artisanlib.roastserver.contract import FAILURE_MESSAGES, MAX_JSON_BYTES, FailureKind
+from artisanlib.roastserver.contract import (
+    FAILURE_MESSAGES,
+    MAX_JSON_BYTES,
+    POSTGRESQL_INTEGER_MAX,
+    FailureKind,
+)
 from artisanlib.roastserver.inventory_contract import (
     MAX_INVENTORY_CURSOR_CHARS,
     InventoryCommandRequest,
+    InventoryOperation,
     build_finalize_request,
     build_release_request,
     build_reserve_request,
@@ -58,6 +64,22 @@ RELEASE_REQUEST = build_release_request(
     planned_grams=1_250,
     occurred_at=NOW,
 )
+
+
+class ForgedHex:
+    hex = '../../auth/me'
+
+
+class EqualToEverything:
+    __hash__ = object.__hash__
+
+    @override
+    def __eq__(self, _other: object) -> bool:
+        return True
+
+
+class OperationString(str):
+    pass
 
 
 def lot_payload() -> dict[str, object]:
@@ -350,6 +372,125 @@ def test_inventory_commands_use_immutable_body_exact_path_and_idempotency_header
     assert call.data is command_request.request_json
     assert result.reservation.state == state
     assert configured.closed_by_client is True
+
+
+@pytest.mark.parametrize(
+    'malicious_request',
+    (
+        pytest.param(object(), id='not-exact-command-dataclass'),
+        pytest.param(
+            replace(
+                RESERVE_REQUEST,
+                operation=cast(InventoryOperation, OperationString('reserve')),
+            ),
+            id='operation-string-subclass',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, operation=cast(InventoryOperation, 'delete')),
+            id='invalid-operation',
+        ),
+        pytest.param(
+            replace(
+                RELEASE_REQUEST,
+                reservation_uuid=cast(UUID, ForgedHex()),
+                idempotency_key=(
+                    f'inventory-v1:{CLIENT_UUID.hex}:../../auth/me:release'
+                ),
+                operation='release',
+            ),
+            id='forged-reservation-path-traversal',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, client_instance_uuid=cast(UUID, ForgedHex())),
+            id='forged-client-uuid',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, roast_uuid=cast(UUID, ForgedHex())),
+            id='forged-roast-uuid',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, lot_id=cast(UUID, ForgedHex())),
+            id='forged-lot-uuid',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, planned_grams=cast(int, True)),
+            id='boolean-planned-grams',
+        ),
+        pytest.param(replace(RESERVE_REQUEST, planned_grams=0), id='zero-planned-grams'),
+        pytest.param(
+            replace(RESERVE_REQUEST, planned_grams=POSTGRESQL_INTEGER_MAX + 1),
+            id='oversized-planned-grams',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, requested_actual_grams=1),
+            id='reserve-with-actual-grams',
+        ),
+        pytest.param(
+            replace(RELEASE_REQUEST, requested_actual_grams=1),
+            id='release-with-actual-grams',
+        ),
+        pytest.param(
+            replace(FINALIZE_REQUEST, requested_actual_grams=cast(int, True)),
+            id='boolean-actual-grams',
+        ),
+        pytest.param(
+            replace(FINALIZE_REQUEST, requested_actual_grams=0),
+            id='zero-actual-grams',
+        ),
+        pytest.param(
+            replace(
+                FINALIZE_REQUEST,
+                requested_actual_grams=POSTGRESQL_INTEGER_MAX + 1,
+            ),
+            id='oversized-actual-grams',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, occurred_at=NOW.replace(tzinfo=None)),
+            id='naive-timestamp',
+        ),
+        pytest.param(
+            replace(
+                RESERVE_REQUEST,
+                occurred_at=NOW.astimezone(timezone(timedelta(hours=1))),
+            ),
+            id='non-utc-timestamp',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, occurred_at=cast(datetime, object())),
+            id='non-datetime-timestamp',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, request_json=cast(bytes, bytearray(b'{}'))),
+            id='mutable-request-body',
+        ),
+        pytest.param(replace(RESERVE_REQUEST, request_json=b''), id='empty-request-body'),
+        pytest.param(
+            replace(RESERVE_REQUEST, request_json=b'x' * (MAX_JSON_BYTES + 1)),
+            id='oversized-request-body',
+        ),
+        pytest.param(
+            replace(
+                RESERVE_REQUEST,
+                idempotency_key=cast(str, EqualToEverything()),
+            ),
+            id='non-string-idempotency-key',
+        ),
+        pytest.param(
+            replace(RESERVE_REQUEST, idempotency_key='inventory-v1:forged'),
+            id='inconsistent-idempotency-key',
+        ),
+    ),
+)
+def test_inventory_command_rejects_malicious_metadata_without_transport(
+    session: RecordingSession,
+    malicious_request: object,
+) -> None:
+    with pytest.raises(ValueError, match='invalid inventory command request'):
+        client(session).execute_inventory_command(
+            cast(InventoryCommandRequest, malicious_request)
+        )
+
+    assert session.calls == []
 
 
 @pytest.mark.parametrize(
