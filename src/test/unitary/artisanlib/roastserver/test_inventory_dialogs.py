@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QPushButton,
     QSpinBox,
     QTextEdit,
     QWidget,
@@ -45,8 +46,17 @@ from artisanlib import roast_properties
 from artisanlib.roast_properties import UI_MODE, editGraphDlg
 from artisanlib.roastserver.contract import FailureKind, Namespace, PublicFailure
 from artisanlib.roastserver.inventory_contract import BeanLot, InventoryProfileLink
-from artisanlib.roastserver.inventory_dialogs import BeanLotTableModel, InventoryLotDialog
-from artisanlib.roastserver.inventory_store import LotCacheSnapshot
+from artisanlib.roastserver.inventory_dialogs import (
+    BeanLotTableModel,
+    InterruptedReservationsDialog,
+    InterruptedReservationsModel,
+    InventoryLotDialog,
+)
+from artisanlib.roastserver.inventory_store import (
+    InterruptedReservation,
+    InventoryLifecycle,
+    LotCacheSnapshot,
+)
 from artisanlib.roastserver.settings import namespace_for
 
 
@@ -95,6 +105,7 @@ WARNING_LOT = BeanLot(
 class FakeController(QObject):
     inventoryLotsChanged = pyqtSignal(object)
     inventoryRefreshFinished = pyqtSignal(str)
+    inventoryRecoveryRequired = pyqtSignal(object)
     operationFailed = pyqtSignal(str, object)
     onlineChanged = pyqtSignal(bool)
     settingsChanged = pyqtSignal(object)
@@ -110,6 +121,7 @@ class FakeController(QObject):
         self.snapshot_error = False
         self.locked = False
         self.lock_calls: list[tuple[InventoryProfileLink | None, UUID | None, bool]] = []
+        self.recovery_calls: list[tuple[UUID, str]] = []
         self.inventoryRefreshFinished.connect(self._refresh_finished)
         self.operationFailed.connect(self._refresh_failed)
         self.settingsChanged.connect(self._context_changed)
@@ -159,6 +171,97 @@ class FakeController(QObject):
     ) -> bool:
         self.lock_calls.append((link, roast_uuid, profile_has_charge))
         return link is not None and self.locked
+
+    def resolve_interrupted_inventory(self, roast_uuid: UUID, action: str) -> None:
+        self.recovery_calls.append((roast_uuid, action))
+
+
+def _recovery(
+    namespace: Namespace,
+    roast_uuid: UUID,
+    *,
+    lot_name: str = '<b>Recovery lot</b>',
+    lifecycle: str = 'reserved',
+) -> InterruptedReservation:
+    return InterruptedReservation(
+        namespace,
+        roast_uuid,
+        LOT.lot_id,
+        lot_name,
+        UUID('dddddddd-dddd-4ddd-8ddd-dddddddddddd'),
+        1_250,
+        cast(InventoryLifecycle, lifecycle),
+        UPDATED_AT,
+    )
+
+
+def test_interrupted_model_exact_safe_fields_and_accessibility() -> None:
+    item = _recovery(NAMESPACE, UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc'))
+    model = InterruptedReservationsModel((item,))
+
+    assert model.rowCount() == 1
+    assert [model.headerData(column, Qt.Orientation.Horizontal)
+        for column in range(model.columnCount())] == [
+            'Lot', 'Roast', 'Planned', 'Namespace', 'Status']
+    assert model.data(model.index(0, 0)) == item.lot_name
+    assert model.data(model.index(0, 1)) == str(item.roast_uuid)
+    assert model.data(model.index(0, 2)) == '1250g'
+    assert NAMESPACE.origin in str(model.data(model.index(0, 3)))
+    assert str(NAMESPACE.organization_id) in str(model.data(model.index(0, 3)))
+    assert model.data(model.index(0, 4)) == 'Reserved'
+    accessible = model.data(model.index(0, 0), Qt.ItemDataRole.AccessibleTextRole)
+    assert item.lot_name in str(accessible)
+    assert model.record_at(0) is item
+
+
+@pytest.mark.parametrize(
+    ('button_name', 'action'),
+    [('finalizeButton', 'finalize'), ('releaseButton', 'release'), ('keepButton', 'keep')],
+)
+def test_inventory_recovery_all_actions_wait_for_resulting_state_signal(
+    button_name: str,
+    action: str,
+) -> None:
+    controller = FakeController()
+    active = _recovery(NAMESPACE, UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc'))
+    old = _recovery(OTHER_NAMESPACE, UUID('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'))
+    dialog = InterruptedReservationsDialog(None, controller, (active, old), NAMESPACE)
+    try:
+        dialog.tableView.selectRow(0)
+        button = cast('QPushButton', getattr(dialog, button_name))
+        QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+        assert controller.recovery_calls == [(active.roast_uuid, action)]
+        assert dialog.model.records == (active, old)
+        assert not dialog.finalizeButton.isEnabled()
+        assert not dialog.releaseButton.isEnabled()
+        assert not dialog.keepButton.isEnabled()
+
+        resulting = (active, old) if action == 'keep' else (old,)
+        controller.inventoryRecoveryRequired.emit(resulting)
+        assert dialog.model.records == resulting
+        if action == 'keep':
+            assert 'pending' in dialog.noticeLabel.text().lower()
+    finally:
+        dialog.clean_up()
+        dialog.close()
+
+
+def test_inventory_recovery_old_namespace_is_visible_keep_only_and_disconnects() -> None:
+    controller = FakeController()
+    old = _recovery(OTHER_NAMESPACE, UUID('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'))
+    baseline = controller.receivers(controller.inventoryRecoveryRequired)
+    dialog = InterruptedReservationsDialog(None, controller, (old,), NAMESPACE)
+    assert controller.receivers(controller.inventoryRecoveryRequired) == baseline + 1
+    dialog.tableView.selectRow(0)
+    assert not dialog.finalizeButton.isEnabled()
+    assert not dialog.releaseButton.isEnabled()
+    assert dialog.keepButton.isEnabled()
+    QTest.mouseClick(dialog.keepButton, Qt.MouseButton.LeftButton)
+    assert controller.recovery_calls == []
+    assert 'current' in dialog.noticeLabel.text().lower()
+    dialog.clean_up()
+    assert controller.receivers(controller.inventoryRecoveryRequired) == baseline
+    dialog.close()
 
 
 def test_model_has_fixed_columns_renders_weights_and_warns_without_mutating() -> None:

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Final, Protocol, override
+from typing import Final, Literal, Protocol, cast, override
 from uuid import UUID
 
 from PyQt6.QtCore import (
@@ -56,9 +56,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from artisanlib.roastserver.contract import PublicFailure
+from artisanlib.roastserver.contract import Namespace, PublicFailure
 from artisanlib.roastserver.inventory_contract import BeanLot
-from artisanlib.roastserver.inventory_store import LotCacheSnapshot
+from artisanlib.roastserver.inventory_store import (
+    InterruptedReservation,
+    LotCacheSnapshot,
+)
 from artisanlib.util import render_weight
 
 _ROOT_INDEX: Final[QModelIndex] = QModelIndex()
@@ -72,6 +75,290 @@ def _tr(text: str) -> str:
 class _Signal(Protocol):
     def connect(self, slot: Callable[..., object]) -> object: ...
     def disconnect(self, slot: Callable[..., object]) -> object: ...
+
+
+class InventoryRecoveryDialogController(Protocol):
+    inventoryRecoveryRequired: _Signal
+
+    def resolve_interrupted_inventory(
+        self,
+        roast_uuid: UUID,
+        action: Literal['finalize', 'release', 'keep'],
+    ) -> object: ...
+
+
+class InterruptedReservationsModel(QAbstractTableModel):
+    RecordRole: Final[int] = int(Qt.ItemDataRole.UserRole) + 1
+    _HEADERS: Final[tuple[str, ...]] = (
+        'Lot',
+        'Roast',
+        'Planned',
+        'Namespace',
+        'Status',
+    )
+    _STATES: Final[dict[str, str]] = {
+        'reserve_queued': 'Reserve queued',
+        'reserved': 'Reserved',
+        'finalize_queued': 'Finalize queued',
+        'finalized': 'Finalized',
+        'release_queued': 'Release queued',
+        'released': 'Released',
+        'paused': 'Paused',
+        'failed': 'Failed',
+    }
+
+    def __init__(
+        self,
+        records: tuple[InterruptedReservation, ...] = (),
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._records = tuple(records)
+
+    @property
+    def records(self) -> tuple[InterruptedReservation, ...]:
+        return self._records
+
+    def replace_records(self, records: tuple[InterruptedReservation, ...]) -> None:
+        self.beginResetModel()
+        self._records = tuple(records)
+        self.endResetModel()
+
+    def record_at(self, row: int) -> InterruptedReservation | None:
+        if 0 <= row < len(self._records):
+            return self._records[row]
+        return None
+
+    @override
+    def rowCount(self, parent: QModelIndex = _ROOT_INDEX) -> int:
+        return 0 if parent.isValid() else len(self._records)
+
+    @override
+    def columnCount(self, parent: QModelIndex = _ROOT_INDEX) -> int:
+        return 0 if parent.isValid() else len(self._HEADERS)
+
+    @override
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if (
+            role == Qt.ItemDataRole.DisplayRole
+            and orientation is Qt.Orientation.Horizontal
+            and 0 <= section < len(self._HEADERS)
+        ):
+            return _tr(self._HEADERS[section])
+        return None
+
+    @override
+    def data(
+        self,
+        index: QModelIndex,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        record = self.record_at(index.row()) if index.isValid() else None
+        if record is None:
+            return None
+        if role == self.RecordRole:
+            return record
+        values = self._display_values(record)
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            return ', '.join(values)
+        if role == Qt.ItemDataRole.DisplayRole and 0 <= index.column() < len(values):
+            return values[index.column()]
+        if role == Qt.ItemDataRole.TextAlignmentRole and index.column() == 2:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    @override
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    @classmethod
+    def _display_values(cls, record: InterruptedReservation) -> tuple[str, ...]:
+        namespace = _tr('{origin} — organization {organization}').format(
+            origin=record.namespace.origin,
+            organization=str(record.namespace.organization_id),
+        )
+        return (
+            record.lot_name,
+            str(record.roast_uuid),
+            render_weight(float(record.planned_grams), 0, 0),
+            namespace,
+            _tr(cls._STATES[record.lifecycle]),
+        )
+
+
+class InterruptedReservationsDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        controller: object,
+        records: tuple[InterruptedReservation, ...],
+        active_namespace: Namespace | None,
+    ) -> None:
+        super().__init__(parent)
+        self._controller = cast(InventoryRecoveryDialogController, controller)
+        self._active_namespace = active_namespace
+        self._pending: tuple[Namespace, UUID, Literal['finalize', 'release', 'keep']] | None = None
+        self._signals_connected = False
+
+        self.setWindowTitle(_tr('Interrupted inventory reservations'))
+        self.setModal(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        intro = QLabel(
+            _tr('Choose how to resolve inventory reservations interrupted before completion.'),
+            self,
+        )
+        intro.setTextFormat(Qt.TextFormat.PlainText)
+        intro.setWordWrap(True)
+
+        self.model = InterruptedReservationsModel(records, self)
+        self.tableView = QTableView(self)
+        self.tableView.setModel(self.model)
+        self.tableView.setAccessibleName(_tr('Interrupted inventory reservations'))
+        self.tableView.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tableView.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tableView.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        vertical_header = self.tableView.verticalHeader()
+        if vertical_header is not None:
+            vertical_header.hide()
+        header = self.tableView.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+
+        self.noticeLabel = QLabel('', self)
+        self.noticeLabel.setTextFormat(Qt.TextFormat.PlainText)
+        self.noticeLabel.setOpenExternalLinks(False)
+        self.noticeLabel.setWordWrap(True)
+        self.noticeLabel.setAccessibleName(_tr('Inventory recovery status'))
+
+        self.finalizeButton = QPushButton(_tr('Finalize planned'), self)
+        self.finalizeButton.setAccessibleName(_tr('Finalize selected reservation using planned weight'))
+        self.releaseButton = QPushButton(_tr('Release'), self)
+        self.releaseButton.setAccessibleName(_tr('Release selected inventory reservation'))
+        self.keepButton = QPushButton(_tr('Keep pending'), self)
+        self.keepButton.setAccessibleName(_tr('Keep selected inventory reservation pending'))
+        self.buttonBox = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+
+        actions = QHBoxLayout()
+        actions.addWidget(self.finalizeButton)
+        actions.addWidget(self.releaseButton)
+        actions.addWidget(self.keepButton)
+        actions.addStretch(1)
+        actions.addWidget(self.buttonBox)
+        layout = QVBoxLayout(self)
+        layout.addWidget(intro)
+        layout.addWidget(self.tableView, 1)
+        layout.addWidget(self.noticeLabel)
+        layout.addLayout(actions)
+
+        selection = self.tableView.selectionModel()
+        if selection is not None:
+            selection.selectionChanged.connect(self._selection_changed)
+        self.finalizeButton.clicked.connect(lambda: self._resolve('finalize'))
+        self.releaseButton.clicked.connect(lambda: self._resolve('release'))
+        self.keepButton.clicked.connect(lambda: self._resolve('keep'))
+        self.buttonBox.rejected.connect(self.reject)
+        self._controller.inventoryRecoveryRequired.connect(self._recovery_changed)
+        self._signals_connected = True
+        if records:
+            self.tableView.selectRow(0)
+        self._selection_changed()
+        self.resize(980, 430)
+
+    def set_active_namespace(self, namespace: Namespace | None) -> None:
+        self._active_namespace = namespace
+        self._pending = None
+        self._selection_changed()
+
+    def clean_up(self) -> None:
+        if not self._signals_connected:
+            return
+        self._signals_connected = False
+        try:
+            self._controller.inventoryRecoveryRequired.disconnect(self._recovery_changed)
+        except (RuntimeError, TypeError):
+            pass
+
+    @pyqtSlot()
+    def _selection_changed(self) -> None:
+        record = self._selected_record()
+        active = record is not None and record.namespace == self._active_namespace
+        waiting = self._pending is not None
+        self.finalizeButton.setEnabled(active and not waiting)
+        self.releaseButton.setEnabled(active and not waiting)
+        self.keepButton.setEnabled(record is not None and not waiting)
+        if record is not None and not active and not waiting:
+            self.noticeLabel.setText(
+                _tr('This reservation is outside the current authenticated namespace. Only Keep pending is available.')
+            )
+
+    @pyqtSlot(object)
+    def _recovery_changed(self, value: object) -> None:
+        if not isinstance(value, tuple) or not all(
+            isinstance(record, InterruptedReservation) for record in value
+        ):
+            return
+        selected = self._selected_record()
+        selected_key = None if selected is None else (selected.namespace, selected.roast_uuid)
+        pending = self._pending
+        records = cast('tuple[InterruptedReservation, ...]', value)
+        self.model.replace_records(records)
+        self._pending = None
+        target_key = selected_key if pending is None else pending[:2]
+        if target_key is not None:
+            for row, record in enumerate(self.model.records):
+                if (record.namespace, record.roast_uuid) == target_key:
+                    self.tableView.selectRow(row)
+                    break
+        if pending is not None:
+            action = pending[2]
+            if action == 'keep':
+                self.noticeLabel.setText(
+                    _tr('Reservation kept pending. This notice remains until it is finalized or released.')
+                )
+            else:
+                self.noticeLabel.setText(
+                    _tr('Inventory recovery state updated.')
+                )
+        self._selection_changed()
+
+    def _selected_record(self) -> InterruptedReservation | None:
+        selection = self.tableView.selectionModel()
+        if selection is None:
+            return None
+        rows = selection.selectedRows()
+        return None if not rows else self.model.record_at(rows[0].row())
+
+    def _resolve(self, action: Literal['finalize', 'release', 'keep']) -> None:
+        if self._pending is not None:
+            return
+        record = self._selected_record()
+        if record is None:
+            return
+        if record.namespace != self._active_namespace:
+            self.noticeLabel.setText(
+                _tr('This reservation cannot be changed from the current Roast Server organization. Keep pending remains selected.')
+            )
+            return
+        self._pending = (record.namespace, record.roast_uuid, action)
+        self.noticeLabel.setText(_tr('Waiting for inventory recovery state.'))
+        self._selection_changed()
+        try:
+            self._controller.resolve_interrupted_inventory(record.roast_uuid, action)
+        except (RuntimeError, ValueError):
+            self._pending = None
+            self.noticeLabel.setText(
+                _tr('Inventory recovery could not be stored. The reservation remains pending.')
+            )
+            self._selection_changed()
 
 
 class InventoryLotDialogController(Protocol):
@@ -566,4 +853,11 @@ class InventoryLotDialog(QDialog):
         return local.strftime('%Y-%m-%d %H:%M')
 
 
-__all__ = ['BeanLotTableModel', 'InventoryLotDialog', 'InventoryLotDialogController']
+__all__ = [
+    'BeanLotTableModel',
+    'InterruptedReservationsDialog',
+    'InterruptedReservationsModel',
+    'InventoryLotDialog',
+    'InventoryLotDialogController',
+    'InventoryRecoveryDialogController',
+]

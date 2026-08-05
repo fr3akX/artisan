@@ -55,6 +55,11 @@ from artisanlib.roastserver.dialogs import (
     RoastServerConfigDialog,
     RoastTableModel,
 )
+from artisanlib.roastserver.inventory_store import (
+    FailedInventoryCommand,
+    InterruptedReservation,
+    InventoryQueueCounts,
+)
 from artisanlib.roastserver.outbox import FailedJob, QueueCounts
 from artisanlib.roastserver.settings import (
     KEYRING_FAILURE_MESSAGE,
@@ -90,6 +95,29 @@ FAILED_JOB = FailedJob(
     error_code='profile_rejected',
     error_message='<b>Rejected & unsafe-looking</b>',
     updated_at=datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
+)
+INVENTORY_NAMESPACE = namespace_for(ORIGIN, IDENTITY.organization.id)
+FAILED_INVENTORY = FailedInventoryCommand(
+    id='c' * 32,
+    namespace=INVENTORY_NAMESPACE,
+    roast_uuid=UUID('55555555-5555-4555-8555-555555555555'),
+    lot_id=UUID('66666666-6666-4666-8666-666666666666'),
+    reservation_uuid=UUID('77777777-7777-4777-8777-777777777777'),
+    operation='reserve',
+    attempts=2,
+    error_code='invalid_inventory_transition',
+    error_message='<b>Inventory rejected</b>',
+    updated_at=datetime(2026, 8, 2, 12, 0, tzinfo=UTC),
+)
+INTERRUPTED = InterruptedReservation(
+    namespace=INVENTORY_NAMESPACE,
+    roast_uuid=FAILED_INVENTORY.roast_uuid,
+    lot_id=FAILED_INVENTORY.lot_id,
+    lot_name='Interrupted lot',
+    reservation_uuid=FAILED_INVENTORY.reservation_uuid,
+    planned_grams=1_000,
+    lifecycle='reserved',
+    updated_at=datetime(2026, 8, 2, 12, 0, tzinfo=UTC),
 )
 SAFE_FAILURE = PublicFailure(
     kind=FailureKind.OFFLINE,
@@ -207,6 +235,9 @@ class FakeController(QObject):
     identityChanged = pyqtSignal(object)
     queueChanged = pyqtSignal(object)
     failedJobsChanged = pyqtSignal(object)
+    inventoryQueueChanged = pyqtSignal(object)
+    inventoryFailedChanged = pyqtSignal(object)
+    inventoryRecoveryRequired = pyqtSignal(object)
     cacheStatsChanged = pyqtSignal(object)
     operationFailed = pyqtSignal(str, object)
 
@@ -217,6 +248,9 @@ class FakeController(QObject):
         self.apply_calls: list[tuple[str, bool, bool, int]] = []
         self.retry_calls: list[str] = []
         self.remove_calls: list[str] = []
+        self.inventory_retry_calls: list[str] = []
+        self.inventory_namespace = INVENTORY_NAMESPACE
+        self.inventory_enabled = True
         self.refresh_calls = 0
         self.clear_calls = 0
         self.remove_credential_calls = 0
@@ -255,6 +289,15 @@ class FakeController(QObject):
 
     def remove_job(self, job_id: str) -> None:
         self.remove_calls.append(job_id)
+
+    def retry_inventory_command(self, command_id: str) -> None:
+        self.inventory_retry_calls.append(command_id)
+
+    def inventory_context(self) -> object:
+        return type('Context', (), {
+            'namespace': self.inventory_namespace,
+            'enabled': self.inventory_enabled,
+        })()
 
     def clear_unused_cache(self) -> None:
         self.clear_calls += 1
@@ -547,6 +590,65 @@ def test_failed_model_has_stable_safe_columns_and_values() -> None:
     assert model.flags(model.index(0, 0)) == (
         Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
     )
+
+
+def test_inventory_queue_failed_retry_same_only_and_interrupted_aggregate(
+    dialog: RoastServerConfigDialog,
+    controller: FakeController,
+) -> None:
+    controller.inventoryQueueChanged.emit(InventoryQueueCounts(4, 3, 2, 1, 9))
+    controller.inventoryFailedChanged.emit((FAILED_INVENTORY,))
+    controller.inventoryRecoveryRequired.emit((INTERRUPTED,))
+
+    assert dialog.inventory_pending_count_label.text() == '4'
+    assert dialog.inventory_retrying_count_label.text() == '3'
+    assert dialog.inventory_paused_count_label.text() == '2'
+    assert dialog.inventory_failed_count_label.text() == '1'
+    assert dialog.inventory_interrupted_count_label.text() == '1'
+    assert dialog.inventory_failed_model.rowCount() == 1
+    assert dialog.inventory_failed_view.accessibleName()
+    assert dialog.inventory_failed_model.data(
+        dialog.inventory_failed_model.index(0, 0),
+        Qt.ItemDataRole.AccessibleTextRole,
+    )
+    retry = dialog.inventory_failed_view.indexWidget(
+        dialog.inventory_failed_model.index(0, 6))
+    assert isinstance(retry, QPushButton)
+    assert 'same command' in retry.text().lower()
+    retry.click()
+    assert controller.inventory_retry_calls == [FAILED_INVENTORY.id]
+    assert dialog.inventory_failed_model.columnCount() == 7
+    assert all(
+        'remove' not in str(dialog.inventory_failed_model.headerData(
+            column, Qt.Orientation.Horizontal)).lower()
+        for column in range(dialog.inventory_failed_model.columnCount())
+    )
+
+
+def test_inventory_old_namespace_retry_disabled_and_unsupported_is_inventory_only(
+    dialog: RoastServerConfigDialog,
+    controller: FakeController,
+) -> None:
+    controller.inventory_namespace = namespace_for(
+        NEW_ORIGIN, UUID('88888888-8888-4888-8888-888888888888'))
+    controller.inventoryFailedChanged.emit((FAILED_INVENTORY,))
+    retry = dialog.inventory_failed_view.indexWidget(
+        dialog.inventory_failed_model.index(0, 6))
+    assert isinstance(retry, QPushButton)
+    assert not retry.isEnabled()
+
+    controller.operationFailed.emit(
+        'inventory-operation',
+        PublicFailure(
+            FailureKind.INVENTORY_UNSUPPORTED,
+            'inventory_unsupported',
+            '<b>arbitrary server message</b>',
+            False,
+        ),
+    )
+    assert dialog.inventory_status_label.text() == 'Server does not support inventory.'
+    assert dialog.inventory_status_label.textFormat() is Qt.TextFormat.PlainText
+    assert dialog.error_label.text() == ''
 
 
 def test_failed_table_per_row_retry_remove_and_refresh_are_controller_only(

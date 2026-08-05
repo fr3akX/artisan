@@ -173,6 +173,7 @@ if TYPE_CHECKING:
     from artisanlib.roastserver.contract import ServerProfileSource
     from artisanlib.roastserver.controller import RoastServerController
     from artisanlib.roastserver.inventory import PreparedInventoryCharge
+    from artisanlib.roastserver.inventory_store import InterruptedReservation
     from artisanlib.roastserver.protection import ProtectionToken
     from plus.stock import Blend, BlendList
     from artisanlib.roastserver.dialogs import RoastServerBrowserDialog, RoastServerConfigDialog
@@ -1557,7 +1558,7 @@ class ApplicationWindow(QMainWindow):
         'main_menu_actions_with_shortcuts', 'ui_mode', 'UIModeMenu',  'productionModeAction', 'defaultModeAction', 'expertModeAction', 'calculatorAction',
         'helpAboutAction', 'checkUpdateAction', 'errorAction', 'messageAction', 'serialAction', 'platformAction', 'aboutQtAction',
         'helpDocumentationAction', 'KshortCAction', 'profile_data_type_adapter', 'official_build',
-        'roastserver_controller', 'roastserver_settings', 'roastserver_config_dialog', 'roastserver_browser_dialog', 'roastserver_open_source',
+        'roastserver_controller', 'roastserver_settings', 'roastserver_config_dialog', 'roastserver_browser_dialog', 'roastserver_inventory_recovery_dialog', 'roastserver_inventory_recovery_records', 'roastserver_inventory_recovery_scheduled', 'roastserver_open_source',
         'roastServerUploadAction', 'roastServerRoastsAction', 'roastServerConfigAction',
         'roasthubs_org_id', 'roasthubs_machine_id', 'roasthubs_token' ]
 
@@ -1644,6 +1645,9 @@ class ApplicationWindow(QMainWindow):
         self.roastserver_settings:'ConnectorSettings|None' = None # noqa: UP037
         self.roastserver_config_dialog:'RoastServerConfigDialog|None' = None # noqa: UP037
         self.roastserver_browser_dialog:'RoastServerBrowserDialog|None' = None # noqa: UP037
+        self.roastserver_inventory_recovery_dialog:QWidget|None = None
+        self.roastserver_inventory_recovery_records:tuple[object,...] = ()
+        self.roastserver_inventory_recovery_scheduled:bool = False
         self.roastserver_open_source:'tuple[Path,ServerProfileSource]|None' = None # noqa: UP037 # runtime import intentionally remains lazy
 
         self.setAcceptDrops(True) # enable drag-and-drop
@@ -4616,6 +4620,89 @@ class ApplicationWindow(QMainWindow):
         self.roastserver_browser_dialog.raise_()
         self.roastserver_browser_dialog.activateWindow()
 
+    @pyqtSlot(object)
+    def scheduleInventoryRecovery(self, value:object) -> None:
+        from artisanlib.roastserver.inventory_store import InterruptedReservation
+
+        if not isinstance(value, tuple) or not all(
+            isinstance(record, InterruptedReservation) for record in value
+        ):
+            return
+        self.roastserver_inventory_recovery_records = value
+        if not value or self.roastserver_inventory_recovery_scheduled:
+            return
+        self.roastserver_inventory_recovery_scheduled = True
+        QTimer.singleShot(0, self.showInventoryRecovery)
+
+    @pyqtSlot()
+    def showInventoryRecovery(self) -> None:
+        from artisanlib.roastserver.inventory_dialogs import InterruptedReservationsDialog
+
+        self.roastserver_inventory_recovery_scheduled = False
+        records = self.roastserver_inventory_recovery_records
+        controller = self.roastserver_controller
+        if controller is None or not records:
+            return
+        context = controller.inventory_context()
+        active_namespace = context.namespace if context.enabled else None
+        dialog = self.roastserver_inventory_recovery_dialog
+        if dialog is None:
+            typed_records = cast('tuple[InterruptedReservation, ...]', records)
+            dialog = InterruptedReservationsDialog(
+                self, controller, typed_records, active_namespace)
+            self.roastserver_inventory_recovery_dialog = dialog
+        elif isinstance(dialog, InterruptedReservationsDialog):
+            dialog.set_active_namespace(active_namespace)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    @pyqtSlot(object)
+    def showInventoryConflict(self, value:object) -> None:
+        from artisanlib.roastserver.inventory_store import InventoryRoastState
+
+        if not isinstance(value, InventoryRoastState) or value.conflict_id is None:
+            return
+        balance = value.balance
+        if balance is None:
+            return
+        warning = QMessageBox(self)
+        warning.setWindowTitle(QApplication.translate(
+            'Message', 'Inventory conflict'))
+        warning.setIcon(QMessageBox.Icon.Warning)
+        warning.setTextFormat(Qt.TextFormat.PlainText)
+        warning.setText(QApplication.translate(
+            'Message',
+            'Inventory conflict for {lot}. Available balance: {balance} g. '
+            'Reconcile this lot in Roast Server before relying on inventory totals.'
+        ).format(lot=value.lot_name, balance=balance.available_grams))
+        warning.setStandardButtons(QMessageBox.StandardButton.Ok)
+        warning.exec()
+
+    def cleanUpRoastServerInventoryPresentation(self) -> None:
+        try:
+            dialog = self.roastserver_inventory_recovery_dialog
+        except (AttributeError, RuntimeError):
+            dialog = None
+        clean_up = getattr(dialog, 'clean_up', None)
+        if callable(clean_up):
+            clean_up()
+        controller = self.roastserver_controller
+        if controller is None:
+            return
+        for signal_name, slot in (
+            ('inventoryRecoveryRequired', self.scheduleInventoryRecovery),
+            ('inventoryConflict', self.showInventoryConflict),
+        ):
+            signal = getattr(controller, signal_name, None)
+            disconnect = getattr(signal, 'disconnect', None)
+            if not callable(disconnect):
+                continue
+            try:
+                disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+
     @staticmethod
     def readRoastServerProfile(
         filename:str,
@@ -4824,6 +4911,8 @@ class ApplicationWindow(QMainWindow):
         self.roastserver_controller = controller
         controller.settingsChanged.connect(self.setRoastServerSettings)
         controller.profileReady.connect(self.openRoastServerProfile)
+        controller.inventoryRecoveryRequired.connect(self.scheduleInventoryRecovery)
+        controller.inventoryConflict.connect(self.showInventoryConflict)
         controller.start()
 
     #
@@ -23210,6 +23299,7 @@ class ApplicationWindow(QMainWindow):
                 flagKeepON = self.qmc.flagKeepON
                 self.qmc.flagKeepON = False # temporarily turn keepOn off
 
+                self.cleanUpRoastServerInventoryPresentation()
                 controller = self.roastserver_controller
                 if not self.releaseRoastServerInventory(self.qmc.roastUUID):
                     self.sendmessage(QApplication.translate(

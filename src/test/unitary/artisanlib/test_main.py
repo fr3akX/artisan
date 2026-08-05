@@ -118,7 +118,7 @@ import stat
 import tempfile
 from pathlib import Path
 from collections.abc import Generator
-from typing import Any
+from typing import Any, cast
 from unittest.mock import ANY, MagicMock, Mock, call, patch
 from uuid import UUID
 
@@ -176,6 +176,7 @@ try:
         QLayout,
         QLCDNumber,
         QLineEdit,
+        QMainWindow,
         QMenu,
         QSlider,
         QTableWidget,
@@ -206,10 +207,16 @@ from artisanlib.roastserver.inventory import (
 )
 from artisanlib.roastserver.inventory_contract import (
     BeanLot,
+    InventoryBalance,
     InventoryProfileLink,
     parse_profile_link,
 )
-from artisanlib.roastserver.inventory_store import InventoryStore, InventoryStoreError
+from artisanlib.roastserver.inventory_store import (
+    InterruptedReservation,
+    InventoryRoastState,
+    InventoryStore,
+    InventoryStoreError,
+)
 from artisanlib.util import FileDestinationTransaction
 from artisanlib.util import deserialize as util_deserialize
 from artisanlib.util import serialize_with_timestamp as util_serialize_with_timestamp
@@ -4087,6 +4094,94 @@ def coordinator_controller(
         release_inventory_roast=release_inventory_roast,
         saved_profile=Mock(),
     )
+
+
+def test_inventory_recovery_startup_is_deferred_reuses_dialog_and_conflict_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PyQt6.QtCore import QObject, pyqtSignal
+    from artisanlib.roastserver import inventory_dialogs
+    from artisanlib.roastserver.settings import namespace_for
+
+    class Controller(QObject):
+        inventoryRecoveryRequired = pyqtSignal(object)
+        inventoryConflict = pyqtSignal(object)
+
+        def inventory_context(self) -> SimpleNamespace:
+            return SimpleNamespace(namespace=namespace, enabled=True)
+
+    class RecoveryDialog:
+        instances: list[object] = []
+
+        def __init__(self, *args: object) -> None:
+            self.args = args
+            self.show_calls = 0
+            self.active_namespaces: list[Namespace | None] = []
+            self.__class__.instances.append(self)
+
+        def set_active_namespace(self, value: Namespace | None) -> None:
+            self.active_namespaces.append(value)
+
+        def show(self) -> None:
+            self.show_calls += 1
+
+        def raise_(self) -> None:
+            return
+
+        def activateWindow(self) -> None:
+            return
+
+    namespace = namespace_for(
+        'https://safe.example', UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))
+    roast_uuid = UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+    lot_id = UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+    reservation_id = UUID('dddddddd-dddd-4ddd-8ddd-dddddddddddd')
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    recovery = InterruptedReservation(
+        namespace, roast_uuid, lot_id, '<b>Safe lot</b>', reservation_id,
+        1_000, 'reserved', now)
+    controller = Controller()
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    QMainWindow.__init__(window)
+    window.roastserver_controller = cast(Any, controller)
+    window.roastserver_inventory_recovery_dialog = None
+    window.roastserver_inventory_recovery_records = ()
+    window.roastserver_inventory_recovery_scheduled = False
+    controller.inventoryRecoveryRequired.connect(window.scheduleInventoryRecovery)
+    controller.inventoryConflict.connect(window.showInventoryConflict)
+    monkeypatch.setattr(
+        inventory_dialogs, 'InterruptedReservationsDialog', RecoveryDialog)
+
+    controller.inventoryRecoveryRequired.emit((recovery,))
+    assert RecoveryDialog.instances == []
+    QApplication.processEvents()
+    assert len(RecoveryDialog.instances) == 1
+    assert RecoveryDialog.instances[0].show_calls == 1
+    controller.inventoryRecoveryRequired.emit((recovery,))
+    QApplication.processEvents()
+    assert len(RecoveryDialog.instances) == 1
+    assert RecoveryDialog.instances[0].show_calls == 2
+
+    conflict = InventoryRoastState(
+        namespace, roast_uuid, lot_id, '<b>Safe lot</b>', reservation_id, None,
+        1_000, None, 'reserved', None, now, None, None, None,
+        InventoryBalance(lot_id, 100, 125, -25, 1), reservation_id,
+        None, None, now, now)
+    message = MagicMock()
+    message_box = MagicMock(return_value=message)
+    message_box.Icon.Warning = object()
+    message_box.StandardButton.Ok = object()
+    monkeypatch.setattr(main_module, 'QMessageBox', message_box)
+    controller.inventoryConflict.emit(conflict)
+    message.setTextFormat.assert_called_once_with(Qt.TextFormat.PlainText)
+    warning = message.setText.call_args.args[0]
+    assert '<b>Safe lot</b>' in warning
+    assert '-25 g' in warning
+    assert 'Reconcile' in warning
+    assert namespace.origin not in warning
+    assert str(namespace.organization_id) not in warning
+    message.exec.assert_called_once()
+    window.deleteLater()
 
 
 def inventory_profile_load_window() -> ApplicationWindow:
