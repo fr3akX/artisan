@@ -79,6 +79,7 @@ from artisanlib.roastserver.worker import (
     ConfigurationFence,
     ConnectionTestRequest,
     InventoryRefreshRequest,
+    InventoryWorkerEvent,
     OpaqueVault,
     RoastServerWorker,
     SavedProfileRequest,
@@ -1165,10 +1166,16 @@ def test_refresh_publishes_only_complete_multi_page_snapshot() -> None:
     assert inventory.replacements == [
         (bean_lot(), bean_lot(second_id, 'Second'))
     ]
-    assert any(
-        cast(LotCacheSnapshot, lots_changed[index][0]).lots
-        == inventory.replacements[0]
+    events = tuple(
+        cast(InventoryWorkerEvent, lots_changed[index][0])
         for index in range(len(lots_changed))
+    )
+    assert any(
+        event.generation == generation
+        and event.namespace == NAMESPACE
+        and event.refresh_id == request_id
+        and cast(LotCacheSnapshot, event.value).lots == inventory.replacements[0]
+        for event in events
     )
     worker.stop()
 

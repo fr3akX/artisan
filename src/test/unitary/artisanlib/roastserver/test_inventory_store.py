@@ -975,6 +975,39 @@ def test_reserve_failure_cascades_dependency_and_manual_retries_are_exact(
     assert retry.attempts == 2
 
 
+def test_all_failed_commands_is_global_and_deterministic(
+    store: InventoryStore,
+) -> None:
+    for namespace, failed_at in (
+        (NAMESPACE, NOW + timedelta(seconds=20)),
+        (OTHER_NAMESPACE, NOW + timedelta(seconds=10)),
+    ):
+        store.enqueue_reserve(namespace, RESERVE_REQUEST, 'Lot', NOW)
+        command = store.lease_next(namespace, NOW, 30)
+        assert command is not None and command.lease_token is not None
+        store.mark_failed(
+            command.id, command.lease_token, failed_at, REJECTED_FAILURE
+        )
+
+    failed = store.all_failed_commands()
+
+    assert tuple(item.namespace for item in failed) == (NAMESPACE, OTHER_NAMESPACE)
+    expected_ids = tuple(item.id for item in failed)
+    assert expected_ids == tuple(
+        item.id
+        for namespace in (NAMESPACE, OTHER_NAMESPACE)
+        for item in store.failed_commands(namespace)
+    )
+    root = store.root
+    store.close()
+    reopened = opened_store(root)
+    try:
+        assert tuple(item.id for item in reopened.all_failed_commands()) == expected_ids
+    finally:
+        reopened.close()
+        store.open()
+
+
 def test_pause_resume_preserves_namespace_and_derives_lifecycle(
     store: InventoryStore,
 ) -> None:

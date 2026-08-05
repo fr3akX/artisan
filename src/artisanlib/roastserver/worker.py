@@ -377,6 +377,14 @@ class InventoryRefreshRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class InventoryWorkerEvent:
+    generation: int
+    namespace: Namespace | None
+    value: object
+    refresh_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ClearUnusedRequest:
     namespace: Namespace
 
@@ -1669,9 +1677,17 @@ class RoastServerWorker(QObject):
             try:
                 if failure is None and result is not None:
                     reservation = store.mark_complete(command.id, token, result, now)
-                    self.inventoryReservationChanged.emit(reservation)
+                    self.inventoryReservationChanged.emit(
+                        InventoryWorkerEvent(
+                            configuration.generation, command.namespace, reservation
+                        )
+                    )
                     self.inventoryLotsChanged.emit(
-                        store.cache_snapshot(command.namespace)
+                        InventoryWorkerEvent(
+                            configuration.generation,
+                            command.namespace,
+                            store.cache_snapshot(command.namespace),
+                        )
                     )
                     self.onlineChanged.emit(True)
                     if result.conflict is not None:
@@ -1864,7 +1880,11 @@ class RoastServerWorker(QObject):
                     raise _StaleConfiguration
                 store.replace_lots(value.namespace, tuple(lots), self._now())
                 snapshot = store.cache_snapshot(value.namespace)
-                self.inventoryLotsChanged.emit(snapshot)
+                self.inventoryLotsChanged.emit(
+                    InventoryWorkerEvent(
+                        value.generation, value.namespace, snapshot, opaque_id
+                    )
+                )
                 self.onlineChanged.emit(True)
                 self._emit_aggregates(value.namespace)
             return
@@ -2619,10 +2639,29 @@ class RoastServerWorker(QObject):
         else:
             if self._cancelled():
                 return
-            self.inventoryQueueChanged.emit(inventory_counts)
-            self.inventoryFailedChanged.emit(inventory_failed)
-            self.inventoryRecoveryChanged.emit(inventory_recovery)
-            self.inventoryLotsChanged.emit(inventory_lots)
+            configuration = self._configuration
+            if configuration is None:
+                return
+            self.inventoryQueueChanged.emit(
+                InventoryWorkerEvent(
+                    configuration.generation, namespace, inventory_counts
+                )
+            )
+            self.inventoryFailedChanged.emit(
+                InventoryWorkerEvent(
+                    configuration.generation, namespace, inventory_failed
+                )
+            )
+            self.inventoryRecoveryChanged.emit(
+                InventoryWorkerEvent(
+                    configuration.generation, namespace, inventory_recovery
+                )
+            )
+            self.inventoryLotsChanged.emit(
+                InventoryWorkerEvent(
+                    configuration.generation, namespace, inventory_lots
+                )
+            )
         if not self._cancelled():
             self._emit_cache_stats(namespace=namespace, matching_operation='cache')
 
@@ -2637,8 +2676,17 @@ class RoastServerWorker(QObject):
         except (InventoryStoreError, ValueError):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_INVENTORY))
             return
-        if reservation is not None and not self._cancelled():
-            self.inventoryReservationChanged.emit(reservation)
+        configuration = self._configuration
+        if (
+            reservation is not None
+            and not self._cancelled()
+            and configuration is not None
+        ):
+            self.inventoryReservationChanged.emit(
+                InventoryWorkerEvent(
+                    configuration.generation, namespace, reservation
+                )
+            )
 
     def _emit_cache_stats(
         self,

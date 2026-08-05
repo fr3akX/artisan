@@ -1273,6 +1273,40 @@ class InventoryStore:
                 )
             return tuple(result)
 
+    def all_failed_commands(self) -> tuple[FailedInventoryCommand, ...]:
+        with self._storage_boundary(), self._read_transaction() as connection:
+            rows = connection.execute(
+                '''SELECT command.*, namespace.origin,
+                          namespace.organization_uuid, namespace.namespace_key
+                   FROM inventory_commands AS command
+                   JOIN namespaces AS namespace ON namespace.id = command.namespace_id
+                   WHERE command.state = 'failed'
+                   ORDER BY command.updated_at DESC, namespace.namespace_key,
+                            CASE command.operation WHEN 'reserve' THEN 0 ELSE 1 END,
+                            command.id'''
+            ).fetchall()
+            result: list[FailedInventoryCommand] = []
+            for row in rows:
+                namespace = _row_namespace(row)
+                command = _row_to_command(row, namespace)
+                if command.error_code is None or command.error_message is None:
+                    raise InventoryStoreError('failed inventory command is invalid')
+                result.append(
+                    FailedInventoryCommand(
+                        command.id,
+                        namespace,
+                        command.roast_uuid,
+                        command.lot_id,
+                        command.reservation_uuid,
+                        command.operation,
+                        command.attempts,
+                        command.error_code,
+                        command.error_message,
+                        command.updated_at,
+                    )
+                )
+            return tuple(result)
+
     def interrupted_reservations(self) -> tuple[InterruptedReservation, ...]:
         with self._storage_boundary(), self._read_transaction() as connection:
             rows = connection.execute(
@@ -1992,12 +2026,16 @@ def _row_to_roast(row: sqlite3.Row, namespace: Namespace) -> InventoryRoastState
     )
 
 
-def _row_to_interrupted(row: sqlite3.Row) -> InterruptedReservation:
-    namespace = Namespace(
+def _row_namespace(row: sqlite3.Row) -> Namespace:
+    return Namespace(
         _stored_bounded_text(row['origin'], _MAX_ORIGIN_CHARS, None),
         UUID(hex=_stored_uuid_hex(row['organization_uuid'])),
         f"namespace-sha256:{_stored_namespace_key(row['namespace_key'])}",
     )
+
+
+def _row_to_interrupted(row: sqlite3.Row) -> InterruptedReservation:
+    namespace = _row_namespace(row)
     roast = _row_to_roast(row, namespace)
     return InterruptedReservation(
         namespace,
