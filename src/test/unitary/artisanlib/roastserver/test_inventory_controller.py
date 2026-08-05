@@ -1,0 +1,411 @@
+#
+# ABOUT
+# Tests for the Artisan Roast Server inventory controller façade
+#
+# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+#   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
+#
+# LICENSE
+# This program or module is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+from __future__ import annotations
+
+from collections.abc import Callable, Generator
+from datetime import UTC, datetime
+import inspect
+from pathlib import Path
+import time
+from typing import cast, override
+from uuid import UUID
+
+from PyQt6.QtCore import QCoreApplication, QObject, QSettings, pyqtSignal, pyqtSlot
+from PyQt6.QtTest import QSignalSpy
+import pytest
+
+from artisanlib.atypes import ProfileData
+from artisanlib.roastserver.api import ClientFactory
+from artisanlib.roastserver.cache import CacheStore
+from artisanlib.roastserver.contract import (
+    IdentityOrganization,
+    IdentityUser,
+    Namespace,
+    ServerIdentity,
+)
+from artisanlib.roastserver.controller import RoastServerController
+from artisanlib.roastserver.inventory import (
+    InventoryContext,
+    InventoryCoordinator,
+    InventoryNotice,
+    PreparedInventoryCharge,
+)
+from artisanlib.roastserver.inventory_contract import BeanLot, InventoryProfileLink
+from artisanlib.roastserver.inventory_store import (
+    FailedInventoryCommand,
+    InterruptedReservation,
+    InventoryQueueCounts,
+    InventoryRoastState,
+    InventoryStore,
+    LotCacheSnapshot,
+)
+from artisanlib.roastserver.outbox import Outbox
+from artisanlib.roastserver.settings import CredentialStore, SettingsStore, namespace_for
+from artisanlib.roastserver.worker import WorkerConfiguration
+
+NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
+ORIGIN = 'https://example.test'
+OTHER_ORIGIN = 'https://other.example.test'
+ORGANIZATION_ID = UUID('11111111-1111-4111-8111-111111111111')
+USER_ID = UUID('22222222-2222-4222-8222-222222222222')
+ROAST_UUID = UUID('33333333-3333-4333-8333-333333333333')
+LOT_ID = UUID('44444444-4444-4444-8444-444444444444')
+RESERVATION_ID = UUID('55555555-5555-4555-8555-555555555555')
+IDENTITY = ServerIdentity(
+    IdentityUser(USER_ID, 'owner@example.test', 'Owner'),
+    IdentityOrganization(ORGANIZATION_ID, 'Roastery', 'roastery'),
+    'admin',
+)
+NAMESPACE = namespace_for(ORIGIN, ORGANIZATION_ID)
+LOT = BeanLot(LOT_ID, 'Test lot', None, (), None, None, 1_000, 0, 1_000, 0)
+PREPARED = PreparedInventoryCharge(
+    True, NAMESPACE, ROAST_UUID, RESERVATION_ID, LOT_ID, LOT.name, 500, False
+)
+NOTICE = InventoryNotice(
+    'inventory_reservation_queued',
+    ROAST_UUID,
+    RESERVATION_ID,
+    LOT_ID,
+    None,
+    None,
+)
+
+
+class TrackingStore(InventoryStore):
+    def __init__(self, root: Path, events: list[str], label: str) -> None:
+        self.root = root
+        self._events = events
+        self._label = label
+        self.opened = False
+        self.lots: tuple[BeanLot, ...] = (LOT,)
+        self.failed: tuple[FailedInventoryCommand, ...] = ()
+        self.recovery: tuple[InterruptedReservation, ...] = ()
+        self.state: InventoryRoastState | None = None
+
+    @override
+    def open(self) -> None:
+        self.opened = True
+        self._events.append(f'{self._label}.open')
+
+    @override
+    def close(self) -> None:
+        self.opened = False
+        self._events.append(f'{self._label}.close')
+
+    @override
+    def cached_lots(self, namespace: Namespace) -> tuple[BeanLot, ...]:
+        assert namespace == NAMESPACE
+        return self.lots
+
+    @override
+    def cache_snapshot(self, namespace: Namespace) -> LotCacheSnapshot:
+        return LotCacheSnapshot(namespace, self.cached_lots(namespace), NOW)
+
+    @override
+    def counts(self, namespace: Namespace) -> InventoryQueueCounts:
+        assert namespace == NAMESPACE
+        return InventoryQueueCounts(0, 0, 0, 0, 0)
+
+    @override
+    def failed_commands(
+        self, namespace: Namespace
+    ) -> tuple[FailedInventoryCommand, ...]:
+        assert namespace == NAMESPACE
+        return self.failed
+
+    @override
+    def interrupted_reservations(self) -> tuple[InterruptedReservation, ...]:
+        return self.recovery
+
+    @override
+    def roast_state(
+        self, namespace: Namespace, roast_uuid: UUID
+    ) -> InventoryRoastState | None:
+        assert namespace == NAMESPACE
+        assert roast_uuid == ROAST_UUID
+        return self.state
+
+
+class FakeCoordinator(InventoryCoordinator):
+    def __init__(self, _store: object, **kwargs: object) -> None:
+        self.wake = cast(Callable[[], None], kwargs['wake'])
+        self.calls: list[tuple[object, ...]] = []
+
+    @override
+    def prepare_charge(self, *args: object) -> PreparedInventoryCharge:
+        self.calls.append(('prepare', *args))
+        return PREPARED
+
+    @override
+    def commit_charge(self, prepared: PreparedInventoryCharge) -> InventoryNotice:
+        self.calls.append(('commit', prepared))
+        self.wake()
+        return NOTICE
+
+    @override
+    def finalize_saved_profile(
+        self, context: InventoryContext, profile: ProfileData
+    ) -> InventoryNotice:
+        self.calls.append(('finalize', context, profile))
+        return NOTICE
+
+    @override
+    def release_for_reset(
+        self, context: InventoryContext, roast_uuid: UUID | None
+    ) -> InventoryNotice:
+        self.calls.append(('release', context, roast_uuid))
+        return NOTICE
+
+    @override
+    def resolve_interrupted(self, *args: object) -> InventoryNotice:
+        self.calls.append(('resolve', *args))
+        return NOTICE
+
+
+class FakeWorker(QObject):
+    connectionTested = pyqtSignal(str, object)
+    credentialCommitted = pyqtSignal(str, object)
+    connectionActivated = pyqtSignal(str, object)
+    connectionRollbackFinished = pyqtSignal(str, bool)
+    pendingConnectionRecoveryRequired = pyqtSignal(str, object)
+    configurationValidated = pyqtSignal(object)
+    credentialRemoved = pyqtSignal(str)
+    operationFailed = pyqtSignal(str, object)
+    queueChanged = pyqtSignal(object)
+    failedJobsChanged = pyqtSignal(object)
+    cacheStatsChanged = pyqtSignal(object)
+    archivePageReady = pyqtSignal(str, object)
+    browseFinished = pyqtSignal(str)
+    downloadStaged = pyqtSignal(str, object)
+    cachedReady = pyqtSignal(str, object)
+    cachedFallbackReady = pyqtSignal(str, object)
+    cachePublished = pyqtSignal(str, object)
+    onlineChanged = pyqtSignal(bool)
+    inventoryLotsChanged = pyqtSignal(object)
+    inventoryQueueChanged = pyqtSignal(object)
+    inventoryFailedChanged = pyqtSignal(object)
+    inventoryReservationChanged = pyqtSignal(object)
+    inventoryRecoveryChanged = pyqtSignal(object)
+    stopped = pyqtSignal()
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__()
+        self.store = cast(TrackingStore, kwargs['inventory_store'])
+        self.events = self.store._events
+        self.configurations: list[WorkerConfiguration] = []
+        self.inventory_refreshes: list[str] = []
+        self.inventory_retries: list[str] = []
+        self.inventory_wakes = 0
+
+    @pyqtSlot()
+    def start(self) -> None:
+        self.store.open()
+        self.events.append('worker.start')
+
+    @pyqtSlot(object)
+    def configure(self, value: object) -> None:
+        assert isinstance(value, WorkerConfiguration)
+        self.configurations.append(value)
+
+    @pyqtSlot(str)
+    def refresh_inventory(self, request_id: str) -> None:
+        self.inventory_refreshes.append(request_id)
+
+    @pyqtSlot(str)
+    def retry_inventory_command(self, command_id: str) -> None:
+        self.inventory_retries.append(command_id)
+
+    @pyqtSlot()
+    def wake_inventory(self) -> None:
+        self.inventory_wakes += 1
+
+    @pyqtSlot()
+    def stop(self) -> None:
+        self.events.append('worker.stop')
+        self.store.close()
+        self.stopped.emit()
+
+    def __getattr__(self, _name: str) -> Callable[..., None]:
+        return lambda *_args, **_kwargs: None
+
+
+class Harness:
+    def __init__(self, tmp_path: Path, app: QCoreApplication) -> None:
+        self.app = app
+        qsettings = QSettings(str(tmp_path / 'inventory.ini'), QSettings.Format.IniFormat)
+        self.settings = SettingsStore(qsettings)
+        self.settings.set_origin(ORIGIN)
+        self.settings.save_connection(ORIGIN, IDENTITY)
+        self.settings.save_options(True, False, 64 * 1024 * 1024)
+        self.events: list[str] = []
+        self.stores: list[TrackingStore] = []
+        self.coordinator = cast(FakeCoordinator, None)
+        self.worker = cast(FakeWorker, None)
+
+        def store_factory(root: Path) -> InventoryStore:
+            label = 'ui' if not self.stores else 'worker'
+            store = TrackingStore(root, self.events, label)
+            self.stores.append(store)
+            return store
+
+        def coordinator_factory(
+            store: InventoryStore, **kwargs: object
+        ) -> InventoryCoordinator:
+            self.coordinator = FakeCoordinator(store, **kwargs)
+            return self.coordinator
+
+        def worker_factory(**kwargs: object) -> FakeWorker:
+            self.worker = FakeWorker(**kwargs)
+            return self.worker
+
+        self.controller = RoastServerController(
+            settings=self.settings,
+            credentials=cast(CredentialStore, object()),
+            data_root=tmp_path / 'data',
+            client_factory=cast(ClientFactory, lambda *_args: None),
+            profile_validator=lambda _path: None,
+            worker_factory=worker_factory,
+            outbox_factory=cast(
+                Callable[[Path, Callable[[], datetime]], Outbox],
+                lambda *_args: object(),
+            ),
+            cache_factory=cast(Callable[[Path], CacheStore], lambda *_args: object()),
+            inventory_store_factory=store_factory,
+            inventory_coordinator_factory=coordinator_factory,
+            clock=lambda: NOW,
+        )
+
+    def wait(self, predicate: Callable[[], bool]) -> None:
+        deadline = time.monotonic() + 2
+        while not predicate():
+            self.app.processEvents()
+            if time.monotonic() >= deadline:
+                raise AssertionError('bounded Qt event wait timed out')
+            time.sleep(0.001)
+        self.app.processEvents()
+
+    def start(self) -> None:
+        self.controller.start()
+        self.wait(lambda: 'worker.start' in self.events)
+        self.wait(lambda: bool(self.worker.configurations))
+
+    def stop(self) -> None:
+        if not self.controller.shutdown(2_000):
+            raise AssertionError('controller did not stop')
+        self.app.processEvents()
+
+
+@pytest.fixture(scope='module')
+def qcoreapplication() -> Generator[QCoreApplication]:
+    app = QCoreApplication.instance() or QCoreApplication([])
+    yield app
+
+
+@pytest.fixture
+def harness(tmp_path: Path, qcoreapplication: QCoreApplication) -> Generator[Harness]:
+    value = Harness(tmp_path, qcoreapplication)
+    yield value
+    if value.controller.worker_thread_running:
+        value.stop()
+
+
+def test_inventory_controller_exposes_binding_facade_and_factories() -> None:
+    signature = inspect.signature(RoastServerController)
+    assert 'inventory_store_factory' in signature.parameters
+    assert 'inventory_coordinator_factory' in signature.parameters
+    for member in (
+        'inventory_context', 'inventory_lots', 'refresh_inventory_lots',
+        'prepare_inventory_charge', 'commit_inventory_charge',
+        'finalize_inventory_profile', 'release_inventory_roast',
+        'resolve_interrupted_inventory', 'retry_inventory_command',
+    ):
+        assert callable(getattr(RoastServerController, member))
+
+
+def test_inventory_controller_exposes_public_signals() -> None:
+    for signal in (
+        'inventoryLotsChanged', 'inventoryStateChanged', 'inventoryQueueChanged',
+        'inventoryFailedChanged', 'inventoryRecoveryRequired', 'inventoryConflict',
+    ):
+        assert hasattr(RoastServerController, signal)
+
+
+def test_two_stores_share_root_and_ui_owns_outer_lifetime(harness: Harness) -> None:
+    startup_recovery = QSignalSpy(harness.controller.inventoryRecoveryRequired)
+    assert len(harness.stores) == 2
+    assert harness.stores[0] is not harness.stores[1]
+    assert harness.stores[0].root == harness.stores[1].root
+
+    harness.start()
+    assert harness.events[:3] == ['ui.open', 'worker.open', 'worker.start']
+    assert list(startup_recovery[-1]) == [()]
+    harness.stop()
+    assert harness.events[-3:] == ['worker.stop', 'worker.close', 'ui.close']
+
+
+def test_context_offline_queueing_facade_and_queued_wake(harness: Harness) -> None:
+    harness.start()
+    context = harness.controller.inventory_context()
+    assert context == InventoryContext(
+        ORIGIN, NAMESPACE, True, True, harness.settings.load().client_instance_uuid
+    )
+    link = InventoryProfileLink(NAMESPACE, LOT_ID, LOT.name)
+    assert harness.controller.inventory_lots() == (LOT,)
+    assert harness.controller.prepare_inventory_charge(link, None, 500, 'g') == PREPARED
+    assert harness.controller.commit_inventory_charge(PREPARED) == NOTICE
+    harness.wait(lambda: harness.worker.inventory_wakes == 1)
+    assert harness.controller.finalize_inventory_profile(ProfileData()) == NOTICE
+    assert harness.controller.release_inventory_roast(ROAST_UUID) == NOTICE
+    assert [call[0] for call in harness.coordinator.calls] == [
+        'prepare', 'commit', 'finalize', 'release'
+    ]
+
+
+def test_refresh_is_opaque_generation_bound_and_cleared_on_origin_change(
+    harness: Harness,
+) -> None:
+    harness.start()
+    request_id = harness.controller.refresh_inventory_lots()
+    assert len(request_id) == 32
+    assert request_id in harness.controller._inventory_refresh_requests
+    harness.wait(lambda: request_id in harness.worker.inventory_refreshes)
+
+    harness.controller.apply_options(
+        OTHER_ORIGIN, False, False, 64 * 1024 * 1024
+    )
+    assert request_id not in harness.controller._inventory_refresh_requests
+    assert not harness.controller._command_vault.contains(request_id)
+
+
+def test_inventory_signal_namespace_filtering_and_safe_frozen_payloads(
+    harness: Harness,
+) -> None:
+    harness.start()
+    lots = QSignalSpy(harness.controller.inventoryLotsChanged)
+    other = namespace_for(OTHER_ORIGIN, ORGANIZATION_ID)
+    harness.worker.inventoryLotsChanged.emit(LotCacheSnapshot(other, (), NOW))
+    harness.app.processEvents()
+    before = len(lots)
+    harness.worker.inventoryLotsChanged.emit(LotCacheSnapshot(NAMESPACE, (LOT,), NOW))
+    harness.wait(lambda: len(lots) > before)
+    assert list(lots[-1]) == [(LOT,)]
+    assert b'request_json' not in repr(lots).encode()
