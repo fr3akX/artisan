@@ -13728,10 +13728,19 @@ class ApplicationWindow(QMainWindow):
                         self.plusAddPath(cast(dict[str, Any], pf), filename_path)
                         serialization_result = serialize_with_timestamp(
                             filename_path, cast(dict[str, Any], pf))
-                        self.notifyRoastServerSavedProfile(
-                            serialization_result.serialized_profile,
-                            copyd.deepcopy(pf),
-                            serialization_result.modified_at)
+                        detached_profile = copyd.deepcopy(pf)
+                        try:
+                            self.notifyRoastServerSavedProfile(
+                                serialization_result.serialized_profile,
+                                detached_profile,
+                                serialization_result.modified_at)
+                        except Exception as error: # pylint: disable=broad-except
+                            _log.exception(error)
+                        try:
+                            self.notifyRoastServerInventorySavedProfile(
+                                detached_profile)
+                        except Exception as error: # pylint: disable=broad-except
+                            _log.exception(error)
                         self.sendmessage(QApplication.translate('Message','Profile {0} saved in: {1}').format(filename,self.qmc.autosavepath))
                         self.setCurrentFile(filename_path,self.qmc.autosaveaddtorecentfilesflag)
                         self.qmc.fileCleanSignal.emit()
@@ -18521,6 +18530,45 @@ class ApplicationWindow(QMainWindow):
         except Exception as error: # pylint: disable=broad-except
             _log.exception(error)
 
+    def notifyRoastServerInventorySavedProfile(
+        self, detached_profile:'ProfileData'
+    ) -> None:
+        from artisanlib.roastserver.controller import ControllerError
+
+        controller = self.roastserver_controller
+        if controller is None:
+            return
+        try:
+            notice = controller.finalize_inventory_profile(detached_profile)
+        except ControllerError as error:
+            _log.exception(error)
+            self.sendmessage(QApplication.translate(
+                'Message',
+                'Inventory finalization could not be stored. The profile was saved.')) # pyright: ignore[reportUnknownArgumentType]
+            return
+        if notice is not None and notice.code == 'inventory_planned_weight_used':
+            self.sendmessage(QApplication.translate(
+                'Message',
+                'Inventory finalization used the planned green weight because the actual green weight was invalid.')) # pyright: ignore[reportUnknownArgumentType]
+
+    def releaseRoastServerInventory(self, roast_uuid:str|None) -> bool:
+        from uuid import UUID
+        from artisanlib.roastserver.controller import ControllerError
+
+        controller = self.roastserver_controller
+        if controller is None or roast_uuid is None:
+            return True
+        try:
+            parsed_roast_uuid = UUID(roast_uuid)
+        except (AttributeError, TypeError, ValueError):
+            return True
+        try:
+            controller.release_inventory_roast(parsed_roast_uuid)
+        except ControllerError as error:
+            _log.exception(error)
+            return False
+        return True
+
     @pyqtSlot()
     @pyqtSlot(bool)
     def fileSave_current_action(self, _:bool = False) -> None:
@@ -18772,6 +18820,10 @@ class ApplicationWindow(QMainWindow):
         except Exception as error: # pylint: disable=broad-except
             _log.exception(error)
         try:
+            self.notifyRoastServerInventorySavedProfile(detached_profile)
+        except Exception as error: # pylint: disable=broad-except
+            _log.exception(error)
+        try:
             self.sendmessage(QApplication.translate('Message','Profile saved'))
         except Exception as error: # pylint: disable=broad-except
             _log.exception(error)
@@ -18864,10 +18916,18 @@ class ApplicationWindow(QMainWindow):
                         ):
                             raise RuntimeError(
                                 'Roast Server cache protection could not be released')
-                        self.notifyRoastServerSavedProfile(
-                            serialization_result.serialized_profile,
-                            detached_profile,
-                            serialization_result.modified_at)
+                        try:
+                            self.notifyRoastServerSavedProfile(
+                                serialization_result.serialized_profile,
+                                detached_profile,
+                                serialization_result.modified_at)
+                        except Exception as error: # pylint: disable=broad-except
+                            _log.exception(error)
+                        try:
+                            self.notifyRoastServerInventorySavedProfile(
+                                detached_profile)
+                        except Exception as error: # pylint: disable=broad-except
+                            _log.exception(error)
                     elif server_open_source is not None:
                         self.restoreRoastServerSaveState(
                             server_save_state, server_open_source)
@@ -23151,6 +23211,10 @@ class ApplicationWindow(QMainWindow):
                 self.qmc.flagKeepON = False # temporarily turn keepOn off
 
                 controller = self.roastserver_controller
+                if not self.releaseRoastServerInventory(self.qmc.roastUUID):
+                    self.sendmessage(QApplication.translate(
+                        'Message',
+                        'Inventory release could not be stored. Shutdown will continue.')) # pyright: ignore[reportUnknownArgumentType]
                 if controller is not None:
                     shutdown_timeout_message = QApplication.translate(
                         'Message',
@@ -23179,6 +23243,9 @@ class ApplicationWindow(QMainWindow):
                     # in case we have unsaved changes and the user decided to discard those, we first reset to have the correct settings (like axis limits) saved
                     lastLoadedProfile = self.curFile # however, we remember the lastLoadedProfile to reload it on restart, even if changes were not saved
                     lastLoadedBackground = self.qmc.backgroundpath
+                    # Inventory release was already queued before the controller
+                    # stopped; do not attempt a second release during this reset.
+                    self.qmc.roastUUID = None
                     self.qmc.reset(redraw=False,soundOn=False,keepProperties=False,fireResetAction=False)
                     if lastLoadedProfile != '':
                         self.curFile = lastLoadedProfile

@@ -8011,8 +8011,21 @@ class tgraphcanvas(QObject):
             except Exception as e: # pylint: disable=broad-except
                 _log.exception(e)
 
-        if not server_read_only and not self.checkSaved():
-            return False
+        inventory_profile_link:tuple[str|None,str|None,str|None,str|None]|None = None
+        if not server_read_only:
+            if not self.checkSaved():
+                return False
+            inventory_profile_link = (
+                self.roastServerInventoryOrigin,
+                self.roastServerInventoryOrganizationUUID,
+                self.roastServerBeanLotUUID,
+                self.roastServerBeanLotName,
+            )
+            if not self.aw.releaseRoastServerInventory(self.roastUUID):
+                self.aw.sendmessage(QApplication.translate(
+                    'Message',
+                    'Inventory release could not be stored. Reset was canceled.')) # pyright: ignore[reportUnknownArgumentType]
+                return False
 
         # restore and clear extra device settings which might have been created on loading a profile with different extra devices settings configuration
         if not server_read_only:
@@ -8113,6 +8126,13 @@ class tgraphcanvas(QObject):
             self.roastServerInventoryOrganizationUUID = None
             self.roastServerBeanLotUUID = None
             self.roastServerBeanLotName = None
+            if inventory_profile_link is not None:
+                (
+                    self.roastServerInventoryOrigin,
+                    self.roastServerInventoryOrganizationUUID,
+                    self.roastServerBeanLotUUID,
+                    self.roastServerBeanLotName,
+                ) = inventory_profile_link
             # clear also the cached sync record and sync record hash used to detect changes in the loaded profile
             if not server_read_only:
                 clearSyncRecordHash()

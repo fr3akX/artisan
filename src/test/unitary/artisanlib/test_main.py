@@ -4066,11 +4066,26 @@ def coordinator_controller(
         except InventoryCoordinatorError as error:
             raise ControllerError(error.code) from None
 
+    def finalize_inventory_profile(profile: ProfileData) -> InventoryNotice | None:
+        try:
+            return coordinator.finalize_saved_profile(context, profile)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def release_inventory_roast(roast_uuid: UUID | None) -> InventoryNotice | None:
+        try:
+            return coordinator.release_for_reset(context, roast_uuid)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
     return SimpleNamespace(
         prepare_inventory_charge=prepare_inventory_charge,
         commit_inventory_charge=commit_inventory_charge,
         inventory_context=lambda: context,
         inventory_lot_locked=inventory_lot_locked,
+        finalize_inventory_profile=finalize_inventory_profile,
+        release_inventory_roast=release_inventory_roast,
+        saved_profile=Mock(),
     )
 
 
@@ -4299,6 +4314,27 @@ class TestRoastServerMainIntegration:
         assert second_call[2].tzinfo is UTC
         assert destination.read_bytes() == second_call[0]
 
+    def test_inventory_save_finalizes_after_upload_with_same_detached_profile(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        profile.update({
+            **INVENTORY_PROFILE_LINK,
+            'timeindex': [0, 0, 0, 0, 0, 0, 0, 0],
+            'weight': [1.25, 1.0, 'Kg'],
+        })
+        ordered = Mock()
+        ordered.attach_mock(controller.saved_profile, 'saved_profile')
+        ordered.attach_mock(
+            controller.finalize_inventory_profile, 'finalize_inventory_profile')
+
+        assert window.fileSave(str(tmp_path / 'roast.alog'))
+
+        assert [item[0] for item in ordered.mock_calls] == [
+            'saved_profile', 'finalize_inventory_profile']
+        detached_profile = controller.saved_profile.call_args.args[1]
+        assert controller.finalize_inventory_profile.call_args.args[0] is detached_profile
+
     def test_inventory_profile_save_copy_preserves_link_without_server_hook(
         self, tmp_path: Path
     ) -> None:
@@ -4310,6 +4346,7 @@ class TestRoastServerMainIntegration:
         ):
             assert not window.fileSave(str(tmp_path / 'failed.alog'))
         controller.saved_profile.assert_not_called()
+        controller.finalize_inventory_profile.assert_not_called()
 
         copy_path = tmp_path / 'copy.alog'
         with patch(
@@ -4322,6 +4359,7 @@ class TestRoastServerMainIntegration:
         assert {name: saved_copy[name] for name in INVENTORY_QMC_FIELDS} == (
             INVENTORY_PROFILE_LINK)
         controller.saved_profile.assert_not_called()
+        controller.finalize_inventory_profile.assert_not_called()
 
         window.setCurrentFile.side_effect = RuntimeError('post-save failed')
         with patch(
@@ -4330,6 +4368,151 @@ class TestRoastServerMainIntegration:
         ):
             assert not window.fileSave(str(tmp_path / 'post-save.alog'))
         controller.saved_profile.assert_not_called()
+        controller.finalize_inventory_profile.assert_not_called()
+
+    def test_inventory_save_upload_failure_does_not_suppress_finalization(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        profile.update(INVENTORY_PROFILE_LINK)
+        controller.saved_profile.side_effect = RuntimeError('upload failed')
+
+        assert window.fileSave(str(tmp_path / 'roast.alog'))
+
+        controller.saved_profile.assert_called_once()
+        controller.finalize_inventory_profile.assert_called_once()
+
+    def test_inventory_save_planned_weight_fallback_warns_without_failing_save(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        profile.update(INVENTORY_PROFILE_LINK)
+        controller.finalize_inventory_profile.return_value = InventoryNotice(
+            'inventory_planned_weight_used',
+            UUID(profile['roastUUID']),
+            UUID('44444444-4444-4444-8444-444444444444'),
+            UUID(INVENTORY_PROFILE_LINK['roastServerBeanLotUUID']),
+            None,
+            None,
+        )
+
+        assert window.fileSave(str(tmp_path / 'roast.alog'))
+
+        assert any(
+            'planned green weight' in call_item.args[0]
+            for call_item in window.sendmessage.call_args_list
+        )
+
+    def test_inventory_save_storage_failure_does_not_rollback_profile(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        profile.update(INVENTORY_PROFILE_LINK)
+        destination = tmp_path / 'roast.alog'
+        controller.finalize_inventory_profile.side_effect = ControllerError(
+            'inventory_storage_failed')
+
+        assert window.fileSave(str(destination))
+
+        assert destination.exists()
+        controller.saved_profile.assert_called_once()
+        assert any(
+            'finalization could not be stored' in call_item.args[0]
+            for call_item in window.sendmessage.call_args_list
+        )
+
+    @pytest.mark.parametrize(
+        ('actual_weight', 'expected_actual_grams', 'expect_warning'),
+        [(1.25, 1250, False), (0.0, None, True)],
+    )
+    def test_inventory_save_coordinator_queues_one_terminal_intent(
+        self,
+        tmp_path: Path,
+        actual_weight: float,
+        expected_actual_grams: int | None,
+        expect_warning: bool,
+    ) -> None:
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        uuid_values = iter((
+            roast_uuid,
+            UUID('44444444-4444-4444-8444-444444444444'),
+        ))
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    lot_id=link.lot_id,
+                    name=link.lot_name,
+                    origin='Ethiopia',
+                    varietals=('Heirloom',),
+                    processing_method='washed',
+                    crop_year=2026,
+                    on_hand_grams=2_000,
+                    reserved_grams=0,
+                    available_grams=2_000,
+                    unresolved_conflict_count=0,
+                ),
+            ),
+            now,
+        )
+        context = InventoryContext(
+            origin=link.namespace.origin,
+            namespace=link.namespace,
+            enabled=True,
+            previously_authenticated=True,
+            client_instance_uuid=UUID(
+                '55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: next(uuid_values),
+            wake=lambda: None,
+        )
+        controller = coordinator_controller(coordinator, context)
+        prepared = coordinator.prepare_charge(context, link, None, 1.5, 'Kg')
+        coordinator.commit_charge(prepared)
+        window, _mock_controller, profile = roastserver_save_window()
+        window.roastserver_controller = controller
+        profile.update({
+            **INVENTORY_PROFILE_LINK,
+            'roastUUID': roast_uuid.hex,
+            'timeindex': [-1, 0, 0, 0, 0, 0, 0, 0],
+            'weight': [actual_weight, 1.0, 'Kg'],
+        })
+
+        try:
+            assert window.fileSave(str(tmp_path / 'no-charge.alog'))
+            assert store.counts(link.namespace).pending == 1
+
+            profile['timeindex'][0] = 0
+            profile['roastUUID'] = '66666666666646668666666666666666'
+            assert window.fileSave(str(tmp_path / 'different-roast.alog'))
+            assert store.counts(link.namespace).pending == 1
+
+            profile['roastUUID'] = roast_uuid.hex
+            assert window.fileSave(str(tmp_path / 'roast.alog'))
+            state = store.roast_state(link.namespace, roast_uuid)
+            assert state is not None
+            assert state.lifecycle == 'finalize_queued'
+            assert state.actual_grams == expected_actual_grams
+            assert store.counts(link.namespace).pending == 2
+
+            assert window.fileSave(str(tmp_path / 'repeat.alog'))
+            assert store.counts(link.namespace).pending == 2
+            assert controller.release_inventory_roast(roast_uuid) is None
+            assert store.counts(link.namespace).pending == 2
+            assert any(
+                'planned green weight' in call_item.args[0]
+                for call_item in window.sendmessage.call_args_list
+            ) is expect_warning
+        finally:
+            store.close()
 
     def test_roastserver_save_as_uses_chosen_path(self, tmp_path: Path) -> None:
         window, controller, profile = roastserver_save_window()
@@ -4341,6 +4524,7 @@ class TestRoastServerMainIntegration:
         window.ArtisanSaveFileDialog.assert_called_once()
         assert chosen.read_bytes() == repr(profile).encode('utf-8')
         controller.saved_profile.assert_called_once()
+        controller.finalize_inventory_profile.assert_called_once()
 
     def test_roastserver_autosave_notifies_only_after_exact_write(
         self, tmp_path: Path
@@ -4364,6 +4548,9 @@ class TestRoastServerMainIntegration:
         assert destination.read_bytes() == repr(profile).encode('utf-8')
         assert [call[0] for call in ordered.mock_calls] == [
             'serialize', 'saved_profile']
+        controller.finalize_inventory_profile.assert_called_once()
+        detached_profile = controller.saved_profile.call_args.args[1]
+        assert controller.finalize_inventory_profile.call_args.args[0] is detached_profile
 
     @pytest.mark.parametrize('failure', ['serialize', 'timestamp'])
     def test_roastserver_autosave_serialization_failure_never_notifies(
@@ -4390,6 +4577,7 @@ class TestRoastServerMainIntegration:
             assert window.automaticsave() == f'{failure}.alog'
 
         controller.saved_profile.assert_not_called()
+        controller.finalize_inventory_profile.assert_not_called()
         assert os.getcwd() == old_directory
 
     @pytest.mark.parametrize('failure', ['post-save', 'plus-status', 'image-export'])
@@ -4779,12 +4967,17 @@ class TestRoastServerMainIntegration:
         window.qmc.safesaveflag = False
         window.qmc.checkSaved.return_value = True
         window.qmc.flagKeepON = True
+        window.qmc.roastUUID = '33333333333343338333333333333333'
         window.roastserver_controller = Mock()
         window.roastserver_controller.shutdown.return_value = stopped
         window.stopActivities = Mock()
         window.closeEventSettings = Mock()
         window.sendmessage = Mock()
         ordered = Mock()
+        ordered.attach_mock(
+            window.roastserver_controller.release_inventory_roast,
+            'release_inventory_roast',
+        )
         ordered.attach_mock(window.roastserver_controller.shutdown, 'shutdown')
         ordered.attach_mock(window.stopActivities, 'stopActivities')
         ordered.attach_mock(window.closeEventSettings, 'closeEventSettings')
@@ -4796,13 +4989,98 @@ class TestRoastServerMainIntegration:
             assert window.closeApp()
 
         assert [call[0] for call in ordered.mock_calls] == [
-            'shutdown', 'stopActivities', 'closeEventSettings', 'exit']
+            'release_inventory_roast', 'shutdown', 'stopActivities',
+            'closeEventSettings', 'exit']
+        window.roastserver_controller.release_inventory_roast.assert_called_once_with(
+            UUID(window.qmc.roastUUID))
         window.roastserver_controller.shutdown.assert_called_once_with(15_000)
         if stopped:
             window.sendmessage.assert_not_called()
         else:
             assert 'shutdown timeout' in window.sendmessage.call_args.args[0]
         assert '.terminate(' not in inspect.getsource(ApplicationWindow.closeApp)
+
+    def test_inventory_shutdown_cancel_does_not_release_or_interrupt_worker(self) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock(
+            safesaveflag=True,
+            roastUUID='33333333333343338333333333333333',
+        )
+        window.qmc.checkSaved.return_value = False
+        window.roastserver_controller = Mock()
+
+        assert not window.closeApp()
+
+        window.roastserver_controller.release_inventory_roast.assert_not_called()
+        window.roastserver_controller.shutdown.assert_not_called()
+
+    def test_inventory_shutdown_discard_reset_does_not_release_after_worker_stop(
+        self,
+    ) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock(
+            safesaveflag=True,
+            flagKeepON=True,
+            roastUUID='33333333333343338333333333333333',
+            backgroundpath='',
+        )
+        window.qmc.checkSaved.return_value = True
+        window.qmc.reset.side_effect = lambda **_kwargs: (
+            window.roastserver_controller.shutdown.assert_called_once_with(15_000)
+            or window.roastserver_controller.release_inventory_roast.assert_called_once()
+            or window.qmc.roastUUID is None
+        )
+        window.curFile = None
+        window.roastserver_controller = Mock()
+        window.roastserver_controller.shutdown.return_value = True
+        window.stopActivities = Mock()
+        window.closeEventSettings = Mock()
+        window.sendmessage = Mock()
+
+        with patch.object(
+            QApplication, 'queryKeyboardModifiers',
+            return_value=Qt.KeyboardModifier.NoModifier,
+        ), patch.object(QApplication, 'exit'):
+            assert window.closeApp()
+
+        window.qmc.reset.assert_called_once_with(
+            redraw=False,
+            soundOn=False,
+            keepProperties=False,
+            fireResetAction=False,
+        )
+        assert window.qmc.roastUUID is None
+
+    def test_inventory_shutdown_release_failure_warns_and_continues(self) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock(
+            safesaveflag=False,
+            flagKeepON=True,
+            roastUUID='33333333333343338333333333333333',
+        )
+        window.qmc.checkSaved.return_value = True
+        window.roastserver_controller = Mock()
+        window.roastserver_controller.release_inventory_roast.side_effect = (
+            ControllerError('inventory_storage_failed'))
+        window.roastserver_controller.shutdown.return_value = True
+        window.stopActivities = Mock()
+        window.closeEventSettings = Mock()
+        window.sendmessage = Mock()
+
+        with patch.object(
+            QApplication, 'queryKeyboardModifiers',
+            return_value=Qt.KeyboardModifier.NoModifier,
+        ), patch.object(QApplication, 'exit'):
+            assert window.closeApp()
+
+        window.roastserver_controller.shutdown.assert_called_once_with(15_000)
+        assert any(
+            'release could not be stored' in call_item.args[0]
+            for call_item in window.sendmessage.call_args_list
+        )
 
     def test_roastserver_validator_normalizes_without_opening_profile(
         self, tmp_path: Path

@@ -1247,6 +1247,104 @@ def inventory_charge_canvas() -> SimpleNamespace:
     )
 
 
+def inventory_reset_canvas() -> SimpleNamespace:
+    aw = MagicMock()
+    aw.centralWidget.return_value = None
+    aw.releaseRoastServerInventory.return_value = True
+    return SimpleNamespace(
+        aw=aw,
+        checkSaved=Mock(return_value=True),
+        roastUUID='33333333333343338333333333333333',
+        roastServerInventoryOrigin='https://archive.example',
+        roastServerInventoryOrganizationUUID='11111111111141118111111111111111',
+        roastServerBeanLotUUID='22222222222242228222222222222222',
+        roastServerBeanLotName='Historical lot',
+    )
+
+
+def successful_inventory_reset_canvas() -> MagicMock:
+    canvas = MagicMock()
+    canvas.aw = MagicMock()
+    canvas.aw.centralWidget.return_value = None
+    canvas.aw.releaseRoastServerInventory.return_value = True
+    canvas.aw.qmc = canvas
+    canvas.checkSaved.return_value = True
+    canvas.roastUUID = '33333333333343338333333333333333'
+    canvas.roastServerInventoryOrigin = 'https://archive.example'
+    canvas.roastServerInventoryOrganizationUUID = '11111111111141118111111111111111'
+    canvas.roastServerBeanLotUUID = '22222222222242228222222222222222'
+    canvas.roastServerBeanLotName = 'Historical lot'
+    canvas.designerflag = False
+    canvas.profileDataSemaphore.available.return_value = 1
+    canvas.batchprefix = ''
+    canvas.roastpropertiesflag = False
+    canvas.weight = (1.25, 0.5, 'Kg')
+    canvas.volume = (1.0, 0.5, 'l')
+    canvas.density_roasted = (0.0, 'g', 1, 'l')
+    canvas.timex = []
+    canvas.flagon = True
+    canvas.meterreads_default = {}
+    canvas.flavorlabels = []
+    canvas.analyzer_connect_id = None
+    canvas.crossmarker = False
+    canvas.backgroundprofile = None
+    canvas.alarmflag = []
+    canvas.autotimex = True
+    canvas.background = True
+    canvas.endofx = 60.0
+    return canvas
+
+
+class TestInventoryReset:
+    def test_inventory_reset_cancel_does_not_release(self) -> None:
+        canvas = inventory_reset_canvas()
+        canvas.checkSaved.return_value = False
+
+        assert not tgraphcanvas.reset(canvas)
+
+        canvas.aw.releaseRoastServerInventory.assert_not_called()
+        assert canvas.roastUUID == '33333333333343338333333333333333'
+
+    def test_inventory_reset_release_failure_blocks_before_profile_mutation(
+        self,
+    ) -> None:
+        canvas = inventory_reset_canvas()
+        canvas.aw.releaseRoastServerInventory.return_value = False
+
+        assert not tgraphcanvas.reset(canvas)
+
+        canvas.aw.releaseRoastServerInventory.assert_called_once_with(
+            '33333333333343338333333333333333')
+        assert canvas.roastUUID == '33333333333343338333333333333333'
+        assert canvas.roastServerBeanLotUUID == '22222222222242228222222222222222'
+        canvas.aw.restoreExtraDeviceSettingsBackup.assert_not_called()
+        canvas.aw.sendmessage.assert_called_once_with(
+            'Inventory release could not be stored. Reset was canceled.')
+
+    def test_inventory_reset_retains_selection_but_clears_roast_uuid(self) -> None:
+        canvas = successful_inventory_reset_canvas()
+
+        def release(roast_uuid: str) -> bool:
+            assert roast_uuid == '33333333333343338333333333333333'
+            assert canvas.roastUUID == roast_uuid
+            return True
+
+        canvas.aw.releaseRoastServerInventory.side_effect = release
+        assert tgraphcanvas.reset(
+            canvas, redraw=False, soundOn=False, fireResetAction=False)
+
+        canvas.aw.releaseRoastServerInventory.assert_called_once_with(
+            '33333333333343338333333333333333')
+        assert canvas.roastUUID is None
+        assert canvas.roastServerInventoryOrigin == 'https://archive.example'
+        assert (
+            canvas.roastServerInventoryOrganizationUUID
+            == '11111111111141118111111111111111'
+        )
+        assert canvas.roastServerBeanLotUUID == '22222222222242228222222222222222'
+        assert canvas.roastServerBeanLotName == 'Historical lot'
+
+
 class TestInventoryCharge:
     def test_inventory_charge_commit_precedes_event(self) -> None:
         canvas = inventory_charge_canvas()
