@@ -411,7 +411,7 @@ def test_mutation_validates_open_conflict_relationships() -> None:
         ('lot_id', UUID(int=1).hex),
         ('roast_uuid', UUID(int=2).hex),
         ('reservation_id', UUID(int=3).hex),
-        ('trigger_operation', 'reservation'),
+        ('trigger_operation', 'not-a-ledger-operation'),
         ('resolution_note', 'secret'),
     )
     for field, value in invalid_fields:
@@ -436,6 +436,23 @@ def test_mutation_validates_open_conflict_relationships() -> None:
     reservation['open_conflict_id'] = CONFLICT_UUID.hex
     with pytest.raises(ContractError):
         parse_mutation(payload)
+
+
+def test_mutation_accepts_carried_forward_reservation_conflict_on_release() -> None:
+    conflict = valid_conflict_payload()
+    conflict['trigger_operation'] = 'reservation'
+    result = parse_mutation(
+        valid_mutation_payload(
+            state='released',
+            completed_at='2026-08-05T12:01:00.000000Z',
+            conflict=conflict,
+        ),
+        operation='release',
+    )
+
+    assert result.reservation.state == 'released'
+    assert result.conflict is not None
+    assert result.conflict.trigger_operation == 'reservation'
 
 
 def test_profile_link_is_all_or_none_canonical_and_namespace_bound() -> None:
@@ -523,6 +540,7 @@ def test_green_weight_supports_every_unit_and_rounds_half_up() -> None:
         (math.nan, 'g'),
         (1, 'kg'),
         (POSTGRESQL_INTEGER_MAX + 1, 'g'),
+        (1e100, 'g'),
         (10**4000, 'g'),
     ),
 )
@@ -559,6 +577,19 @@ def test_build_reserve_request_is_canonical_and_stable() -> None:
     assert request.requested_actual_grams is None
     with pytest.raises((AttributeError, TypeError)):
         request.request_json = b'changed'  # type: ignore[misc]
+
+
+def test_build_reserve_request_formats_low_year_canonically() -> None:
+    request = build_reserve_request(
+        client_instance_uuid=CLIENT_UUID,
+        reservation_uuid=RESERVATION_UUID,
+        roast_uuid=ROAST_UUID,
+        lot_id=LOT_UUID,
+        planned_grams=1_250,
+        occurred_at=datetime(1, 1, 2, 3, 4, 5, 6, tzinfo=UTC),
+    )
+
+    assert b'"occurred_at":"0001-01-02T03:04:05.000006Z"' in request.request_json
 
 
 def test_build_finalize_and_release_requests_have_exact_payloads() -> None:

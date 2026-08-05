@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import math
 import re
@@ -121,13 +121,6 @@ LedgerOperation = Literal[
     'reservation_release',
     'consumption',
 ]
-
-_EXPECTED_CONFLICT_OPERATION: Final[dict[InventoryOperation, LedgerOperation]] = {
-    'reserve': 'reservation',
-    'finalize': 'consumption',
-    'release': 'reservation_release',
-}
-
 
 @dataclass(frozen=True, slots=True)
 class InventoryProfileLink:
@@ -635,7 +628,6 @@ def parse_inventory_mutation(
         or conflict.lot_id != expected_lot_id
         or conflict.roast_uuid != expected_roast_uuid
         or conflict.reservation_id != reservation.reservation_id
-        or conflict.trigger_operation != _EXPECTED_CONFLICT_OPERATION[operation]
     ):
         _fail()
     return InventoryMutationResult(
@@ -728,7 +720,12 @@ def green_weight_grams(value: object, unit: object) -> int | None:
     if not math.isfinite(number) or number <= 0 or unit not in weight_units:
         return None
     grams = convertWeight(number, weight_units.index(unit), 0)
-    rounded = int(Decimal(str(grams)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    try:
+        rounded = int(
+            Decimal(str(grams)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+        )
+    except InvalidOperation:
+        return None
     return rounded if 1 <= rounded <= POSTGRESQL_INTEGER_MAX else None
 
 
@@ -763,7 +760,10 @@ def _validate_builder_timestamp(value: object) -> datetime:
 
 
 def _timestamp_text(value: datetime) -> str:
-    return value.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    return (
+        f'{value.year:04d}-{value.month:02d}-{value.day:02d}'
+        f'T{value.hour:02d}:{value.minute:02d}:{value.second:02d}.{value.microsecond:06d}Z'
+    )
 
 
 def _request_json(payload: dict[str, object]) -> bytes:
