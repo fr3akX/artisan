@@ -535,6 +535,10 @@ class RoastServerController(QObject):
             or generation is None
         ):
             raise ControllerError('inventory_namespace_inactive')
+        refresh_context = (generation, context.namespace)
+        for request_id, tracked_context in self._inventory_refresh_requests.items():
+            if tracked_context == refresh_context:
+                return request_id
         self._invalidate_inventory_refreshes()
         request_id = self._put_command(
             InventoryRefreshRequest(context.namespace, generation)

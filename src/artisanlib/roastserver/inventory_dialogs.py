@@ -79,6 +79,8 @@ class InventoryLotDialogController(Protocol):
     inventoryRefreshFinished: _Signal
     operationFailed: _Signal
     onlineChanged: _Signal
+    settingsChanged: _Signal
+    identityChanged: _Signal
 
     def inventory_cache_snapshot(self) -> LotCacheSnapshot | None: ...
     def inventory_lots(self) -> tuple[BeanLot, ...]: ...
@@ -352,6 +354,8 @@ class InventoryLotDialog(QDialog):
         self._controller.inventoryRefreshFinished.connect(self._refresh_finished)
         self._controller.operationFailed.connect(self._operation_failed)
         self._controller.onlineChanged.connect(self._online_changed)
+        self._controller.settingsChanged.connect(self._context_changed)
+        self._controller.identityChanged.connect(self._context_changed)
         self._signals_connected = True
 
     def clean_up(self) -> None:
@@ -363,6 +367,8 @@ class InventoryLotDialog(QDialog):
             (self._controller.inventoryRefreshFinished, self._refresh_finished),
             (self._controller.operationFailed, self._operation_failed),
             (self._controller.onlineChanged, self._online_changed),
+            (self._controller.settingsChanged, self._context_changed),
+            (self._controller.identityChanged, self._context_changed),
         ):
             try:
                 signal.disconnect(slot)
@@ -466,6 +472,23 @@ class InventoryLotDialog(QDialog):
     @pyqtSlot(bool)
     def _online_changed(self, online: bool) -> None:
         self._online = online
+        self._update_status()
+
+    @pyqtSlot(object)
+    def _context_changed(self, _value: object) -> None:
+        self._pending_refresh = None
+        self.refreshButton.setEnabled(True)
+        self._snapshot_read_failed = False
+        self.model.replace_lots(())
+        self._cached_at = None
+        try:
+            snapshot = self._controller.inventory_cache_snapshot()
+        except RuntimeError:
+            self._snapshot_read_failed = True
+            self._show_snapshot_unavailable(retained=False)
+            return
+        self.model.replace_lots(() if snapshot is None else snapshot.lots)
+        self._cached_at = None if snapshot is None else snapshot.refreshed_at
         self._update_status()
 
     @pyqtSlot()

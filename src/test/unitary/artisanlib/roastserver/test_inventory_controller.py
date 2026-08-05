@@ -480,6 +480,21 @@ def test_refresh_is_opaque_generation_bound_and_cleared_on_origin_change(
     assert not harness.controller._command_vault.contains(request_id)
 
 
+def test_refresh_coalesces_for_current_namespace_and_generation(
+    harness: Harness,
+) -> None:
+    harness.start()
+    request = harness.controller.refresh_inventory_lots()
+    coalesced = harness.controller.refresh_inventory_lots()
+
+    assert coalesced == request
+    assert harness.controller._inventory_refresh_requests == {
+        request: (harness.controller._inventory_generation, NAMESPACE)
+    }
+    harness.wait(lambda: request in harness.worker.inventory_refreshes)
+    assert harness.worker.inventory_refreshes == [request]
+
+
 def test_inventory_signal_namespace_filtering_and_safe_frozen_payloads(
     harness: Harness,
 ) -> None:
