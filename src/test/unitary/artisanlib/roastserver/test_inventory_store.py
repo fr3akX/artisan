@@ -17,8 +17,22 @@ from uuid import UUID
 import pytest
 
 from artisanlib.roastserver import inventory_store as store_module
-from artisanlib.roastserver.contract import Namespace
-from artisanlib.roastserver.inventory_contract import BeanLot
+from artisanlib.roastserver.contract import (
+    FAILURE_MESSAGES,
+    FailureKind,
+    Namespace,
+    PublicFailure,
+)
+from artisanlib.roastserver.inventory_contract import (
+    BeanLot,
+    InventoryBalance,
+    InventoryConflict,
+    InventoryMutationResult,
+    InventoryReservation,
+    build_finalize_request,
+    build_release_request,
+    build_reserve_request,
+)
 from artisanlib.roastserver.inventory_store import (
     InventoryStore,
     InventoryStoreError,
@@ -31,6 +45,49 @@ LOT_UUID = UUID('11111111-1111-4111-8111-111111111111')
 OTHER_LOT_UUID = UUID('22222222-2222-4222-8222-222222222222')
 ORGANIZATION_UUID = UUID('33333333-3333-4333-8333-333333333333')
 OTHER_ORGANIZATION_UUID = UUID('44444444-4444-4444-8444-444444444444')
+ROAST_UUID = UUID('55555555-5555-4555-8555-555555555555')
+RESERVATION_UUID = UUID('66666666-6666-4666-8666-666666666666')
+CLIENT_UUID = UUID('77777777-7777-4777-8777-777777777777')
+SERVER_RESERVATION_UUID = UUID('88888888-8888-4888-8888-888888888888')
+CONFLICT_UUID = UUID('99999999-9999-4999-8999-999999999999')
+LEDGER_UUID = UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+RESERVE_REQUEST = build_reserve_request(
+    client_instance_uuid=CLIENT_UUID,
+    reservation_uuid=RESERVATION_UUID,
+    roast_uuid=ROAST_UUID,
+    lot_id=LOT_UUID,
+    planned_grams=1_250,
+    occurred_at=NOW,
+)
+FINALIZE_REQUEST = build_finalize_request(
+    client_instance_uuid=CLIENT_UUID,
+    reservation_uuid=RESERVATION_UUID,
+    roast_uuid=ROAST_UUID,
+    lot_id=LOT_UUID,
+    planned_grams=1_250,
+    actual_grams=1_200,
+    occurred_at=LATER,
+)
+RELEASE_REQUEST = build_release_request(
+    client_instance_uuid=CLIENT_UUID,
+    reservation_uuid=RESERVATION_UUID,
+    roast_uuid=ROAST_UUID,
+    lot_id=LOT_UUID,
+    planned_grams=1_250,
+    occurred_at=LATER,
+)
+OFFLINE_FAILURE = PublicFailure(
+    FailureKind.OFFLINE,
+    'connection_error',
+    FAILURE_MESSAGES[FailureKind.OFFLINE],
+    True,
+)
+REJECTED_FAILURE = PublicFailure(
+    FailureKind.INVENTORY_REJECTED,
+    'invalid_inventory_transition',
+    'Invalid inventory transition',
+    False,
+)
 
 
 def namespace_for_test(
@@ -77,6 +134,71 @@ def opened_store(root: Path) -> InventoryStore:
 
 def database_path(root: Path) -> Path:
     return root / 'inventory.sqlite3'
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> Iterator[InventoryStore]:
+    value = opened_store(tmp_path / 'inventory')
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+def mutation_result(
+    operation: str = 'reserve',
+    *,
+    actual_grams: int | None = None,
+    conflict: bool = False,
+) -> InventoryMutationResult:
+    state = {'reserve': 'reserved', 'finalize': 'finalized', 'release': 'released'}[
+        operation
+    ]
+    completed_at = None if operation == 'reserve' else LATER
+    conflict_id = CONFLICT_UUID if conflict else None
+    return InventoryMutationResult(
+        reservation=InventoryReservation(
+            reservation_id=SERVER_RESERVATION_UUID,
+            client_reservation_uuid=RESERVATION_UUID,
+            lot_id=LOT_UUID,
+            roast_uuid=ROAST_UUID,
+            client_instance_uuid=CLIENT_UUID,
+            state=cast(Any, state),
+            planned_grams=1_250,
+            actual_grams=actual_grams,
+            reserved_at=NOW,
+            completed_at=completed_at,
+            created_at=NOW,
+            updated_at=completed_at or NOW,
+            open_conflict_id=conflict_id,
+        ),
+        balance=InventoryBalance(
+            lot_id=LOT_UUID,
+            on_hand_grams=8_750,
+            reserved_grams=0 if operation != 'reserve' else 1_250,
+            available_grams=8_750 if operation != 'reserve' else 7_500,
+            unresolved_conflict_count=1 if conflict else 0,
+        ),
+        conflict=(
+            InventoryConflict(
+                conflict_id=CONFLICT_UUID,
+                lot_id=LOT_UUID,
+                source_ledger_entry_id=LEDGER_UUID,
+                roast_uuid=ROAST_UUID,
+                reservation_id=SERVER_RESERVATION_UUID,
+                trigger_operation='consumption',
+                available_grams_snapshot=-125,
+                state='open',
+                resolution_note=None,
+                resolved_by_user_id=None,
+                resolved_at=None,
+                created_at=LATER,
+            )
+            if conflict
+            else None
+        ),
+        idempotent_replay=False,
+    )
 
 
 def test_fresh_schema_is_exact_versioned_and_task_3_ready(tmp_path: Path) -> None:
@@ -599,3 +721,306 @@ def test_failed_publication_retains_old_generation(
         assert store.cache_snapshot(NAMESPACE).refreshed_at == NOW
     finally:
         store.close()
+
+
+def test_duplicate_reserve_is_idempotent_and_immutable_body_conflicts(
+    store: InventoryStore,
+) -> None:
+    first = store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    assert store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', LATER) == first
+    changed = build_reserve_request(
+        client_instance_uuid=CLIENT_UUID,
+        reservation_uuid=RESERVATION_UUID,
+        roast_uuid=ROAST_UUID,
+        lot_id=LOT_UUID,
+        planned_grams=1_251,
+        occurred_at=NOW,
+    )
+    with pytest.raises(InventoryStoreError, match='immutable'):
+        store.enqueue_reserve(NAMESPACE, changed, 'Lot', LATER)
+    assert store.counts(NAMESPACE).pending == 1
+
+
+def test_terminal_command_waits_for_reserve_and_only_one_intent_wins(
+    store: InventoryStore,
+) -> None:
+    reserve = store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    finalized = store.enqueue_finalize(NAMESPACE, FINALIZE_REQUEST, 1_200, NOW)
+    assert finalized.terminal_intent == 'finalize'
+    with pytest.raises(InventoryStoreError, match='terminal intent'):
+        store.enqueue_release(NAMESPACE, RELEASE_REQUEST, NOW)
+    leased = store.lease_next(NAMESPACE, NOW, 30)
+    assert leased is not None and leased.operation == 'reserve'
+    assert store.lease_next(NAMESPACE, NOW, 30) is None
+    assert leased.lease_token is not None
+    after_reserve = store.mark_complete(
+        leased.id,
+        leased.lease_token,
+        mutation_result(),
+        NOW + timedelta(seconds=1),
+    )
+    assert after_reserve.lifecycle == 'finalize_queued'
+    assert after_reserve.actual_grams == 1_200
+    terminal = store.lease_next(NAMESPACE, NOW + timedelta(seconds=1), 30)
+    assert terminal is not None and terminal.operation == 'finalize'
+    assert reserve.roast_uuid == finalized.roast_uuid
+
+
+def test_lease_token_cas_expiry_retry_and_next_due(store: InventoryStore) -> None:
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    assert store.next_due_at(NAMESPACE) == NOW
+    command = store.lease_next(NAMESPACE, NOW, 30)
+    assert command is not None and command.lease_token is not None
+    assert len(command.lease_token) == 32 and command.attempts == 1
+    with pytest.raises(InventoryStoreError, match='^lease_lost$'):
+        store.mark_retry(command.id, '0' * 32, NOW, LATER, OFFLINE_FAILURE)
+    with pytest.raises(InventoryStoreError, match='^lease_lost$'):
+        store.mark_retry(
+            command.id,
+            command.lease_token,
+            NOW + timedelta(seconds=31),
+            LATER,
+            OFFLINE_FAILURE,
+        )
+    assert store.recover_expired_leases(NOW + timedelta(seconds=30)) == 1
+    recovered = store.lease_next(NAMESPACE, NOW + timedelta(seconds=30), 30)
+    assert recovered is not None and recovered.attempts == 2
+    assert recovered.lease_token not in {None, command.lease_token}
+    assert recovered.lease_token is not None
+    store.mark_retry(
+        recovered.id,
+        recovered.lease_token,
+        NOW + timedelta(seconds=31),
+        LATER,
+        OFFLINE_FAILURE,
+    )
+    assert store.next_due_at(NAMESPACE) == LATER
+    assert store.counts(NAMESPACE).retrying == 1
+
+
+def test_completion_atomically_updates_roast_balance_cache_and_conflict(
+    store: InventoryStore,
+) -> None:
+    store.replace_lots(NAMESPACE, (lot(),), NOW)
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    command = store.lease_next(NAMESPACE, NOW, 30)
+    assert command is not None and command.lease_token is not None
+    result = mutation_result(conflict=True)
+    state = store.mark_complete(
+        command.id, command.lease_token, result, NOW + timedelta(seconds=10)
+    )
+    assert state.lifecycle == 'reserved'
+    assert state.server_reservation_uuid == SERVER_RESERVATION_UUID
+    assert state.balance == result.balance and state.conflict_id == CONFLICT_UUID
+    assert store.cached_lots(NAMESPACE)[0].reserved_grams == 1_250
+    assert store.cached_lots(NAMESPACE)[0].unresolved_conflict_count == 1
+    assert store.counts(NAMESPACE).complete == 1
+
+
+def test_finalize_without_requested_actual_uses_verified_planned_grams(
+    store: InventoryStore,
+) -> None:
+    finalize = build_finalize_request(
+        client_instance_uuid=CLIENT_UUID,
+        reservation_uuid=RESERVATION_UUID,
+        roast_uuid=ROAST_UUID,
+        lot_id=LOT_UUID,
+        planned_grams=1_250,
+        actual_grams=None,
+        occurred_at=LATER,
+    )
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    store.enqueue_finalize(NAMESPACE, finalize, None, NOW)
+    reserve = store.lease_next(NAMESPACE, NOW, 30)
+    assert reserve is not None and reserve.lease_token is not None
+    store.mark_complete(
+        reserve.id, reserve.lease_token, mutation_result(), NOW + timedelta(seconds=1)
+    )
+    terminal = store.lease_next(NAMESPACE, NOW + timedelta(seconds=1), 30)
+    assert terminal is not None and terminal.lease_token is not None
+    state = store.mark_complete(
+        terminal.id,
+        terminal.lease_token,
+        mutation_result('finalize', actual_grams=1_250),
+        NOW + timedelta(seconds=2),
+    )
+    assert state.lifecycle == 'finalized' and state.actual_grams == 1_250
+
+
+def test_invalid_completion_result_is_rejected_without_partial_update(
+    store: InventoryStore,
+) -> None:
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    command = store.lease_next(NAMESPACE, NOW, 30)
+    assert command is not None and command.lease_token is not None
+    invalid = replace(
+        mutation_result(),
+        balance=replace(mutation_result().balance, lot_id=OTHER_LOT_UUID),
+    )
+    with pytest.raises(ValueError, match='result'):
+        store.mark_complete(
+            command.id,
+            command.lease_token,
+            invalid,
+            NOW + timedelta(seconds=10),
+        )
+    assert store.roast_state(NAMESPACE, ROAST_UUID).server_state is None  # type: ignore[union-attr]
+    assert store.counts(NAMESPACE).pending == 1
+
+
+def test_reserve_failure_cascades_dependency_and_manual_retries_are_exact(
+    store: InventoryStore,
+) -> None:
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    store.enqueue_finalize(NAMESPACE, FINALIZE_REQUEST, 1_200, NOW)
+    reserve = store.lease_next(NAMESPACE, NOW, 30)
+    assert reserve is not None and reserve.lease_token is not None
+    store.mark_failed(
+        reserve.id,
+        reserve.lease_token,
+        NOW + timedelta(seconds=10),
+        REJECTED_FAILURE,
+    )
+    failed = store.failed_commands(NAMESPACE)
+    assert [(item.operation, item.error_code, item.error_message) for item in failed] == [
+        ('reserve', 'invalid_inventory_transition', 'Inventory operation rejected.'),
+        ('finalize', 'dependency_failed', 'Inventory reservation dependency failed.'),
+    ]
+    state = store.roast_state(NAMESPACE, ROAST_UUID)
+    assert state is not None and state.lifecycle == 'failed'
+    store.retry_same(reserve.id, LATER)
+    retry = store.lease_next(NAMESPACE, LATER, 30)
+    assert retry is not None
+    assert retry.request_json == RESERVE_REQUEST.request_json
+    assert retry.idempotency_key == RESERVE_REQUEST.idempotency_key
+    assert retry.attempts == 2
+
+
+def test_pause_resume_preserves_namespace_and_derives_lifecycle(
+    store: InventoryStore,
+) -> None:
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    assert store.pause_namespace(NAMESPACE, NOW, 'credential_removed') == 1
+    state = store.roast_state(NAMESPACE, ROAST_UUID)
+    assert state is not None and state.lifecycle == 'paused'
+    assert store.counts(NAMESPACE).paused == 1
+    assert store.resume_namespace(NAMESPACE, LATER) == 1
+    state = store.roast_state(NAMESPACE, ROAST_UUID)
+    assert state is not None and state.lifecycle == 'reserve_queued'
+    command = store.lease_next(NAMESPACE, LATER, 30)
+    assert command is not None and command.lease_token is not None
+    store.mark_paused(command.id, command.lease_token, LATER, OFFLINE_FAILURE)
+    assert store.roast_state(NAMESPACE, ROAST_UUID).lifecycle == 'paused'  # type: ignore[union-attr]
+
+
+def test_restart_recovery_and_interrupted_reservation_discovery(tmp_path: Path) -> None:
+    root = tmp_path / 'inventory'
+    first = opened_store(root)
+    first.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    leased = first.lease_next(NAMESPACE, NOW, 30)
+    assert leased is not None
+    first.close()
+    reopened = opened_store(root)
+    try:
+        assert reopened.interrupted_reservations() == (
+            store_module.InterruptedReservation(
+                NAMESPACE,
+                ROAST_UUID,
+                LOT_UUID,
+                'Lot',
+                RESERVATION_UUID,
+                1_250,
+                'reserve_queued',
+                NOW,
+            ),
+        )
+        assert reopened.recover_expired_leases(NOW + timedelta(seconds=30)) == 1
+        assert reopened.lease_next(NAMESPACE, NOW + timedelta(seconds=30), 30) is not None
+        reopened.enqueue_release(NAMESPACE, RELEASE_REQUEST, LATER)
+        assert reopened.interrupted_reservations() == ()
+    finally:
+        reopened.close()
+
+
+def test_completed_history_prunes_only_old_terminal_roasts(
+    store: InventoryStore,
+) -> None:
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    store.enqueue_release(NAMESPACE, RELEASE_REQUEST, NOW)
+    reserve = store.lease_next(NAMESPACE, NOW, 30)
+    assert reserve is not None and reserve.lease_token is not None
+    store.mark_complete(reserve.id, reserve.lease_token, mutation_result(), NOW)
+    release = store.lease_next(NAMESPACE, NOW, 30)
+    assert release is not None and release.lease_token is not None
+    store.mark_complete(
+        release.id,
+        release.lease_token,
+        mutation_result('release'),
+        NOW,
+    )
+    assert store.counts(NAMESPACE).complete == 2
+    other_roast = UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+    other_reservation = UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+    later_request = build_reserve_request(
+        client_instance_uuid=CLIENT_UUID,
+        reservation_uuid=other_reservation,
+        roast_uuid=other_roast,
+        lot_id=LOT_UUID,
+        planned_grams=500,
+        occurred_at=NOW + timedelta(days=30),
+    )
+    store.enqueue_reserve(NAMESPACE, later_request, 'Lot', NOW + timedelta(days=30))
+    assert store.counts(NAMESPACE).complete == 0
+
+
+def test_two_store_reserve_and_terminal_intent_races_are_serialized(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'inventory'
+    first = opened_store(root)
+    second = opened_store(root)
+    barrier = threading.Barrier(2)
+    reserve_results: list[object] = []
+    terminal_results: list[str] = []
+
+    def reserve_with(value: InventoryStore) -> None:
+        barrier.wait(timeout=5)
+        reserve_results.append(value.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW))
+
+    threads = [threading.Thread(target=reserve_with, args=(item,)) for item in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert len(reserve_results) == 2 and reserve_results[0] == reserve_results[1]
+
+    barrier = threading.Barrier(2)
+
+    def terminal_with(value: InventoryStore, operation: str) -> None:
+        barrier.wait(timeout=5)
+        try:
+            if operation == 'finalize':
+                value.enqueue_finalize(NAMESPACE, FINALIZE_REQUEST, 1_200, LATER)
+            else:
+                value.enqueue_release(NAMESPACE, RELEASE_REQUEST, LATER)
+            terminal_results.append(operation)
+        except InventoryStoreError:
+            terminal_results.append('rejected')
+
+    threads = [
+        threading.Thread(target=terminal_with, args=(first, 'finalize')),
+        threading.Thread(target=terminal_with, args=(second, 'release')),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    try:
+        assert sorted(terminal_results) in [
+            ['finalize', 'rejected'],
+            ['rejected', 'release'],
+        ]
+        assert first.counts(NAMESPACE).pending == 2
+    finally:
+        first.close()
+        second.close()

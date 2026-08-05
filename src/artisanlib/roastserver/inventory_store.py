@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
 import json
@@ -44,18 +44,28 @@ from uuid import UUID, uuid4
 
 from artisanlib.roastserver import _filesystem as secure_filesystem
 from artisanlib.roastserver.contract import (
+    FAILURE_MESSAGES,
     MAX_ERROR_MESSAGE_CODE_POINTS,
     MAX_JSON_BYTES,
     POSTGRESQL_INTEGER_MAX,
+    FailureKind,
     Namespace,
+    PublicFailure,
 )
 from artisanlib.roastserver.inventory_contract import (
     MAX_CACHED_LOTS,
     BeanLot,
     InventoryBalance,
+    InventoryCommandRequest,
+    InventoryConflict,
+    InventoryMutationResult,
     InventoryOperation,
+    InventoryReservation,
     ProcessingMethod,
     ReservationState,
+    build_finalize_request,
+    build_release_request,
+    build_reserve_request,
 )
 
 _SCHEMA_VERSION: Final[int] = 1
@@ -71,6 +81,52 @@ _MAX_DESCRIPTOR_BYTES: Final[int] = 400
 _MAX_VARIETALS: Final[int] = 16
 _MAX_ERROR_CODE_CHARS: Final[int] = 100
 _MAX_IDEMPOTENCY_KEY_CHARS: Final[int] = 255
+_MAX_LEASE_SECONDS: Final[int] = 24 * 60 * 60
+_COMPLETED_RETENTION_DAYS: Final[int] = 30
+_DEPENDENCY_FAILURE_CODE: Final[str] = 'dependency_failed'
+_DEPENDENCY_FAILURE_MESSAGE: Final[str] = 'Inventory reservation dependency failed.'
+_PAUSE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        'connector_disabled',
+        'credential_rejected',
+        'credential_removed',
+        'inventory_unsupported',
+    }
+)
+_FAILURE_CODES_BY_KIND: Final[dict[FailureKind, frozenset[str]]] = {
+    FailureKind.OFFLINE: frozenset(
+        {
+            'connection_error',
+            'deadline_exceeded',
+            'inventory_unavailable',
+            'offline',
+            'request_error',
+            'server_unavailable',
+            'tls_error',
+        }
+    ),
+    FailureKind.CREDENTIAL_REJECTED: frozenset(
+        {'authentication_required', 'credential_rejected'}
+    ),
+    FailureKind.RATE_LIMITED: frozenset({'rate_limited'}),
+    FailureKind.INVALID_RESPONSE: frozenset(
+        {'client_closed', 'invalid_response', 'request_error'}
+    ),
+    FailureKind.INVENTORY_REJECTED: frozenset(
+        {
+            'bean_lot_archived',
+            'bean_lot_not_found',
+            'invalid_inventory_transition',
+            'invalid_request',
+            'inventory_reservation_not_found',
+        }
+    ),
+    FailureKind.INVENTORY_CONFLICT: frozenset(
+        {'inventory_idempotency_conflict'}
+    ),
+    FailureKind.INVENTORY_UNSUPPORTED: frozenset({'inventory_unsupported'}),
+    FailureKind.LOCAL_INVENTORY: frozenset({'local_inventory'}),
+}
 _UUID_HEX_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
 _NAMESPACE_KEY_RE: Final[re.Pattern[str]] = re.compile(r'^namespace-sha256:([0-9a-f]{64})$')
 _PROCESSING_METHODS: Final[frozenset[str]] = frozenset(
@@ -524,6 +580,852 @@ class InventoryStore:
                 refreshed_at,
             )
 
+    def enqueue_reserve(
+        self,
+        namespace: Namespace,
+        request: InventoryCommandRequest,
+        lot_name: str,
+        now: datetime,
+    ) -> InventoryRoastState:
+        namespace_values = _namespace_values(namespace)
+        request_value = _validated_command_request(request, 'reserve')
+        lot_name_value = _bounded_text(
+            lot_name, _MAX_LOT_NAME_CHARS, _MAX_LOT_NAME_BYTES, 'lot name'
+        )
+        now_text = _datetime_text(now)
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            namespace_id = self._namespace_id(connection, namespace_values, create=True)
+            if namespace_id is None:
+                raise InventoryStoreError('inventory namespace was not persisted')
+            existing = connection.execute(
+                '''SELECT * FROM roast_inventory
+                   WHERE namespace_id = ? AND roast_uuid = ?''',
+                (namespace_id, request_value.roast_uuid.hex),
+            ).fetchone()
+            if existing is not None:
+                self._require_reserve_match(
+                    connection,
+                    namespace_id,
+                    existing,
+                    request_value,
+                    lot_name_value,
+                )
+                return _row_to_roast(existing, namespace)
+            reservation_owner = connection.execute(
+                '''SELECT roast_uuid FROM roast_inventory
+                   WHERE namespace_id = ? AND client_reservation_uuid = ?''',
+                (namespace_id, request_value.reservation_uuid.hex),
+            ).fetchone()
+            if reservation_owner is not None:
+                raise InventoryStoreError('inventory reservation UUID conflicts')
+            connection.execute(
+                '''INSERT INTO roast_inventory
+                   (namespace_id, roast_uuid, lot_uuid, lot_name,
+                    client_reservation_uuid, planned_grams, lifecycle,
+                    reserve_occurred_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'reserve_queued', ?, ?, ?)''',
+                (
+                    namespace_id,
+                    request_value.roast_uuid.hex,
+                    request_value.lot_id.hex,
+                    lot_name_value,
+                    request_value.reservation_uuid.hex,
+                    request_value.planned_grams,
+                    _datetime_text(request_value.occurred_at),
+                    now_text,
+                    now_text,
+                ),
+            )
+            self._insert_command(
+                connection, namespace_id, request_value, None, now_text
+            )
+            self._prune_completed(connection, now)
+            row = connection.execute(
+                '''SELECT * FROM roast_inventory
+                   WHERE namespace_id = ? AND roast_uuid = ?''',
+                (namespace_id, request_value.roast_uuid.hex),
+            ).fetchone()
+            if row is None:
+                raise InventoryStoreError('inventory roast was not persisted')
+            return _row_to_roast(row, namespace)
+
+    def enqueue_finalize(
+        self,
+        namespace: Namespace,
+        request: InventoryCommandRequest,
+        actual_grams: int | None,
+        now: datetime,
+    ) -> InventoryRoastState:
+        if actual_grams is not None and not _bounded_int(
+            actual_grams, 1, POSTGRESQL_INTEGER_MAX
+        ):
+            raise ValueError('inventory actual grams are invalid')
+        request_value = _validated_command_request(request, 'finalize')
+        if request_value.requested_actual_grams != actual_grams:
+            raise ValueError('inventory actual grams do not match request')
+        return self._enqueue_terminal(namespace, request_value, actual_grams, now)
+
+    def enqueue_release(
+        self,
+        namespace: Namespace,
+        request: InventoryCommandRequest,
+        now: datetime,
+    ) -> InventoryRoastState:
+        request_value = _validated_command_request(request, 'release')
+        return self._enqueue_terminal(namespace, request_value, None, now)
+
+    def _enqueue_terminal(
+        self,
+        namespace: Namespace,
+        request: InventoryCommandRequest,
+        actual_grams: int | None,
+        now: datetime,
+    ) -> InventoryRoastState:
+        namespace_values = _namespace_values(namespace)
+        now_text = _datetime_text(now)
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            namespace_id = self._namespace_id(
+                connection, namespace_values, create=False
+            )
+            if namespace_id is None:
+                raise InventoryStoreError('inventory reservation is unavailable')
+            row = connection.execute(
+                '''SELECT * FROM roast_inventory
+                   WHERE namespace_id = ? AND roast_uuid = ?''',
+                (namespace_id, request.roast_uuid.hex),
+            ).fetchone()
+            if row is None:
+                raise InventoryStoreError('inventory reservation is unavailable')
+            _require_request_matches_roast(row, request)
+            terminal_intent = cast(str | None, row['terminal_intent'])
+            if terminal_intent is not None and terminal_intent != request.operation:
+                raise InventoryStoreError('inventory terminal intent conflicts')
+            reserve = connection.execute(
+                '''SELECT * FROM inventory_commands
+                   WHERE namespace_id = ? AND reservation_uuid = ?
+                     AND operation = 'reserve' ''',
+                (namespace_id, request.reservation_uuid.hex),
+            ).fetchone()
+            if reserve is None:
+                raise InventoryStoreError('inventory reserve dependency is unavailable')
+            existing = connection.execute(
+                '''SELECT * FROM inventory_commands
+                   WHERE namespace_id = ? AND reservation_uuid = ? AND operation = ?''',
+                (namespace_id, request.reservation_uuid.hex, request.operation),
+            ).fetchone()
+            occurred_column = (
+                'finalize_occurred_at'
+                if request.operation == 'finalize'
+                else 'release_occurred_at'
+            )
+            if existing is not None:
+                if not _command_body_matches(existing, request):
+                    raise InventoryStoreError('inventory immutable command conflicts')
+                if row['actual_grams'] != actual_grams:
+                    raise InventoryStoreError('inventory immutable command conflicts')
+                return _row_to_roast(row, namespace)
+            if terminal_intent is not None or row['server_state'] in {'finalized', 'released'}:
+                raise InventoryStoreError('inventory terminal intent conflicts')
+            lifecycle = f'{request.operation}_queued'
+            connection.execute(
+                f'''UPDATE roast_inventory
+                    SET actual_grams = ?, lifecycle = ?, terminal_intent = ?,
+                        {occurred_column} = ?, error_code = NULL,
+                        error_message = NULL, updated_at = ?
+                    WHERE namespace_id = ? AND roast_uuid = ?''',
+                (
+                    actual_grams,
+                    lifecycle,
+                    request.operation,
+                    _datetime_text(request.occurred_at),
+                    now_text,
+                    namespace_id,
+                    request.roast_uuid.hex,
+                ),
+            )
+            self._insert_command(
+                connection,
+                namespace_id,
+                request,
+                _stored_uuid_hex(reserve['id']),
+                now_text,
+            )
+            self._prune_completed(connection, now)
+            updated = connection.execute(
+                '''SELECT * FROM roast_inventory
+                   WHERE namespace_id = ? AND roast_uuid = ?''',
+                (namespace_id, request.roast_uuid.hex),
+            ).fetchone()
+            if updated is None:
+                raise InventoryStoreError('inventory roast was not persisted')
+            return _row_to_roast(updated, namespace)
+
+    def lease_next(
+        self, namespace: Namespace, now: datetime, lease_seconds: int
+    ) -> InventoryCommand | None:
+        namespace_values = _namespace_values(namespace)
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= _MAX_LEASE_SECONDS:
+            raise ValueError(
+                f'lease_seconds must be an integer between 1 and {_MAX_LEASE_SECONDS}'
+            )
+        now_text = _datetime_text(now)
+        try:
+            lease_expires_text = _datetime_text(
+                now + timedelta(seconds=lease_seconds)
+            )
+        except OverflowError as exc:
+            raise ValueError('lease_seconds is out of range') from exc
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            namespace_id = self._namespace_id(
+                connection, namespace_values, create=False
+            )
+            if namespace_id is None:
+                return None
+            row = connection.execute(
+                '''SELECT command.* FROM inventory_commands AS command
+                   LEFT JOIN inventory_commands AS dependency
+                     ON dependency.id = command.dependency_id
+                   WHERE command.namespace_id = ?
+                     AND (command.state = 'pending'
+                          OR (command.state = 'retry_wait'
+                              AND command.next_attempt_at <= ?))
+                     AND (command.dependency_id IS NULL
+                          OR dependency.state = 'complete')
+                   ORDER BY CASE WHEN command.state = 'retry_wait'
+                                 THEN command.next_attempt_at
+                                 ELSE command.created_at END,
+                            command.created_at, command.rowid
+                   LIMIT 1''',
+                (namespace_id, now_text),
+            ).fetchone()
+            if row is None:
+                return None
+            lease_token = uuid4().hex
+            cursor = connection.execute(
+                '''UPDATE inventory_commands
+                   SET state = 'leased', attempts = attempts + 1,
+                       next_attempt_at = NULL, lease_expires_at = ?, lease_token = ?,
+                       error_code = NULL, error_message = NULL, updated_at = ?
+                   WHERE id = ? AND state IN ('pending', 'retry_wait')''',
+                (lease_expires_text, lease_token, now_text, row['id']),
+            )
+            if cursor.rowcount != 1:
+                raise InventoryStoreError('lease_lost')
+            leased = connection.execute(
+                'SELECT * FROM inventory_commands WHERE id = ?', (row['id'],)
+            ).fetchone()
+            if leased is None:
+                raise InventoryStoreError('leased inventory command disappeared')
+            return _row_to_command(leased, namespace)
+
+    def next_due_at(self, namespace: Namespace) -> datetime | None:
+        namespace_values = _namespace_values(namespace)
+        with self._storage_boundary(), self._read_transaction() as connection:
+            namespace_id = self._namespace_id(
+                connection, namespace_values, create=False
+            )
+            if namespace_id is None:
+                return None
+            row = connection.execute(
+                '''SELECT CASE WHEN command.state = 'retry_wait'
+                               THEN command.next_attempt_at
+                               ELSE command.created_at END AS due_at
+                   FROM inventory_commands AS command
+                   LEFT JOIN inventory_commands AS dependency
+                     ON dependency.id = command.dependency_id
+                   WHERE command.namespace_id = ?
+                     AND command.state IN ('pending', 'retry_wait')
+                     AND (command.dependency_id IS NULL
+                          OR dependency.state = 'complete')
+                   ORDER BY due_at, command.created_at, command.rowid LIMIT 1''',
+                (namespace_id,),
+            ).fetchone()
+            return None if row is None else _stored_datetime(row['due_at'])
+
+    def mark_complete(
+        self,
+        command_id: str,
+        lease_token: str,
+        result: InventoryMutationResult,
+        now: datetime,
+    ) -> InventoryRoastState:
+        command_hex = _command_identifier(command_id)
+        token_hex = _command_identifier(lease_token)
+        now_text = _datetime_text(now)
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            row = self._leased_command(
+                connection, command_hex, token_hex, now_text
+            )
+            namespace = _namespace_from_command(connection, row)
+            roast = connection.execute(
+                '''SELECT * FROM roast_inventory
+                   WHERE namespace_id = ? AND roast_uuid = ?''',
+                (row['namespace_id'], row['roast_uuid']),
+            ).fetchone()
+            if roast is None:
+                raise InventoryStoreError('inventory roast is unavailable')
+            validated_result = _validated_mutation_result(result, row, roast)
+            cursor = connection.execute(
+                '''UPDATE inventory_commands
+                   SET state = 'complete', next_attempt_at = NULL,
+                       lease_expires_at = NULL, lease_token = NULL,
+                       error_code = NULL, error_message = NULL,
+                       updated_at = ?, completed_at = ?
+                   WHERE id = ? AND state = 'leased' AND lease_token = ?
+                     AND lease_expires_at > ?''',
+                (now_text, now_text, command_hex, token_hex, now_text),
+            )
+            if cursor.rowcount != 1:
+                raise InventoryStoreError('lease_lost')
+            reservation = validated_result.reservation
+            balance = validated_result.balance
+            operation = cast(InventoryOperation, row['operation'])
+            persisted_actual_grams = (
+                reservation.actual_grams
+                if operation == 'finalize'
+                else cast(int | None, roast['actual_grams'])
+            )
+            lifecycle: InventoryLifecycle
+            if operation == 'reserve':
+                terminal_intent = cast(str | None, roast['terminal_intent'])
+                lifecycle = cast(
+                    InventoryLifecycle,
+                    'reserved'
+                    if terminal_intent is None
+                    else f'{terminal_intent}_queued',
+                )
+            else:
+                lifecycle = cast(InventoryLifecycle, f'{operation}d')
+            connection.execute(
+                '''UPDATE roast_inventory
+                   SET server_reservation_uuid = ?, server_state = ?, lifecycle = ?,
+                       actual_grams = ?,
+                       balance_on_hand_grams = ?, balance_reserved_grams = ?,
+                       balance_available_grams = ?,
+                       balance_unresolved_conflict_count = ?, conflict_uuid = ?,
+                       error_code = NULL, error_message = NULL, updated_at = ?
+                   WHERE namespace_id = ? AND roast_uuid = ?''',
+                (
+                    reservation.reservation_id.hex,
+                    reservation.state,
+                    lifecycle,
+                    persisted_actual_grams,
+                    balance.on_hand_grams,
+                    balance.reserved_grams,
+                    balance.available_grams,
+                    balance.unresolved_conflict_count,
+                    (
+                        validated_result.conflict.conflict_id.hex
+                        if validated_result.conflict is not None
+                        else None
+                    ),
+                    now_text,
+                    row['namespace_id'],
+                    row['roast_uuid'],
+                ),
+            )
+            connection.execute(
+                '''UPDATE bean_lots
+                   SET on_hand_grams = ?, reserved_grams = ?, available_grams = ?,
+                       unresolved_conflict_count = ?
+                   WHERE namespace_id = ? AND lot_uuid = ?''',
+                (
+                    balance.on_hand_grams,
+                    balance.reserved_grams,
+                    balance.available_grams,
+                    balance.unresolved_conflict_count,
+                    row['namespace_id'],
+                    row['lot_uuid'],
+                ),
+            )
+            self._prune_completed(connection, now)
+            updated = connection.execute(
+                '''SELECT * FROM roast_inventory
+                   WHERE namespace_id = ? AND roast_uuid = ?''',
+                (row['namespace_id'], row['roast_uuid']),
+            ).fetchone()
+            if updated is None:
+                raise InventoryStoreError('inventory roast is unavailable')
+            return _row_to_roast(updated, namespace)
+
+    def mark_retry(
+        self,
+        command_id: str,
+        lease_token: str,
+        now: datetime,
+        next_attempt_at: datetime,
+        failure: PublicFailure,
+    ) -> None:
+        _datetime_text(next_attempt_at)
+        _datetime_text(now)
+        if next_attempt_at.astimezone(UTC) < now.astimezone(UTC):
+            raise ValueError('next attempt cannot be before now')
+        self._transition_leased_failure(
+            command_id,
+            lease_token,
+            now,
+            failure,
+            'retry_wait',
+            next_attempt_at,
+        )
+
+    def mark_paused(
+        self,
+        command_id: str,
+        lease_token: str,
+        now: datetime,
+        failure: PublicFailure,
+    ) -> None:
+        self._transition_leased_failure(
+            command_id, lease_token, now, failure, 'paused', None
+        )
+
+    def mark_failed(
+        self,
+        command_id: str,
+        lease_token: str,
+        now: datetime,
+        failure: PublicFailure,
+    ) -> None:
+        self._transition_leased_failure(
+            command_id, lease_token, now, failure, 'failed', None
+        )
+
+    def _transition_leased_failure(
+        self,
+        command_id: str,
+        lease_token: str,
+        now: datetime,
+        failure: PublicFailure,
+        state: Literal['retry_wait', 'paused', 'failed'],
+        next_attempt_at: datetime | None,
+    ) -> None:
+        command_hex = _command_identifier(command_id)
+        token_hex = _command_identifier(lease_token)
+        now_text = _datetime_text(now)
+        next_text = (
+            None if next_attempt_at is None else _datetime_text(next_attempt_at)
+        )
+        error_code, error_message = _failure_fields(failure)
+        stored_message = None if state == 'paused' else error_message
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            row = self._leased_command(
+                connection, command_hex, token_hex, now_text
+            )
+            cursor = connection.execute(
+                '''UPDATE inventory_commands
+                   SET state = ?, next_attempt_at = ?, lease_expires_at = NULL,
+                       lease_token = NULL, error_code = ?, error_message = ?,
+                       updated_at = ?
+                   WHERE id = ? AND state = 'leased' AND lease_token = ?
+                     AND lease_expires_at > ?''',
+                (
+                    state,
+                    next_text,
+                    error_code,
+                    stored_message,
+                    now_text,
+                    command_hex,
+                    token_hex,
+                    now_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise InventoryStoreError('lease_lost')
+            if state in {'paused', 'failed'}:
+                connection.execute(
+                    '''UPDATE roast_inventory
+                       SET lifecycle = ?, error_code = ?, error_message = ?, updated_at = ?
+                       WHERE namespace_id = ? AND roast_uuid = ?''',
+                    (
+                        state,
+                        error_code,
+                        stored_message,
+                        now_text,
+                        row['namespace_id'],
+                        row['roast_uuid'],
+                    ),
+                )
+            if state == 'failed' and row['operation'] == 'reserve':
+                connection.execute(
+                    '''UPDATE inventory_commands
+                       SET state = 'failed', next_attempt_at = NULL,
+                           lease_expires_at = NULL, lease_token = NULL,
+                           error_code = ?, error_message = ?, updated_at = ?
+                       WHERE dependency_id = ?
+                         AND state IN ('pending', 'retry_wait', 'paused')''',
+                    (
+                        _DEPENDENCY_FAILURE_CODE,
+                        _DEPENDENCY_FAILURE_MESSAGE,
+                        now_text,
+                        command_hex,
+                    ),
+                )
+            self._prune_completed(connection, now)
+
+    def recover_expired_leases(self, now: datetime) -> int:
+        now_text = _datetime_text(now)
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            cursor = connection.execute(
+                '''UPDATE inventory_commands
+                   SET state = 'pending', next_attempt_at = NULL,
+                       lease_expires_at = NULL, lease_token = NULL,
+                       error_code = NULL, error_message = NULL, updated_at = ?
+                   WHERE state = 'leased' AND lease_expires_at <= ?''',
+                (now_text, now_text),
+            )
+            self._prune_completed(connection, now)
+            return cursor.rowcount
+
+    def pause_namespace(self, namespace: Namespace, now: datetime, code: str) -> int:
+        namespace_values = _namespace_values(namespace)
+        now_text = _datetime_text(now)
+        code_value = _pause_code(code)
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            namespace_id = self._namespace_id(
+                connection, namespace_values, create=False
+            )
+            if namespace_id is None:
+                return 0
+            cursor = connection.execute(
+                '''UPDATE inventory_commands
+                   SET state = 'paused', lease_expires_at = NULL, lease_token = NULL,
+                       error_code = ?, error_message = NULL, updated_at = ?
+                   WHERE namespace_id = ? AND state IN ('pending', 'retry_wait')''',
+                (code_value, now_text, namespace_id),
+            )
+            connection.execute(
+                '''UPDATE roast_inventory
+                   SET lifecycle = 'paused', error_code = ?, error_message = NULL,
+                       updated_at = ?
+                   WHERE namespace_id = ?
+                     AND lifecycle NOT IN ('finalized', 'released', 'failed')
+                     AND EXISTS (
+                       SELECT 1 FROM inventory_commands
+                       WHERE inventory_commands.namespace_id = roast_inventory.namespace_id
+                         AND inventory_commands.roast_uuid = roast_inventory.roast_uuid
+                         AND inventory_commands.state = 'paused')''',
+                (code_value, now_text, namespace_id),
+            )
+            self._prune_completed(connection, now)
+            return cursor.rowcount
+
+    def resume_namespace(self, namespace: Namespace, now: datetime) -> int:
+        namespace_values = _namespace_values(namespace)
+        now_text = _datetime_text(now)
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            namespace_id = self._namespace_id(
+                connection, namespace_values, create=False
+            )
+            if namespace_id is None:
+                return 0
+            roast_ids = tuple(
+                cast(str, row['roast_uuid'])
+                for row in connection.execute(
+                    '''SELECT DISTINCT roast_uuid FROM inventory_commands
+                       WHERE namespace_id = ? AND state = 'paused' ''',
+                    (namespace_id,),
+                )
+            )
+            cursor = connection.execute(
+                '''UPDATE inventory_commands
+                   SET state = 'pending', next_attempt_at = NULL,
+                       error_code = NULL, error_message = NULL, updated_at = ?
+                   WHERE namespace_id = ? AND state = 'paused' ''',
+                (now_text, namespace_id),
+            )
+            for roast_uuid in roast_ids:
+                self._restore_roast_lifecycle(
+                    connection, namespace_id, roast_uuid, now_text
+                )
+            self._prune_completed(connection, now)
+            return cursor.rowcount
+
+    def retry_same(self, command_id: str, now: datetime) -> None:
+        command_hex = _command_identifier(command_id)
+        now_text = _datetime_text(now)
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            row = connection.execute(
+                'SELECT * FROM inventory_commands WHERE id = ?', (command_hex,)
+            ).fetchone()
+            if row is None or row['state'] != 'failed':
+                raise InventoryStoreError('inventory command is not failed')
+            connection.execute(
+                '''UPDATE inventory_commands
+                   SET state = 'pending', next_attempt_at = NULL,
+                       lease_expires_at = NULL, lease_token = NULL,
+                       error_code = NULL, error_message = NULL, updated_at = ?
+                   WHERE id = ? AND state = 'failed' ''',
+                (now_text, command_hex),
+            )
+            self._restore_roast_lifecycle(
+                connection,
+                cast(int, row['namespace_id']),
+                _stored_uuid_hex(row['roast_uuid']),
+                now_text,
+            )
+            self._prune_completed(connection, now)
+
+    def counts(self, namespace: Namespace) -> InventoryQueueCounts:
+        namespace_values = _namespace_values(namespace)
+        with self._storage_boundary(), self._read_transaction() as connection:
+            namespace_id = self._namespace_id(
+                connection, namespace_values, create=False
+            )
+            if namespace_id is None:
+                return InventoryQueueCounts(0, 0, 0, 0, 0)
+            row = connection.execute(
+                '''SELECT
+                     COALESCE(SUM(state IN ('pending', 'leased')), 0) AS pending,
+                     COALESCE(SUM(state = 'retry_wait'), 0) AS retrying,
+                     COALESCE(SUM(state = 'paused'), 0) AS paused,
+                     COALESCE(SUM(state = 'failed'), 0) AS failed,
+                     COALESCE(SUM(state = 'complete'), 0) AS complete
+                   FROM inventory_commands WHERE namespace_id = ?''',
+                (namespace_id,),
+            ).fetchone()
+            if row is None:
+                raise InventoryStoreError('inventory command count query failed')
+            return InventoryQueueCounts(
+                cast(int, row['pending']),
+                cast(int, row['retrying']),
+                cast(int, row['paused']),
+                cast(int, row['failed']),
+                cast(int, row['complete']),
+            )
+
+    def failed_commands(
+        self, namespace: Namespace
+    ) -> tuple[FailedInventoryCommand, ...]:
+        namespace_values = _namespace_values(namespace)
+        with self._storage_boundary(), self._read_transaction() as connection:
+            namespace_id = self._namespace_id(
+                connection, namespace_values, create=False
+            )
+            if namespace_id is None:
+                return ()
+            rows = connection.execute(
+                '''SELECT * FROM inventory_commands
+                   WHERE namespace_id = ? AND state = 'failed'
+                   ORDER BY updated_at DESC,
+                            CASE operation WHEN 'reserve' THEN 0 ELSE 1 END,
+                            id''',
+                (namespace_id,),
+            ).fetchall()
+            result: list[FailedInventoryCommand] = []
+            for row in rows:
+                command = _row_to_command(row, namespace)
+                if command.error_code is None or command.error_message is None:
+                    raise InventoryStoreError('failed inventory command is invalid')
+                result.append(
+                    FailedInventoryCommand(
+                        command.id,
+                        namespace,
+                        command.roast_uuid,
+                        command.lot_id,
+                        command.reservation_uuid,
+                        command.operation,
+                        command.attempts,
+                        command.error_code,
+                        command.error_message,
+                        command.updated_at,
+                    )
+                )
+            return tuple(result)
+
+    def interrupted_reservations(self) -> tuple[InterruptedReservation, ...]:
+        with self._storage_boundary(), self._read_transaction() as connection:
+            rows = connection.execute(
+                '''SELECT roast.*, namespace.origin, namespace.organization_uuid,
+                          namespace.namespace_key
+                   FROM roast_inventory AS roast
+                   JOIN namespaces AS namespace ON namespace.id = roast.namespace_id
+                   WHERE roast.terminal_intent IS NULL
+                     AND roast.lifecycle NOT IN ('finalized', 'released')
+                   ORDER BY roast.updated_at, namespace.namespace_key, roast.roast_uuid'''
+            ).fetchall()
+            return tuple(_row_to_interrupted(row) for row in rows)
+
+    def roast_state(
+        self, namespace: Namespace, roast_uuid: UUID
+    ) -> InventoryRoastState | None:
+        namespace_values = _namespace_values(namespace)
+        if not isinstance(roast_uuid, UUID):
+            raise ValueError('inventory roast UUID is invalid')
+        with self._storage_boundary(), self._read_transaction() as connection:
+            namespace_id = self._namespace_id(
+                connection, namespace_values, create=False
+            )
+            if namespace_id is None:
+                return None
+            row = connection.execute(
+                '''SELECT * FROM roast_inventory
+                   WHERE namespace_id = ? AND roast_uuid = ?''',
+                (namespace_id, roast_uuid.hex),
+            ).fetchone()
+            return None if row is None else _row_to_roast(row, namespace)
+
+    def _require_reserve_match(
+        self,
+        connection: sqlite3.Connection,
+        namespace_id: int,
+        roast: sqlite3.Row,
+        request: InventoryCommandRequest,
+        lot_name: str,
+    ) -> None:
+        if (
+            roast['lot_uuid'] != request.lot_id.hex
+            or roast['lot_name'] != lot_name
+            or roast['client_reservation_uuid'] != request.reservation_uuid.hex
+            or roast['planned_grams'] != request.planned_grams
+            or _stored_datetime(roast['reserve_occurred_at']) != request.occurred_at.astimezone(UTC)
+        ):
+            raise InventoryStoreError('inventory immutable reservation conflicts')
+        command = connection.execute(
+            '''SELECT * FROM inventory_commands
+               WHERE namespace_id = ? AND reservation_uuid = ?
+                 AND operation = 'reserve' ''',
+            (namespace_id, request.reservation_uuid.hex),
+        ).fetchone()
+        if command is None or not _command_body_matches(command, request):
+            raise InventoryStoreError('inventory immutable command conflicts')
+
+    @staticmethod
+    def _insert_command(
+        connection: sqlite3.Connection,
+        namespace_id: int,
+        request: InventoryCommandRequest,
+        dependency_id: str | None,
+        now_text: str,
+    ) -> None:
+        connection.execute(
+            '''INSERT INTO inventory_commands
+               (id, namespace_id, roast_uuid, lot_uuid, reservation_uuid,
+                operation, request_json, idempotency_key, dependency_id, state,
+                attempts, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)''',
+            (
+                uuid4().hex,
+                namespace_id,
+                request.roast_uuid.hex,
+                request.lot_id.hex,
+                request.reservation_uuid.hex,
+                request.operation,
+                request.request_json,
+                request.idempotency_key,
+                dependency_id,
+                now_text,
+                now_text,
+            ),
+        )
+
+    @staticmethod
+    def _leased_command(
+        connection: sqlite3.Connection,
+        command_id: str,
+        lease_token: str,
+        now_text: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            '''SELECT * FROM inventory_commands
+               WHERE id = ? AND state = 'leased' AND lease_token = ?
+                 AND lease_expires_at > ?''',
+            (command_id, lease_token, now_text),
+        ).fetchone()
+        if row is None:
+            raise InventoryStoreError('lease_lost')
+        return cast(sqlite3.Row, row)
+
+    @staticmethod
+    def _restore_roast_lifecycle(
+        connection: sqlite3.Connection,
+        namespace_id: int,
+        roast_uuid: str,
+        now_text: str,
+    ) -> None:
+        row = connection.execute(
+            '''SELECT * FROM roast_inventory
+               WHERE namespace_id = ? AND roast_uuid = ?''',
+            (namespace_id, roast_uuid),
+        ).fetchone()
+        if row is None:
+            raise InventoryStoreError('inventory roast is unavailable')
+        server_state = cast(str | None, row['server_state'])
+        terminal_intent = cast(str | None, row['terminal_intent'])
+        if server_state in {'finalized', 'released'}:
+            lifecycle = server_state
+        elif server_state is None:
+            lifecycle = 'reserve_queued'
+        elif terminal_intent is None:
+            lifecycle = 'reserved'
+        else:
+            lifecycle = f'{terminal_intent}_queued'
+        connection.execute(
+            '''UPDATE roast_inventory
+               SET lifecycle = ?, error_code = NULL, error_message = NULL,
+                   updated_at = ?
+               WHERE namespace_id = ? AND roast_uuid = ?''',
+            (lifecycle, now_text, namespace_id, roast_uuid),
+        )
+
+    @staticmethod
+    def _prune_completed(connection: sqlite3.Connection, now: datetime) -> None:
+        threshold = _datetime_text(now - timedelta(days=_COMPLETED_RETENTION_DAYS))
+        eligible = '''completed_at <= ? AND EXISTS (
+              SELECT 1 FROM roast_inventory AS roast
+              WHERE roast.namespace_id = inventory_commands.namespace_id
+                AND roast.roast_uuid = inventory_commands.roast_uuid
+                AND roast.lifecycle IN ('finalized', 'released'))'''
+        connection.execute(
+            f'''DELETE FROM inventory_commands
+                WHERE operation IN ('finalize', 'release') AND {eligible}''',
+            (threshold,),
+        )
+        connection.execute(
+            f'''DELETE FROM inventory_commands
+                WHERE operation = 'reserve' AND {eligible}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM inventory_commands AS dependent
+                    WHERE dependent.dependency_id = inventory_commands.id)''',
+            (threshold,),
+        )
+
     def _initialize_schema(self) -> None:
         connection = self._require_connection()
         connection.execute('BEGIN IMMEDIATE')
@@ -729,6 +1631,382 @@ class InventoryStore:
         return self._connection
 
 
+def _validated_command_request(
+    value: object, operation: InventoryOperation
+) -> InventoryCommandRequest:
+    if not isinstance(value, InventoryCommandRequest) or value.operation != operation:
+        raise ValueError('inventory command request is invalid')
+    if not all(
+        isinstance(item, UUID)
+        for item in (
+            value.reservation_uuid,
+            value.roast_uuid,
+            value.lot_id,
+            value.client_instance_uuid,
+        )
+    ):
+        raise ValueError('inventory command request is invalid')
+    request_json: object = value.request_json
+    if not isinstance(request_json, bytes) or not 1 <= len(request_json) <= MAX_JSON_BYTES:
+        raise ValueError('inventory command request is invalid')
+    try:
+        canonical = _canonical_json_bytes(request_json)
+    except InventoryStoreError:
+        raise ValueError('inventory command request is invalid') from None
+    if canonical != request_json:
+        raise ValueError('inventory command request is invalid')
+    _bounded_text(
+        value.idempotency_key,
+        _MAX_IDEMPOTENCY_KEY_CHARS,
+        None,
+        'idempotency key',
+    )
+    _datetime_text(value.occurred_at)
+    if not _bounded_int(value.planned_grams, 1, POSTGRESQL_INTEGER_MAX):
+        raise ValueError('inventory command request is invalid')
+    actual = value.requested_actual_grams
+    if actual is not None and not _bounded_int(actual, 1, POSTGRESQL_INTEGER_MAX):
+        raise ValueError('inventory command request is invalid')
+    if operation != 'finalize' and actual is not None:
+        raise ValueError('inventory command request is invalid')
+    try:
+        if operation == 'reserve':
+            expected = build_reserve_request(
+                client_instance_uuid=value.client_instance_uuid,
+                reservation_uuid=value.reservation_uuid,
+                roast_uuid=value.roast_uuid,
+                lot_id=value.lot_id,
+                planned_grams=value.planned_grams,
+                occurred_at=value.occurred_at,
+            )
+        elif operation == 'finalize':
+            expected = build_finalize_request(
+                client_instance_uuid=value.client_instance_uuid,
+                reservation_uuid=value.reservation_uuid,
+                roast_uuid=value.roast_uuid,
+                lot_id=value.lot_id,
+                planned_grams=value.planned_grams,
+                actual_grams=value.requested_actual_grams,
+                occurred_at=value.occurred_at,
+            )
+        else:
+            expected = build_release_request(
+                client_instance_uuid=value.client_instance_uuid,
+                reservation_uuid=value.reservation_uuid,
+                roast_uuid=value.roast_uuid,
+                lot_id=value.lot_id,
+                planned_grams=value.planned_grams,
+                occurred_at=value.occurred_at,
+            )
+    except (TypeError, ValueError):
+        raise ValueError('inventory command request is invalid') from None
+    if value != expected:
+        raise ValueError('inventory command request is invalid')
+    return value
+
+
+def _require_request_matches_roast(
+    row: sqlite3.Row, request: InventoryCommandRequest
+) -> None:
+    if (
+        row['roast_uuid'] != request.roast_uuid.hex
+        or row['lot_uuid'] != request.lot_id.hex
+        or row['client_reservation_uuid'] != request.reservation_uuid.hex
+        or row['planned_grams'] != request.planned_grams
+    ):
+        raise InventoryStoreError('inventory immutable reservation conflicts')
+
+
+def _command_body_matches(
+    row: sqlite3.Row, request: InventoryCommandRequest
+) -> bool:
+    return bool(
+        row['roast_uuid'] == request.roast_uuid.hex
+        and row['lot_uuid'] == request.lot_id.hex
+        and row['reservation_uuid'] == request.reservation_uuid.hex
+        and row['operation'] == request.operation
+        and row['request_json'] == request.request_json
+        and row['idempotency_key'] == request.idempotency_key
+    )
+
+
+def _command_identifier(value: object) -> str:
+    if not isinstance(value, str) or _UUID_HEX_RE.fullmatch(value) is None:
+        raise ValueError('inventory command identifier is invalid')
+    return value
+
+
+def _failure_fields(failure: object) -> tuple[str, str]:
+    if not isinstance(failure, PublicFailure):
+        raise ValueError('failure is invalid')
+    kind: object = failure.kind
+    retryable: object = failure.retryable
+    if not isinstance(kind, FailureKind) or type(retryable) is not bool:
+        raise ValueError('failure is invalid')
+    code = _bounded_text(
+        failure.code, _MAX_ERROR_CODE_CHARS, None, 'failure code'
+    )
+    _bounded_text(
+        failure.message,
+        MAX_ERROR_MESSAGE_CODE_POINTS,
+        MAX_ERROR_MESSAGE_CODE_POINTS * 4,
+        'failure message',
+    )
+    if kind not in _FAILURE_CODES_BY_KIND or code not in _FAILURE_CODES_BY_KIND[kind]:
+        raise ValueError('failure is invalid')
+    return code, FAILURE_MESSAGES[kind]
+
+
+def _pause_code(value: object) -> str:
+    code = _bounded_text(value, _MAX_ERROR_CODE_CHARS, None, 'pause code')
+    if code not in _PAUSE_CODES:
+        raise ValueError('pause code is invalid')
+    return code
+
+
+def _validated_mutation_result(
+    value: object, command: sqlite3.Row, roast: sqlite3.Row
+) -> InventoryMutationResult:
+    if not isinstance(value, InventoryMutationResult):
+        raise ValueError('inventory mutation result is invalid')
+    reservation_value: object = value.reservation
+    balance_value: object = value.balance
+    conflict_value: object = value.conflict
+    replay_value: object = value.idempotent_replay
+    if (
+        not isinstance(reservation_value, InventoryReservation)
+        or not isinstance(balance_value, InventoryBalance)
+        or (
+            conflict_value is not None
+            and not isinstance(conflict_value, InventoryConflict)
+        )
+        or type(replay_value) is not bool
+    ):
+        raise ValueError('inventory mutation result is invalid')
+    reservation = reservation_value
+    balance = balance_value
+    conflict = conflict_value
+    operation = command['operation']
+    expected_state = {
+        'reserve': 'reserved',
+        'finalize': 'finalized',
+        'release': 'released',
+    }.get(operation)
+    key_parts = cast(str, command['idempotency_key']).split(':')
+    if len(key_parts) != 4:
+        raise ValueError('inventory mutation result is invalid')
+    try:
+        expected_client_uuid = UUID(hex=key_parts[1])
+    except ValueError:
+        raise ValueError('inventory mutation result is invalid') from None
+    expected_actual = (
+        roast['actual_grams'] or roast['planned_grams']
+        if operation == 'finalize'
+        else None
+    )
+    reservation_uuid_values: tuple[object, ...] = (
+        reservation.reservation_id,
+        reservation.client_reservation_uuid,
+        reservation.lot_id,
+        reservation.roast_uuid,
+        reservation.client_instance_uuid,
+    )
+    balance_lot_id: object = balance.lot_id
+    if not all(isinstance(item, UUID) for item in reservation_uuid_values) or not isinstance(
+        balance_lot_id, UUID
+    ):
+        raise ValueError('inventory mutation result is invalid')
+    if (
+        reservation.client_reservation_uuid.hex != command['reservation_uuid']
+        or reservation.lot_id.hex != command['lot_uuid']
+        or reservation.roast_uuid.hex != command['roast_uuid']
+        or reservation.client_instance_uuid != expected_client_uuid
+        or reservation.state != expected_state
+        or reservation.planned_grams != roast['planned_grams']
+        or reservation.actual_grams != expected_actual
+        or balance.lot_id != reservation.lot_id
+        or reservation.open_conflict_id
+        != (None if conflict is None else conflict.conflict_id)
+    ):
+        raise ValueError('inventory mutation result relationships are invalid')
+    for timestamp in (
+        reservation.reserved_at,
+        reservation.created_at,
+        reservation.updated_at,
+    ):
+        _datetime_text(timestamp)
+    if operation == 'reserve':
+        if reservation.completed_at is not None:
+            raise ValueError('inventory mutation result is invalid')
+    elif reservation.completed_at is None:
+        raise ValueError('inventory mutation result is invalid')
+    else:
+        _datetime_text(reservation.completed_at)
+    if (
+        not _bounded_int(reservation.planned_grams, 1, POSTGRESQL_INTEGER_MAX)
+        or (
+            reservation.actual_grams is not None
+            and not _bounded_int(
+                reservation.actual_grams, 1, POSTGRESQL_INTEGER_MAX
+            )
+        )
+        or not _bounded_int(
+            balance.on_hand_grams,
+            -POSTGRESQL_INTEGER_MAX,
+            POSTGRESQL_INTEGER_MAX,
+        )
+        or not _bounded_int(balance.reserved_grams, 0, POSTGRESQL_INTEGER_MAX)
+        or not _bounded_int(
+            balance.available_grams,
+            -POSTGRESQL_INTEGER_MAX,
+            POSTGRESQL_INTEGER_MAX,
+        )
+        or not _bounded_int(
+            balance.unresolved_conflict_count, 0, POSTGRESQL_INTEGER_MAX
+        )
+        or balance.available_grams != balance.on_hand_grams - balance.reserved_grams
+    ):
+        raise ValueError('inventory mutation result is invalid')
+    if conflict is not None:
+        if (
+            not all(
+                isinstance(item, UUID)
+                for item in (
+                    conflict.conflict_id,
+                    conflict.lot_id,
+                    conflict.source_ledger_entry_id,
+                )
+            )
+            or conflict.lot_id != reservation.lot_id
+            or conflict.roast_uuid != reservation.roast_uuid
+            or conflict.reservation_id != reservation.reservation_id
+            or conflict.state != 'open'
+            or conflict.resolved_at is not None
+            or conflict.resolved_by_user_id is not None
+            or conflict.resolution_note is not None
+        ):
+            raise ValueError('inventory mutation result relationships are invalid')
+        _datetime_text(conflict.created_at)
+    return value
+
+
+def _namespace_from_command(
+    connection: sqlite3.Connection, row: sqlite3.Row
+) -> Namespace:
+    namespace = connection.execute(
+        'SELECT * FROM namespaces WHERE id = ?', (row['namespace_id'],)
+    ).fetchone()
+    if namespace is None:
+        raise InventoryStoreError('inventory namespace is unavailable')
+    return Namespace(
+        _stored_bounded_text(namespace['origin'], _MAX_ORIGIN_CHARS, None),
+        UUID(hex=_stored_uuid_hex(namespace['organization_uuid'])),
+        f"namespace-sha256:{_stored_namespace_key(namespace['namespace_key'])}",
+    )
+
+
+def _row_to_command(row: sqlite3.Row, namespace: Namespace) -> InventoryCommand:
+    _validate_stored_command(row, {cast(int, row['namespace_id']): ('', '', '')})
+    return InventoryCommand(
+        id=_stored_uuid_hex(row['id']),
+        namespace=namespace,
+        roast_uuid=UUID(hex=_stored_uuid_hex(row['roast_uuid'])),
+        lot_id=UUID(hex=_stored_uuid_hex(row['lot_uuid'])),
+        reservation_uuid=UUID(hex=_stored_uuid_hex(row['reservation_uuid'])),
+        operation=cast(InventoryOperation, row['operation']),
+        request_json=cast(bytes, row['request_json']),
+        idempotency_key=_stored_bounded_text(
+            row['idempotency_key'], _MAX_IDEMPOTENCY_KEY_CHARS, None
+        ),
+        dependency_id=_stored_optional_uuid_hex(row['dependency_id']),
+        state=cast(InventoryCommandState, row['state']),
+        attempts=cast(int, row['attempts']),
+        next_attempt_at=_optional_stored_datetime(row['next_attempt_at']),
+        lease_expires_at=_optional_stored_datetime(row['lease_expires_at']),
+        lease_token=_stored_optional_uuid_hex(row['lease_token']),
+        error_code=_stored_optional_bounded_text(
+            row['error_code'], _MAX_ERROR_CODE_CHARS
+        ),
+        error_message=_stored_optional_bounded_text(
+            row['error_message'], MAX_ERROR_MESSAGE_CODE_POINTS
+        ),
+        created_at=_stored_datetime(row['created_at']),
+        updated_at=_stored_datetime(row['updated_at']),
+    )
+
+
+def _row_to_roast(row: sqlite3.Row, namespace: Namespace) -> InventoryRoastState:
+    _validate_stored_roast(row, {cast(int, row['namespace_id']): ('', '', '')})
+    balance: InventoryBalance | None
+    if row['balance_on_hand_grams'] is None:
+        balance = None
+    else:
+        balance = InventoryBalance(
+            UUID(hex=_stored_uuid_hex(row['lot_uuid'])),
+            cast(int, row['balance_on_hand_grams']),
+            cast(int, row['balance_reserved_grams']),
+            cast(int, row['balance_available_grams']),
+            cast(int, row['balance_unresolved_conflict_count']),
+        )
+    return InventoryRoastState(
+        namespace=namespace,
+        roast_uuid=UUID(hex=_stored_uuid_hex(row['roast_uuid'])),
+        lot_id=UUID(hex=_stored_uuid_hex(row['lot_uuid'])),
+        lot_name=_stored_bounded_text(
+            row['lot_name'], _MAX_LOT_NAME_CHARS, _MAX_LOT_NAME_BYTES
+        ),
+        reservation_uuid=UUID(
+            hex=_stored_uuid_hex(row['client_reservation_uuid'])
+        ),
+        server_reservation_uuid=(
+            None
+            if row['server_reservation_uuid'] is None
+            else UUID(hex=_stored_uuid_hex(row['server_reservation_uuid']))
+        ),
+        planned_grams=cast(int, row['planned_grams']),
+        actual_grams=cast(int | None, row['actual_grams']),
+        lifecycle=cast(InventoryLifecycle, row['lifecycle']),
+        terminal_intent=cast(Literal['finalize', 'release'] | None, row['terminal_intent']),
+        reserve_occurred_at=_stored_datetime(row['reserve_occurred_at']),
+        finalize_occurred_at=_optional_stored_datetime(row['finalize_occurred_at']),
+        release_occurred_at=_optional_stored_datetime(row['release_occurred_at']),
+        server_state=cast(ReservationState | None, row['server_state']),
+        balance=balance,
+        conflict_id=(
+            None
+            if row['conflict_uuid'] is None
+            else UUID(hex=_stored_uuid_hex(row['conflict_uuid']))
+        ),
+        error_code=_stored_optional_bounded_text(
+            row['error_code'], _MAX_ERROR_CODE_CHARS
+        ),
+        error_message=_stored_optional_bounded_text(
+            row['error_message'], MAX_ERROR_MESSAGE_CODE_POINTS
+        ),
+        created_at=_stored_datetime(row['created_at']),
+        updated_at=_stored_datetime(row['updated_at']),
+    )
+
+
+def _row_to_interrupted(row: sqlite3.Row) -> InterruptedReservation:
+    namespace = Namespace(
+        _stored_bounded_text(row['origin'], _MAX_ORIGIN_CHARS, None),
+        UUID(hex=_stored_uuid_hex(row['organization_uuid'])),
+        f"namespace-sha256:{_stored_namespace_key(row['namespace_key'])}",
+    )
+    roast = _row_to_roast(row, namespace)
+    return InterruptedReservation(
+        namespace,
+        roast.roast_uuid,
+        roast.lot_id,
+        roast.lot_name,
+        roast.reservation_uuid,
+        roast.planned_grams,
+        roast.lifecycle,
+        roast.updated_at,
+    )
+
+
 def _namespace_values(namespace: object) -> tuple[str, str, str]:
     if not isinstance(namespace, Namespace):
         raise ValueError('inventory namespace is invalid')
@@ -905,8 +2183,18 @@ def _validate_stored_roast(
     )
     if not (
         (lifecycle not in {'paused', 'failed'} and error_code is None and error_message is None)
-        or (lifecycle == 'paused' and error_code is not None and error_message is None)
-        or (lifecycle == 'failed' and error_code is not None and error_message is not None)
+        or (
+            lifecycle == 'paused'
+            and error_code is not None
+            and error_message is None
+            and _stored_failure_code_is_known(error_code)
+        )
+        or (
+            lifecycle == 'failed'
+            and error_code is not None
+            and error_message is not None
+            and _stored_failure_pair_is_known(error_code, error_message)
+        )
     ):
         raise InventoryStoreError('stored inventory roast is invalid')
 
@@ -966,18 +2254,42 @@ def _validate_stored_command(
             and next_attempt is not None
             and error_code is not None
             and error_message is not None
+            and _stored_failure_pair_is_known(error_code, error_message)
         )
-        or (state == 'paused' and error_code is not None and error_message is None)
+        or (
+            state == 'paused'
+            and error_code is not None
+            and error_message is None
+            and _stored_failure_code_is_known(error_code)
+        )
         or (
             state == 'failed'
             and next_attempt is None
             and error_code is not None
             and error_message is not None
+            and _stored_failure_pair_is_known(error_code, error_message)
         )
         or (state == 'complete' and next_attempt is None and error_code is None and error_message is None)
     )
     if not valid_state:
         raise InventoryStoreError('stored inventory command is invalid')
+
+
+def _stored_failure_code_is_known(code: str) -> bool:
+    return (
+        code in _PAUSE_CODES
+        or code == _DEPENDENCY_FAILURE_CODE
+        or any(code in codes for codes in _FAILURE_CODES_BY_KIND.values())
+    )
+
+
+def _stored_failure_pair_is_known(code: str, message: str) -> bool:
+    if code == _DEPENDENCY_FAILURE_CODE:
+        return message == _DEPENDENCY_FAILURE_MESSAGE
+    return any(
+        code in codes and message == FAILURE_MESSAGES[kind]
+        for kind, codes in _FAILURE_CODES_BY_KIND.items()
+    )
 
 
 def _row_to_lot(row: sqlite3.Row, generation: str) -> BeanLot:
