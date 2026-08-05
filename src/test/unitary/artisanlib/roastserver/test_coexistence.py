@@ -86,6 +86,11 @@ class CoexistenceWorker(QObject):
     cachedFallbackReady = pyqtSignal(str, object)
     cachePublished = pyqtSignal(str, object)
     onlineChanged = pyqtSignal(bool)
+    inventoryLotsChanged = pyqtSignal(object)
+    inventoryQueueChanged = pyqtSignal(object)
+    inventoryFailedChanged = pyqtSignal(object)
+    inventoryReservationChanged = pyqtSignal(object)
+    inventoryRecoveryChanged = pyqtSignal(object)
     stopped = pyqtSignal()
 
     def no_op(self, *_args: object) -> None:
@@ -111,6 +116,9 @@ class CoexistenceWorker(QObject):
     discard_staged = no_op
     update_protected_paths = no_op
     clear_unused = no_op
+    refresh_inventory = no_op
+    retry_inventory_command = no_op
+    wake_inventory = no_op
     stop = no_op
 
 

@@ -541,6 +541,22 @@ class RoastServerController(QObject):
         self._refreshInventoryWorker.emit(request_id)
         return request_id
 
+    def inventory_lot_locked(
+        self,
+        link: InventoryProfileLink | None,
+        roast_uuid: UUID | None,
+        profile_has_charge: bool,
+    ) -> bool:
+        self._require_ui_thread()
+        if link is None:
+            return False
+        try:
+            return self._inventory_coordinator.is_locked(
+                link.namespace, roast_uuid, profile_has_charge
+            )
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
     def prepare_inventory_charge(
         self,
         link: InventoryProfileLink | None,

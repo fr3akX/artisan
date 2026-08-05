@@ -212,6 +212,18 @@ class FakeCoordinator(InventoryCoordinator):
         self.calls.append(('resolve', *args))
         return NOTICE
 
+    @override
+    def is_locked(
+        self,
+        namespace: Namespace,
+        roast_uuid: UUID | None,
+        profile_has_charge: bool,
+    ) -> bool:
+        if self.error is not None:
+            raise self.error
+        self.calls.append(('locked', namespace, roast_uuid, profile_has_charge))
+        return profile_has_charge or roast_uuid is not None
+
 
 class FakeWorker(QObject):
     connectionTested = pyqtSignal(str, object)
@@ -371,7 +383,7 @@ def test_inventory_controller_exposes_binding_facade_and_factories() -> None:
     assert 'inventory_coordinator_factory' in signature.parameters
     for member in (
         'inventory_context', 'inventory_lots', 'refresh_inventory_lots',
-        'prepare_inventory_charge', 'commit_inventory_charge',
+        'inventory_lot_locked', 'prepare_inventory_charge', 'commit_inventory_charge',
         'finalize_inventory_profile', 'release_inventory_roast',
         'resolve_interrupted_inventory', 'retry_inventory_command',
     ):
@@ -415,6 +427,24 @@ def test_context_offline_queueing_facade_and_queued_wake(harness: Harness) -> No
     assert [call[0] for call in harness.coordinator.calls] == [
         'prepare', 'commit', 'finalize', 'release'
     ]
+
+
+def test_inventory_lot_lock_facade_short_circuits_without_link_and_delegates(
+    harness: Harness,
+) -> None:
+    harness.start()
+    assert not harness.controller.inventory_lot_locked(None, ROAST_UUID, True)
+    assert not any(call[0] == 'locked' for call in harness.coordinator.calls)
+
+    link = InventoryProfileLink(NAMESPACE, LOT_ID, LOT.name)
+    assert harness.controller.inventory_lot_locked(link, ROAST_UUID, False)
+    assert harness.coordinator.calls[-1] == (
+        'locked', NAMESPACE, ROAST_UUID, False
+    )
+
+    harness.coordinator.error = InventoryCoordinatorError('inventory_storage_failed')
+    with pytest.raises(ControllerError, match='inventory_storage_failed'):
+        harness.controller.inventory_lot_locked(link, None, False)
 
 
 def test_refresh_is_opaque_generation_bound_and_cleared_on_origin_change(
