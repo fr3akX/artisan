@@ -192,11 +192,24 @@ if not QApplication.instance():
 from artisanlib import main as main_module
 from artisanlib import util as util_module
 from artisanlib.atypes import ProfileData, RecentRoast
+from artisanlib.canvas import tgraphcanvas
 from artisanlib.main import ApplicationWindow, UI_MODE
 from artisanlib.roastserver import dialogs as roastserver_dialogs
 from artisanlib.roastserver.contract import MAX_PROFILE_BYTES, Namespace, ServerProfileSource
 from artisanlib.roastserver.controller import ControllerError
-from artisanlib.roastserver.inventory import InventoryNotice, PreparedInventoryCharge
+from artisanlib.roastserver.inventory import (
+    InventoryContext,
+    InventoryCoordinator,
+    InventoryCoordinatorError,
+    InventoryNotice,
+    PreparedInventoryCharge,
+)
+from artisanlib.roastserver.inventory_contract import (
+    BeanLot,
+    InventoryProfileLink,
+    parse_profile_link,
+)
+from artisanlib.roastserver.inventory_store import InventoryStore, InventoryStoreError
 from artisanlib.util import FileDestinationTransaction
 from artisanlib.util import deserialize as util_deserialize
 from artisanlib.util import serialize_with_timestamp as util_serialize_with_timestamp
@@ -3932,6 +3945,119 @@ def set_qmc_inventory_profile_link(qmc: object, values: dict[str, str]) -> None:
         setattr(qmc, name, values[name])
 
 
+class InventoryChargeSemaphore:
+    def __init__(self) -> None:
+        self.release_calls = 0
+
+    def acquire(self, _count: int) -> None:
+        pass
+
+    def release(self, _count: int) -> None:
+        self.release_calls += 1
+
+
+def coordinator_inventory_charge_canvas(window: ApplicationWindow) -> SimpleNamespace:
+    window.ntb = MagicMock()
+    window.ntb._nav_stack.return_value = False
+    window.buttonCHARGE = MagicMock()
+    window.buttonCHARGE.isFlat.return_value = False
+    window.soundpopSignal = MagicMock()
+    window.arabicReshape = Mock(side_effect=lambda text: text)
+    window.eventslidervisibilities = [False, False, False, False]
+    window.simulator = None
+    window.pidcontrol = MagicMock()
+    window.pidcontrol.pidOnCHARGE = False
+    window.santokerWarmupController = MagicMock()
+    window.updateSantokerWarmupControls = Mock()
+    window.onMarkMoveToNext = Mock()
+    window.sendmessage = Mock()  # type: ignore[method-assign]
+    canvas = SimpleNamespace(
+        aw=window,
+        profileDataSemaphore=InventoryChargeSemaphore(),
+        flagstart=True,
+        fileDirtySignal=MagicMock(),
+        timeindex=[-1, 0, 0, 0, 0, 0, 0, 0],
+        autoChargeIdx=-1,
+        device=0,
+        timex=[0.0],
+        temp1=[100.0],
+        temp2=[90.0],
+        roastUUID=None,
+        weight=(1.25, 0.0, 'Kg'),
+        chargeTimerPeriod=0,
+        locktimex=False,
+        locktimex_start=0.0,
+        chargemintime=0.0,
+        startofx=0.0,
+        fixmaxtime=False,
+        endofx=100.0,
+        resetmaxtime=100.0,
+        BTcurve=False,
+        ETcurve=False,
+        updateProjection=Mock(),
+        xaxistosm=Mock(),
+        EventRecordAction=Mock(),
+        timealign=Mock(),
+        buttonactions=[0],
+        buttonactionstrings=[''],
+        LCDdecimalplaces=False,
+        mode='C',
+        roastpropertiesAutoOpenFlag=False,
+        l_annotations=[],
+        l_annotations_dict={},
+        ystep_down=0,
+        ystep_up=0,
+        adderror=Mock(),
+        _tgraphcanvas__dijkstra_to_ascii=lambda text: text,
+    )
+    set_qmc_inventory_profile_link(canvas, INVENTORY_PROFILE_LINK)
+    window.qmc = canvas
+    return canvas
+
+
+def coordinator_controller(
+    coordinator: InventoryCoordinator, context: InventoryContext
+) -> SimpleNamespace:
+    def prepare_inventory_charge(
+        link: InventoryProfileLink | None,
+        roast_uuid: UUID | None,
+        weight: object,
+        unit: object,
+    ) -> PreparedInventoryCharge:
+        try:
+            return coordinator.prepare_charge(
+                context, link, roast_uuid, weight, unit)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def commit_inventory_charge(
+        prepared: PreparedInventoryCharge,
+    ) -> InventoryNotice:
+        try:
+            return coordinator.commit_charge(prepared)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def inventory_lot_locked(
+        link: InventoryProfileLink | None,
+        roast_uuid: UUID | None,
+        profile_has_charge: bool,
+    ) -> bool:
+        assert link is not None
+        try:
+            return coordinator.is_locked(
+                link.namespace, roast_uuid, profile_has_charge)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    return SimpleNamespace(
+        prepare_inventory_charge=prepare_inventory_charge,
+        commit_inventory_charge=commit_inventory_charge,
+        inventory_context=lambda: context,
+        inventory_lot_locked=inventory_lot_locked,
+    )
+
+
 def inventory_profile_load_window() -> ApplicationWindow:
     window = ApplicationWindow.__new__(ApplicationWindow)
     window.qmc = Mock()
@@ -4868,6 +4994,176 @@ class TestRoastServerMainIntegration:
 
         assert window.commitRoastServerInventoryCharge(prepared) == roast_uuid.hex
         window.sendmessage.assert_not_called()
+
+    def test_inventory_charge_coordinator_seam_is_durable_locked_and_idempotent(
+        self, tmp_path: Path
+    ) -> None:
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        reservation_uuid = UUID('44444444-4444-4444-8444-444444444444')
+        uuid_values = iter((roast_uuid, reservation_uuid))
+        wake_calls: list[None] = []
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    lot_id=link.lot_id,
+                    name=link.lot_name,
+                    origin='Ethiopia',
+                    varietals=('Heirloom',),
+                    processing_method='washed',
+                    crop_year=2026,
+                    on_hand_grams=2_000,
+                    reserved_grams=0,
+                    available_grams=2_000,
+                    unresolved_conflict_count=0,
+                ),
+            ),
+            now,
+        )
+        context = InventoryContext(
+            origin=link.namespace.origin,
+            namespace=link.namespace,
+            enabled=True,
+            previously_authenticated=True,
+            client_instance_uuid=UUID(
+                '55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: next(uuid_values),
+            wake=lambda: wake_calls.append(None),
+        )
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        canvas = coordinator_inventory_charge_canvas(window)
+        controller = coordinator_controller(coordinator, context)
+        window.roastserver_controller = controller
+        enqueue_reserve = store.enqueue_reserve
+
+        def checked_enqueue(*args: Any, **kwargs: Any) -> Any:
+            assert canvas.timeindex[0] == -1
+            return enqueue_reserve(*args, **kwargs)
+
+        try:
+            with patch.object(
+                store, 'enqueue_reserve', side_effect=checked_enqueue
+            ) as enqueue:
+                tgraphcanvas._markCharge(canvas, noaction=True)
+
+                assert canvas.timeindex[0] == 0
+                assert canvas.roastUUID == roast_uuid.hex
+                state = store.roast_state(link.namespace, roast_uuid)
+                assert state is not None
+                assert state.reservation_uuid == reservation_uuid
+                assert store.counts(link.namespace).pending == 1
+                assert enqueue.call_count == 1
+                assert wake_calls == [None]
+                assert controller.inventory_lot_locked(
+                    link, roast_uuid, False)
+
+                window.buttonCHARGE.isFlat.return_value = True
+                tgraphcanvas._markCharge(canvas, noaction=True)
+                assert canvas.timeindex[0] == -1
+                assert canvas.roastUUID == roast_uuid.hex
+
+                window.buttonCHARGE.isFlat.return_value = False
+                tgraphcanvas._markCharge(canvas, noaction=True)
+
+                repeated_state = store.roast_state(link.namespace, roast_uuid)
+                assert repeated_state is not None
+                assert repeated_state.reservation_uuid == reservation_uuid
+                assert canvas.roastUUID == roast_uuid.hex
+                assert store.counts(link.namespace).pending == 1
+                assert enqueue.call_count == 1
+                assert wake_calls == [None]
+        finally:
+            store.close()
+
+    def test_inventory_charge_coordinator_store_failure_preserves_profile(
+        self, tmp_path: Path
+    ) -> None:
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        uuid_values = iter((
+            roast_uuid,
+            UUID('44444444-4444-4444-8444-444444444444'),
+        ))
+        wake_calls: list[None] = []
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    lot_id=link.lot_id,
+                    name=link.lot_name,
+                    origin='Ethiopia',
+                    varietals=('Heirloom',),
+                    processing_method='washed',
+                    crop_year=2026,
+                    on_hand_grams=2_000,
+                    reserved_grams=0,
+                    available_grams=2_000,
+                    unresolved_conflict_count=0,
+                ),
+            ),
+            now,
+        )
+        context = InventoryContext(
+            origin=link.namespace.origin,
+            namespace=link.namespace,
+            enabled=True,
+            previously_authenticated=True,
+            client_instance_uuid=UUID(
+                '55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: next(uuid_values),
+            wake=lambda: wake_calls.append(None),
+        )
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        canvas = coordinator_inventory_charge_canvas(window)
+        window.roastserver_controller = coordinator_controller(
+            coordinator, context)
+        profile_before = (
+            list(canvas.timeindex),
+            list(canvas.timex),
+            list(canvas.temp1),
+            list(canvas.temp2),
+            canvas.roastUUID,
+        )
+
+        try:
+            with patch.object(
+                store,
+                'enqueue_reserve',
+                side_effect=InventoryStoreError('injected failure'),
+            ):
+                tgraphcanvas._markCharge(canvas, noaction=True)
+
+            assert (
+                canvas.timeindex,
+                canvas.timex,
+                canvas.temp1,
+                canvas.temp2,
+                canvas.roastUUID,
+            ) == profile_before
+            assert store.roast_state(link.namespace, roast_uuid) is None
+            assert store.counts(link.namespace).pending == 0
+            assert wake_calls == []
+            window.sendmessage.assert_called_once_with(
+                'Inventory reservation could not be stored. CHARGE was canceled.')
+        finally:
+            store.close()
 
     def test_inventory_charge_commit_storage_failure_blocks(self) -> None:
         window = self.inventory_charge_window()

@@ -1163,17 +1163,29 @@ class TestEventValueConversions:
 
 
 class ChargeSemaphore:
-    def __init__(self) -> None:
-        self.acquired = False
+    def __init__(self, acquired: bool = False) -> None:
+        self.acquired = acquired
+        self.acquire_calls = 0
+        self.release_calls = 0
 
     def acquire(self, _count: int) -> None:
+        self.acquire_calls += 1
         self.acquired = True
 
     def available(self) -> int:
         return 0 if self.acquired else 1
 
     def release(self, _count: int) -> None:
+        self.release_calls += 1
         self.acquired = False
+
+
+class ChargeCurve:
+    def __init__(self, x_values: list[float], y_values: list[float]) -> None:
+        self.data = (list(x_values), list(y_values))
+
+    def set_data(self, x_values: list[float], y_values: list[float]) -> None:
+        self.data = (list(x_values), list(y_values))
 
 
 def inventory_charge_canvas() -> SimpleNamespace:
@@ -1252,6 +1264,7 @@ class TestInventoryCharge:
 
         def acquire(_count: int) -> None:
             canvas.aw.prepareRoastServerInventoryCharge.assert_called_once_with()
+            canvas.profileDataSemaphore.acquire_calls += 1
             canvas.profileDataSemaphore.acquired = True
 
         canvas.profileDataSemaphore.acquire = acquire
@@ -1260,8 +1273,21 @@ class TestInventoryCharge:
 
         canvas.aw.commitRoastServerInventoryCharge.assert_called_once_with(
             canvas.aw.prepareRoastServerInventoryCharge.return_value)
+        assert canvas.profileDataSemaphore.release_calls == 1
 
-    def test_inventory_charge_no_data_returns_without_commit_or_warning(self) -> None:
+    def test_inventory_charge_blocked_prepare_does_not_release_preheld_semaphore(
+        self,
+    ) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.profileDataSemaphore = ChargeSemaphore(acquired=True)
+        canvas.aw.prepareRoastServerInventoryCharge.return_value = None
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.profileDataSemaphore.acquire_calls == 0
+        assert canvas.profileDataSemaphore.release_calls == 0
+
+    def test_inventory_charge_no_data_releases_acquired_semaphore_once(self) -> None:
         canvas = inventory_charge_canvas()
         canvas.timex = []
         canvas.temp1 = []
@@ -1270,6 +1296,8 @@ class TestInventoryCharge:
         tgraphcanvas._markCharge(canvas, noaction=True)
 
         assert canvas.timeindex[0] == -1
+        assert canvas.profileDataSemaphore.acquire_calls == 1
+        assert canvas.profileDataSemaphore.release_calls == 1
         canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
         canvas.aw.sendmessage.assert_called_once_with(
             'Not enough data collected yet. Try again in a few seconds')
@@ -1294,6 +1322,59 @@ class TestInventoryCharge:
         assert canvas.roastUUID is None
         canvas.aw.santokerWarmupController.mark_charge.assert_not_called()
         canvas.aw.pidcontrol.pidOn.assert_not_called()
+
+    def test_inventory_charge_manual_commit_failure_rolls_back_sample_and_curves(
+        self,
+    ) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.ETcurve = True
+        canvas.BTcurve = True
+        canvas.l_temp1 = ChargeCurve(canvas.timex, canvas.temp1)
+        canvas.l_temp2 = ChargeCurve(canvas.timex, canvas.temp2)
+        canvas.drawmanual = lambda et, bt, tx: tgraphcanvas.drawmanual(
+            canvas, et, bt, tx)
+        canvas.aw.ser.NONE.return_value = (1.0, 101.0, 91.0)
+        canvas.aw.commitRoastServerInventoryCharge.return_value = None
+        profile_before = (
+            list(canvas.timex), list(canvas.temp1), list(canvas.temp2))
+        curves_before = (canvas.l_temp1.data, canvas.l_temp2.data)
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert (canvas.timex, canvas.temp1, canvas.temp2) == profile_before
+        assert (canvas.l_temp1.data, canvas.l_temp2.data) == curves_before
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID is None
+
+    def test_inventory_charge_manual_commit_precedes_sample_append(self) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.ETcurve = True
+        canvas.BTcurve = True
+        canvas.l_temp1 = ChargeCurve(canvas.timex, canvas.temp1)
+        canvas.l_temp2 = ChargeCurve(canvas.timex, canvas.temp2)
+        canvas.drawmanual = lambda et, bt, tx: tgraphcanvas.drawmanual(
+            canvas, et, bt, tx)
+        canvas.aw.ser.NONE.return_value = (1.0, 101.0, 91.0)
+
+        def commit(_prepared: object) -> str:
+            assert canvas.timex == [0.0]
+            assert canvas.temp1 == [100.0]
+            assert canvas.temp2 == [90.0]
+            return '33333333333343338333333333333333'
+
+        canvas.aw.commitRoastServerInventoryCharge.side_effect = commit
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == 1
+        assert canvas.timex == [0.0, 1.0]
+        assert canvas.temp1 == [100.0, 101.0]
+        assert canvas.temp2 == [90.0, 91.0]
+        assert canvas.l_temp1.data == (canvas.timex, canvas.temp1)
+        assert canvas.l_temp2.data == (canvas.timex, canvas.temp2)
+        assert canvas.profileDataSemaphore.release_calls == 1
 
     def test_inventory_charge_undo_and_remark_reuse_roast_uuid_and_link(self) -> None:
         canvas = inventory_charge_canvas()

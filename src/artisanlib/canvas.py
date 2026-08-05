@@ -14419,6 +14419,7 @@ class tgraphcanvas(QObject):
         except Exception: # pylint: disable=broad-except
             pass
         removed = False
+        semaphore_acquired = False
         try:
             prepared_inventory_charge = None
             if (
@@ -14429,6 +14430,7 @@ class tgraphcanvas(QObject):
                 if prepared_inventory_charge is None:
                     return
             self.profileDataSemaphore.acquire(1)
+            semaphore_acquired = True
             if self.flagstart:
                 try:
                     self.aw.soundpopSignal.emit()
@@ -14459,11 +14461,12 @@ class tgraphcanvas(QObject):
                         self.xaxistosm(redraw=False, set_xlim=not zoomed_in) # need to fix uneven x-axis labels like -0:13
                     elif not self.aw.buttonCHARGE.isFlat():
                         _log.debug('EVENT: CHARGE')
+                        manual_charge_values = None
                         if self.device == 18 and self.aw.simulator is None: #manual mode
                             tx,et,bt = self.aw.ser.NONE()
                             if bt != 1 and et != -1:  #cancel
-                                self.drawmanual(et,bt,tx)
-                                charge_idx = len(self.timex)-1
+                                manual_charge_values = (tx,et,bt)
+                                charge_idx = len(self.timex)
                             else:
                                 return
                         elif self.autoChargeIdx > 0:
@@ -14488,6 +14491,17 @@ class tgraphcanvas(QObject):
                             prepared_inventory_charge)
                         if inventory_roast_uuid is None:
                             return
+                        if manual_charge_values is not None:
+                            tx,et,bt = manual_charge_values
+                            projected_charge_idx = charge_idx
+                            self.drawmanual(et,bt,tx)
+                            charge_idx = len(self.timex)-1
+                            if (
+                                charge_idx != projected_charge_idx
+                                or len(self.temp1) <= charge_idx
+                                or len(self.temp2) <= charge_idx
+                            ):
+                                raise ValueError('manual CHARGE sample was not appended')
                         if inventory_roast_uuid:
                             self.roastUUID = inventory_roast_uuid
                         self.timeindex[0] = charge_idx
@@ -14558,7 +14572,7 @@ class tgraphcanvas(QObject):
             _, _, exc_tb = sys.exc_info()
             self.adderror((QApplication.translate('Error Message', 'Exception:') + ' markCharge() {0}').format(str(ex)),getattr(exc_tb, 'tb_lineno', '?'))
         finally:
-            if self.profileDataSemaphore.available() < 1:
+            if semaphore_acquired:
                 self.profileDataSemaphore.release(1)
         if self.flagstart:
             # redraw (within timealign) should not be called if semaphore is hold!
