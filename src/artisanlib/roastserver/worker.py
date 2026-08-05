@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import Enum, auto
 import math
 from pathlib import Path
 import re
@@ -61,6 +62,11 @@ from artisanlib.roastserver.contract import (
     RoastPage,
     ServerIdentity,
     validate_archive_filters,
+)
+from artisanlib.roastserver.inventory_store import (
+    InventoryCommand,
+    InventoryStore,
+    InventoryStoreError,
 )
 from artisanlib.roastserver.metadata import project_profile
 from artisanlib.roastserver.origin import SettingsError, canonical_origin
@@ -393,8 +399,14 @@ class _StaleConfiguration(RuntimeError):
     pass
 
 
+class _QueueClass(Enum):
+    PROFILE = auto()
+    INVENTORY = auto()
+
+
 type TimerFactory = Callable[[QObject], QTimer]
 type OperationHook = Callable[[str], None]
+type InventoryDelivery = Callable[[WorkerConfiguration, InventoryCommand], None]
 
 
 class RoastServerWorker(QObject):
@@ -423,6 +435,7 @@ class RoastServerWorker(QObject):
         *,
         outbox: Outbox,
         cache: CacheStore,
+        inventory_store: InventoryStore | None = None,
         credentials: CredentialStore,
         client_factory: ClientFactory,
         clock: Callable[[], datetime],
@@ -433,10 +446,13 @@ class RoastServerWorker(QObject):
         protection_registry: ProtectionRegistry | None = None,
         timer_factory: TimerFactory | None = None,
         operation_hook: OperationHook | None = None,
+        _inventory_delivery: InventoryDelivery | None = None,
     ) -> None:
         super().__init__()
         self._outbox = outbox
         self._cache = cache
+        self._inventory_store = inventory_store
+        self._inventory_delivery = _inventory_delivery
         self._credentials = credentials
         self._client_factory = client_factory
         self._clock = clock
@@ -458,7 +474,9 @@ class RoastServerWorker(QObject):
         self._stop_event = threading.Event()
         self._started = False
         self._outbox_open = False
+        self._inventory_store_open = False
         self._cache_open = False
+        self._last_queue_class: _QueueClass | None = None
         self._stopped = False
 
     @override
@@ -483,15 +501,32 @@ class RoastServerWorker(QObject):
             self._outbox_open = True
             if self._cancelled():
                 return
-            self._cache.open()
-            self._cache_open = True
-            if self._cancelled():
-                return
-            self._outbox.recover_expired_leases(self._now())
+            if self._inventory_store is None:
+                self._cache.open()
+                self._cache_open = True
+                if self._cancelled():
+                    return
+                self._outbox.recover_expired_leases(self._now())
+            else:
+                self._outbox.recover_expired_leases(self._now())
+                if self._cancelled():
+                    return
+                self._inventory_store.open()
+                self._inventory_store_open = True
+                if self._cancelled():
+                    return
+                self._inventory_store.recover_expired_leases(self._now())
+                if self._cancelled():
+                    return
+                self._cache.open()
+                self._cache_open = True
             if self._cancelled():
                 return
         except CacheError as error:
             self._emit_failure('start', error.failure)
+            return
+        except InventoryStoreError:
+            self._emit_failure('start', _failure(FailureKind.LOCAL_INVENTORY))
             return
         except (OutboxError, OSError, ValueError):
             self._emit_failure('start', _failure(FailureKind.LOCAL_PROFILE))
@@ -723,10 +758,17 @@ class RoastServerWorker(QObject):
         try:
             with permit:
                 self._outbox.resume_namespace(namespace, now)
+                if self._inventory_store_open and self._inventory_store is not None:
+                    self._inventory_store.resume_namespace(namespace, now)
         except (OutboxError, ValueError):
             self._credential = None
             self._authorized_target = None
             self._emit_failure('configure', _failure(FailureKind.LOCAL_PROFILE))
+            self._stop_timer()
+        except InventoryStoreError:
+            self._credential = None
+            self._authorized_target = None
+            self._emit_failure('configure', _failure(FailureKind.LOCAL_INVENTORY))
             self._stop_timer()
         if self._cancelled() or self._reject_stale_configuration(configuration):
             return
@@ -1279,18 +1321,57 @@ class RoastServerWorker(QObject):
             return
 
         now = self._now()
+        selected: _QueueClass | None
         try:
             self._outbox.recover_expired_leases(now)
             if self._cancelled():
                 return
-            permit = self._operation_permit(configuration, 'lease_next')
-            if permit is None:
-                self._reject_stale_configuration(configuration)
-                return
-            with permit:
-                outcome = self._outbox.lease_next(namespace, now, _LEASE_SECONDS)
+            inventory_store = self._inventory_store
+            if self._inventory_store_open and inventory_store is not None:
+                inventory_store.recover_expired_leases(now)
+                if self._cancelled():
+                    return
+            selected = self._select_queue_class(namespace)
         except (OutboxError, OSError, ValueError):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+            self._emit_aggregates(namespace)
+            self._stop_timer()
+            return
+        except InventoryStoreError:
+            self._emit_failure('queue', _failure(FailureKind.LOCAL_INVENTORY))
+            self._emit_aggregates(namespace)
+            self._stop_timer()
+            return
+        if self._cancelled():
+            return
+        if selected is None:
+            self._emit_aggregates(namespace)
+            self._schedule_next(namespace)
+            return
+        permit = self._operation_permit(configuration, 'lease_next')
+        if permit is None:
+            self._reject_stale_configuration(configuration)
+            return
+        try:
+            with permit:
+                if selected is _QueueClass.PROFILE:
+                    outcome: Job | InventoryCommand | None = self._outbox.lease_next(
+                        namespace, now, _LEASE_SECONDS
+                    )
+                else:
+                    inventory_store = self._inventory_store
+                    if inventory_store is None or self._inventory_delivery is None:
+                        return
+                    outcome = inventory_store.lease_next(
+                        namespace, now, _LEASE_SECONDS
+                    )
+        except (OutboxError, OSError, ValueError):
+            self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+            self._emit_aggregates(namespace)
+            self._stop_timer()
+            return
+        except InventoryStoreError:
+            self._emit_failure('queue', _failure(FailureKind.LOCAL_INVENTORY))
             self._emit_aggregates(namespace)
             self._stop_timer()
             return
@@ -1300,15 +1381,29 @@ class RoastServerWorker(QObject):
             self._emit_aggregates(namespace)
             self._schedule_next(namespace)
             return
-        if isinstance(outcome, LeaseFailure):
-            self._emit_failure('queue', outcome.failure)
-            self._emit_aggregates(namespace)
-            self._schedule_next(namespace)
-            return
-
-        if self._cancelled():
-            return
-        self._deliver_job(configuration, outcome)
+        self._last_queue_class = selected
+        if selected is _QueueClass.PROFILE:
+            if isinstance(outcome, LeaseFailure):
+                self._emit_failure('queue', outcome.failure)
+                self._emit_aggregates(namespace)
+                self._schedule_next(namespace)
+                return
+            if not isinstance(outcome, Job):
+                self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+                self._schedule_next(namespace)
+                return
+            self._deliver_job(configuration, outcome)
+        else:
+            if not isinstance(outcome, InventoryCommand):
+                self._emit_failure('queue', _failure(FailureKind.LOCAL_INVENTORY))
+                self._schedule_next(namespace)
+                return
+            delivery = self._inventory_delivery
+            if delivery is None:
+                return
+            delivery(configuration, outcome)
+            if not self._cancelled():
+                self._schedule_next(namespace)
         if not self._cancelled():
             self._emit_aggregates(namespace)
 
@@ -1489,6 +1584,16 @@ class RoastServerWorker(QObject):
             return
         if not self._cancelled():
             self._emit_aggregates(self._current_namespace())
+
+    @pyqtSlot()
+    def wake_inventory(self) -> None:
+        if self._reject_wrong_thread('queue', FailureKind.INVALID_RESPONSE):
+            return
+        if self._cancelled() or not self._inventory_store_open:
+            return
+        namespace = self._current_namespace()
+        if namespace is not None:
+            self._schedule_next(namespace)
 
     @pyqtSlot(str)
     def retry_job(self, job_id: str) -> None:
@@ -2076,10 +2181,18 @@ class RoastServerWorker(QObject):
     def _pause_namespace(self, namespace: Namespace, code: str) -> None:
         if self._cancelled() or not self._outbox_open:
             return
+        now = self._now()
         try:
-            self._outbox.pause_namespace(namespace, self._now(), code)
+            self._outbox.pause_namespace(namespace, now, code)
         except (OutboxError, ValueError):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+        inventory_store = self._inventory_store
+        if not self._inventory_store_open or inventory_store is None:
+            return
+        try:
+            inventory_store.pause_namespace(namespace, now, code)
+        except (InventoryStoreError, ValueError):
+            self._emit_failure('queue', _failure(FailureKind.LOCAL_INVENTORY))
 
     def _emit_aggregates(self, namespace: Namespace | None) -> None:
         if self._cancelled() or namespace is None or not self._outbox_open:
@@ -2149,6 +2262,13 @@ class RoastServerWorker(QObject):
         finally:
             self._cache_open = False
             self._pending_stages.clear()
+        if self._inventory_store_open and self._inventory_store is not None:
+            try:
+                self._inventory_store.close()
+            except InventoryStoreError:
+                self._emit_failure('stop', _failure(FailureKind.LOCAL_INVENTORY))
+            finally:
+                self._inventory_store_open = False
         if self._outbox_open:
             try:
                 self._outbox.close()
@@ -2224,6 +2344,42 @@ class RoastServerWorker(QObject):
             raise ValueError('worker clock must return an aware datetime')
         return now.astimezone(UTC)
 
+    def _select_queue_class(self, namespace: Namespace) -> _QueueClass | None:
+        profile_due = self._outbox.next_due_at(namespace)
+        inventory_due: datetime | None = None
+        inventory_store = self._inventory_store
+        if (
+            self._inventory_delivery is not None
+            and self._inventory_store_open
+            and inventory_store is not None
+        ):
+            inventory_due = inventory_store.next_due_at(namespace)
+        if profile_due is None:
+            return None if inventory_due is None else _QueueClass.INVENTORY
+        if inventory_due is None or profile_due < inventory_due:
+            return _QueueClass.PROFILE
+        if inventory_due < profile_due:
+            return _QueueClass.INVENTORY
+        if self._last_queue_class is _QueueClass.PROFILE:
+            return _QueueClass.INVENTORY
+        return _QueueClass.PROFILE
+
+    def _next_due_at(self, namespace: Namespace) -> datetime | None:
+        profile_due = self._outbox.next_due_at(namespace)
+        inventory_due: datetime | None = None
+        inventory_store = self._inventory_store
+        if (
+            self._inventory_delivery is not None
+            and self._inventory_store_open
+            and inventory_store is not None
+        ):
+            inventory_due = inventory_store.next_due_at(namespace)
+        if profile_due is None:
+            return inventory_due
+        if inventory_due is None:
+            return profile_due
+        return min(profile_due, inventory_due)
+
     def _schedule_next(self, namespace: Namespace) -> None:
         configuration = self._configuration
         if (
@@ -2235,9 +2391,13 @@ class RoastServerWorker(QObject):
             self._stop_timer()
             return
         try:
-            due = self._outbox.next_due_at(namespace)
+            due = self._next_due_at(namespace)
         except (OutboxError, ValueError):
             self._emit_failure('queue', _failure(FailureKind.LOCAL_PROFILE))
+            self._stop_timer()
+            return
+        except InventoryStoreError:
+            self._emit_failure('queue', _failure(FailureKind.LOCAL_INVENTORY))
             self._stop_timer()
             return
         if self._cancelled():

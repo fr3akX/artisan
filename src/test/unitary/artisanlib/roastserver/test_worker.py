@@ -1115,6 +1115,7 @@ def test_every_external_slot_rejects_direct_wrong_thread_use_without_io(
     worker_harness.worker.enqueue_saved(profile_id)
     worker_harness.worker.process_queue_once()
     worker_harness.worker.refresh()
+    worker_harness.worker.wake_inventory()
     worker_harness.worker.retry_job('d' * 32)
     worker_harness.worker.remove_job('e' * 32)
     worker_harness.worker.browse(command_ids[1])
@@ -1126,7 +1127,7 @@ def test_every_external_slot_rejects_direct_wrong_thread_use_without_io(
     worker_harness.worker.clear_unused(command_ids[6])
     worker_harness.worker.stop()
 
-    assert len(failed) == 22
+    assert len(failed) == 23
     assert not worker_harness.secret_vault.contains(candidate_id)
     assert not worker_harness.profile_vault.contains(profile_id)
     assert all(
@@ -1185,6 +1186,7 @@ def test_start_timer_and_public_connection_signal_run_on_worker_thread(
 def test_persisted_configuration_is_authenticated_before_queue_authorization(
     worker_harness: WorkerHarness,
 ) -> None:
+    assert worker_harness.worker._inventory_store is None
     assert worker_harness.configuration_calls == (('test_connection',),)
     assert worker_harness.credentials.get_calls
     assert worker_harness.outbox.resume_calls
