@@ -49,6 +49,7 @@ ROAST_UUID = UUID('55555555-5555-4555-8555-555555555555')
 RESERVATION_UUID = UUID('66666666-6666-4666-8666-666666666666')
 CLIENT_UUID = UUID('77777777-7777-4777-8777-777777777777')
 SERVER_RESERVATION_UUID = UUID('88888888-8888-4888-8888-888888888888')
+OTHER_SERVER_RESERVATION_UUID = UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
 CONFLICT_UUID = UUID('99999999-9999-4999-8999-999999999999')
 LEDGER_UUID = UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
 RESERVE_REQUEST = build_reserve_request(
@@ -845,6 +846,84 @@ def test_finalize_without_requested_actual_uses_verified_planned_grams(
         NOW + timedelta(seconds=2),
     )
     assert state.lifecycle == 'finalized' and state.actual_grams == 1_250
+
+
+def test_terminal_completion_rejects_changed_server_reservation_without_updates(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'inventory'
+    store = opened_store(root)
+    try:
+        store.replace_lots(NAMESPACE, (lot(),), NOW)
+        store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+        store.enqueue_finalize(NAMESPACE, FINALIZE_REQUEST, 1_200, NOW)
+        reserve = store.lease_next(NAMESPACE, NOW, 30)
+        assert reserve is not None and reserve.lease_token is not None
+        store.mark_complete(
+            reserve.id,
+            reserve.lease_token,
+            mutation_result(),
+            NOW + timedelta(seconds=1),
+        )
+        terminal = store.lease_next(NAMESPACE, NOW + timedelta(seconds=1), 30)
+        assert terminal is not None and terminal.lease_token is not None
+
+        connection = sqlite3.connect(database_path(root))
+        try:
+            before = (
+                connection.execute(
+                    'SELECT * FROM inventory_commands WHERE id = ?', (terminal.id,)
+                ).fetchone(),
+                connection.execute(
+                    'SELECT * FROM roast_inventory WHERE roast_uuid = ?',
+                    (ROAST_UUID.hex,),
+                ).fetchone(),
+                connection.execute(
+                    'SELECT * FROM bean_lots WHERE lot_uuid = ?', (LOT_UUID.hex,)
+                ).fetchone(),
+            )
+        finally:
+            connection.close()
+        before_roast = store.roast_state(NAMESPACE, ROAST_UUID)
+        before_cache = store.cache_snapshot(NAMESPACE)
+        mismatched = replace(
+            mutation_result('finalize', actual_grams=1_200),
+            reservation=replace(
+                mutation_result('finalize', actual_grams=1_200).reservation,
+                reservation_id=OTHER_SERVER_RESERVATION_UUID,
+            ),
+        )
+
+        with pytest.raises(InventoryStoreError, match='reservation'):
+            store.mark_complete(
+                terminal.id,
+                terminal.lease_token,
+                mismatched,
+                NOW + timedelta(seconds=2),
+            )
+
+        connection = sqlite3.connect(database_path(root))
+        try:
+            after = (
+                connection.execute(
+                    'SELECT * FROM inventory_commands WHERE id = ?', (terminal.id,)
+                ).fetchone(),
+                connection.execute(
+                    'SELECT * FROM roast_inventory WHERE roast_uuid = ?',
+                    (ROAST_UUID.hex,),
+                ).fetchone(),
+                connection.execute(
+                    'SELECT * FROM bean_lots WHERE lot_uuid = ?', (LOT_UUID.hex,)
+                ).fetchone(),
+            )
+        finally:
+            connection.close()
+        assert before[0] is not None and before[0][9] == 'leased'
+        assert after == before
+        assert store.roast_state(NAMESPACE, ROAST_UUID) == before_roast
+        assert store.cache_snapshot(NAMESPACE) == before_cache
+    finally:
+        store.close()
 
 
 def test_invalid_completion_result_is_rejected_without_partial_update(

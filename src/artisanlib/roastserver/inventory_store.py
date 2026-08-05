@@ -881,6 +881,11 @@ class InventoryStore:
             if roast is None:
                 raise InventoryStoreError('inventory roast is unavailable')
             validated_result = _validated_mutation_result(result, row, roast)
+            operation = cast(InventoryOperation, row['operation'])
+            if operation != 'reserve' and roast['server_reservation_uuid'] != (
+                validated_result.reservation.reservation_id.hex
+            ):
+                raise InventoryStoreError('inventory server reservation conflicts')
             cursor = connection.execute(
                 '''UPDATE inventory_commands
                    SET state = 'complete', next_attempt_at = NULL,
@@ -895,7 +900,6 @@ class InventoryStore:
                 raise InventoryStoreError('lease_lost')
             reservation = validated_result.reservation
             balance = validated_result.balance
-            operation = cast(InventoryOperation, row['operation'])
             persisted_actual_grams = (
                 reservation.actual_grams
                 if operation == 'finalize'
