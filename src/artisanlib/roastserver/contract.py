@@ -97,6 +97,10 @@ class FailureKind(StrEnum):
     CACHE_CORRUPT = 'cache_corrupt'
     KEYRING = 'keyring'
     SETTINGS = 'settings'
+    INVENTORY_REJECTED = 'inventory_rejected'
+    INVENTORY_CONFLICT = 'inventory_conflict'
+    INVENTORY_UNSUPPORTED = 'inventory_unsupported'
+    LOCAL_INVENTORY = 'local_inventory'
 
 
 FAILURE_MESSAGES: Final[dict[FailureKind, str]] = {
@@ -110,6 +114,10 @@ FAILURE_MESSAGES: Final[dict[FailureKind, str]] = {
     FailureKind.CACHE_CORRUPT: 'Cached copy corrupt or unavailable.',
     FailureKind.KEYRING: 'Operating-system keyring unavailable.',
     FailureKind.SETTINGS: 'Roast Server settings could not be saved.',
+    FailureKind.INVENTORY_REJECTED: 'Inventory operation rejected.',
+    FailureKind.INVENTORY_CONFLICT: 'Inventory conflict requires review.',
+    FailureKind.INVENTORY_UNSUPPORTED: 'Server does not support inventory.',
+    FailureKind.LOCAL_INVENTORY: 'Inventory state could not be saved.',
 }
 
 
