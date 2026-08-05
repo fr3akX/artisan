@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import os
 from pathlib import Path
+import queue
 import sqlite3
 import stat
+import threading
+from typing import Any, cast, override
 from uuid import UUID
 
 import pytest
@@ -297,6 +302,134 @@ def test_two_connections_publish_and_read_without_thread_warnings(tmp_path: Path
     finally:
         first.close()
         second.close()
+
+
+def test_cache_snapshot_uses_one_generation_across_concurrent_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generation_read = threading.Event()
+    release_reader = threading.Event()
+    pause_reads = threading.Event()
+    original_connect = store_module.sqlite3.connect
+
+    class PausingConnection(sqlite3.Connection):
+        @override
+        def execute(  # type: ignore[override]
+            self, sql: str, parameters: tuple[object, ...] = ()
+        ) -> sqlite3.Cursor:
+            cursor = super().execute(sql, parameters)
+            if pause_reads.is_set() and 'SELECT generation, refreshed_at' in sql:
+                generation_read.set()
+                if not release_reader.wait(timeout=5):
+                    raise RuntimeError('timed out waiting to resume cache read')
+            return cursor
+
+    def pausing_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:  # noqa: ANN401
+        return cast(
+            sqlite3.Connection,
+            original_connect(*args, factory=PausingConnection, **kwargs),
+        )
+
+    monkeypatch.setattr(store_module.sqlite3, 'connect', pausing_connect)
+    root = tmp_path / 'inventory'
+    reader = opened_store(root)
+    writer = opened_store(root)
+    old_lots = (
+        lot(name='Old A'),
+        lot(lot_id=OTHER_LOT_UUID, name='Old B'),
+    )
+    new_lots = (lot(name='New'),)
+    reader.replace_lots(NAMESPACE, old_lots, NOW)
+    snapshots: list[LotCacheSnapshot] = []
+    failures: list[BaseException] = []
+
+    def read_snapshot() -> None:
+        try:
+            snapshots.append(reader.cache_snapshot(NAMESPACE))
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            failures.append(exc)
+
+    pause_reads.set()
+    thread = threading.Thread(target=read_snapshot)
+    thread.start()
+    try:
+        assert generation_read.wait(timeout=5)
+        writer.replace_lots(NAMESPACE, new_lots, LATER)
+    finally:
+        release_reader.set()
+        thread.join(timeout=5)
+        reader.close()
+        writer.close()
+    assert not thread.is_alive()
+    assert failures == []
+    assert snapshots in [
+        [LotCacheSnapshot(NAMESPACE, old_lots, NOW)],
+        [LotCacheSnapshot(NAMESPACE, new_lots, LATER)],
+    ]
+
+
+def test_replace_lots_waits_for_another_instances_process_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'inventory'
+    writer = opened_store(root)
+    owner = InventoryStore(root)
+    owner_has_lock = threading.Event()
+    release_owner = threading.Event()
+    outcomes: queue.Queue[str] = queue.Queue()
+    failures: list[BaseException] = []
+    original_process_lock = store_module.secure_filesystem.process_lock
+
+    @contextmanager
+    def pausing_process_lock(
+        lock_root: Path, lock_name: str, thread_lock: threading.RLock
+    ) -> Iterator[None]:
+        if threading.current_thread().name == 'cache-writer':
+            outcomes.put('attempted-lock')
+        with original_process_lock(lock_root, lock_name, thread_lock):
+            if threading.current_thread().name == 'open-owner':
+                owner_has_lock.set()
+                if not release_owner.wait(timeout=5):
+                    raise RuntimeError('timed out waiting to release process lock')
+            yield
+
+    monkeypatch.setattr(
+        store_module.secure_filesystem, 'process_lock', pausing_process_lock
+    )
+
+    def open_owner() -> None:
+        try:
+            owner.open()
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            failures.append(exc)
+
+    def publish_lots() -> None:
+        try:
+            writer.replace_lots(NAMESPACE, (lot(),), NOW)
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            failures.append(exc)
+        finally:
+            outcomes.put('write-finished')
+
+    owner_thread = threading.Thread(target=open_owner, name='open-owner')
+    owner_thread.start()
+    assert owner_has_lock.wait(timeout=5)
+    writer_thread = threading.Thread(target=publish_lots, name='cache-writer')
+    writer_thread.start()
+    first_outcome = outcomes.get(timeout=5)
+    try:
+        assert first_outcome == 'attempted-lock'
+        assert writer_thread.is_alive()
+    finally:
+        release_owner.set()
+        owner_thread.join(timeout=5)
+        writer_thread.join(timeout=5)
+        owner.close()
+        writer.close()
+    assert not owner_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert failures == []
+    assert outcomes.get_nowait() == 'write-finished'
 
 
 def test_replace_lots_is_complete_atomic_and_namespace_isolated(tmp_path: Path) -> None:

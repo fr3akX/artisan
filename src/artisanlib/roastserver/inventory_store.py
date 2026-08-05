@@ -444,7 +444,11 @@ class InventoryStore:
         validated_lots = _validated_lots(lots)
         refreshed_text = _datetime_text(refreshed_at)
         generation = uuid4().hex
-        with self._storage_boundary(), self._transaction() as connection:
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
             namespace_id = self._namespace_id(
                 connection, namespace_values, create=True
             )
@@ -491,8 +495,7 @@ class InventoryStore:
 
     def cache_snapshot(self, namespace: Namespace) -> LotCacheSnapshot:
         namespace_values = _namespace_values(namespace)
-        with self._storage_boundary(), self._lock:
-            connection = self._require_connection()
+        with self._storage_boundary(), self._read_transaction() as connection:
             namespace_id = self._namespace_id(
                 connection, namespace_values, create=False
             )
@@ -686,6 +689,16 @@ class InventoryStore:
             raise
         except (OSError, secure_filesystem.FilesystemError):
             raise InventoryStoreError(_STORAGE_ERROR) from None
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            connection = self._require_connection()
+            connection.execute('BEGIN DEFERRED')
+            try:
+                yield connection
+            finally:
+                connection.rollback()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
