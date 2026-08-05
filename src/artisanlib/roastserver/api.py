@@ -41,7 +41,7 @@ import secrets
 import threading
 import time
 from types import TracebackType
-from typing import BinaryIO, Final, NoReturn, Protocol, Self, TypeVar, cast, override, runtime_checkable
+from typing import TYPE_CHECKING, BinaryIO, Final, NoReturn, Protocol, Self, TypeVar, cast, override, runtime_checkable
 from uuid import UUID
 import weakref
 
@@ -73,6 +73,13 @@ from artisanlib.roastserver.contract import (
     validate_archive_filters,
 )
 from artisanlib.roastserver.origin import canonical_origin
+
+if TYPE_CHECKING:
+    from artisanlib.roastserver.inventory_contract import (
+        BeanLotPage,
+        InventoryCommandRequest,
+        InventoryMutationResult,
+    )
 
 CONNECT_TIMEOUT_SECONDS: Final[float] = 4.0
 READ_TIMEOUT_SECONDS: Final[float] = 10.0
@@ -471,6 +478,102 @@ class RoastServerClient:
 
         return self._run_operation(operation)
 
+    def list_inventory_lots(
+        self,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> BeanLotPage:
+        def operation(deadline: _DeadlineGuard) -> BeanLotPage:
+            from artisanlib.roastserver.inventory_contract import (
+                MAX_INVENTORY_CURSOR_CHARS,
+                MAX_INVENTORY_PAGES,
+                parse_bean_lot_page,
+            )
+
+            if isinstance(limit, bool) or not 1 <= limit <= MAX_INVENTORY_PAGES:
+                raise ValueError('invalid inventory page limit')
+            params: dict[str, str | int] = {'limit': limit}
+            if cursor is not None:
+                params['cursor'] = _bounded_query_text(
+                    cursor,
+                    maximum=MAX_INVENTORY_CURSOR_CHARS,
+                    name='inventory cursor',
+                )
+            deadline.check()
+            response = self._request(
+                'GET',
+                '/api/v1/inventory/bean-lots',
+                deadline=deadline,
+                params=params,
+                stream=True,
+            )
+            try:
+                self._require_inventory_status(
+                    response,
+                    frozenset({200}),
+                    deadline,
+                )
+                return self._parse_json_response(
+                    response,
+                    parse_bean_lot_page,
+                    deadline,
+                )
+            finally:
+                _close_response(response)
+
+        return self._run_operation(operation)
+
+    def execute_inventory_command(
+        self,
+        request: InventoryCommandRequest,
+    ) -> InventoryMutationResult:
+        def operation(deadline: _DeadlineGuard) -> InventoryMutationResult:
+            from artisanlib.roastserver.inventory_contract import parse_inventory_mutation
+
+            _validate_inventory_command_request(request)
+            if request.operation == 'reserve':
+                path = '/api/v1/inventory/reservations'
+                success_statuses = frozenset({201})
+            else:
+                path = (
+                    f'/api/v1/inventory/reservations/{request.reservation_uuid.hex}/'
+                    f'{request.operation}'
+                )
+                success_statuses = frozenset({200})
+            deadline.check()
+            response = self._request(
+                'POST',
+                path,
+                deadline=deadline,
+                json_bytes=request.request_json,
+                additional_headers={'Idempotency-Key': request.idempotency_key},
+                stream=True,
+            )
+            try:
+                self._require_inventory_status(
+                    response,
+                    success_statuses,
+                    deadline,
+                )
+                return self._parse_json_response(
+                    response,
+                    lambda value: parse_inventory_mutation(
+                        value,
+                        operation=request.operation,
+                        expected_client_reservation_uuid=request.reservation_uuid,
+                        expected_client_instance_uuid=request.client_instance_uuid,
+                        expected_roast_uuid=request.roast_uuid,
+                        expected_lot_id=request.lot_id,
+                        expected_planned_grams=request.planned_grams,
+                        requested_actual_grams=request.requested_actual_grams,
+                    ),
+                    deadline,
+                )
+            finally:
+                _close_response(response)
+
+        return self._run_operation(operation)
+
     def get_roast(self, roast_uuid: UUID) -> RoastDetail:
         def operation(deadline: _DeadlineGuard) -> RoastDetail:
             response = self._request(
@@ -565,6 +668,7 @@ class RoastServerClient:
         json_bytes: bytes | None = None,
         body_content_type: str | None = None,
         body_content_length: int | None = None,
+        additional_headers: Mapping[str, str] | None = None,
         stream: bool = False,
     ) -> requests.Response:
         deadline.check()
@@ -579,6 +683,20 @@ class RoastServerClient:
         url = self._same_origin_url(path)
         headers = dict(_FIXED_SESSION_HEADERS)
         headers['Authorization'] = f'Bearer {self._credential}'
+        if additional_headers is not None:
+            if (
+                set(additional_headers) != {'Idempotency-Key'}
+                or not isinstance(additional_headers.get('Idempotency-Key'), str)
+            ):
+                raise ValueError('invalid additional request header')
+            idempotency_key = additional_headers['Idempotency-Key']
+            if (
+                not 1 <= len(idempotency_key) <= 255
+                or idempotency_key.strip() == ''
+                or _has_prohibited_text_code_point(idempotency_key)
+            ):
+                raise ValueError('invalid additional request header')
+            headers['Idempotency-Key'] = idempotency_key
         request_data: Mapping[str, str | bytes] | BinaryIO | bytes | None = data
         if json_bytes is not None:
             if data is not None or body_content_type is not None:
@@ -778,6 +896,70 @@ class RoastServerClient:
             ),
             status_code,
             retry_after_seconds,
+        )
+
+    def _require_inventory_status(
+        self,
+        response: requests.Response,
+        expected_statuses: frozenset[int],
+        deadline: _DeadlineGuard,
+    ) -> None:
+        if response.status_code in expected_statuses:
+            return
+        raise self._inventory_response_api_failure(response, deadline)
+
+    def _inventory_response_api_failure(
+        self,
+        response: requests.Response,
+        deadline: _DeadlineGuard,
+    ) -> ApiFailure:
+        from artisanlib.roastserver.inventory_contract import parse_inventory_error
+
+        status_code = response.status_code
+        parsed_failure: PublicFailure | None = None
+        try:
+            body = _bounded_body(response, MAX_JSON_BYTES, deadline)
+            parsed_failure = parse_inventory_error(status_code, body)
+        except _ResponseBodyError:
+            pass
+        if parsed_failure is not None:
+            retry_after_seconds = (
+                _parse_retry_after(response.headers.get('Retry-After'))
+                if status_code == 429 or 500 <= status_code <= 599
+                else None
+            )
+            return ApiFailure(parsed_failure, status_code, retry_after_seconds)
+        if 300 <= status_code <= 399:
+            kind = FailureKind.INVALID_RESPONSE
+            retryable = False
+        elif status_code in {401, 403}:
+            kind = FailureKind.CREDENTIAL_REJECTED
+            retryable = False
+        elif status_code == 404:
+            kind = FailureKind.INVENTORY_UNSUPPORTED
+            retryable = False
+        elif status_code == 429:
+            kind = FailureKind.RATE_LIMITED
+            retryable = True
+        elif 500 <= status_code <= 599:
+            kind = FailureKind.OFFLINE
+            retryable = True
+        elif 400 <= status_code <= 499:
+            kind = FailureKind.INVENTORY_REJECTED
+            retryable = False
+        else:
+            kind = FailureKind.INVALID_RESPONSE
+            retryable = False
+        retry_after_seconds = (
+            _parse_retry_after(response.headers.get('Retry-After'))
+            if status_code == 429 or 500 <= status_code <= 599
+            else None
+        )
+        return _fixed_api_failure(
+            kind,
+            status_code=status_code,
+            retryable=retryable,
+            retry_after_seconds=retry_after_seconds,
         )
 
     def _parse_json_response(
@@ -1380,6 +1562,27 @@ def _finish_profile_destination(
         failed = True
     if failed:
         raise _fixed_api_failure(FailureKind.CACHE_CORRUPT, status_code=None)
+
+
+def _validate_inventory_command_request(request: object) -> None:
+    from artisanlib.roastserver.inventory_contract import InventoryCommandRequest
+
+    if (
+        not isinstance(request, InventoryCommandRequest)
+        or request.operation not in {'reserve', 'finalize', 'release'}
+    ):
+        raise ValueError('invalid inventory command request')
+    _require_bounded_bytes(
+        request.request_json,
+        maximum=MAX_JSON_BYTES,
+        name='inventory command JSON',
+    )
+    expected_idempotency_key = (
+        f'inventory-v1:{request.client_instance_uuid.hex}:'
+        f'{request.reservation_uuid.hex}:{request.operation}'
+    )
+    if request.idempotency_key != expected_idempotency_key:
+        raise ValueError('invalid inventory command request')
 
 
 def _require_bounded_bytes(value: object, *, maximum: int, name: str) -> None:
