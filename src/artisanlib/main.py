@@ -215,6 +215,8 @@ except Exception: # pylint: disable=broad-except
 
 
 from artisanlib.atypes import (ProfileData, ComputedProfileInformation, RecentRoast, CurveSimilarity, ProductionData, ProductionDataStr, Wheel)
+from artisanlib.roastserver.contract import ContractError
+from artisanlib.roastserver.inventory_contract import parse_profile_link, profile_link_fields
 from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, encodeLocal, encodeLocalStrict, s2a, fill_gaps,
         deltaLabelPrefix, deltaLabelUTF8, deltaLabelBigPrefix, stringfromseconds, stringtoseconds,
         fromFtoCstrict, fromCtoFstrict, RoRfromFtoCstrict, RoRfromCtoFstrict,
@@ -14228,7 +14230,9 @@ class ApplicationWindow(QMainWindow):
                 'plus_file_last_modified', 'plus_sync_record_hash',
                 'plus_store', 'plus_store_label', 'plus_coffee',
                 'plus_coffee_label', 'plus_blend_spec', 'plus_blend_label',
-                'plus_blend_spec_labels',
+                'plus_blend_spec_labels', 'roastServerInventoryOrigin',
+                'roastServerInventoryOrganizationUUID', 'roastServerBeanLotUUID',
+                'roastServerBeanLotName',
             )
         }
         controller = self.roastserver_controller
@@ -16953,6 +16957,27 @@ class ApplicationWindow(QMainWindow):
             if 'title' in profile:
                 self.qmc.title = decodeLocalStrict(profile['title'], self.qmc.title)
 
+            self.qmc.roastServerInventoryOrigin = None
+            self.qmc.roastServerInventoryOrganizationUUID = None
+            self.qmc.roastServerBeanLotUUID = None
+            self.qmc.roastServerBeanLotName = None
+            try:
+                inventory_profile_link = parse_profile_link(profile)
+            except ContractError:
+                self.sendmessage(QApplication.translate(
+                    'Message', 'Invalid Roast Server inventory lot link ignored.'))
+            else:
+                if inventory_profile_link is not None:
+                    inventory_profile_fields = profile_link_fields(inventory_profile_link)
+                    self.qmc.roastServerInventoryOrigin = inventory_profile_fields[
+                        'roastServerInventoryOrigin']
+                    self.qmc.roastServerInventoryOrganizationUUID = inventory_profile_fields[
+                        'roastServerInventoryOrganizationUUID']
+                    self.qmc.roastServerBeanLotUUID = inventory_profile_fields[
+                        'roastServerBeanLotUUID']
+                    self.qmc.roastServerBeanLotName = inventory_profile_fields[
+                        'roastServerBeanLotName']
+
 #PLUS
             if 'plus_store' in profile:
                 self.qmc.plus_store = decodeLocalStrict(profile['plus_store'])
@@ -18069,6 +18094,26 @@ class ApplicationWindow(QMainWindow):
             profile['title'] = encodeLocalStrict(self.qmc.title)
             profile['locale'] = self.locale_str
 
+            try:
+                inventory_profile_link = parse_profile_link({
+                    'roastServerInventoryOrigin': self.qmc.roastServerInventoryOrigin,
+                    'roastServerInventoryOrganizationUUID': self.qmc.roastServerInventoryOrganizationUUID,
+                    'roastServerBeanLotUUID': self.qmc.roastServerBeanLotUUID,
+                    'roastServerBeanLotName': self.qmc.roastServerBeanLotName,
+                })
+            except ContractError:
+                inventory_profile_link = None
+            if inventory_profile_link is not None:
+                inventory_profile_fields = profile_link_fields(inventory_profile_link)
+                profile['roastServerInventoryOrigin'] = inventory_profile_fields[
+                    'roastServerInventoryOrigin']
+                profile['roastServerInventoryOrganizationUUID'] = inventory_profile_fields[
+                    'roastServerInventoryOrganizationUUID']
+                profile['roastServerBeanLotUUID'] = inventory_profile_fields[
+                    'roastServerBeanLotUUID']
+                profile['roastServerBeanLotName'] = inventory_profile_fields[
+                    'roastServerBeanLotName']
+
 #PLUS
             if self.qmc.plus_store is not None:
                 profile['plus_store'] = encodeLocalStrict(self.qmc.plus_store)
@@ -18494,7 +18539,9 @@ class ApplicationWindow(QMainWindow):
             'plus_file_last_modified', 'plus_sync_record_hash', 'plus_store',
             'plus_store_label', 'plus_coffee', 'plus_coffee_label',
             'plus_blend_spec', 'plus_blend_label', 'plus_blend_spec_labels',
-            'roastUUID',
+            'roastServerInventoryOrigin',
+            'roastServerInventoryOrganizationUUID', 'roastServerBeanLotUUID',
+            'roastServerBeanLotName', 'roastUUID',
         ):
             qmc_state[name] = copyd.deepcopy(getattr(self.qmc, name))
         controller = self.roastserver_controller

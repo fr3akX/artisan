@@ -306,7 +306,8 @@ class tgraphcanvas(QObject):
         'organization_setup', 'operator_setup', 'roastertype_setup', 'roastersize_setup', 'roastersize_setup_default', 'roasterheating_setup', 'roasterheating_setup_default', 'drumspeed_setup', 'last_batchsize', 'machinesetup_energy_ratings',
         'machinesetup', 'roastingnotes', 'cuppingnotes', 'roastdate', 'roastepoch', 'roastepoch_timeout', 'lastroastepoch', 'batchcounter', 'batchsequence', 'batchprefix', 'neverUpdateBatchCounter',
         'roastbatchnr', 'roastbatchprefix', 'roastbatchpos', 'roasttzoffset', 'roastUUID', 'scheduleID', 'scheduleDate', 'plus_default_store', 'plus_store', 'plus_store_label', 'plus_coffee',
-        'plus_coffee_label', 'plus_blend_spec', 'plus_blend_spec_labels', 'plus_blend_label', 'plus_custom_blend', 'plus_sync_record_hash', 'plus_file_last_modified', 'beans', 'ETprojectFlag', 'BTprojectFlag', 'curveVisibilityCache', 'ETcurve', 'BTcurve',
+        'plus_coffee_label', 'plus_blend_spec', 'plus_blend_spec_labels', 'plus_blend_label', 'plus_custom_blend', 'plus_sync_record_hash', 'plus_file_last_modified',
+        'roastServerInventoryOrigin', 'roastServerInventoryOrganizationUUID', 'roastServerBeanLotUUID', 'roastServerBeanLotName', 'beans', 'ETprojectFlag', 'BTprojectFlag', 'curveVisibilityCache', 'ETcurve', 'BTcurve',
         'ETlcd', 'BTlcd', 'swaplcds', 'LCDdecimalplaces', 'foregroundShowFullflag', 'interpolateDropsflag', 'DeltaETflag', 'DeltaBTflag', 'DeltaETlcdflag', 'DeltaBTlcdflag',
         'swapdeltalcds', 'PIDbuttonflag', 'Controlbuttonflag', 'deltaETfilter', 'deltaBTfilter', 'curvefilter', 'deltaETspan', 'deltaBTspan',
         'deltaETsamples', 'deltaBTsamples', 'profile_sampling_interval', 'background_profile_sampling_interval', 'profile_meter', 'optimalSmoothing', 'polyfitRoRcalc',
@@ -1659,6 +1660,10 @@ class tgraphcanvas(QObject):
         self.plus_custom_blend:CustomBlend|None = None # holds the one custom blend, an instance of plus.blend.Blend, or None
         self.plus_sync_record_hash:str|None = None
         self.plus_file_last_modified:float|None = None # holds the last_modified timestamp of the loaded profile as EPOCH (float incl. milliseconds as returned by time.time())
+        self.roastServerInventoryOrigin:str|None = None
+        self.roastServerInventoryOrganizationUUID:str|None = None
+        self.roastServerBeanLotUUID:str|None = None
+        self.roastServerBeanLotName:str|None = None
         # plus_file_last_modified is set on load, reset on RESET, and updated on save. It is also update, if not None and new data is received from the server (sync:applyServerUpdates)
         # this timestamp is used in sync:fetchServerUpdate to ask server for updated data
 
@@ -8103,6 +8108,10 @@ class tgraphcanvas(QObject):
             # reset plus sync
             self.plus_sync_record_hash = None
             self.plus_file_last_modified = None
+            self.roastServerInventoryOrigin = None
+            self.roastServerInventoryOrganizationUUID = None
+            self.roastServerBeanLotUUID = None
+            self.roastServerBeanLotName = None
             # clear also the cached sync record and sync record hash used to detect changes in the loaded profile
             if not server_read_only:
                 clearSyncRecordHash()

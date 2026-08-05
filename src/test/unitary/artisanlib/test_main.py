@@ -3907,6 +3907,64 @@ ROASTSERVER_PROFILE: dict[str, Any] = {
     'plus_blend_spec': [{'coffee': 'coffee-1', 'ratio': 1.0}],
     'computed': {'nested': [1.0, 2.0]},
 }
+INVENTORY_PROFILE_LINK: dict[str, str] = {
+    'roastServerInventoryOrigin': 'https://archive.example',
+    'roastServerInventoryOrganizationUUID': '11111111111141118111111111111111',
+    'roastServerBeanLotUUID': '22222222222242228222222222222222',
+    'roastServerBeanLotName': 'Historical lot',
+}
+INVENTORY_QMC_FIELDS = (
+    'roastServerInventoryOrigin',
+    'roastServerInventoryOrganizationUUID',
+    'roastServerBeanLotUUID',
+    'roastServerBeanLotName',
+)
+
+
+def qmc_inventory_profile_link(qmc: object) -> dict[str, object]:
+    return {name: getattr(qmc, name) for name in INVENTORY_QMC_FIELDS}
+
+
+def set_qmc_inventory_profile_link(qmc: object, values: dict[str, str]) -> None:
+    for name in INVENTORY_QMC_FIELDS:
+        setattr(qmc, name, values[name])
+
+
+def inventory_profile_load_window() -> ApplicationWindow:
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    window.qmc = Mock()
+    window.qmc.extradevices = []
+    window.qmc.etypes = ['Air', 'Drum', 'Damper', 'Burner', '--']
+    window.qmc.flavors = []
+    window.qmc.flavorlabels = []
+    window.qmc.weight = (0.0, 0.0, 'g')
+    window.qmc.volume = (0.0, 0.0, 'l')
+    window.qmc.timex = []
+    window.qmc.temp1 = []
+    window.qmc.temp2 = []
+    window.qmc.extratimex = []
+    window.qmc.extratemp1 = []
+    window.qmc.extratemp2 = []
+    window.qmc.mode = 'C'
+    window.qmc.loadalarmsfromprofile = False
+    window.qmc.loadaxisfromprofile = False
+    window.qmc.locktimex = False
+    window.qmc.timeindex = [-1, 0, 0, 0, 0, 0, 0, 0]
+    window.qmc.phasesbuttonflag = False
+    window.qmc.backgroundUUID = None
+    window.qmc.fileDirtySignal.emit = Mock()
+    window.qmc.updateDeltaSamples = Mock()
+    window.qmc.resetlinecountcaches = Mock()
+    window.nLCDS = 10
+    window.pidcontrol = Mock(loadRampSoakFromProfile=False)
+    window.get_profile_etypes = Mock(return_value=window.qmc.etypes)
+    window.updateLCDproperties = Mock()
+    window.loadEnergyFromProfile = Mock()
+    window.loadBbpFromProfile = Mock()
+    window.autoAdjustAxis = Mock()
+    window.sendmessage = Mock()
+    window.plusAddPath = Mock()
+    return window
 
 
 def roastserver_save_window() -> tuple[ApplicationWindow, Mock, dict[str, Any]]:
@@ -3930,6 +3988,8 @@ def roastserver_save_window() -> tuple[ApplicationWindow, Mock, dict[str, Any]]:
     window.qmc.batchprefix = ''
     window.qmc.autosaveprefix = ''
     window.qmc.plus_file_last_modified = None
+    for name in INVENTORY_QMC_FIELDS:
+        setattr(window.qmc, name, None)
     window.MaxRecentFiles = 20
     window.getProfile = Mock(return_value=profile)
     window.plusAddPath = Mock()
@@ -4095,10 +4155,11 @@ class TestRoastServerMainIntegration:
         assert second_call[2].tzinfo is UTC
         assert destination.read_bytes() == second_call[0]
 
-    def test_roastserver_failed_copy_or_post_save_failure_does_not_enqueue(
+    def test_inventory_profile_save_copy_preserves_link_without_server_hook(
         self, tmp_path: Path
     ) -> None:
-        window, controller, _profile = roastserver_save_window()
+        window, controller, profile = roastserver_save_window()
+        profile.update(INVENTORY_PROFILE_LINK)
         with patch(
             'artisanlib.main.serialize_with_timestamp',
             side_effect=OSError('write failed'),
@@ -4106,11 +4167,16 @@ class TestRoastServerMainIntegration:
             assert not window.fileSave(str(tmp_path / 'failed.alog'))
         controller.saved_profile.assert_not_called()
 
+        copy_path = tmp_path / 'copy.alog'
         with patch(
             'artisanlib.main.serialize_with_timestamp',
             wraps=util_serialize_with_timestamp,
         ):
-            assert window.fileSave(str(tmp_path / 'copy.alog'), copy=True)
+            assert window.fileSave(str(copy_path), copy=True)
+        saved_copy = util_deserialize(str(copy_path))
+        assert saved_copy is not None
+        assert {name: saved_copy[name] for name in INVENTORY_QMC_FIELDS} == (
+            INVENTORY_PROFILE_LINK)
         controller.saved_profile.assert_not_called()
 
         window.setCurrentFile.side_effect = RuntimeError('post-save failed')
@@ -4622,37 +4688,7 @@ class TestRoastServerMainIntegration:
     def test_real_set_profile_server_mode_uses_pure_blend_conversion(
         self,
     ) -> None:
-        window = ApplicationWindow.__new__(ApplicationWindow)
-        window.qmc = Mock()
-        window.qmc.extradevices = []
-        window.qmc.etypes = ['Air', 'Drum', 'Damper', 'Burner', '--']
-        window.qmc.flavors = []
-        window.qmc.flavorlabels = []
-        window.qmc.weight = (0.0, 0.0, 'g')
-        window.qmc.volume = (0.0, 0.0, 'l')
-        window.qmc.timex = []
-        window.qmc.temp1 = []
-        window.qmc.temp2 = []
-        window.qmc.extratimex = []
-        window.qmc.extratemp1 = []
-        window.qmc.extratemp2 = []
-        window.qmc.mode = 'C'
-        window.qmc.loadalarmsfromprofile = False
-        window.qmc.loadaxisfromprofile = False
-        window.qmc.locktimex = False
-        window.qmc.timeindex = [-1, 0, 0, 0, 0, 0, 0, 0]
-        window.qmc.phasesbuttonflag = False
-        window.qmc.backgroundUUID = None
-        window.qmc.fileDirtySignal.emit = Mock()
-        window.qmc.updateDeltaSamples = Mock()
-        window.qmc.resetlinecountcaches = Mock()
-        window.nLCDS = 10
-        window.pidcontrol = Mock(loadRampSoakFromProfile=False)
-        window.get_profile_etypes = Mock(return_value=window.qmc.etypes)
-        window.updateLCDproperties = Mock()
-        window.loadEnergyFromProfile = Mock()
-        window.loadBbpFromProfile = Mock()
-        window.autoAdjustAxis = Mock()
+        window = inventory_profile_load_window()
         profile = ProfileData(
             roastUUID='0123456789abcdef0123456789abcdef',
             plus_blend_spec=['Archive blend', [['coffee-1', 1.0]]],
@@ -4676,13 +4712,71 @@ class TestRoastServerMainIntegration:
         plus_sync.assert_not_called()
         settings.assert_not_called()
 
-    def test_get_profile_read_only_snapshot_is_observationally_pure(self) -> None:
+    @pytest.mark.parametrize(
+        ('profile_fields', 'expected', 'warning'),
+        [
+            ({}, dict.fromkeys(INVENTORY_QMC_FIELDS), False),
+            (INVENTORY_PROFILE_LINK, INVENTORY_PROFILE_LINK, False),
+            (
+                {'roastServerInventoryOrigin': 'https://archive.example'},
+                dict.fromkeys(INVENTORY_QMC_FIELDS),
+                True,
+            ),
+            (
+                {
+                    **INVENTORY_PROFILE_LINK,
+                    'roastServerBeanLotUUID': 'NOT-A-UUID',
+                },
+                dict.fromkeys(INVENTORY_QMC_FIELDS),
+                True,
+            ),
+        ],
+    )
+    def test_inventory_profile_load_is_all_or_none_and_historical(
+        self,
+        profile_fields: dict[str, str],
+        expected: dict[str, object],
+        warning: bool,
+    ) -> None:
+        window = inventory_profile_load_window()
+        set_qmc_inventory_profile_link(window.qmc, {
+            name: f'prior-{name}' for name in INVENTORY_QMC_FIELDS
+        })
+        profile = ProfileData(
+            roastUUID='0123456789abcdef0123456789abcdef',
+            **profile_fields,
+        )
+
+        with patch.object(main_module.plus.register, 'getPath') as register_get, patch.object(
+            main_module.plus.sync, 'sync'
+        ) as plus_sync, patch.object(main_module, 'QSettings') as settings, patch.object(
+            main_module.QMessageBox, 'information'
+        ):
+            assert window.setProfile(
+                'profile.alog', profile, quiet=True, reset=False)
+
+        assert qmc_inventory_profile_link(window.qmc) == expected
+        if warning:
+            window.sendmessage.assert_called_once_with(
+                'Invalid Roast Server inventory lot link ignored.')
+        else:
+            window.sendmessage.assert_not_called()
+        register_get.assert_not_called()
+        plus_sync.assert_not_called()
+        settings.assert_not_called()
+        window.plusAddPath.assert_not_called()
+
+    def test_inventory_profile_typed_keys_are_optional(self) -> None:
+        assert set(INVENTORY_QMC_FIELDS) <= ProfileData.__optional_keys__
+
+    def test_inventory_profile_get_and_copy_are_observationally_pure(self) -> None:
         window = ApplicationWindow.__new__(ApplicationWindow)
         window.qmc = MagicMock()
         window.app = MagicMock(artisanviewerMode=False)
         window.pidcontrol = MagicMock()
         window.ser = MagicMock(externalprogram='', externaloutprogram='')
         window.get_os = Mock(return_value=('Linux', 'test', 'x86_64'))
+        window.plusAddPath = Mock()
         window.locale_str = 'en'
         window.nLCDS = 4
         window.recording_version = 'recording-version'
@@ -4721,6 +4815,7 @@ class TestRoastServerMainIntegration:
         qmc.plus_store = None
         qmc.plus_coffee = None
         qmc.plus_blend_spec = None
+        set_qmc_inventory_profile_link(qmc, INVENTORY_PROFILE_LINK)
         qmc.beans = ''
         qmc.weight = (0.0, 0.0, 'g')
         qmc.volume = (0.0, 0.0, 'l')
@@ -4811,12 +4906,28 @@ class TestRoastServerMainIntegration:
 
         assert profile
         assert 'roastUUID' not in profile
+        assert {name: profile[name] for name in INVENTORY_QMC_FIELDS} == (
+            INVENTORY_PROFILE_LINK)
         assert copy.deepcopy(observed_state()) == before
         window.consolidateSpecialEvents.assert_not_called()
         window.ensureCorrectExtraDeviceListLength.assert_not_called()
         window.computedProfileInformation.assert_not_called()
         assert 'computed' not in profile
         qmc.adderror.assert_not_called()
+
+        window.consolidateSpecialEvents = Mock()
+        window.ensureCorrectExtraDeviceListLength = Mock()
+        window.computedProfileInformation = Mock(return_value={})
+        copy_profile = window.getProfile(copy=True)
+
+        assert {name: copy_profile[name] for name in INVENTORY_QMC_FIELDS} == (
+            INVENTORY_PROFILE_LINK)
+        assert copy_profile['roastUUID'] != qmc.roastUUID
+        window.plusAddPath.assert_not_called()
+
+        qmc.roastServerBeanLotName = None
+        incomplete_profile = window.getProfile(server_read_only=True)
+        assert not set(INVENTORY_QMC_FIELDS) & incomplete_profile.keys()
 
     def test_canvas_server_reset_skips_dirty_external_and_presentation_hooks_on_failure(
         self,
@@ -5034,6 +5145,8 @@ class TestRoastServerReadOnlyLoad:
         window.qmc.safesaveflag = True
         window.qmc.plus_file_last_modified = datetime(2025, 1, 1, tzinfo=UTC)
         window.qmc.plus_sync_record_hash = 'previous-plus-hash'
+        for name in INVENTORY_QMC_FIELDS:
+            setattr(window.qmc, name, None)
         window.qmc.backgroundprofile = None
         window.qmc.hideBgafterprofileload = False
         window.qmc.background = False
@@ -5951,6 +6064,22 @@ class TestRoastServerReadOnlySaveTransition:
         window.roastServerWriteRecentFiles = Mock()
         window.ArtisanSaveFileDialog.return_value = str(destination)
         return window, controller, cache_file, destination
+
+    def test_inventory_profile_read_only_save_rollback_restores_all_fields(
+        self, tmp_path: Path
+    ) -> None:
+        window, _controller, cache_file, _destination = self.source_window(tmp_path)
+        source = window.roastserver_open_source
+        assert source is not None
+        set_qmc_inventory_profile_link(window.qmc, INVENTORY_PROFILE_LINK)
+        state = window.snapshotRoastServerSaveState()
+        set_qmc_inventory_profile_link(window.qmc, {
+            name: f'mutated-{name}' for name in INVENTORY_QMC_FIELDS
+        })
+
+        window.restoreRoastServerSaveState(state, (cache_file, SERVER_SOURCE))
+
+        assert qmc_inventory_profile_link(window.qmc) == INVENTORY_PROFILE_LINK
 
     def test_save_after_server_open_forces_save_as_and_resumes_normal_hooks(
         self, tmp_path: Path
