@@ -4116,6 +4116,9 @@ def test_inventory_recovery_startup_is_deferred_reuses_dialog_and_conflict_is_sa
         def __init__(self, *args: object) -> None:
             self.args = args
             self.show_calls = 0
+            self.hide_calls = 0
+            self.clean_up_calls = 0
+            self.close_calls = 0
             self.active_namespaces: list[Namespace | None] = []
             self.__class__.instances.append(self)
 
@@ -4131,6 +4134,15 @@ def test_inventory_recovery_startup_is_deferred_reuses_dialog_and_conflict_is_sa
         def activateWindow(self) -> None:
             return
 
+        def hide(self) -> None:
+            self.hide_calls += 1
+
+        def clean_up(self) -> None:
+            self.clean_up_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+
     namespace = namespace_for(
         'https://safe.example', UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))
     roast_uuid = UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
@@ -4141,6 +4153,8 @@ def test_inventory_recovery_startup_is_deferred_reuses_dialog_and_conflict_is_sa
         namespace, roast_uuid, lot_id, '<b>Safe lot</b>', reservation_id,
         1_000, 'reserved', now)
     controller = Controller()
+    recovery_baseline = controller.receivers(controller.inventoryRecoveryRequired)
+    conflict_baseline = controller.receivers(controller.inventoryConflict)
     window = ApplicationWindow.__new__(ApplicationWindow)
     QMainWindow.__init__(window)
     window.roastserver_controller = cast(Any, controller)
@@ -4181,6 +4195,89 @@ def test_inventory_recovery_startup_is_deferred_reuses_dialog_and_conflict_is_sa
     assert namespace.origin not in warning
     assert str(namespace.organization_id) not in warning
     message.exec.assert_called_once()
+
+    dialog = cast(Any, RecoveryDialog.instances[0])
+    window.cleanUpRoastServerInventoryPresentation()
+    window.cleanUpRoastServerInventoryPresentation()
+    assert dialog.hide_calls == 1
+    assert dialog.clean_up_calls == 1
+    assert dialog.close_calls == 1
+    assert controller.receivers(controller.inventoryRecoveryRequired) == recovery_baseline
+    assert controller.receivers(controller.inventoryConflict) == conflict_baseline
+    window.deleteLater()
+
+
+def test_inventory_recovery_cleanup_invalidates_pending_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PyQt6.QtCore import QObject, pyqtSignal
+    from artisanlib.roastserver import inventory_dialogs
+    from artisanlib.roastserver.settings import namespace_for
+
+    class Controller(QObject):
+        inventoryRecoveryRequired = pyqtSignal(object)
+        inventoryConflict = pyqtSignal(object)
+
+        def inventory_context(self) -> SimpleNamespace:
+            return SimpleNamespace(namespace=namespace, enabled=True)
+
+    class RecoveryDialog:
+        instances: list[object] = []
+
+        def __init__(self, *_args: object) -> None:
+            self.__class__.instances.append(self)
+
+        def show(self) -> None:
+            return
+
+        def raise_(self) -> None:
+            return
+
+        def activateWindow(self) -> None:
+            return
+
+    namespace = namespace_for(
+        'https://safe.example', UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))
+    recovery = InterruptedReservation(
+        namespace,
+        UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
+        UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
+        'Safe lot',
+        UUID('dddddddd-dddd-4ddd-8ddd-dddddddddddd'),
+        1_000,
+        'reserved',
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+    )
+    controller = Controller()
+    recovery_baseline = controller.receivers(controller.inventoryRecoveryRequired)
+    conflict_baseline = controller.receivers(controller.inventoryConflict)
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    QMainWindow.__init__(window)
+    window.roastserver_controller = cast(Any, controller)
+    window.roastserver_inventory_recovery_dialog = None
+    window.roastserver_inventory_recovery_records = ()
+    window.roastserver_inventory_recovery_scheduled = False
+    controller.inventoryRecoveryRequired.connect(window.scheduleInventoryRecovery)
+    controller.inventoryConflict.connect(window.showInventoryConflict)
+    monkeypatch.setattr(
+        inventory_dialogs, 'InterruptedReservationsDialog', RecoveryDialog)
+
+    controller.inventoryRecoveryRequired.emit((recovery,))
+    assert window.roastserver_inventory_recovery_scheduled
+    assert window.roastserver_inventory_recovery_records == (recovery,)
+    assert RecoveryDialog.instances == []
+
+    window.cleanUpRoastServerInventoryPresentation()
+    window.cleanUpRoastServerInventoryPresentation()
+    assert not window.roastserver_inventory_recovery_scheduled
+    assert window.roastserver_inventory_recovery_records == ()
+    assert controller.receivers(controller.inventoryRecoveryRequired) == recovery_baseline
+    assert controller.receivers(controller.inventoryConflict) == conflict_baseline
+
+    QApplication.processEvents()
+    assert RecoveryDialog.instances == []
+    assert controller.receivers(controller.inventoryRecoveryRequired) == recovery_baseline
+    assert controller.receivers(controller.inventoryConflict) == conflict_baseline
     window.deleteLater()
 
 

@@ -1558,7 +1558,7 @@ class ApplicationWindow(QMainWindow):
         'main_menu_actions_with_shortcuts', 'ui_mode', 'UIModeMenu',  'productionModeAction', 'defaultModeAction', 'expertModeAction', 'calculatorAction',
         'helpAboutAction', 'checkUpdateAction', 'errorAction', 'messageAction', 'serialAction', 'platformAction', 'aboutQtAction',
         'helpDocumentationAction', 'KshortCAction', 'profile_data_type_adapter', 'official_build',
-        'roastserver_controller', 'roastserver_settings', 'roastserver_config_dialog', 'roastserver_browser_dialog', 'roastserver_inventory_recovery_dialog', 'roastserver_inventory_recovery_records', 'roastserver_inventory_recovery_scheduled', 'roastserver_open_source',
+        'roastserver_controller', 'roastserver_settings', 'roastserver_config_dialog', 'roastserver_browser_dialog', 'roastserver_inventory_recovery_dialog', 'roastserver_inventory_recovery_records', 'roastserver_inventory_recovery_scheduled', 'roastserver_inventory_recovery_generation', 'roastserver_inventory_presentation_cleaned_up', 'roastserver_open_source',
         'roastServerUploadAction', 'roastServerRoastsAction', 'roastServerConfigAction',
         'roasthubs_org_id', 'roasthubs_machine_id', 'roasthubs_token' ]
 
@@ -1648,6 +1648,8 @@ class ApplicationWindow(QMainWindow):
         self.roastserver_inventory_recovery_dialog:QWidget|None = None
         self.roastserver_inventory_recovery_records:tuple[object,...] = ()
         self.roastserver_inventory_recovery_scheduled:bool = False
+        self.roastserver_inventory_recovery_generation:int = 0
+        self.roastserver_inventory_presentation_cleaned_up:bool = False
         self.roastserver_open_source:'tuple[Path,ServerProfileSource]|None' = None # noqa: UP037 # runtime import intentionally remains lazy
 
         self.setAcceptDrops(True) # enable drag-and-drop
@@ -4624,20 +4626,45 @@ class ApplicationWindow(QMainWindow):
     def scheduleInventoryRecovery(self, value:object) -> None:
         from artisanlib.roastserver.inventory_store import InterruptedReservation
 
-        if not isinstance(value, tuple) or not all(
-            isinstance(record, InterruptedReservation) for record in value
+        if (
+            getattr(self, 'roastserver_inventory_presentation_cleaned_up', False)
+            or not isinstance(value, tuple)
+            or not all(isinstance(record, InterruptedReservation) for record in value)
         ):
             return
         self.roastserver_inventory_recovery_records = value
-        if not value or self.roastserver_inventory_recovery_scheduled:
+        if not value:
+            self.roastserver_inventory_recovery_scheduled = False
+            self.roastserver_inventory_recovery_generation = getattr(
+                self, 'roastserver_inventory_recovery_generation', 0) + 1
+            return
+        if self.roastserver_inventory_recovery_scheduled:
             return
         self.roastserver_inventory_recovery_scheduled = True
-        QTimer.singleShot(0, self.showInventoryRecovery)
+        generation = getattr(
+            self, 'roastserver_inventory_recovery_generation', 0) + 1
+        self.roastserver_inventory_recovery_generation = generation
+        QTimer.singleShot(
+            0, lambda: self._showInventoryRecoveryIfCurrent(generation))
+
+    def _showInventoryRecoveryIfCurrent(self, generation:int) -> None:
+        if (
+            getattr(self, 'roastserver_inventory_presentation_cleaned_up', False)
+            or generation != getattr(
+                self, 'roastserver_inventory_recovery_generation', 0)
+        ):
+            return
+        self.showInventoryRecovery()
 
     @pyqtSlot()
     def showInventoryRecovery(self) -> None:
         from artisanlib.roastserver.inventory_dialogs import InterruptedReservationsDialog
 
+        if (
+            getattr(self, 'roastserver_inventory_presentation_cleaned_up', False)
+            or not self.roastserver_inventory_recovery_scheduled
+        ):
+            return
         self.roastserver_inventory_recovery_scheduled = False
         records = self.roastserver_inventory_recovery_records
         controller = self.roastserver_controller
@@ -4681,12 +4708,27 @@ class ApplicationWindow(QMainWindow):
 
     def cleanUpRoastServerInventoryPresentation(self) -> None:
         try:
+            generation = self.roastserver_inventory_recovery_generation
+        except (AttributeError, RuntimeError):
+            generation = 0
+        try:
+            self.roastserver_inventory_presentation_cleaned_up = True
+            self.roastserver_inventory_recovery_generation = generation + 1
+            self.roastserver_inventory_recovery_scheduled = False
+            self.roastserver_inventory_recovery_records = ()
             dialog = self.roastserver_inventory_recovery_dialog
+            self.roastserver_inventory_recovery_dialog = None
         except (AttributeError, RuntimeError):
             dialog = None
+        hide = getattr(dialog, 'hide', None)
+        if callable(hide):
+            hide()
         clean_up = getattr(dialog, 'clean_up', None)
         if callable(clean_up):
             clean_up()
+        close = getattr(dialog, 'close', None)
+        if callable(close):
+            close()
         controller = self.roastserver_controller
         if controller is None:
             return
