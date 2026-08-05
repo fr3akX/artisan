@@ -219,6 +219,7 @@ class RoastServerController(QObject):
     onlineChanged = pyqtSignal(bool)
     profileReady = pyqtSignal(str, object)
     inventoryLotsChanged = pyqtSignal(object)
+    inventoryRefreshFinished = pyqtSignal(str)
     inventoryStateChanged = pyqtSignal(object)
     inventoryQueueChanged = pyqtSignal(object)
     inventoryFailedChanged = pyqtSignal(object)
@@ -1802,8 +1803,10 @@ class RoastServerController(QObject):
             or snapshot.namespace != value.namespace
         ):
             return
-        self._complete_inventory_refresh(value)
+        completed_refresh = self._complete_inventory_refresh(value)
         self.inventoryLotsChanged.emit(snapshot.lots)
+        if completed_refresh is not None:
+            self.inventoryRefreshFinished.emit(completed_refresh)
 
     @pyqtSlot(object)
     def _on_inventory_queue_changed(self, value: object) -> None:
@@ -2198,13 +2201,15 @@ class RoastServerController(QObject):
         while len(self._stale_inventory_refresh_requests) > _MAX_STALE_INVENTORY_REFRESHES:
             self._stale_inventory_refresh_requests.popitem(last=False)
 
-    def _complete_inventory_refresh(self, event: InventoryWorkerEvent) -> None:
+    def _complete_inventory_refresh(self, event: InventoryWorkerEvent) -> str | None:
         request_id = event.refresh_id
         if request_id is None:
-            return
+            return None
         tracked = self._inventory_refresh_requests.get(request_id)
-        if tracked == (event.generation, event.namespace):
-            self._inventory_refresh_requests.pop(request_id, None)
+        if tracked != (event.generation, event.namespace):
+            return None
+        self._inventory_refresh_requests.pop(request_id, None)
+        return request_id
 
     def _emit_inventory_notice_state(self, notice: InventoryNotice) -> None:
         namespace = self.inventory_context().namespace

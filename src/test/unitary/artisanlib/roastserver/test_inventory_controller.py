@@ -393,7 +393,8 @@ def test_inventory_controller_exposes_binding_facade_and_factories() -> None:
 
 def test_inventory_controller_exposes_public_signals() -> None:
     for signal in (
-        'inventoryLotsChanged', 'inventoryStateChanged', 'inventoryQueueChanged',
+        'inventoryLotsChanged', 'inventoryRefreshFinished', 'inventoryStateChanged',
+        'inventoryQueueChanged',
         'inventoryFailedChanged', 'inventoryRecoveryRequired', 'inventoryConflict',
     ):
         assert hasattr(RoastServerController, signal)
@@ -514,6 +515,7 @@ def test_same_namespace_old_generation_events_are_rejected_and_refresh_is_exact(
     assert generation is not None and generation != old_generation
     request = harness.controller.refresh_inventory_lots()
     lots = QSignalSpy(harness.controller.inventoryLotsChanged)
+    finished = QSignalSpy(harness.controller.inventoryRefreshFinished)
     states = QSignalSpy(harness.controller.inventoryStateChanged)
 
     harness.worker.inventoryLotsChanged.emit(
@@ -530,6 +532,7 @@ def test_same_namespace_old_generation_events_are_rejected_and_refresh_is_exact(
     harness.app.processEvents()
     assert len(lots) == 0
     assert len(states) == 0
+    assert len(finished) == 0
     assert request in harness.controller._inventory_refresh_requests
 
     harness.worker.inventoryLotsChanged.emit(
@@ -542,6 +545,7 @@ def test_same_namespace_old_generation_events_are_rejected_and_refresh_is_exact(
     )
     harness.app.processEvents()
     assert request in harness.controller._inventory_refresh_requests
+    assert len(finished) == 0
     harness.worker.inventoryLotsChanged.emit(
         InventoryWorkerEvent(
             generation,
@@ -552,6 +556,7 @@ def test_same_namespace_old_generation_events_are_rejected_and_refresh_is_exact(
     )
     harness.wait(lambda: request not in harness.controller._inventory_refresh_requests)
     assert list(lots[-1]) == [(LOT,)]
+    assert [list(item) for item in finished] == [[request]]
 
 
 def test_global_failed_and_recovery_remain_visible_across_context_changes(

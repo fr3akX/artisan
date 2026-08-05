@@ -76,6 +76,7 @@ class _Signal(Protocol):
 
 class InventoryLotDialogController(Protocol):
     inventoryLotsChanged: _Signal
+    inventoryRefreshFinished: _Signal
     operationFailed: _Signal
     onlineChanged: _Signal
 
@@ -246,7 +247,13 @@ class InventoryLotDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._controller = controller
-        snapshot = controller.inventory_cache_snapshot()
+        try:
+            snapshot = controller.inventory_cache_snapshot()
+        except RuntimeError:
+            snapshot = None
+            self._snapshot_read_failed = True
+        else:
+            self._snapshot_read_failed = False
         self._cached_at = None if snapshot is None else snapshot.refreshed_at
         self._online = online
         self._pending_refresh: str | None = None
@@ -333,12 +340,16 @@ class InventoryLotDialog(QDialog):
         self.tableView.doubleClicked.connect(self._choose_index)
         self.tableView.activated.connect(self._choose_index)
         self._select_lot(selected_lot_id)
-        self._update_status()
+        if self._snapshot_read_failed:
+            self._show_snapshot_unavailable(retained=False)
+        else:
+            self._update_status()
         self._connect_signals()
         self.resize(900, 430)
 
     def _connect_signals(self) -> None:
         self._controller.inventoryLotsChanged.connect(self._lots_changed)
+        self._controller.inventoryRefreshFinished.connect(self._refresh_finished)
         self._controller.operationFailed.connect(self._operation_failed)
         self._controller.onlineChanged.connect(self._online_changed)
         self._signals_connected = True
@@ -349,6 +360,7 @@ class InventoryLotDialog(QDialog):
         self._signals_connected = False
         for signal, slot in (
             (self._controller.inventoryLotsChanged, self._lots_changed),
+            (self._controller.inventoryRefreshFinished, self._refresh_finished),
             (self._controller.operationFailed, self._operation_failed),
             (self._controller.onlineChanged, self._online_changed),
         ):
@@ -391,6 +403,7 @@ class InventoryLotDialog(QDialog):
         if self._pending_refresh is not None:
             return
         self.refreshButton.setEnabled(False)
+        self._snapshot_read_failed = False
         try:
             self._pending_refresh = self._controller.refresh_inventory_lots()
         except (RuntimeError, ValueError) as error:
@@ -405,13 +418,35 @@ class InventoryLotDialog(QDialog):
         selected = self._selected_lot()
         if selected is not None:
             selected_id = selected.lot_id
-        snapshot = self._controller.inventory_cache_snapshot()
+        try:
+            snapshot = self._controller.inventory_cache_snapshot()
+        except RuntimeError:
+            self._snapshot_read_failed = True
+            self._show_snapshot_unavailable(retained=True)
+            return
+        self._snapshot_read_failed = False
         self.model.replace_lots(() if snapshot is None else snapshot.lots)
         self._cached_at = None if snapshot is None else snapshot.refreshed_at
+        self._select_lot(selected_id)
+        if self._pending_refresh is None:
+            self._update_status()
+
+    @pyqtSlot(str)
+    def _refresh_finished(self, operation: str) -> None:
+        if operation != self._pending_refresh:
+            return
         self._pending_refresh = None
         self.refreshButton.setEnabled(True)
-        self._select_lot(selected_id)
-        self._update_status()
+        if self._snapshot_read_failed:
+            self._show_snapshot_unavailable(retained=True)
+            return
+        refreshed = _tr('Inventory refreshed. {cached}').format(
+            cached=self._cached_status()
+        )
+        self.statusLabel.setText(
+            refreshed if self._online else _tr('Offline. {cached}').format(
+                cached=refreshed)
+        )
 
     @pyqtSlot(str, object)
     def _operation_failed(self, operation: str, value: object) -> None:
@@ -484,6 +519,16 @@ class InventoryLotDialog(QDialog):
         return _tr('Cached inventory from {timestamp}.').format(
             timestamp=self._format_timestamp(self._cached_at)
         )
+
+    def _show_snapshot_unavailable(self, *, retained: bool) -> None:
+        if retained:
+            self.statusLabel.setText(
+                _tr('Inventory is unavailable. Previous cached inventory was retained. {cached}').format(
+                    cached=self._cached_status()
+                )
+            )
+        else:
+            self.statusLabel.setText(_tr('Inventory is unavailable.'))
 
     def _update_status(self) -> None:
         cached = self._cached_status()

@@ -568,6 +568,8 @@ class editGraphDlg(ArtisanResizeablDialog):
     _inventory_selection_staged:bool
     _inventory_lots:tuple[BeanLot, ...]
     _inventory_cached_at:datetime|None
+    _inventory_snapshot_failed:bool
+    _inventory_context_revision:int
     _inventory_refresh_request:str|None
     _inventory_signals_connected:bool
     _inventory_status_override:str|None
@@ -2060,6 +2062,8 @@ class editGraphDlg(ArtisanResizeablDialog):
         self._inventory_selection_staged = False
         self._inventory_lots = ()
         self._inventory_cached_at = None
+        self._inventory_snapshot_failed = False
+        self._inventory_context_revision = 0
         self._inventory_refresh_request = None
         self._inventory_signals_connected = False
         self._inventory_status_override = None
@@ -2108,6 +2112,7 @@ class editGraphDlg(ArtisanResizeablDialog):
         if controller is not None:
             self._readInventoryCacheSnapshot()
             controller.inventoryLotsChanged.connect(self._inventoryLotsChanged)
+            controller.inventoryRefreshFinished.connect(self._inventoryRefreshFinished)
             controller.operationFailed.connect(self._inventoryOperationFailed)
             controller.onlineChanged.connect(self._inventoryOnlineChanged)
             controller.settingsChanged.connect(self._inventoryContextChanged)
@@ -2115,7 +2120,7 @@ class editGraphDlg(ArtisanResizeablDialog):
             self._inventory_signals_connected = True
         self.updateInventoryLotRow()
 
-    def _readInventoryCacheSnapshot(self) -> bool:
+    def _readInventoryCacheSnapshot(self, *, retain_on_failure:bool = False) -> bool:
         controller = self.aw.roastserver_controller
         if controller is None:
             self._inventory_lots = ()
@@ -2124,9 +2129,13 @@ class editGraphDlg(ArtisanResizeablDialog):
         try:
             snapshot = controller.inventory_cache_snapshot()
         except RuntimeError:
+            self._inventory_snapshot_failed = True
             self._inventory_status_override = QApplication.translate(
-                'RoastServerInventory', 'Inventory is unavailable.')
+                'RoastServerInventory',
+                ('Inventory is unavailable. Previous cached inventory was retained.'
+                    if retain_on_failure else 'Inventory is unavailable.'))
             return False
+        self._inventory_snapshot_failed = False
         self._inventory_lots = () if snapshot is None else snapshot.lots
         self._inventory_cached_at = None if snapshot is None else snapshot.refreshed_at
         return True
@@ -2237,6 +2246,7 @@ class editGraphDlg(ArtisanResizeablDialog):
         if controller is None or self._inventoryLotLocked():
             return
         selection_namespace = self._inventoryNamespace()
+        selection_revision = self._inventory_context_revision
         self.inventoryLotDialog = InventoryLotDialog(
             self,
             cast(InventoryLotDialogController, controller),
@@ -2245,7 +2255,10 @@ class editGraphDlg(ArtisanResizeablDialog):
         )
         try:
             if self.inventoryLotDialog.exec() == QDialog.DialogCode.Accepted:
-                if selection_namespace != self._inventoryNamespace():
+                if (
+                    selection_revision != self._inventory_context_revision
+                    or selection_namespace != self._inventoryNamespace()
+                ):
                     self._inventory_status_override = QApplication.translate(
                         'RoastServerInventory',
                         'The inventory selection was not changed because the server organization changed.')
@@ -2291,6 +2304,7 @@ class editGraphDlg(ArtisanResizeablDialog):
         if controller is None or self._inventory_refresh_request is not None:
             return
         self.inventoryLotRefreshButton.setEnabled(False)
+        self._inventory_snapshot_failed = False
         try:
             self._inventory_refresh_request = controller.refresh_inventory_lots()
         except RuntimeError:
@@ -2303,8 +2317,15 @@ class editGraphDlg(ArtisanResizeablDialog):
     def _inventoryLotsChanged(self, value:object) -> None:
         if not isinstance(value, tuple) or not all(isinstance(lot, BeanLot) for lot in value):
             return
+        self._readInventoryCacheSnapshot(retain_on_failure=True)
+        self.updateInventoryLotRow()
+
+    @pyqtSlot(str)
+    def _inventoryRefreshFinished(self, operation:str) -> None:
+        if operation != self._inventory_refresh_request:
+            return
         self._inventory_refresh_request = None
-        if self._readInventoryCacheSnapshot():
+        if not self._inventory_snapshot_failed:
             self._inventory_status_override = QApplication.translate(
                 'RoastServerInventory', 'Inventory refreshed.')
         self.updateInventoryLotRow()
@@ -2334,6 +2355,10 @@ class editGraphDlg(ArtisanResizeablDialog):
 
     @pyqtSlot(object)
     def _inventoryContextChanged(self, _value:object) -> None:
+        self._inventory_context_revision += 1
+        self._synchronizeInventoryContext()
+
+    def _synchronizeInventoryContext(self) -> None:
         if (self._inventory_selection_staged and self._inventory_link is not None and
                 self._inventory_link.namespace != self._inventoryNamespace()):
             self._inventory_link = None
@@ -2345,7 +2370,7 @@ class editGraphDlg(ArtisanResizeablDialog):
         self.updateInventoryLotRow()
 
     def commitInventoryLotSelection(self) -> None:
-        self._inventoryContextChanged(object())
+        self._synchronizeInventoryContext()
         fields:dict[str, str|None] = {
             'roastServerInventoryOrigin': None,
             'roastServerInventoryOrganizationUUID': None,
@@ -2367,6 +2392,7 @@ class editGraphDlg(ArtisanResizeablDialog):
         self._inventory_signals_connected = False
         for signal, slot in (
                 (controller.inventoryLotsChanged, self._inventoryLotsChanged),
+                (controller.inventoryRefreshFinished, self._inventoryRefreshFinished),
                 (controller.operationFailed, self._inventoryOperationFailed),
                 (controller.onlineChanged, self._inventoryOnlineChanged),
                 (controller.settingsChanged, self._inventoryContextChanged),

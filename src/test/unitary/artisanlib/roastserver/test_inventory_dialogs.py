@@ -27,9 +27,10 @@ from types import SimpleNamespace
 from typing import cast
 from uuid import UUID
 
+import pytest
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QDialog, QTextEdit
+from PyQt6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QSpinBox, QTextEdit
 
 from artisanlib.roast_properties import editGraphDlg
 from artisanlib.roastserver.contract import FailureKind, Namespace, PublicFailure
@@ -83,6 +84,7 @@ WARNING_LOT = BeanLot(
 
 class FakeController(QObject):
     inventoryLotsChanged = pyqtSignal(object)
+    inventoryRefreshFinished = pyqtSignal(str)
     operationFailed = pyqtSignal(str, object)
     onlineChanged = pyqtSignal(bool)
     settingsChanged = pyqtSignal(object)
@@ -94,9 +96,12 @@ class FakeController(QObject):
         self.refreshes: list[str] = []
         self.namespace: Namespace | None = NAMESPACE
         self.cached_at: datetime | None = CACHED_AT
+        self.snapshot_error = False
         self.locked = False
 
     def inventory_cache_snapshot(self) -> LotCacheSnapshot | None:
+        if self.snapshot_error:
+            raise RuntimeError('inventory_storage_failed')
         if self.namespace is None:
             return None
         return LotCacheSnapshot(self.namespace, self.lots, self.cached_at)
@@ -171,7 +176,35 @@ def test_dialog_searches_all_descriptive_fields_case_insensitively() -> None:
         dialog.close()
 
 
-def test_dialog_reads_persisted_timestamp_and_refresh_retains_or_updates_cache() -> None:
+def test_dialog_contains_snapshot_failures_at_construction_and_after_publication() -> None:
+    controller = FakeController((LOT,))
+    controller.snapshot_error = True
+    dialog = InventoryLotDialog(None, controller)
+    try:
+        assert dialog.model.lots == ()
+        assert 'unavailable' in dialog.statusLabel.text().lower()
+    finally:
+        dialog.close()
+
+    controller.snapshot_error = False
+    dialog = InventoryLotDialog(None, controller)
+    try:
+        dialog.refresh()
+        request_id = controller.refreshes[-1]
+        controller.snapshot_error = True
+        controller.inventoryLotsChanged.emit((WARNING_LOT,))
+        assert dialog.model.lots == (LOT,)
+        assert rendered_timestamp(CACHED_AT) in dialog.statusLabel.text()
+        assert not dialog.refreshButton.isEnabled()
+        controller.inventoryRefreshFinished.emit(request_id)
+        assert dialog.refreshButton.isEnabled()
+        assert dialog.model.lots == (LOT,)
+        assert 'retained' in dialog.statusLabel.text().lower()
+    finally:
+        dialog.close()
+
+
+def test_dialog_reads_persisted_timestamp_and_correlates_refresh_completion() -> None:
     controller = FakeController((LOT,))
     dialog = InventoryLotDialog(None, controller, online=False)
     try:
@@ -190,11 +223,18 @@ def test_dialog_reads_persisted_timestamp_and_refresh_retains_or_updates_cache()
         assert rendered_timestamp(CACHED_AT) in dialog.statusLabel.text()
 
         dialog.refresh()
+        success_id = controller.refreshes[-1]
         controller.lots = (WARNING_LOT,)
         controller.cached_at = UPDATED_AT
         controller.inventoryLotsChanged.emit(controller.lots)
         assert dialog.model.lots == (WARNING_LOT,)
+        assert not dialog.refreshButton.isEnabled()
+        assert 'refreshed' not in dialog.statusLabel.text().lower()
+        controller.inventoryRefreshFinished.emit('unrelated')
+        assert not dialog.refreshButton.isEnabled()
+        controller.inventoryRefreshFinished.emit(success_id)
         assert dialog.refreshButton.isEnabled()
+        assert 'refreshed' in dialog.statusLabel.text().lower()
         assert rendered_timestamp(UPDATED_AT) in dialog.statusLabel.text()
         assert rendered_timestamp(CACHED_AT) not in dialog.statusLabel.text()
     finally:
@@ -242,7 +282,7 @@ def test_dialog_choose_clear_keyboard_accessibility_and_plain_text() -> None:
 
 
 def _staging_dialog(
-    controller: FakeController,
+    controller: FakeController | None,
     link: InventoryProfileLink | None = None,
 ) -> tuple[editGraphDlg, SimpleNamespace]:
     qmc = SimpleNamespace(
@@ -256,8 +296,13 @@ def _staging_dialog(
         timeindex=[-1, 0, 0, 0, 0, 0, 0, 0],
         title='Untouched title',
         weight=(750.0, 0.0, 'g'),
+        plus_store='plus-store',
+        plus_store_label='Plus Store',
         plus_coffee='plus-coffee',
+        plus_coffee_label='Plus Coffee',
         plus_blend_label='plus-blend',
+        plus_blend_spec={'label': 'Plus Blend', 'ingredients': []},
+        plus_blend_spec_labels=[],
     )
     aw = SimpleNamespace(qmc=qmc, roastserver_controller=controller)
     dialog = editGraphDlg.__new__(editGraphDlg)
@@ -266,6 +311,185 @@ def _staging_dialog(
     dialog.beansedit = QTextEdit()
     dialog.initializeInventoryLotSelection()
     return dialog, qmc
+
+
+def test_roast_properties_plus_widget_callbacks_match_without_or_with_controller() -> None:
+    for controller in (None, FakeController()):
+        dialog, qmc = _staging_dialog(controller)
+        callbacks: list[str] = []
+        try:
+            dialog.plus_coffees = None
+            dialog.plus_blends = None
+            dialog.plus_coffees_combo = QComboBox()
+            dialog.plus_blends_combo = QComboBox()
+            dialog.plus_coffees_combo.addItems(['', 'Coffee'])
+            dialog.plus_blends_combo.addItems(['', 'Blend'])
+            dialog.plus_coffees_combo.setCurrentIndex(1)
+            dialog.plus_blends_combo.setCurrentIndex(1)
+            dialog.defaultCoffeeData = lambda target=callbacks: target.append('default')
+            dialog.updateTitle = lambda *_args, target=callbacks: target.append('title')
+            dialog.checkWeightIn = lambda target=callbacks: target.append('weight')
+            dialog.updatePlusSelectedLine = lambda target=callbacks: target.append('line')
+            dialog.plus_store_selected = qmc.plus_store
+            dialog.plus_store_selected_label = qmc.plus_store_label
+            dialog.plus_coffee_selected = qmc.plus_coffee
+            dialog.plus_coffee_selected_label = qmc.plus_coffee_label
+            dialog.plus_blend_selected_label = qmc.plus_blend_label
+            dialog.plus_blend_selected_spec = qmc.plus_blend_spec
+            dialog.plus_blend_selected_spec_labels = qmc.plus_blend_spec_labels
+            dialog.plus_amount_selected = 1.0
+            dialog.plus_amount_replace_selected = 2.0
+            dialog.user_updated_coffee_or_blend = False
+
+            dialog.plus_coffees_combo.currentIndexChanged.connect(
+                dialog.coffeeSelectionChanged)
+            dialog.plus_coffees_combo.setCurrentIndex(0)
+            assert dialog.user_updated_coffee_or_blend
+            assert dialog.plus_coffee_selected is None
+            assert dialog.plus_store_selected is None
+            assert callbacks == ['default', 'title', 'weight', 'line']
+
+            callbacks.clear()
+            dialog.plus_store_selected = qmc.plus_store
+            dialog.plus_blend_selected_label = qmc.plus_blend_label
+            dialog.plus_blend_selected_spec = qmc.plus_blend_spec
+            dialog.plus_blend_selected_spec_labels = qmc.plus_blend_spec_labels
+            dialog.plus_blends_combo.currentIndexChanged.connect(
+                dialog.blendSelectionChanged)
+            dialog.plus_blends_combo.setCurrentIndex(0)
+            assert dialog.plus_blend_selected_label is None
+            assert dialog.plus_blend_selected_spec is None
+            assert callbacks == ['default', 'title', 'weight', 'line']
+
+            if controller is None:
+                assert not dialog.inventoryLotChooseButton.isEnabled()
+                assert not dialog.inventoryLotRefreshButton.isEnabled()
+            else:
+                coffee_index = dialog.plus_coffees_combo.currentIndex()
+                blend_index = dialog.plus_blends_combo.currentIndex()
+                plus_state = (
+                    dialog.plus_store_selected,
+                    dialog.plus_coffee_selected,
+                    dialog.plus_blend_selected_spec,
+                )
+                dialog.chooseInventoryLot(LOT)
+                assert dialog.plus_coffees_combo.currentIndex() == coffee_index
+                assert dialog.plus_blends_combo.currentIndex() == blend_index
+                assert (
+                    dialog.plus_store_selected,
+                    dialog.plus_coffee_selected,
+                    dialog.plus_blend_selected_spec,
+                ) == plus_state
+        finally:
+            dialog.cleanUpInventoryLotSelection()
+            QDialog.reject(dialog)
+
+
+def test_roast_properties_real_ok_and_cancel_are_inventory_only() -> None:
+    controller = FakeController()
+    ok_dialog, ok_qmc = _staging_dialog(controller)
+    ok_buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    ok_buttons.accepted.connect(ok_dialog.commitInventoryLotSelection)
+    ok_buttons.accepted.connect(ok_dialog.accept)
+    try:
+        plus_before = (
+            ok_qmc.plus_store,
+            ok_qmc.plus_coffee,
+            ok_qmc.plus_blend_label,
+            ok_qmc.plus_blend_spec,
+        )
+        ok_dialog.chooseInventoryLot(LOT)
+        ok_button = ok_buttons.button(QDialogButtonBox.StandardButton.Ok)
+        assert ok_button is not None
+        QTest.mouseClick(ok_button, Qt.MouseButton.LeftButton)
+        assert ok_dialog.result() == QDialog.DialogCode.Accepted
+        assert ok_qmc.roastServerBeanLotUUID == LOT.lot_id.hex
+        assert (
+            ok_qmc.plus_store,
+            ok_qmc.plus_coffee,
+            ok_qmc.plus_blend_label,
+            ok_qmc.plus_blend_spec,
+        ) == plus_before
+    finally:
+        ok_dialog.cleanUpInventoryLotSelection()
+        QDialog.reject(ok_dialog)
+
+    cancel_dialog, cancel_qmc = _staging_dialog(controller)
+    cancel_buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    cancel_buttons.rejected.connect(cancel_dialog.closeEvent)
+    cancel_dialog.restoreAllEnergySettings = lambda: None
+    cancel_dialog.org_beans = 'Original beans'
+    cancel_dialog.org_density = (0.0, 'g', 0.0, 'l')
+    cancel_dialog.org_density_roasted = (0.0, 'g', 0.0, 'l')
+    cancel_dialog.org_beansize_min = 0
+    cancel_dialog.org_beansize_max = 0
+    cancel_dialog.org_moisture_greens = 0.0
+    cancel_dialog.org_weight = cancel_qmc.weight
+    cancel_dialog.org_end_weight_est = 0.0
+    cancel_dialog.org_volume = (0.0, 0.0, 'l')
+    cancel_dialog.org_roasted_defects_mode = False
+    cancel_dialog.org_perKgRoastMode = False
+    cancel_dialog.org_specialevents = []
+    cancel_dialog.org_specialeventstype = []
+    cancel_dialog.org_specialeventsStrings = []
+    cancel_dialog.org_specialeventsvalue = []
+    cancel_dialog.org_timeindex = list(cancel_qmc.timeindex)
+    cancel_dialog.org_phases = []
+    cancel_dialog.org_ambientTemp = 0.0
+    cancel_dialog.org_ambient_humidity = 0.0
+    cancel_dialog.org_ambient_pressure = 0.0
+    cancel_dialog.org_roastpropertiesAutoOpenFlag = False
+    cancel_dialog.org_roastpropertiesAutoOpenDropFlag = False
+    cancel_qmc.beans = 'Original beans'
+    cancel_qmc.density = cancel_dialog.org_density
+    cancel_qmc.density_roasted = cancel_dialog.org_density_roasted
+    cancel_qmc.beansize_min = 0
+    cancel_qmc.beansize_max = 0
+    cancel_qmc.moisture_greens = 0.0
+    cancel_qmc.end_weight_est = 0.0
+    cancel_qmc.volume = cancel_dialog.org_volume
+    cancel_qmc.roasted_defects_mode = False
+    cancel_qmc.perKgRoastMode = False
+    cancel_qmc.specialevents = []
+    cancel_qmc.specialeventstype = []
+    cancel_qmc.specialeventsStrings = []
+    cancel_qmc.specialeventsvalue = []
+    cancel_qmc.phases = []
+    cancel_qmc.ambientTemp = 0.0
+    cancel_qmc.ambient_humidity = 0.0
+    cancel_qmc.ambient_pressure = 0.0
+    cancel_qmc.roastpropertiesAutoOpenFlag = False
+    cancel_qmc.roastpropertiesAutoOpenDropFlag = False
+    cancel_qmc.flagon = True
+    cancel_qmc.clear_last_picked_event_selection = lambda: None
+    cancel_dialog.aw.eNumberSpinBox = QSpinBox()
+    cancel_dialog.clean_up = cancel_dialog.cleanUpInventoryLotSelection
+    try:
+        plus_before = (
+            cancel_qmc.plus_store,
+            cancel_qmc.plus_coffee,
+            cancel_qmc.plus_blend_label,
+            cancel_qmc.plus_blend_spec,
+        )
+        cancel_dialog.chooseInventoryLot(WARNING_LOT)
+        cancel_button = cancel_buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        assert cancel_button is not None
+        QTest.mouseClick(cancel_button, Qt.MouseButton.LeftButton)
+        assert cancel_dialog.result() == QDialog.DialogCode.Rejected
+        assert cancel_qmc.roastServerBeanLotUUID is None
+        assert (
+            cancel_qmc.plus_store,
+            cancel_qmc.plus_coffee,
+            cancel_qmc.plus_blend_label,
+            cancel_qmc.plus_blend_spec,
+        ) == plus_before
+    finally:
+        cancel_dialog.cleanUpInventoryLotSelection()
+        QDialog.reject(cancel_dialog)
 
 
 def test_roast_properties_selection_is_staged_fills_only_empty_and_commits_all_fields() -> None:
@@ -296,6 +520,70 @@ def test_roast_properties_selection_is_staged_fills_only_empty_and_commits_all_f
         QDialog.reject(dialog)
 
 
+def test_roast_properties_refresh_is_correlated_and_snapshot_failures_are_contained() -> None:
+    controller = FakeController((LOT,))
+    dialog, _qmc = _staging_dialog(controller)
+    try:
+        dialog.refreshInventoryLots()
+        request_id = controller.refreshes[-1]
+        controller.lots = (WARNING_LOT,)
+        controller.cached_at = UPDATED_AT
+        controller.inventoryLotsChanged.emit(controller.lots)
+        assert dialog._inventory_refresh_request == request_id
+        assert not dialog.inventoryLotRefreshButton.isEnabled()
+        assert 'refreshed' not in dialog.inventoryLotStatusLabel.text().lower()
+        controller.inventoryRefreshFinished.emit('unrelated')
+        assert dialog._inventory_refresh_request == request_id
+        controller.inventoryRefreshFinished.emit(request_id)
+        assert dialog._inventory_refresh_request is None
+        assert dialog.inventoryLotRefreshButton.isEnabled()
+        assert 'refreshed' in dialog.inventoryLotStatusLabel.text().lower()
+
+        dialog.refreshInventoryLots()
+        failed_request = controller.refreshes[-1]
+        controller.snapshot_error = True
+        controller.inventoryLotsChanged.emit((LOT,))
+        assert dialog._inventory_lots == (WARNING_LOT,)
+        assert rendered_timestamp(UPDATED_AT) in dialog.inventoryLotStatusLabel.text()
+        assert dialog._inventory_refresh_request == failed_request
+        controller.operationFailed.emit(
+            failed_request,
+            PublicFailure(FailureKind.OFFLINE, 'offline', 'Connection failed.', True),
+        )
+        assert dialog._inventory_refresh_request is None
+        assert 'retained' in dialog.inventoryLotStatusLabel.text().lower()
+    finally:
+        dialog.cleanUpInventoryLotSelection()
+        QDialog.reject(dialog)
+
+
+def test_roast_properties_rejects_chooser_result_after_namespace_aba(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = FakeController((LOT,))
+    dialog, qmc = _staging_dialog(controller)
+
+    def exec_with_namespace_aba(chooser: InventoryLotDialog) -> QDialog.DialogCode:
+        controller.namespace = OTHER_NAMESPACE
+        controller.settingsChanged.emit(object())
+        controller.lots = (WARNING_LOT,)
+        controller.namespace = NAMESPACE
+        controller.identityChanged.emit(object())
+        chooser.selected_lot = WARNING_LOT
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(InventoryLotDialog, 'exec', exec_with_namespace_aba)
+    try:
+        dialog.openInventoryLotDialog()
+        assert dialog._inventory_link is None
+        assert qmc.roastServerBeanLotUUID is None
+        assert WARNING_LOT.name not in dialog.beansedit.toPlainText()
+        assert 'organization changed' in dialog.inventoryLotStatusLabel.text().lower()
+    finally:
+        dialog.cleanUpInventoryLotSelection()
+        QDialog.reject(dialog)
+
+
 def test_roast_properties_cancel_lock_and_context_change_rules() -> None:
     original = InventoryProfileLink(OTHER_NAMESPACE, LOT.lot_id, LOT.name)
     controller = FakeController()
@@ -311,11 +599,34 @@ def test_roast_properties_cancel_lock_and_context_change_rules() -> None:
         controller.cached_at = UPDATED_AT
         controller.inventoryLotsChanged.emit(controller.lots)
         assert rendered_timestamp(UPDATED_AT) in dialog.inventoryLotStatusLabel.text()
+        inventory_signals = (
+            controller.inventoryLotsChanged,
+            controller.inventoryRefreshFinished,
+            controller.operationFailed,
+            controller.onlineChanged,
+            controller.settingsChanged,
+            controller.identityChanged,
+        )
+        assert all(controller.receivers(signal) > 0 for signal in inventory_signals)
         dialog.cleanUpInventoryLotSelection()
+        assert all(controller.receivers(signal) == 0 for signal in inventory_signals)
         assert qmc.roastServerInventoryOrigin == OTHER_NAMESPACE.origin
         assert qmc.roastServerBeanLotUUID == LOT.lot_id.hex
     finally:
         QDialog.reject(dialog)
+
+    charge_controller = FakeController()
+    charged_link = InventoryProfileLink(NAMESPACE, LOT.lot_id, LOT.name)
+    charged_dialog, charged_qmc = _staging_dialog(charge_controller, charged_link)
+    try:
+        charged_qmc.timeindex[0] = 0
+        charged_dialog.updateInventoryLotRow()
+        assert not charged_dialog.inventoryLotChooseButton.isEnabled()
+        assert not charged_dialog.inventoryLotClearButton.isEnabled()
+        assert charged_dialog.inventoryLotRefreshButton.isEnabled()
+    finally:
+        charged_dialog.cleanUpInventoryLotSelection()
+        QDialog.reject(charged_dialog)
 
     controller = FakeController()
     staged_dialog, staged_qmc = _staging_dialog(controller)
