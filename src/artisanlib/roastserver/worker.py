@@ -1415,8 +1415,13 @@ class RoastServerWorker(QObject):
                 self._schedule_next(namespace)
                 return
             self._deliver_inventory_command(configuration, outcome)
-            if not self._cancelled():
+            if (
+                not self._cancelled()
+                and self._configuration is configuration
+                and self._configuration_fence.authorizes(configuration.generation)
+            ):
                 self._schedule_next(namespace)
+            return
         if not self._cancelled():
             self._emit_aggregates(namespace)
 
@@ -1641,53 +1646,80 @@ class RoastServerWorker(QObject):
         except Exception:  # pylint: disable=broad-exception-caught
             failure = _failure(FailureKind.INVALID_RESPONSE)
 
-        if self._interrupted():
+        if (
+            self._interrupted()
+            or self._configuration is not configuration
+            or not self._configuration_fence.authorizes(configuration.generation)
+        ):
             self._stop_timer()
             return
-        if not self._configuration_fence.authorizes(configuration.generation):
+        permit = self._operation_permit(configuration, 'inventory_transition')
+        if permit is None:
             self._stop_timer()
             return
-        now = self._now()
-        try:
-            if failure is None and result is not None:
-                reservation = store.mark_complete(command.id, token, result, now)
-                self.inventoryReservationChanged.emit(reservation)
-                self.inventoryLotsChanged.emit(store.cache_snapshot(command.namespace))
-                self.onlineChanged.emit(True)
-                if result.conflict is not None:
-                    self._emit_failure(
-                        'queue', _failure(FailureKind.INVENTORY_CONFLICT)
-                    )
+        with permit:
+            if (
+                self._interrupted()
+                or self._configuration is not configuration
+                or not self._configuration_fence.authorizes(configuration.generation)
+            ):
+                self._stop_timer()
                 return
+            now = self._now()
+            try:
+                if failure is None and result is not None:
+                    reservation = store.mark_complete(command.id, token, result, now)
+                    self.inventoryReservationChanged.emit(reservation)
+                    self.inventoryLotsChanged.emit(
+                        store.cache_snapshot(command.namespace)
+                    )
+                    self.onlineChanged.emit(True)
+                    if result.conflict is not None:
+                        self._emit_failure(
+                            'queue', _failure(FailureKind.INVENTORY_CONFLICT)
+                        )
+                    self._emit_aggregates(command.namespace)
+                    return
 
-            assert failure is not None
-            if status_code in {401, 403} or failure.kind is FailureKind.CREDENTIAL_REJECTED:
-                paused = _failure(FailureKind.CREDENTIAL_REJECTED)
-                store.mark_paused(command.id, token, now, paused)
-                self._pause_namespace(command.namespace, 'credential_rejected')
-                self._credential = None
-                self._authorized_target = None
-                self.onlineChanged.emit(False)
-                self._stop_timer()
-            elif failure.kind is FailureKind.INVENTORY_UNSUPPORTED:
-                unsupported = _failure(FailureKind.INVENTORY_UNSUPPORTED)
-                store.mark_paused(command.id, token, now, unsupported)
-                store.pause_namespace(command.namespace, now, 'inventory_unsupported')
-                self._stop_timer()
-            elif failure.retryable:
-                next_attempt_at = now + timedelta(
-                    seconds=_retry_delay(command.attempts, retry_after)
+                assert failure is not None
+                if (
+                    status_code in {401, 403}
+                    or failure.kind is FailureKind.CREDENTIAL_REJECTED
+                ):
+                    paused = _failure(FailureKind.CREDENTIAL_REJECTED)
+                    store.mark_paused(command.id, token, now, paused)
+                    self._pause_namespace(command.namespace, 'credential_rejected')
+                    self._credential = None
+                    self._authorized_target = None
+                    self.onlineChanged.emit(False)
+                    self._stop_timer()
+                elif failure.kind is FailureKind.INVENTORY_UNSUPPORTED:
+                    unsupported = _failure(FailureKind.INVENTORY_UNSUPPORTED)
+                    store.mark_paused(command.id, token, now, unsupported)
+                    store.pause_namespace(
+                        command.namespace, now, 'inventory_unsupported'
+                    )
+                    self._stop_timer()
+                elif failure.retryable:
+                    next_attempt_at = now + timedelta(
+                        seconds=_retry_delay(command.attempts, retry_after)
+                    )
+                    store.mark_retry(
+                        command.id, token, now, next_attempt_at, failure
+                    )
+                    self.onlineChanged.emit(False)
+                else:
+                    store.mark_failed(command.id, token, now, failure)
+                self._emit_inventory_reservation(
+                    command.namespace, command.roast_uuid
                 )
-                store.mark_retry(
-                    command.id, token, now, next_attempt_at, failure
+                self._emit_failure('queue', failure)
+                self._emit_aggregates(command.namespace)
+            except (InventoryStoreError, TypeError, ValueError):
+                self._emit_failure(
+                    'queue', _failure(FailureKind.LOCAL_INVENTORY)
                 )
-                self.onlineChanged.emit(False)
-            else:
-                store.mark_failed(command.id, token, now, failure)
-            self._emit_inventory_reservation(command.namespace, command.roast_uuid)
-            self._emit_failure('queue', failure)
-        except (InventoryStoreError, TypeError, ValueError):
-            self._emit_failure('queue', _failure(FailureKind.LOCAL_INVENTORY))
+                self._emit_aggregates(command.namespace)
 
     def _inventory_command_request(
         self,
@@ -1713,6 +1745,7 @@ class RoastServerWorker(QObject):
             occurred_at = state.release_occurred_at
         if occurred_at is None:
             raise InventoryStoreError('inventory command time is invalid')
+        client_instance_uuid = _inventory_command_client_uuid(command)
         return InventoryCommandRequest(
             operation=command.operation,
             reservation_uuid=command.reservation_uuid,
@@ -1721,7 +1754,7 @@ class RoastServerWorker(QObject):
             request_json=command.request_json,
             idempotency_key=command.idempotency_key,
             occurred_at=occurred_at,
-            client_instance_uuid=configuration.client_instance_uuid,
+            client_instance_uuid=client_instance_uuid,
             planned_grams=state.planned_grams,
             requested_actual_grams=(
                 state.actual_grams if command.operation == 'finalize' else None
@@ -1809,20 +1842,32 @@ class RoastServerWorker(QObject):
                     cursor = next_cursor
                 else:
                     raise _DeliveryFailure(_failure(FailureKind.INVALID_RESPONSE))
-            if not self._configuration_fence.authorizes(configuration.generation):
+            if (
+                self._cancelled()
+                or self._configuration is not configuration
+                or not self._configuration_fence.authorizes(
+                    configuration.generation
+                )
+            ):
                 raise _StaleConfiguration
             permit = self._operation_permit(configuration, 'inventory_refresh_commit')
             if permit is None:
                 raise _StaleConfiguration
             with permit:
-                if not self._configuration_fence.authorizes(configuration.generation):
+                if (
+                    self._cancelled()
+                    or self._configuration is not configuration
+                    or not self._configuration_fence.authorizes(
+                        configuration.generation
+                    )
+                ):
                     raise _StaleConfiguration
                 store.replace_lots(value.namespace, tuple(lots), self._now())
                 snapshot = store.cache_snapshot(value.namespace)
-            if not self._configuration_fence.authorizes(configuration.generation):
-                raise _StaleConfiguration
-            self.inventoryLotsChanged.emit(snapshot)
-            self.onlineChanged.emit(True)
+                self.inventoryLotsChanged.emit(snapshot)
+                self.onlineChanged.emit(True)
+                self._emit_aggregates(value.namespace)
+            return
         except _StaleConfiguration:
             self._stop_timer()
             return
@@ -1836,8 +1881,33 @@ class RoastServerWorker(QObject):
         except Exception:  # pylint: disable=broad-exception-caught
             failure = _failure(FailureKind.INVALID_RESPONSE)
 
-        if failure is not None and not self._cancelled():
-            if status_code in {401, 403} or failure.kind is FailureKind.CREDENTIAL_REJECTED:
+        if (
+            self._interrupted()
+            or self._configuration is not configuration
+            or not self._configuration_fence.authorizes(configuration.generation)
+        ):
+            self._stop_timer()
+            return
+        permit = self._operation_permit(
+            configuration, 'inventory_refresh_transition'
+        )
+        if permit is None:
+            self._stop_timer()
+            return
+        with permit:
+            if (
+                self._interrupted()
+                or self._configuration is not configuration
+                or not self._configuration_fence.authorizes(
+                    configuration.generation
+                )
+            ):
+                self._stop_timer()
+                return
+            if (
+                status_code in {401, 403}
+                or failure.kind is FailureKind.CREDENTIAL_REJECTED
+            ):
                 self._pause_namespace(value.namespace, 'credential_rejected')
                 self._credential = None
                 self._authorized_target = None
@@ -1854,7 +1924,7 @@ class RoastServerWorker(QObject):
             elif failure.retryable:
                 self.onlineChanged.emit(False)
             self._emit_failure(request_id, failure)
-        self._emit_aggregates(value.namespace)
+            self._emit_aggregates(value.namespace)
 
     @pyqtSlot()
     def refresh(self) -> None:
@@ -2864,6 +2934,35 @@ _INVENTORY_FIXED_FAILURES: Final[dict[str, tuple[FailureKind, str, bool]]] = {
         FailureKind.INVENTORY_REJECTED, 'Invalid request', False
     ),
 }
+
+
+def _inventory_command_client_uuid(command: InventoryCommand) -> UUID:
+    parts = command.idempotency_key.split(':')
+    if len(parts) != 4:
+        raise InventoryStoreError('inventory command idempotency key is invalid')
+    prefix, client_hex, reservation_hex, operation = parts
+    try:
+        client_instance_uuid = UUID(hex=client_hex)
+        reservation_uuid = UUID(hex=reservation_hex)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise InventoryStoreError(
+            'inventory command idempotency key is invalid'
+        ) from error
+    expected = (
+        f'inventory-v1:{client_instance_uuid.hex}:'
+        f'{reservation_uuid.hex}:{command.operation}'
+    )
+    if (
+        prefix != 'inventory-v1'
+        or client_hex != client_instance_uuid.hex
+        or reservation_hex != reservation_uuid.hex
+        or reservation_uuid != command.reservation_uuid
+        or operation not in {'reserve', 'finalize', 'release'}
+        or operation != command.operation
+        or command.idempotency_key != expected
+    ):
+        raise InventoryStoreError('inventory command idempotency key is invalid')
+    return client_instance_uuid
 
 
 def _inventory_persistence_failure(failure: object) -> PublicFailure:

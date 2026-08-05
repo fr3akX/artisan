@@ -21,19 +21,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import inspect
+import json
 from typing import cast, override
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from PyQt6.QtCore import QCoreApplication, QObject, QTimer
 from PyQt6.QtTest import QSignalSpy
 import pytest
+import requests
+from requests.adapters import HTTPAdapter
 
-from artisanlib.roastserver.api import ApiFailure, ClientFactory
+from artisanlib.roastserver.api import ApiFailure, ClientFactory, RoastServerClient
 from artisanlib.roastserver.cache import CacheStore
 from artisanlib.roastserver.contract import (
     IdentityOrganization,
@@ -51,11 +55,17 @@ from artisanlib.roastserver.inventory_contract import (
     InventoryCommandRequest,
     InventoryConflict,
     InventoryMutationResult,
+    InventoryOperation,
     InventoryReservation,
+    ReservationState,
+    build_finalize_request,
+    build_release_request,
+    build_reserve_request,
 )
 from artisanlib.roastserver.inventory_store import (
     FailedInventoryCommand,
     InventoryCommand,
+    InventoryLifecycle,
     InventoryQueueCounts,
     InventoryRoastState,
     InventoryStore,
@@ -83,6 +93,7 @@ ROAST_UUID = UUID('33333333-3333-4333-8333-333333333333')
 LOT_ID = UUID('44444444-4444-4444-8444-444444444444')
 RESERVATION_UUID = UUID('55555555-5555-4555-8555-555555555555')
 CLIENT_UUID = UUID('66666666-6666-4666-8666-666666666666')
+DURABLE_CLIENT_UUID = UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
 NAMESPACE = namespace_for(ORIGIN, ORGANIZATION_ID)
 IDENTITY = ServerIdentity(
     user=IdentityUser(USER_ID, 'owner@example.test', 'Owner'),
@@ -304,16 +315,53 @@ def profile_job(namespace: Namespace, now: datetime) -> Job:
     )
 
 
-def inventory_command(namespace: Namespace, now: datetime) -> InventoryCommand:
+def canonical_command_request(
+    operation: InventoryOperation = 'reserve',
+) -> InventoryCommandRequest:
+    if operation == 'reserve':
+        return build_reserve_request(
+            client_instance_uuid=DURABLE_CLIENT_UUID,
+            reservation_uuid=RESERVATION_UUID,
+            roast_uuid=ROAST_UUID,
+            lot_id=LOT_ID,
+            planned_grams=1_000,
+            occurred_at=NOW,
+        )
+    if operation == 'finalize':
+        return build_finalize_request(
+            client_instance_uuid=DURABLE_CLIENT_UUID,
+            reservation_uuid=RESERVATION_UUID,
+            roast_uuid=ROAST_UUID,
+            lot_id=LOT_ID,
+            planned_grams=1_000,
+            actual_grams=900,
+            occurred_at=NOW,
+        )
+    return build_release_request(
+        client_instance_uuid=DURABLE_CLIENT_UUID,
+        reservation_uuid=RESERVATION_UUID,
+        roast_uuid=ROAST_UUID,
+        lot_id=LOT_ID,
+        planned_grams=1_000,
+        occurred_at=NOW,
+    )
+
+
+def inventory_command(
+    namespace: Namespace,
+    now: datetime,
+    operation: InventoryOperation = 'reserve',
+) -> InventoryCommand:
+    request = canonical_command_request(operation)
     return InventoryCommand(
         id='d' * 32,
         namespace=namespace,
-        roast_uuid=ROAST_UUID,
-        lot_id=LOT_ID,
-        reservation_uuid=RESERVATION_UUID,
-        operation='reserve',
-        request_json=b'{}',
-        idempotency_key='inventory-test',
+        roast_uuid=request.roast_uuid,
+        lot_id=request.lot_id,
+        reservation_uuid=request.reservation_uuid,
+        operation=request.operation,
+        request_json=request.request_json,
+        idempotency_key=request.idempotency_key,
         dependency_id=None,
         state='leased',
         attempts=1,
@@ -327,7 +375,9 @@ def inventory_command(namespace: Namespace, now: datetime) -> InventoryCommand:
     )
 
 
-def inventory_roast_state() -> InventoryRoastState:
+def inventory_roast_state(
+    operation: InventoryOperation = 'reserve',
+) -> InventoryRoastState:
     return InventoryRoastState(
         namespace=NAMESPACE,
         roast_uuid=ROAST_UUID,
@@ -336,12 +386,12 @@ def inventory_roast_state() -> InventoryRoastState:
         reservation_uuid=RESERVATION_UUID,
         server_reservation_uuid=None,
         planned_grams=1_000,
-        actual_grams=None,
-        lifecycle='reserve_queued',
-        terminal_intent=None,
+        actual_grams=900 if operation == 'finalize' else None,
+        lifecycle=cast(InventoryLifecycle, f'{operation}_queued'),
+        terminal_intent=None if operation == 'reserve' else operation,
         reserve_occurred_at=NOW,
-        finalize_occurred_at=None,
-        release_occurred_at=None,
+        finalize_occurred_at=NOW if operation == 'finalize' else None,
+        release_occurred_at=NOW if operation == 'release' else None,
         server_state=None,
         balance=None,
         conflict_id=None,
@@ -352,11 +402,21 @@ def inventory_roast_state() -> InventoryRoastState:
     )
 
 
+def _failure_value(
+    kind: FailureKind, code: str, retryable: bool
+) -> PublicFailure:
+    return PublicFailure(kind, code, FAILURE_MESSAGES[kind], retryable)
+
+
 def bean_lot(lot_id: UUID = LOT_ID, name: str = 'Test lot') -> BeanLot:
     return BeanLot(lot_id, name, None, (), None, None, 2_000, 0, 2_000, 0)
 
 
-def mutation_result(*, conflict: bool = False) -> InventoryMutationResult:
+def mutation_result(
+    *,
+    conflict: bool = False,
+    operation: InventoryOperation = 'reserve',
+) -> InventoryMutationResult:
     server_reservation_uuid = UUID('77777777-7777-4777-8777-777777777777')
     conflict_id = UUID('88888888-8888-4888-8888-888888888888')
     inventory_conflict = (
@@ -383,12 +443,19 @@ def mutation_result(*, conflict: bool = False) -> InventoryMutationResult:
             RESERVATION_UUID,
             LOT_ID,
             ROAST_UUID,
-            CLIENT_UUID,
-            'reserved',
+            DURABLE_CLIENT_UUID,
+            cast(
+                ReservationState,
+                {
+                    'reserve': 'reserved',
+                    'finalize': 'finalized',
+                    'release': 'released',
+                }[operation],
+            ),
             1_000,
-            None,
+            900 if operation == 'finalize' else None,
             NOW,
-            None,
+            None if operation == 'reserve' else NOW,
             NOW,
             NOW,
             conflict_id if conflict else None,
@@ -518,6 +585,84 @@ class DeliveryInventoryStore(FakeInventoryStore):
         self.command_value = replace(self.command_value, state='pending')
 
 
+class InventoryResponseAdapter(HTTPAdapter):
+    def __init__(self, operation: InventoryOperation) -> None:
+        super().__init__(max_retries=0)
+        self.operation = operation
+        self.calls: list[requests.PreparedRequest] = []
+
+    @override
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        stream: bool = False,
+        timeout: object = None,
+        verify: object = True,
+        cert: object = None,
+        proxies: Mapping[str, str] | None = None,
+    ) -> requests.Response:
+        del stream, timeout, verify, cert, proxies
+        self.calls.append(request)
+        state = {
+            'reserve': 'reserved',
+            'finalize': 'finalized',
+            'release': 'released',
+        }[self.operation]
+        completed_at = None if self.operation == 'reserve' else '2026-08-05T12:00:00.000000Z'
+        payload = {
+            'reservation': {
+                'reservation_id': UUID('77777777-7777-4777-8777-777777777777').hex,
+                'client_reservation_uuid': RESERVATION_UUID.hex,
+                'lot_id': LOT_ID.hex,
+                'roast_uuid': ROAST_UUID.hex,
+                'client_instance_uuid': DURABLE_CLIENT_UUID.hex,
+                'state': state,
+                'planned_grams': 1_000,
+                'actual_grams': 900 if self.operation == 'finalize' else None,
+                'reserved_at': '2026-08-05T12:00:00.000000Z',
+                'completed_at': completed_at,
+                'created_at': '2026-08-05T12:00:00.000000Z',
+                'updated_at': '2026-08-05T12:00:00.000000Z',
+                'open_conflict_id': None,
+            },
+            'balance': {
+                'lot_id': LOT_ID.hex,
+                'on_hand_grams': 2_000,
+                'reserved_grams': 1_000 if self.operation == 'reserve' else 0,
+                'available_grams': 1_000 if self.operation == 'reserve' else 2_000,
+                'unresolved_conflict_count': 0,
+            },
+            'conflict': None,
+            'idempotent_replay': False,
+        }
+        body = json.dumps(payload, separators=(',', ':')).encode()
+        response = requests.Response()
+        response.status_code = 201 if self.operation == 'reserve' else 200
+        response.headers.update(
+            {
+                'Content-Type': 'application/json',
+                'Content-Length': str(len(body)),
+            }
+        )
+        response._content = body
+        vars(response)['_content_consumed'] = True
+        response.request = request
+        response.url = request.url or ''
+        return response
+
+
+def real_inventory_client(
+    operation: InventoryOperation,
+) -> tuple[RoastServerClient, InventoryResponseAdapter]:
+    client = RoastServerClient(ORIGIN, 'test-only')
+    session = cast(requests.Session, vars(client)['_session'])
+    replaced = session.get_adapter('https://')
+    adapter = InventoryResponseAdapter(operation)
+    session.mount('https://', adapter)
+    replaced.close()
+    return client, adapter
+
+
 class FakeInventoryClient:
     def __init__(
         self,
@@ -526,11 +671,13 @@ class FakeInventoryClient:
         failure: ApiFailure | None = None,
         pages: list[BeanLotPage] | None = None,
         on_execute: Callable[[], None] | None = None,
+        on_list: Callable[[], None] | None = None,
     ) -> None:
         self.result = result
         self.failure = failure
         self.pages = [] if pages is None else pages
         self.on_execute = on_execute
+        self.on_list = on_list
         self.requests: list[object] = []
         self.cursors: list[str | None] = []
 
@@ -553,6 +700,8 @@ class FakeInventoryClient:
     ) -> BeanLotPage:
         assert limit == 100
         self.cursors.append(cursor)
+        if self.on_list is not None:
+            self.on_list()
         if self.failure is not None:
             raise self.failure
         return self.pages.pop(0)
@@ -624,7 +773,9 @@ def make_worker(
 
 
 def make_delivery_worker(
-    client: FakeInventoryClient,
+    client: FakeInventoryClient | RoastServerClient,
+    *,
+    operation_hook: Callable[[str], None] | None = None,
 ) -> tuple[
     RoastServerWorker,
     DeliveryInventoryStore,
@@ -650,6 +801,7 @@ def make_delivery_worker(
         command_vault=command_vault,
         configuration_fence=fence,
         timer_factory=FakeTimer,
+        operation_hook=operation_hook,
     )
     worker.start()
     generation = fence.advance()
@@ -693,8 +845,10 @@ def test_delivery_completes_atomically_with_exact_stored_bytes_and_signals() -> 
     assert inventory.transitions == [('complete', result)]
     assert len(client.requests) == 1
     request = cast(InventoryCommandRequest, client.requests[0])
-    assert request.request_json == b'{}'
-    assert request.idempotency_key == 'inventory-test'
+    expected = canonical_command_request()
+    assert request.client_instance_uuid == DURABLE_CLIENT_UUID
+    assert request.request_json == expected.request_json
+    assert request.idempotency_key == expected.idempotency_key
     assert len(reservations) == 1
     worker.stop()
 
@@ -711,6 +865,167 @@ def test_revoked_mutation_response_cannot_commit() -> None:
 
     assert inventory.command_value.state == 'leased'
     assert inventory.transitions == []
+    worker.stop()
+
+
+@pytest.mark.parametrize(
+    'outcome',
+    ['success', 'retry', 'terminal', 'unsupported', 'credential'],
+)
+def test_revocation_at_mutation_transition_has_zero_response_side_effects(
+    outcome: str,
+) -> None:
+    failures = {
+        'retry': ApiFailure(
+            _failure_value(FailureKind.RATE_LIMITED, 'rate_limited', True),
+            429,
+            30,
+        ),
+        'terminal': ApiFailure(
+            PublicFailure(
+                FailureKind.INVENTORY_REJECTED,
+                'invalid_request',
+                'Invalid request',
+                False,
+            ),
+            422,
+            None,
+        ),
+        'unsupported': ApiFailure(
+            _failure_value(
+                FailureKind.INVENTORY_UNSUPPORTED,
+                'inventory_unsupported',
+                False,
+            ),
+            404,
+            None,
+        ),
+        'credential': ApiFailure(
+            _failure_value(
+                FailureKind.CREDENTIAL_REJECTED,
+                'credential_rejected',
+                False,
+            ),
+            403,
+            None,
+        ),
+    }
+    client = FakeInventoryClient(
+        result=mutation_result() if outcome == 'success' else None,
+        failure=failures.get(outcome),
+    )
+    fence_ref: list[ConfigurationFence] = []
+
+    def revoke_at_transition(operation: str) -> None:
+        if operation == 'inventory_transition':
+            fence_ref[0].revoke()
+
+    worker, inventory, outbox, fence, _vault = make_delivery_worker(
+        client, operation_hook=revoke_at_transition
+    )
+    fence_ref.append(fence)
+    operation_failed = QSignalSpy(worker.operationFailed)
+    reservation_changed = QSignalSpy(worker.inventoryReservationChanged)
+    lots_changed = QSignalSpy(worker.inventoryLotsChanged)
+    online_changed = QSignalSpy(worker.onlineChanged)
+
+    worker.process_queue_once()
+
+    assert inventory.command_value.state == 'leased'
+    assert inventory.transitions == []
+    assert inventory.pause_calls == []
+    assert outbox.pause_calls == []
+    assert worker._credential == 'test-only'
+    assert not operation_failed
+    assert not reservation_changed
+    assert not lots_changed
+    assert not online_changed
+    worker.stop()
+
+
+@pytest.mark.parametrize(
+    'idempotency_key',
+    [
+        f'inventory-v2:{DURABLE_CLIENT_UUID.hex}:{RESERVATION_UUID.hex}:reserve',
+        f'inventory-v1:{DURABLE_CLIENT_UUID.hex}:{RESERVATION_UUID.hex}',
+        f'inventory-v1:{DURABLE_CLIENT_UUID.hex.upper()}:{RESERVATION_UUID.hex}:reserve',
+        f'inventory-v1:{DURABLE_CLIENT_UUID.hex}:{UUID(int=1).hex}:reserve',
+        f'inventory-v1:{DURABLE_CLIENT_UUID.hex}:{RESERVATION_UUID.hex}:release',
+    ],
+    ids=['prefix', 'segments', 'client-canonical', 'reservation', 'operation'],
+)
+def test_malformed_durable_idempotency_key_is_fixed_local_terminal_failure(
+    idempotency_key: str,
+) -> None:
+    client = FakeInventoryClient(result=mutation_result())
+    worker, inventory, _outbox, _fence, _vault = make_delivery_worker(client)
+    inventory.command_value = replace(
+        inventory.command_value, idempotency_key=idempotency_key
+    )
+
+    worker.process_queue_once()
+
+    assert client.requests == []
+    assert inventory.transitions[0][0] == 'failed'
+    persisted = cast(PublicFailure, inventory.transitions[0][1])
+    assert persisted.kind is FailureKind.LOCAL_INVENTORY
+    assert persisted.code == 'local_inventory'
+    worker.stop()
+
+
+def test_malformed_durable_key_transition_is_generation_fenced() -> None:
+    fence_ref: list[ConfigurationFence] = []
+
+    def revoke_at_transition(operation: str) -> None:
+        if operation == 'inventory_transition':
+            fence_ref[0].revoke()
+
+    client = FakeInventoryClient(result=mutation_result())
+    worker, inventory, _outbox, fence, _vault = make_delivery_worker(
+        client, operation_hook=revoke_at_transition
+    )
+    fence_ref.append(fence)
+    inventory.command_value = replace(
+        inventory.command_value, idempotency_key='inventory-v1:malformed'
+    )
+    failures = QSignalSpy(worker.operationFailed)
+
+    worker.process_queue_once()
+
+    assert client.requests == []
+    assert inventory.transitions == []
+    assert not failures
+    worker.stop()
+
+
+@pytest.mark.parametrize('operation', ['reserve', 'finalize', 'release'])
+def test_durable_client_uuid_reaches_real_api_transport_after_configuration_drift(
+    operation: InventoryOperation,
+) -> None:
+    client, adapter = real_inventory_client(operation)
+    worker, inventory, _outbox, _fence, _vault = make_delivery_worker(client)
+    inventory.command_value = inventory_command(NAMESPACE, NOW, operation)
+    inventory.roast = inventory_roast_state(operation)
+    expected = canonical_command_request(operation)
+
+    worker.process_queue_once()
+
+    assert inventory.transitions[0][0] == 'complete'
+    assert CLIENT_UUID != DURABLE_CLIENT_UUID
+    assert len(adapter.calls) == 1
+    call = adapter.calls[0]
+    expected_path = (
+        '/api/v1/inventory/reservations'
+        if operation == 'reserve'
+        else (
+            f'/api/v1/inventory/reservations/{RESERVATION_UUID.hex}/'
+            f'{operation}'
+        )
+    )
+    assert urlsplit(call.url).path == expected_path
+    assert call.body == expected.request_json
+    assert call.headers['Idempotency-Key'] == expected.idempotency_key
+    assert DURABLE_CLIENT_UUID.hex.encode() in expected.request_json or operation != 'reserve'
     worker.stop()
 
 
@@ -924,6 +1239,140 @@ def test_refresh_partial_api_error_retains_old_cache() -> None:
     )
 
     assert inventory.replacements == []
+    worker.stop()
+
+
+@pytest.mark.parametrize(
+    'failure',
+    [
+        ApiFailure(
+            _failure_value(
+                FailureKind.CREDENTIAL_REJECTED,
+                'credential_rejected',
+                False,
+            ),
+            403,
+            None,
+        ),
+        ApiFailure(
+            _failure_value(
+                FailureKind.INVENTORY_UNSUPPORTED,
+                'inventory_unsupported',
+                False,
+            ),
+            404,
+            None,
+        ),
+        ApiFailure(
+            _failure_value(FailureKind.RATE_LIMITED, 'rate_limited', True),
+            429,
+            60,
+        ),
+    ],
+    ids=['credential', 'unsupported', 'retryable'],
+)
+@pytest.mark.parametrize('revoke_point', ['http', 'transition'])
+def test_revoked_refresh_error_has_zero_stale_side_effects(
+    failure: ApiFailure,
+    revoke_point: str,
+) -> None:
+    fence_ref: list[ConfigurationFence] = []
+
+    def revoke_on_list() -> None:
+        if revoke_point == 'http':
+            fence_ref[0].revoke()
+
+    def revoke_at_transition(operation: str) -> None:
+        if (
+            revoke_point == 'transition'
+            and operation == 'inventory_refresh_transition'
+        ):
+            fence_ref[0].revoke()
+
+    client = FakeInventoryClient(failure=failure, on_list=revoke_on_list)
+    worker, inventory, outbox, fence, vault = make_delivery_worker(
+        client, operation_hook=revoke_at_transition
+    )
+    fence_ref.append(fence)
+    old_snapshot = inventory.snapshot
+    configuration = cast(WorkerConfiguration, worker._configuration)
+    operation_failed = QSignalSpy(worker.operationFailed)
+    online_changed = QSignalSpy(worker.onlineChanged)
+    queue_changed = QSignalSpy(worker.inventoryQueueChanged)
+    lots_changed = QSignalSpy(worker.inventoryLotsChanged)
+
+    worker.refresh_inventory(
+        vault.put(InventoryRefreshRequest(NAMESPACE, configuration.generation))
+    )
+
+    assert inventory.snapshot == old_snapshot
+    assert inventory.replacements == []
+    assert inventory.pause_calls == []
+    assert outbox.pause_calls == []
+    assert worker._credential == 'test-only'
+    assert not operation_failed
+    assert not online_changed
+    assert not queue_changed
+    assert not lots_changed
+    worker.stop()
+
+
+@pytest.mark.parametrize('revoke_point', ['http', 'transition'])
+def test_revoked_partial_page_error_has_zero_stale_side_effects(
+    revoke_point: str,
+) -> None:
+    failure = ApiFailure(
+        _failure_value(FailureKind.OFFLINE, 'connection_error', True),
+        None,
+        None,
+    )
+    fence_ref: list[ConfigurationFence] = []
+
+    class RevokedPartialErrorClient(FakeInventoryClient):
+        @override
+        def list_inventory_lots(
+            self, cursor: str | None = None, limit: int = 100
+        ) -> BeanLotPage:
+            if cursor is not None:
+                if revoke_point == 'http':
+                    fence_ref[0].revoke()
+                raise failure
+            return super().list_inventory_lots(cursor, limit)
+
+    def revoke_at_transition(operation: str) -> None:
+        if (
+            revoke_point == 'transition'
+            and operation == 'inventory_refresh_transition'
+        ):
+            fence_ref[0].revoke()
+
+    client = RevokedPartialErrorClient(
+        pages=[BeanLotPage((bean_lot(),), 'more')]
+    )
+    worker, inventory, outbox, fence, vault = make_delivery_worker(
+        client, operation_hook=revoke_at_transition
+    )
+    fence_ref.append(fence)
+    old_snapshot = inventory.snapshot
+    configuration = cast(WorkerConfiguration, worker._configuration)
+    operation_failed = QSignalSpy(worker.operationFailed)
+    online_changed = QSignalSpy(worker.onlineChanged)
+    queue_changed = QSignalSpy(worker.inventoryQueueChanged)
+    lots_changed = QSignalSpy(worker.inventoryLotsChanged)
+
+    worker.refresh_inventory(
+        vault.put(InventoryRefreshRequest(NAMESPACE, configuration.generation))
+    )
+
+    assert inventory.snapshot == old_snapshot
+    assert inventory.replacements == []
+    assert inventory.pause_calls == []
+    assert outbox.pause_calls == []
+    assert worker._credential == 'test-only'
+    assert not operation_failed
+    assert not online_changed
+    assert not queue_changed
+    assert not lots_changed
     worker.stop()
 
 
