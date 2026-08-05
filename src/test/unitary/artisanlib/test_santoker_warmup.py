@@ -252,6 +252,8 @@ def compact_window(
         buttonStates=[],
         setExtraEventButtonStyleSignal=Mock(),
         reportSantokerWarmupResult=Mock(),
+        prepareRoastServerInventoryCharge=Mock(return_value=object()),
+        commitRoastServerInventoryCharge=Mock(return_value=''),
         sendmessage=Mock(),
     )
     window.santokerWarmupButtonStateSignal = ImmediateBoolSignal(
@@ -1105,6 +1107,8 @@ def test_rejected_charge_does_not_set_latch(
         ser=SimpleNamespace(NONE=Mock(return_value=manual_reading)),
         santokerWarmupController=controller,
         updateSantokerWarmupControls=Mock(),
+        prepareRoastServerInventoryCharge=Mock(return_value=object()),
+        commitRoastServerInventoryCharge=Mock(return_value=''),
         sendmessage=Mock(),
     )
     canvas = SimpleNamespace(

@@ -71,8 +71,9 @@ modules with Qt dependencies and complex canvas/graphics operations.
 import os
 import sys
 from collections.abc import Generator
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import hypothesis.strategies as st
 import numpy as np
@@ -1159,6 +1160,171 @@ class TestEventValueConversions:
 
         # Act & Assert
         assert canvas.str2eventsvalue('  10  ') == 2.0  # Should strip whitespace
+
+
+class ChargeSemaphore:
+    def __init__(self) -> None:
+        self.acquired = False
+
+    def acquire(self, _count: int) -> None:
+        self.acquired = True
+
+    def available(self) -> int:
+        return 0 if self.acquired else 1
+
+    def release(self, _count: int) -> None:
+        self.acquired = False
+
+
+def inventory_charge_canvas() -> SimpleNamespace:
+    aw = MagicMock()
+    aw.ntb._nav_stack.return_value = False
+    aw.buttonCHARGE.isFlat.return_value = False
+    aw.arabicReshape.side_effect = lambda text: text
+    aw.eventslidervisibilities = [False, False, False, False]
+    aw.simulator = None
+    aw.pidcontrol.pidOnCHARGE = False
+    prepared = object()
+    aw.prepareRoastServerInventoryCharge.return_value = prepared
+    aw.commitRoastServerInventoryCharge.return_value = (
+        '33333333333343338333333333333333')
+    return SimpleNamespace(
+        aw=aw,
+        profileDataSemaphore=ChargeSemaphore(),
+        flagstart=True,
+        fileDirtySignal=MagicMock(),
+        timeindex=[-1, 0, 0, 0, 0, 0, 0, 0],
+        autoChargeIdx=-1,
+        device=0,
+        timex=[0.0],
+        temp1=[100.0],
+        temp2=[90.0],
+        roastUUID=None,
+        roastServerInventoryOrigin='https://archive.example',
+        roastServerInventoryOrganizationUUID='11111111111141118111111111111111',
+        roastServerBeanLotUUID='22222222222242228222222222222222',
+        roastServerBeanLotName='Historical lot',
+        chargeTimerPeriod=0,
+        locktimex=False,
+        locktimex_start=0.0,
+        chargemintime=0.0,
+        startofx=0.0,
+        fixmaxtime=False,
+        endofx=100.0,
+        resetmaxtime=100.0,
+        BTcurve=False,
+        ETcurve=False,
+        updateProjection=Mock(),
+        xaxistosm=Mock(),
+        EventRecordAction=Mock(),
+        timealign=Mock(),
+        buttonactions=[0],
+        buttonactionstrings=[''],
+        LCDdecimalplaces=False,
+        mode='C',
+        roastpropertiesAutoOpenFlag=False,
+        l_annotations=[],
+        l_annotations_dict={},
+        ystep_down=0,
+        ystep_up=0,
+        adderror=Mock(),
+        _tgraphcanvas__dijkstra_to_ascii=lambda text: text,
+    )
+
+
+class TestInventoryCharge:
+    def test_inventory_charge_commit_precedes_event(self) -> None:
+        canvas = inventory_charge_canvas()
+        ordered = Mock(return_value=None)
+        canvas.aw.commitRoastServerInventoryCharge.side_effect = (
+            lambda _prepared: ordered('inventory', canvas.timeindex[0])
+            or '33333333333343338333333333333333')
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert ordered.call_args.args == ('inventory', -1)
+        assert canvas.timeindex[0] == 0
+        assert canvas.roastUUID == '33333333333343338333333333333333'
+        canvas.aw.prepareRoastServerInventoryCharge.assert_called_once_with()
+
+    def test_inventory_charge_prepare_precedes_profile_semaphore(self) -> None:
+        canvas = inventory_charge_canvas()
+
+        def acquire(_count: int) -> None:
+            canvas.aw.prepareRoastServerInventoryCharge.assert_called_once_with()
+            canvas.profileDataSemaphore.acquired = True
+
+        canvas.profileDataSemaphore.acquire = acquire
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        canvas.aw.commitRoastServerInventoryCharge.assert_called_once_with(
+            canvas.aw.prepareRoastServerInventoryCharge.return_value)
+
+    def test_inventory_charge_no_data_returns_without_commit_or_warning(self) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.timex = []
+        canvas.temp1 = []
+        canvas.temp2 = []
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == -1
+        canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
+        canvas.aw.sendmessage.assert_called_once_with(
+            'Not enough data collected yet. Try again in a few seconds')
+
+    def test_inventory_charge_manual_cancel_returns_without_commit(self) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.aw.ser.NONE.return_value = (0.0, -1.0, 1.0)
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == -1
+        canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
+
+    def test_inventory_charge_commit_failure_leaves_event_unmarked(self) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.aw.commitRoastServerInventoryCharge.return_value = None
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID is None
+        canvas.aw.santokerWarmupController.mark_charge.assert_not_called()
+        canvas.aw.pidcontrol.pidOn.assert_not_called()
+
+    def test_inventory_charge_undo_and_remark_reuse_roast_uuid_and_link(self) -> None:
+        canvas = inventory_charge_canvas()
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+        roast_uuid = canvas.roastUUID
+        inventory_link = (
+            canvas.roastServerInventoryOrigin,
+            canvas.roastServerInventoryOrganizationUUID,
+            canvas.roastServerBeanLotUUID,
+            canvas.roastServerBeanLotName,
+        )
+        canvas.aw.buttonCHARGE.isFlat.return_value = True
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID == roast_uuid
+        assert (
+            canvas.roastServerInventoryOrigin,
+            canvas.roastServerInventoryOrganizationUUID,
+            canvas.roastServerBeanLotUUID,
+            canvas.roastServerBeanLotName,
+        ) == inventory_link
+        canvas.aw.releaseRoastServerInventory.assert_not_called()
+
+        canvas.aw.buttonCHARGE.isFlat.return_value = False
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.roastUUID == roast_uuid
+        assert canvas.aw.prepareRoastServerInventoryCharge.call_count == 2
+        assert canvas.aw.commitRoastServerInventoryCharge.call_count == 2
 
 
 class TestHeatConversion:

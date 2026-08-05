@@ -195,6 +195,8 @@ from artisanlib.atypes import ProfileData, RecentRoast
 from artisanlib.main import ApplicationWindow, UI_MODE
 from artisanlib.roastserver import dialogs as roastserver_dialogs
 from artisanlib.roastserver.contract import MAX_PROFILE_BYTES, Namespace, ServerProfileSource
+from artisanlib.roastserver.controller import ControllerError
+from artisanlib.roastserver.inventory import InventoryNotice, PreparedInventoryCharge
 from artisanlib.util import FileDestinationTransaction
 from artisanlib.util import deserialize as util_deserialize
 from artisanlib.util import serialize_with_timestamp as util_serialize_with_timestamp
@@ -4768,6 +4770,114 @@ class TestRoastServerMainIntegration:
 
     def test_inventory_profile_typed_keys_are_optional(self) -> None:
         assert set(INVENTORY_QMC_FIELDS) <= ProfileData.__optional_keys__
+
+    @staticmethod
+    def inventory_charge_window(
+        profile_link: dict[str, str] | None = INVENTORY_PROFILE_LINK,
+    ) -> ApplicationWindow:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.qmc = SimpleNamespace(
+            roastUUID='33333333333343338333333333333333',
+            weight=(1.25, 0.0, 'Kg'),
+        )
+        for name in INVENTORY_QMC_FIELDS:
+            setattr(
+                window.qmc,
+                name,
+                None if profile_link is None else profile_link[name],
+            )
+        window.roastserver_controller = Mock()
+        window.sendmessage = Mock()  # type: ignore[method-assign]
+        return window
+
+    def test_inventory_charge_prepare_builds_link_and_passes_profile_values(
+        self,
+    ) -> None:
+        window = self.inventory_charge_window()
+        prepared = Mock()
+        window.roastserver_controller.prepare_inventory_charge.return_value = prepared
+
+        assert window.prepareRoastServerInventoryCharge() is prepared
+
+        link, roast_uuid, weight, unit = (
+            window.roastserver_controller.prepare_inventory_charge.call_args.args)
+        assert link.namespace.origin == 'https://archive.example'
+        assert link.namespace.organization_id == UUID(
+            '11111111-1111-4111-8111-111111111111')
+        assert link.lot_id == UUID('22222222-2222-4222-8222-222222222222')
+        assert link.lot_name == 'Historical lot'
+        assert roast_uuid == UUID('33333333-3333-4333-8333-333333333333')
+        assert (weight, unit) == (1.25, 'Kg')
+        window.sendmessage.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ('code', 'expected'),
+        [
+            ('connector_disabled', 'Enable Roast Server or clear the selected inventory lot.'),
+            ('inventory_namespace_stale', 'Choose an inventory lot from the current Roast Server organization.'),
+            ('inventory_lot_unavailable', 'Refresh inventory and choose an available lot before CHARGE.'),
+            ('inventory_weight_invalid', 'Enter a valid positive green weight before CHARGE.'),
+            ('inventory_storage_failed', 'Inventory reservation could not be stored. CHARGE was canceled.'),
+        ],
+    )
+    def test_inventory_charge_errors_block_with_plain_status(
+        self, code: str, expected: str
+    ) -> None:
+        window = self.inventory_charge_window()
+        window.roastserver_controller.prepare_inventory_charge.side_effect = (
+            ControllerError(code))
+
+        assert window.prepareRoastServerInventoryCharge() is None
+        window.sendmessage.assert_called_once_with(expected)
+
+    def test_inventory_charge_untracked_warns_only_at_commit(self) -> None:
+        window = self.inventory_charge_window(None)
+        prepared = PreparedInventoryCharge(
+            False, None, None, None, None, None, None, False)
+        window.roastserver_controller.prepare_inventory_charge.return_value = prepared
+        window.roastserver_controller.commit_inventory_charge.return_value = InventoryNotice(
+            'inventory_untracked', None, None, None, None, None)
+        window.roastserver_controller.inventory_context.return_value.enabled = True
+
+        assert window.prepareRoastServerInventoryCharge() is prepared
+        window.sendmessage.assert_not_called()
+        assert window.commitRoastServerInventoryCharge(prepared) == ''
+        window.sendmessage.assert_called_once_with(
+            'No inventory lot selected. This roast will not be tracked in inventory.')
+
+    def test_inventory_charge_commit_returns_durable_roast_uuid(self) -> None:
+        window = self.inventory_charge_window()
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        prepared = PreparedInventoryCharge(
+            True,
+            Namespace(
+                'https://archive.example',
+                UUID('11111111-1111-4111-8111-111111111111'),
+                'https://archive.example|11111111111141118111111111111111',
+            ),
+            roast_uuid,
+            UUID('44444444-4444-4444-8444-444444444444'),
+            UUID('22222222-2222-4222-8222-222222222222'),
+            'Historical lot',
+            1250,
+            False,
+        )
+        window.roastserver_controller.commit_inventory_charge.return_value = InventoryNotice(
+            'inventory_reservation_queued', roast_uuid, prepared.reservation_uuid,
+            prepared.lot_id, None, None)
+
+        assert window.commitRoastServerInventoryCharge(prepared) == roast_uuid.hex
+        window.sendmessage.assert_not_called()
+
+    def test_inventory_charge_commit_storage_failure_blocks(self) -> None:
+        window = self.inventory_charge_window()
+        prepared = Mock()
+        window.roastserver_controller.commit_inventory_charge.side_effect = (
+            ControllerError('inventory_storage_failed'))
+
+        assert window.commitRoastServerInventoryCharge(prepared) is None
+        window.sendmessage.assert_called_once_with(
+            'Inventory reservation could not be stored. CHARGE was canceled.')
 
     def test_inventory_profile_get_and_copy_are_observationally_pure(self) -> None:
         window = ApplicationWindow.__new__(ApplicationWindow)

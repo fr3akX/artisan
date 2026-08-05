@@ -172,6 +172,7 @@ if TYPE_CHECKING:
     from artisanlib.atypes import ExtraDeviceSettings, Palette # pylint: disable=unused-import
     from artisanlib.roastserver.contract import ServerProfileSource
     from artisanlib.roastserver.controller import RoastServerController
+    from artisanlib.roastserver.inventory import PreparedInventoryCharge
     from artisanlib.roastserver.protection import ProtectionToken
     from plus.stock import Blend, BlendList
     from artisanlib.roastserver.dialogs import RoastServerBrowserDialog, RoastServerConfigDialog
@@ -4686,6 +4687,99 @@ class ApplicationWindow(QMainWindow):
             and not self.qmc.safesaveflag
             and self.roastServerRegularProfile(self.curFile)
         )
+
+    @staticmethod
+    def roastServerInventoryChargeErrorMessage(code:str) -> str:
+        messages:dict[str,str] = {
+            'connector_disabled': QApplication.translate(
+                'Message', 'Enable Roast Server or clear the selected inventory lot.'),
+            'inventory_namespace_inactive': QApplication.translate(
+                'Message', 'Choose an inventory lot from the current Roast Server organization.'),
+            'inventory_namespace_stale': QApplication.translate(
+                'Message', 'Choose an inventory lot from the current Roast Server organization.'),
+            'inventory_lot_unavailable': QApplication.translate(
+                'Message', 'Refresh inventory and choose an available lot before CHARGE.'),
+            'inventory_weight_invalid': QApplication.translate(
+                'Message', 'Enter a valid positive green weight before CHARGE.'),
+            'inventory_storage_failed': QApplication.translate(
+                'Message', 'Inventory reservation could not be stored. CHARGE was canceled.'),
+            'inventory_roast_uuid_invalid': QApplication.translate(
+                'Message', 'The current roast identifier is invalid. Reset the roast before CHARGE.'),
+            'inventory_roast_terminal': QApplication.translate(
+                'Message', 'Inventory for this roast is already complete. Reset before CHARGE.'),
+            'inventory_reservation_mismatch': QApplication.translate(
+                'Message', 'The selected inventory lot does not match this roast reservation.'),
+            'inventory_preparation_invalid': QApplication.translate(
+                'Message', 'Inventory reservation preparation expired. Try CHARGE again.'),
+        }
+        return messages.get(code, QApplication.translate(
+            'Message', 'Inventory reservation could not be prepared. CHARGE was canceled.'))
+
+    def prepareRoastServerInventoryCharge(
+        self,
+    ) -> 'PreparedInventoryCharge|None':
+        from uuid import UUID
+        from artisanlib.roastserver.controller import ControllerError
+        from artisanlib.roastserver.inventory import PreparedInventoryCharge
+
+        try:
+            link = parse_profile_link({
+                'roastServerInventoryOrigin': self.qmc.roastServerInventoryOrigin,
+                'roastServerInventoryOrganizationUUID': self.qmc.roastServerInventoryOrganizationUUID,
+                'roastServerBeanLotUUID': self.qmc.roastServerBeanLotUUID,
+                'roastServerBeanLotName': self.qmc.roastServerBeanLotName,
+            })
+        except ContractError:
+            self.sendmessage(self.roastServerInventoryChargeErrorMessage(
+                'inventory_lot_unavailable'))
+            return None
+        roast_uuid = None
+        if self.qmc.roastUUID is not None:
+            try:
+                roast_uuid = UUID(self.qmc.roastUUID)
+            except (TypeError, ValueError, AttributeError):
+                self.sendmessage(self.roastServerInventoryChargeErrorMessage(
+                    'inventory_roast_uuid_invalid'))
+                return None
+        controller = self.roastserver_controller
+        if controller is None:
+            if link is not None:
+                self.sendmessage(self.roastServerInventoryChargeErrorMessage(
+                    'connector_disabled'))
+                return None
+            return PreparedInventoryCharge(
+                False, None, None, None, None, None, None, False)
+        try:
+            return controller.prepare_inventory_charge(
+                link, roast_uuid, self.qmc.weight[0], self.qmc.weight[2])
+        except ControllerError as error:
+            self.sendmessage(self.roastServerInventoryChargeErrorMessage(str(error)))
+            return None
+
+    def commitRoastServerInventoryCharge(
+        self, prepared:'PreparedInventoryCharge'
+    ) -> str|None:
+        from artisanlib.roastserver.controller import ControllerError
+
+        controller = self.roastserver_controller
+        if controller is None:
+            return ''
+        try:
+            notice = controller.commit_inventory_charge(prepared)
+        except ControllerError as error:
+            self.sendmessage(self.roastServerInventoryChargeErrorMessage(str(error)))
+            return None
+        if notice.code == 'inventory_untracked':
+            if controller.inventory_context().enabled:
+                self.sendmessage(QApplication.translate(
+                    'Message',
+                    'No inventory lot selected. This roast will not be tracked in inventory.'))
+            return ''
+        if notice.roast_uuid is None:
+            self.sendmessage(self.roastServerInventoryChargeErrorMessage(
+                'inventory_preparation_invalid'))
+            return None
+        return notice.roast_uuid.hex
 
     @pyqtSlot()
     @pyqtSlot(bool)

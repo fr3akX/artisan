@@ -14420,6 +14420,14 @@ class tgraphcanvas(QObject):
             pass
         removed = False
         try:
+            prepared_inventory_charge = None
+            if (
+                self.flagstart
+                and not self.aw.buttonCHARGE.isFlat()
+            ):
+                prepared_inventory_charge = self.aw.prepareRoastServerInventoryCharge()
+                if prepared_inventory_charge is None:
+                    return
             self.profileDataSemaphore.acquire(1)
             if self.flagstart:
                 try:
@@ -14455,25 +14463,34 @@ class tgraphcanvas(QObject):
                             tx,et,bt = self.aw.ser.NONE()
                             if bt != 1 and et != -1:  #cancel
                                 self.drawmanual(et,bt,tx)
-                                self.timeindex[0] = len(self.timex)-1
+                                charge_idx = len(self.timex)-1
                             else:
                                 return
                         elif self.autoChargeIdx > 0:
                             # prevent CHARGE out of index:
                             if len(self.timex) > self.autoChargeIdx:
-                                self.timeindex[0] = self.autoChargeIdx
+                                charge_idx = self.autoChargeIdx
                             elif len(self.timex) > self.autoChargeIdx - 1:
                                 # not yet enough readings
-                                self.timeindex[0] = self.autoChargeIdx - 1
+                                charge_idx = self.autoChargeIdx - 1
                             else:
                                 return
                         elif len(self.timex) > 0:
-                            self.timeindex[0] = len(self.timex)-1
+                            charge_idx = len(self.timex)-1
                         else:
                             self.autoChargeIdx = 1 # set CHARGE on next (first) reading
                             message = QApplication.translate('Message','Not enough data collected yet. Try again in a few seconds')
                             self.aw.sendmessage(message)
                             return
+                        if prepared_inventory_charge is None:
+                            return
+                        inventory_roast_uuid = self.aw.commitRoastServerInventoryCharge(
+                            prepared_inventory_charge)
+                        if inventory_roast_uuid is None:
+                            return
+                        if inventory_roast_uuid:
+                            self.roastUUID = inventory_roast_uuid
+                        self.timeindex[0] = charge_idx
                         self.aw.santokerWarmupController.mark_charge()
                         self.aw.updateSantokerWarmupControls()
                         if ((self.device != 18 or self.aw.simulator is not None) and
