@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
+import json
 from pathlib import Path
 from typing import Literal, cast
 from uuid import UUID
@@ -19,10 +21,15 @@ from artisanlib.roastserver.inventory import (
 )
 from artisanlib.roastserver.inventory_contract import (
     BeanLot,
+    InventoryCommandRequest,
     InventoryProfileLink,
     profile_link_fields,
 )
-from artisanlib.roastserver.inventory_store import InventoryStore
+from artisanlib.roastserver.inventory_store import (
+    InventoryRoastState,
+    InventoryStore,
+    InventoryStoreError,
+)
 
 NOW = datetime(2026, 8, 5, 12, 0, 0, 123456, tzinfo=UTC)
 LATER = NOW + timedelta(minutes=5)
@@ -34,6 +41,7 @@ RESERVATION_UUID = UUID('55555555-5555-4555-8555-555555555555')
 CLIENT_UUID = UUID('66666666-6666-4666-8666-666666666666')
 SECOND_ROAST_UUID = UUID('77777777-7777-4777-8777-777777777777')
 SECOND_RESERVATION_UUID = UUID('88888888-8888-4888-8888-888888888888')
+OTHER_CLIENT_UUID = UUID('99999999-9999-4999-8999-999999999999')
 
 
 def namespace_for_test(origin: str, organization_uuid: UUID) -> Namespace:
@@ -282,6 +290,167 @@ def test_commit_is_durable_before_wake_and_repeated_commit_is_idempotent(
     second = coordinator.commit_charge(prepared)
     assert second.code == 'inventory_reservation_queued'
     assert wake_calls == [None]
+
+
+def test_new_preparation_replaces_pending_snapshot_and_uses_latest_client(
+    store: InventoryStore,
+) -> None:
+    wake_calls: list[None] = []
+    coordinator = InventoryCoordinator(
+        store,
+        clock=Clock(),
+        uuid_factory=SequenceFactory(RESERVATION_UUID, SECOND_RESERVATION_UUID),
+        wake=lambda: wake_calls.append(None),
+    )
+    client_b = replace(CONTEXT, client_instance_uuid=OTHER_CLIENT_UUID)
+    older = coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg')
+    latest = coordinator.prepare_charge(client_b, LINK, ROAST_UUID, 1.25, 'Kg')
+
+    assert_error(
+        'inventory_preparation_invalid', lambda: coordinator.commit_charge(older)
+    )
+    coordinator.commit_charge(latest)
+    command = store.lease_next(NAMESPACE, LATER, 60)
+    assert command is not None
+    body = json.loads(command.request_json)
+    assert body['client_instance_uuid'] == OTHER_CLIENT_UUID.hex
+    assert body['client_reservation_uuid'] == SECOND_RESERVATION_UUID.hex
+    assert wake_calls == [None]
+
+
+def test_altered_and_reconstructed_stale_preparations_are_rejected(
+    store: InventoryStore,
+) -> None:
+    coordinator = InventoryCoordinator(
+        store,
+        clock=Clock(),
+        uuid_factory=SequenceFactory(RESERVATION_UUID, SECOND_RESERVATION_UUID),
+        wake=lambda: None,
+    )
+    stale = coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg')
+    current = coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.5, 'Kg')
+    reconstructed_stale = PreparedInventoryCharge(
+        stale.tracked,
+        stale.namespace,
+        stale.roast_uuid,
+        stale.reservation_uuid,
+        stale.lot_id,
+        stale.lot_name,
+        stale.planned_grams,
+        stale.existing,
+    )
+
+    assert_error(
+        'inventory_preparation_invalid',
+        lambda: coordinator.commit_charge(reconstructed_stale),
+    )
+    assert_error(
+        'inventory_preparation_invalid',
+        lambda: coordinator.commit_charge(replace(current, planned_grams=1_499)),
+    )
+    coordinator.commit_charge(current)
+
+
+def test_untracked_prepare_and_commit_invalidate_pending_tracked_snapshot(
+    store: InventoryStore,
+) -> None:
+    coordinator = InventoryCoordinator(
+        store,
+        clock=Clock(),
+        uuid_factory=SequenceFactory(
+            RESERVATION_UUID,
+            SECOND_RESERVATION_UUID,
+            UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+        ),
+        wake=lambda: None,
+    )
+    before_untracked_prepare = coordinator.prepare_charge(
+        CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg'
+    )
+    untracked = coordinator.prepare_charge(CONTEXT, None, None, 0, 'bogus')
+    assert_error(
+        'inventory_preparation_invalid',
+        lambda: coordinator.commit_charge(before_untracked_prepare),
+    )
+
+    before_untracked_commit = coordinator.prepare_charge(
+        CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg'
+    )
+    assert coordinator.commit_charge(untracked).code == 'inventory_untracked'
+    assert_error(
+        'inventory_preparation_invalid',
+        lambda: coordinator.commit_charge(before_untracked_commit),
+    )
+
+    before_new_invalid = coordinator.prepare_charge(
+        CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg'
+    )
+    assert_error(
+        'inventory_weight_invalid',
+        lambda: coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 0, 'Kg'),
+    )
+    assert_error(
+        'inventory_preparation_invalid',
+        lambda: coordinator.commit_charge(before_new_invalid),
+    )
+
+
+def test_store_failure_retains_exact_pending_command_for_retry(
+    store: InventoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wake_calls: list[None] = []
+    coordinator = InventoryCoordinator(
+        store,
+        clock=Clock(),
+        uuid_factory=SequenceFactory(RESERVATION_UUID),
+        wake=lambda: wake_calls.append(None),
+    )
+    prepared = coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg')
+    requests: list[InventoryCommandRequest] = []
+    transaction_times: list[datetime] = []
+    enqueue_reserve = store.enqueue_reserve
+
+    def fail_once(
+        namespace: Namespace,
+        request: InventoryCommandRequest,
+        lot_name: str,
+        now: datetime,
+    ) -> InventoryRoastState:
+        requests.append(request)
+        transaction_times.append(now)
+        if len(requests) == 1:
+            raise InventoryStoreError('sensitive injected failure')
+        return enqueue_reserve(namespace, request, lot_name, now)
+
+    monkeypatch.setattr(store, 'enqueue_reserve', fail_once)
+
+    assert_error(
+        'inventory_storage_failed', lambda: coordinator.commit_charge(prepared)
+    )
+    assert wake_calls == []
+    coordinator.commit_charge(prepared)
+
+    assert len(requests) == 2
+    assert requests[1] is requests[0]
+    assert requests[1].request_json == requests[0].request_json
+    assert requests[1].idempotency_key == requests[0].idempotency_key
+    assert transaction_times == [NOW, NOW + timedelta(seconds=1)]
+    command = store.lease_next(NAMESPACE, LATER, 60)
+    assert command is not None
+    assert command.request_json == requests[0].request_json
+    assert wake_calls == [None]
+
+
+def test_successful_and_durable_commits_clear_pending_snapshot(
+    coordinator: InventoryCoordinator,
+) -> None:
+    prepared = coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg')
+    coordinator.commit_charge(prepared)
+    assert coordinator._pending_charge is None
+
+    coordinator.commit_charge(prepared)
+    assert coordinator._pending_charge is None
 
 
 def test_undo_and_recharge_reuse_existing_reservation(

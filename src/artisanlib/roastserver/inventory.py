@@ -38,6 +38,7 @@ from artisanlib.roastserver.contract import ContractError, Namespace
 from artisanlib.roastserver.inventory_contract import (
     BeanLot,
     InventoryBalance,
+    InventoryCommandRequest,
     InventoryProfileLink,
     build_finalize_request,
     build_release_request,
@@ -91,6 +92,13 @@ class InventoryCoordinatorError(RuntimeError):
         super().__init__(code)
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingInventoryCharge:
+    prepared: PreparedInventoryCharge
+    client_instance_uuid: UUID
+    request: InventoryCommandRequest | None = None
+
+
 class InventoryCoordinator:
     def __init__(
         self,
@@ -104,7 +112,7 @@ class InventoryCoordinator:
         self._clock = clock
         self._uuid_factory = uuid_factory
         self._wake = wake
-        self._prepared_clients: dict[tuple[Namespace, UUID], UUID] = {}
+        self._pending_charge: _PendingInventoryCharge | None = None
 
     def prepare_charge(
         self,
@@ -114,6 +122,7 @@ class InventoryCoordinator:
         green_weight: object,
         weight_unit: object,
     ) -> PreparedInventoryCharge:
+        self._pending_charge = None
         if link is None:
             return PreparedInventoryCharge(
                 False, None, None, None, None, None, None, False
@@ -150,10 +159,7 @@ class InventoryCoordinator:
 
         selected_roast_uuid = roast_uuid or self._new_uuid()
         reservation_uuid = self._new_uuid()
-        self._prepared_clients[(link.namespace, selected_roast_uuid)] = (
-            context.client_instance_uuid
-        )
-        return PreparedInventoryCharge(
+        prepared = PreparedInventoryCharge(
             True,
             link.namespace,
             selected_roast_uuid,
@@ -163,11 +169,16 @@ class InventoryCoordinator:
             planned_grams,
             False,
         )
+        self._pending_charge = _PendingInventoryCharge(
+            prepared, context.client_instance_uuid
+        )
+        return prepared
 
     def commit_charge(
         self, prepared: PreparedInventoryCharge
     ) -> InventoryNotice:
         if not prepared.tracked:
+            self._pending_charge = None
             return InventoryNotice(
                 'inventory_untracked', None, None, None, None, None
             )
@@ -177,26 +188,32 @@ class InventoryCoordinator:
         existing = self._roast_state(namespace, roast_uuid)
         if existing is not None:
             self._require_prepared_matches_state(prepared, existing)
-            self._prepared_clients.pop((namespace, roast_uuid), None)
+            self._pending_charge = None
             return self._notice(self._reservation_notice_code(existing), existing)
 
-        client_instance_uuid = self._prepared_clients.get((namespace, roast_uuid))
-        if client_instance_uuid is None:
+        pending = self._pending_charge
+        if pending is None or pending.prepared != prepared:
             raise InventoryCoordinatorError('inventory_preparation_invalid')
         try:
             now = self._clock()
-            request = build_reserve_request(
-                client_instance_uuid=client_instance_uuid,
-                reservation_uuid=reservation_uuid,
-                roast_uuid=roast_uuid,
-                lot_id=lot_id,
-                planned_grams=planned_grams,
-                occurred_at=now,
-            )
+            request = pending.request
+            if request is None:
+                request = build_reserve_request(
+                    client_instance_uuid=pending.client_instance_uuid,
+                    reservation_uuid=reservation_uuid,
+                    roast_uuid=roast_uuid,
+                    lot_id=lot_id,
+                    planned_grams=planned_grams,
+                    occurred_at=now,
+                )
+                pending = _PendingInventoryCharge(
+                    pending.prepared, pending.client_instance_uuid, request
+                )
+                self._pending_charge = pending
             state = self._store.enqueue_reserve(namespace, request, lot_name, now)
         except (InventoryStoreError, ValueError):
             raise InventoryCoordinatorError('inventory_storage_failed') from None
-        self._prepared_clients.pop((namespace, roast_uuid), None)
+        self._pending_charge = None
         self._wake()
         return self._notice('inventory_reservation_queued', state)
 
