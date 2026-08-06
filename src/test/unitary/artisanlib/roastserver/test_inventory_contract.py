@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import math
+import subprocess
 import sys
-from types import MappingProxyType, ModuleType
+from types import MappingProxyType
 from uuid import UUID
 
 import pytest
 
 from artisanlib.roastserver import InventoryCommandRequest as ExportedInventoryCommandRequest
+from artisanlib.roastserver import inventory_contract as inventory_contract_module
 from artisanlib.roastserver.contract import (
     ContractError,
     FAILURE_MESSAGES,
@@ -17,6 +20,7 @@ from artisanlib.roastserver.contract import (
     FailureKind,
     Namespace,
 )
+from artisanlib.weight import convertWeight, weight_units
 from artisanlib.roastserver.inventory_contract import (
     MAX_CACHED_LOTS,
     MAX_INVENTORY_CURSOR_CHARS,
@@ -530,18 +534,46 @@ def test_green_weight_supports_every_unit_and_rounds_half_up() -> None:
     assert green_weight_grams(0.0004, 'Kg') is None
 
 
-def test_green_weight_conversion_ignores_collection_time_module_replacement(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    replacement = ModuleType('artisanlib.util')
-    replacement.weight_units = ['g', 'kg', 'oz', 'lb']  # type: ignore[attr-defined]
-    replacement.convertWeight = lambda *_args: 500.0  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, 'artisanlib.util', replacement)
+def test_inventory_weight_conversion_names_are_canonical() -> None:
+    assert inventory_contract_module.weight_units is weight_units
+    assert inventory_contract_module.convertWeight is convertWeight
 
-    assert green_weight_grams(1, 'g') == 1
+
+@pytest.mark.parametrize(
+    ('value', 'unit'),
+    ((2.5, 'g'), (1.0005, 'Kg'), (1.0, 'lb'), (1.0, 'oz')),
+)
+def test_green_weight_matches_canonical_conversion(value: float, unit: str) -> None:
+    grams = convertWeight(value, weight_units.index(unit), weight_units.index('g'))
+    expected = int(Decimal(str(grams)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
+    assert green_weight_grams(value, unit) == expected
+
+
+def test_green_weight_canonical_conversion_preserves_half_overflow_and_errors() -> None:
     assert green_weight_grams(1.0005, 'Kg') == 1001
-    assert green_weight_grams(1, 'lb') == 454
-    assert green_weight_grams(1, 'oz') == 28
+    assert green_weight_grams(POSTGRESQL_INTEGER_MAX + 0.5, 'g') is None
+    assert green_weight_grams(1, 'kg') is None
+    with pytest.raises(IndexError, match=r'^index error in convertWeight\(1,-1,0\)$'):
+        convertWeight(1, -1, 0)
+
+
+def test_inventory_contract_import_boundary_excludes_util_qt_plus_network_and_keyring() -> None:
+    script = r'''
+import sys
+from artisanlib.roastserver.inventory_contract import green_weight_grams
+assert green_weight_grams(1, 'g') == 1
+blocked = ('artisanlib.util', 'PyQt6', 'plus', 'requests', 'keyring')
+assert not any(name == blocked[0] or name.startswith(blocked[1:]) for name in sys.modules)
+'''
+    completed = subprocess.run(
+        [sys.executable, '-c', script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize(

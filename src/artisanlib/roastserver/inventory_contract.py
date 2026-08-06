@@ -51,6 +51,7 @@ from artisanlib.roastserver.contract import (
     parse_error_envelope,
 )
 from artisanlib.roastserver.origin import SettingsError, canonical_origin
+from artisanlib.weight import convertWeight, weight_units
 
 MAX_INVENTORY_CURSOR_CHARS: Final[int] = 4096
 MAX_INVENTORY_PAGES: Final[int] = 100
@@ -63,12 +64,6 @@ _MAX_DESCRIPTOR_CODE_POINTS: Final[int] = 100
 _MAX_DESCRIPTOR_BYTES: Final[int] = 400
 _MAX_VARIETALS: Final[int] = 16
 _MIN_SIGNED_GRAMS: Final[int] = -POSTGRESQL_INTEGER_MAX
-_GRAMS_PER_WEIGHT_UNIT: Final[dict[str, float]] = {
-    'g': 1.0,
-    'Kg': 1000.0,
-    'lb': 1 / (2.20462262185 / 1000),
-    'oz': 1000 / (2.20462262185 * 16),
-}
 _CANONICAL_TIMESTAMP_RE: Final[re.Pattern[str]] = re.compile(
     r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$'
 )
@@ -728,10 +723,10 @@ def green_weight_grams(value: object, unit: object) -> int | None:
         not math.isfinite(number)
         or number <= 0
         or not isinstance(unit, str)
-        or unit not in _GRAMS_PER_WEIGHT_UNIT
+        or unit not in weight_units
     ):
         return None
-    grams = number * _GRAMS_PER_WEIGHT_UNIT[unit]
+    grams = convertWeight(number, weight_units.index(unit), weight_units.index('g'))
     try:
         rounded = int(
             Decimal(str(grams)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)

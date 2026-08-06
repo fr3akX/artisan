@@ -1239,6 +1239,13 @@ def test_float2floatWeightVolume(value: float, expected: float) -> None:
     assert float2floatWeightVolume(value) == expected
 
 
+def test_util_weight_conversion_names_are_canonical() -> None:
+    from artisanlib import util, weight
+
+    assert util.weight_units is weight.weight_units
+    assert util.convertWeight is weight.convertWeight
+
+
 @pytest.mark.parametrize(
     'amount,from_unit,to_unit,expected_result,tolerance',
     [
