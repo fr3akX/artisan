@@ -25,22 +25,29 @@ from collections.abc import Callable, Generator
 from datetime import UTC, datetime
 import inspect
 from pathlib import Path
+import sys
 import threading
 import time
-from typing import cast, override
+from types import ModuleType
+from typing import Any, cast, override
+from unittest.mock import Mock
 from uuid import UUID
 
+from PyQt6 import sip
 from PyQt6.QtCore import QCoreApplication, QObject, QSettings, pyqtSignal, pyqtSlot
 from PyQt6.QtTest import QSignalSpy
 import pytest
 
 from artisanlib.atypes import ProfileData
-from artisanlib.roastserver.api import ClientFactory
+from artisanlib.roastserver.api import ApiFailure, ClientFactory
 from artisanlib.roastserver.cache import CacheStore
 from artisanlib.roastserver.contract import (
+    FAILURE_MESSAGES,
+    FailureKind,
     IdentityOrganization,
     IdentityUser,
     Namespace,
+    PublicFailure,
     ServerIdentity,
 )
 from artisanlib.roastserver.controller import ControllerError, RoastServerController
@@ -51,7 +58,20 @@ from artisanlib.roastserver.inventory import (
     InventoryNotice,
     PreparedInventoryCharge,
 )
-from artisanlib.roastserver.inventory_contract import BeanLot, InventoryProfileLink
+from artisanlib.roastserver.inventory_contract import (
+    BeanLot,
+    BeanLotPage,
+    InventoryBalance,
+    InventoryCommandRequest,
+    InventoryConflict,
+    InventoryMutationResult,
+    InventoryProfileLink,
+    InventoryReservation,
+    build_finalize_request,
+    build_release_request,
+    build_reserve_request,
+    profile_link_fields,
+)
 from artisanlib.roastserver.inventory_store import (
     FailedInventoryCommand,
     InterruptedReservation,
@@ -363,6 +383,154 @@ class Harness:
         self.app.processEvents()
 
 
+class FakeLifecycleCredentials:
+    def get(self, origin: str) -> str | None:
+        assert origin == ORIGIN
+        return 'fake-only-credential'
+
+
+class FakeLifecycleServer:
+    def __init__(self) -> None:
+        self.fail_authentication = False
+        self.active_operations = 0
+        self.maximum_active_operations = 0
+        self.requests: list[InventoryCommandRequest] = []
+        self.list_calls: list[tuple[str | None, int]] = []
+        self._server_reservation_id = UUID('77777777-7777-4777-8777-777777777777')
+        self._ledger_id = UUID('88888888-8888-4888-8888-888888888888')
+        self._conflict_id = UUID('99999999-9999-4999-8999-999999999999')
+
+    def __call__(self, origin: str, credential: str) -> FakeLifecycleServer:
+        assert origin == ORIGIN
+        assert credential == 'fake-only-credential'
+        return self
+
+    def __enter__(self) -> FakeLifecycleServer:
+        self.active_operations += 1
+        self.maximum_active_operations = max(
+            self.maximum_active_operations, self.active_operations
+        )
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.active_operations -= 1
+
+    def test_connection(self) -> ServerIdentity:
+        if self.fail_authentication:
+            raise ApiFailure(
+                PublicFailure(
+                    FailureKind.OFFLINE,
+                    'connection_error',
+                    FAILURE_MESSAGES[FailureKind.OFFLINE],
+                    True,
+                ),
+                None,
+                None,
+            )
+        return IDENTITY
+
+    def list_inventory_lots(
+        self, cursor: str | None = None, limit: int = 100
+    ) -> BeanLotPage:
+        self.list_calls.append((cursor, limit))
+        return BeanLotPage((LOT,), None)
+
+    def execute_inventory_command(
+        self, request: InventoryCommandRequest
+    ) -> InventoryMutationResult:
+        self.requests.append(request)
+        operation = request.operation
+        state = {
+            'reserve': 'reserved',
+            'finalize': 'finalized',
+            'release': 'released',
+        }[operation]
+        actual_grams = 450 if operation == 'finalize' else None
+        conflict = operation == 'finalize'
+        completed_at = None if operation == 'reserve' else NOW
+        return InventoryMutationResult(
+            InventoryReservation(
+                self._server_reservation_id,
+                request.reservation_uuid,
+                request.lot_id,
+                request.roast_uuid,
+                request.client_instance_uuid,
+                cast(Any, state),
+                500,
+                actual_grams,
+                NOW,
+                completed_at,
+                NOW,
+                NOW,
+                self._conflict_id if conflict else None,
+            ),
+            InventoryBalance(
+                request.lot_id,
+                1_000 if operation != 'finalize' else 550,
+                500 if operation == 'reserve' else 0,
+                500 if operation == 'reserve' else (550 if operation == 'finalize' else 1_000),
+                1 if conflict else 0,
+            ),
+            (
+                InventoryConflict(
+                    self._conflict_id,
+                    request.lot_id,
+                    self._ledger_id,
+                    request.roast_uuid,
+                    self._server_reservation_id,
+                    'consumption',
+                    -1,
+                    'open',
+                    None,
+                    None,
+                    None,
+                    NOW,
+                )
+                if conflict
+                else None
+            ),
+            False,
+        )
+
+
+def lifecycle_controller(
+    tmp_path: Path,
+    server: FakeLifecycleServer,
+    stores: list[InventoryStore],
+) -> RoastServerController:
+    settings = SettingsStore(
+        QSettings(str(tmp_path / 'lifecycle.ini'), QSettings.Format.IniFormat)
+    )
+    settings.set_origin(ORIGIN)
+    settings.save_connection(ORIGIN, IDENTITY)
+    settings.save_options(True, False, 64 * 1024 * 1024)
+
+    def store_factory(root: Path) -> InventoryStore:
+        value = InventoryStore(root)
+        stores.append(value)
+        return value
+
+    return RoastServerController(
+        settings=settings,
+        credentials=cast(CredentialStore, FakeLifecycleCredentials()),
+        data_root=tmp_path / 'data',
+        client_factory=cast(ClientFactory, server),
+        profile_validator=lambda _path: None,
+        inventory_store_factory=store_factory,
+        clock=lambda: NOW,
+    )
+
+
+def wait_for(app: QCoreApplication, predicate: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + 5
+    while not predicate():
+        app.processEvents()
+        if time.monotonic() >= deadline:
+            raise AssertionError('bounded lifecycle event wait timed out')
+        time.sleep(0.002)
+    app.processEvents()
+
+
 @pytest.fixture(scope='module')
 def qcoreapplication() -> Generator[QCoreApplication]:
     app = QCoreApplication.instance() or QCoreApplication([])
@@ -398,6 +566,174 @@ def test_inventory_controller_exposes_public_signals() -> None:
         'inventoryFailedChanged', 'inventoryRecoveryRequired', 'inventoryConflict',
     ):
         assert hasattr(RoastServerController, signal)
+
+
+def test_real_controller_fake_server_inventory_lifecycle_is_serial_and_leak_free(
+    tmp_path: Path,
+    qcoreapplication: QCoreApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plus_calls = [Mock(), Mock(), Mock(), Mock()]
+    plus_package = ModuleType('plus')
+    plus_package.__path__ = []
+    plus_register = ModuleType('plus.register')
+    plus_register.addPath = plus_calls[0]  # type: ignore[attr-defined]
+    plus_register.getPath = plus_calls[1]  # type: ignore[attr-defined]
+    plus_sync = ModuleType('plus.sync')
+    plus_sync.sync = plus_calls[2]  # type: ignore[attr-defined]
+    plus_controller = ModuleType('plus.controller')
+    plus_controller.updateSyncRecordHashAndSync = plus_calls[3]  # type: ignore[attr-defined]
+    for name, module in (
+        ('plus', plus_package),
+        ('plus.register', plus_register),
+        ('plus.sync', plus_sync),
+        ('plus.controller', plus_controller),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+    server = FakeLifecycleServer()
+    stores: list[InventoryStore] = []
+    controller = lifecycle_controller(tmp_path / 'finalize-run', server, stores)
+    online = QSignalSpy(controller.onlineChanged)
+    conflicts = QSignalSpy(controller.inventoryConflict)
+    controller.start()
+    wait_for(
+        qcoreapplication,
+        lambda: any(bool(online[index][0]) for index in range(len(online))),
+    )
+
+    refresh_id = controller.refresh_inventory_lots()
+    wait_for(qcoreapplication, lambda: controller.inventory_lots() == (LOT,))
+    assert server.list_calls == [(None, 100)]
+    link = InventoryProfileLink(NAMESPACE, LOT_ID, LOT.name)
+
+    server.fail_authentication = True
+    controller.apply_options(ORIGIN, True, False, 64 * 1024 * 1024)
+    wait_for(qcoreapplication, lambda: bool(online) and not bool(online[-1][0]))
+    prepared = controller.prepare_inventory_charge(link, None, 500, 'g')
+    queued = controller.commit_inventory_charge(prepared)
+    assert queued.code == 'inventory_reservation_queued'
+    roast_uuid = prepared.roast_uuid
+    reservation_uuid = prepared.reservation_uuid
+    assert roast_uuid is not None
+    assert reservation_uuid is not None
+    assert server.requests == []
+
+    expected_reserve = build_reserve_request(
+        client_instance_uuid=controller.inventory_context().client_instance_uuid,
+        reservation_uuid=reservation_uuid,
+        roast_uuid=roast_uuid,
+        lot_id=LOT_ID,
+        planned_grams=500,
+        occurred_at=NOW,
+    )
+    server.fail_authentication = False
+    controller.apply_options(ORIGIN, True, False, 64 * 1024 * 1024)
+    wait_for(
+        qcoreapplication,
+        lambda: (
+            (state := stores[0].roast_state(NAMESPACE, roast_uuid)) is not None
+            and state.lifecycle == 'reserved'
+        ),
+    )
+    assert server.requests == [expected_reserve]
+
+    profile = cast(
+        ProfileData,
+        {
+            'roastUUID': roast_uuid.hex,
+            'timeindex': [0],
+            'weight': [450, 0, 'g'],
+            **profile_link_fields(link),
+        },
+    )
+    finalized = controller.finalize_inventory_profile(profile)
+    assert finalized is not None and finalized.code == 'inventory_finalization_queued'
+    expected_finalize = build_finalize_request(
+        client_instance_uuid=controller.inventory_context().client_instance_uuid,
+        reservation_uuid=reservation_uuid,
+        roast_uuid=roast_uuid,
+        lot_id=LOT_ID,
+        planned_grams=500,
+        actual_grams=450,
+        occurred_at=NOW,
+    )
+    wait_for(
+        qcoreapplication,
+        lambda: (
+            (state := stores[0].roast_state(NAMESPACE, roast_uuid)) is not None
+            and state.lifecycle == 'finalized'
+        ),
+    )
+    wait_for(qcoreapplication, lambda: len(conflicts) == 1)
+    assert server.requests == [expected_reserve, expected_finalize]
+    assert list(conflicts[-1])[0].conflict_id == server._conflict_id
+    assert refresh_id not in controller._inventory_refresh_requests
+    worker = controller._worker_object
+    assert controller.shutdown(5_000)
+    qcoreapplication.processEvents()
+    assert not controller.worker_thread_running
+    assert sip.isdeleted(worker)
+    assert all(store._connection is None for store in stores)
+
+    release_stores: list[InventoryStore] = []
+    release_controller = lifecycle_controller(
+        tmp_path / 'release-run', server, release_stores
+    )
+    release_controller.start()
+    release_controller.refresh_inventory_lots()
+    wait_for(qcoreapplication, lambda: release_controller.inventory_lots() == (LOT,))
+    release_prepared = release_controller.prepare_inventory_charge(link, None, 500, 'g')
+    release_controller.commit_inventory_charge(release_prepared)
+    release_roast_uuid = release_prepared.roast_uuid
+    release_reservation_uuid = release_prepared.reservation_uuid
+    assert release_roast_uuid is not None
+    assert release_reservation_uuid is not None
+    wait_for(
+        qcoreapplication,
+        lambda: (
+            (
+                state := release_stores[0].roast_state(
+                    NAMESPACE, release_roast_uuid
+                )
+            )
+            is not None
+            and state.lifecycle == 'reserved'
+        ),
+    )
+    released = release_controller.release_inventory_roast(release_roast_uuid)
+    assert released is not None and released.code == 'inventory_release_queued'
+    expected_release = build_release_request(
+        client_instance_uuid=release_controller.inventory_context().client_instance_uuid,
+        reservation_uuid=release_reservation_uuid,
+        roast_uuid=release_roast_uuid,
+        lot_id=LOT_ID,
+        planned_grams=500,
+        occurred_at=NOW,
+    )
+    wait_for(
+        qcoreapplication,
+        lambda: (
+            (
+                state := release_stores[0].roast_state(
+                    NAMESPACE, release_roast_uuid
+                )
+            )
+            is not None
+            and state.lifecycle == 'released'
+        ),
+    )
+    assert server.requests[-1] == expected_release
+    release_worker = release_controller._worker_object
+    assert release_controller.shutdown(5_000)
+    qcoreapplication.processEvents()
+
+    assert server.maximum_active_operations == 1
+    assert server.active_operations == 0
+    assert not release_controller.worker_thread_running
+    assert sip.isdeleted(release_worker)
+    assert all(store._connection is None for store in release_stores)
+    assert all(call.call_count == 0 for call in plus_calls)
 
 
 def test_two_stores_share_root_and_ui_owns_outer_lifetime(harness: Harness) -> None:

@@ -434,6 +434,7 @@ class InventoryStore:
             connection: sqlite3.Connection | None = None
             try:
                 secure_filesystem.prepare_private_root(self.root)
+                secure_filesystem.verify_private_permissions(self.root, 0o700)
                 with self._filesystem_lock():
                     self._secure_database_files_before_connect()
                     connection = sqlite3.connect(

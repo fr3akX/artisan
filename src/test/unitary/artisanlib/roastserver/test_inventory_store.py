@@ -10,7 +10,12 @@ from pathlib import Path
 import queue
 import sqlite3
 import stat
+import subprocess
+import sys
+import textwrap
 import threading
+import time
+from types import SimpleNamespace
 from typing import Any, cast, override
 from uuid import UUID
 
@@ -124,6 +129,97 @@ def lot(
         reserved_grams=reserved_grams,
         available_grams=available_grams,
         unresolved_conflict_count=0,
+    )
+
+
+class PortableWindowsInventoryNative:
+    def __init__(self) -> None:
+        self.reparse_path: Path | None = None
+        self.inherited_path: Path | None = None
+        self.permission_checks: list[tuple[Path, int]] = []
+
+    def open_readonly(self, path: Path, *, directory: bool = False) -> int:
+        if path == self.reparse_path:
+            raise OSError('injected reparse point')
+        flags = os.O_RDONLY
+        if directory:
+            flags |= getattr(os, 'O_DIRECTORY', 0)
+        return os.open(path, flags)
+
+    @staticmethod
+    def open_lock(path: Path) -> int:
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+    def set_private_permissions(self, path: Path, mode: int) -> None:
+        os.chmod(path, mode)
+
+    def verify_private_permissions(self, path: Path, mode: int) -> None:
+        self.permission_checks.append((path, mode))
+        if path == self.inherited_path:
+            raise OSError('injected inherited DACL')
+        if stat.S_IMODE(path.stat().st_mode) != mode:
+            raise OSError('injected ACL mismatch')
+
+    @staticmethod
+    def flush(descriptor: int, *, directory: bool) -> None:
+        del directory
+        os.fsync(descriptor)
+
+    @staticmethod
+    def flush_directory(_path: Path) -> None:
+        pass
+
+    @staticmethod
+    def publish(source: Path, destination: Path) -> None:
+        os.rename(source, destination)
+
+    @staticmethod
+    def replace(source: Path, destination: Path) -> None:
+        os.replace(source, destination)
+
+    @staticmethod
+    def replace_with_backup(
+        replacement: Path, destination: Path, backup: Path
+    ) -> None:
+        os.replace(destination, backup)
+        os.replace(replacement, destination)
+
+    @staticmethod
+    def move_no_replace(source: Path, destination: Path) -> None:
+        if destination.exists():
+            raise FileExistsError
+        os.rename(source, destination)
+
+    @staticmethod
+    def unlink(path: Path) -> None:
+        path.unlink()
+
+    @staticmethod
+    def unlink_if_identity(path: Path, expected_identity: tuple[int, int]) -> bool:
+        path_stat = path.stat()
+        if (path_stat.st_dev, path_stat.st_ino) != expected_identity:
+            return False
+        path.unlink()
+        return True
+
+
+def enable_portable_windows_filesystem(
+    monkeypatch: pytest.MonkeyPatch, native: PortableWindowsInventoryNative
+) -> None:
+    original_import = store_module.secure_filesystem.importlib.import_module
+    fake_msvcrt = SimpleNamespace(
+        LK_LOCK=1,
+        LK_NBLCK=2,
+        LK_UNLCK=3,
+        locking=lambda *_args: None,
+    )
+    monkeypatch.setattr(store_module.secure_filesystem, '_IS_WINDOWS', True)
+    monkeypatch.setattr(store_module.secure_filesystem, '_HAS_DIRECTORY_FDS', False)
+    monkeypatch.setattr(store_module.secure_filesystem, '_WINDOWS_NATIVE', native)
+    monkeypatch.setattr(
+        store_module.secure_filesystem.importlib,
+        'import_module',
+        lambda name: fake_msvcrt if name == 'msvcrt' else original_import(name),
     )
 
 
@@ -1025,6 +1121,73 @@ def test_pause_resume_preserves_namespace_and_derives_lifecycle(
     assert store.roast_state(NAMESPACE, ROAST_UUID).lifecycle == 'paused'  # type: ignore[union-attr]
 
 
+def test_portable_windows_store_fails_closed_on_inherited_private_dacl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'inventory'
+    root.mkdir()
+    native = PortableWindowsInventoryNative()
+    native.inherited_path = root
+    enable_portable_windows_filesystem(monkeypatch, native)
+
+    with pytest.raises(InventoryStoreError, match='inventory storage operation failed'):
+        opened_store(root)
+    assert native.permission_checks == [(root, 0o700)]
+
+
+@pytest.mark.parametrize('suffix', ['', '-wal', '-shm'], ids=['database', 'wal', 'shm'])
+def test_portable_windows_store_rejects_database_reparse_points(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    root = tmp_path / 'inventory'
+    bootstrap = opened_store(root)
+    bootstrap.close()
+    reparse_path = Path(f'{database_path(root)}{suffix}')
+    if suffix:
+        reparse_path.write_bytes(b'injected')
+    native = PortableWindowsInventoryNative()
+    native.reparse_path = reparse_path
+    enable_portable_windows_filesystem(monkeypatch, native)
+
+    with pytest.raises(InventoryStoreError, match='inventory storage operation failed'):
+        opened_store(root)
+
+
+@pytest.mark.win32
+@pytest.mark.skipif(os.name != 'nt', reason='requires native Windows ACL behavior')
+def test_windows_runtime_store_applies_private_protected_dacls(tmp_path: Path) -> None:
+    root = tmp_path / 'inventory'
+    value = opened_store(root)
+    try:
+        secure = store_module.secure_filesystem
+        secure.verify_private_permissions(root, 0o700)
+        secure.verify_private_permissions(database_path(root), 0o600)
+    finally:
+        value.close()
+
+
+@pytest.mark.win32
+@pytest.mark.skipif(os.name != 'nt', reason='requires native Windows reparse behavior')
+@pytest.mark.parametrize('suffix', ['', '-wal', '-shm'], ids=['database', 'wal', 'shm'])
+def test_windows_runtime_store_rejects_database_reparse_points(
+    tmp_path: Path, suffix: str
+) -> None:
+    root = tmp_path / 'inventory'
+    bootstrap = opened_store(root)
+    bootstrap.close()
+    path = Path(f'{database_path(root)}{suffix}')
+    target = tmp_path / f'target{suffix or ".db"}'
+    target.write_bytes(b'not inventory data')
+    if path.exists():
+        path.unlink()
+    try:
+        path.symlink_to(target)
+    except OSError:
+        pytest.skip('Windows reparse-point creation unavailable')
+    with pytest.raises(InventoryStoreError, match='inventory storage operation failed'):
+        opened_store(root)
+
+
 def test_restart_recovery_and_interrupted_reservation_discovery(tmp_path: Path) -> None:
     root = tmp_path / 'inventory'
     first = opened_store(root)
@@ -1052,6 +1215,23 @@ def test_restart_recovery_and_interrupted_reservation_discovery(tmp_path: Path) 
         assert reopened.interrupted_reservations() == ()
     finally:
         reopened.close()
+
+
+@pytest.mark.win32
+@pytest.mark.skipif(os.name != 'nt', reason='requires native Windows restart behavior')
+def test_windows_runtime_restart_recovers_expired_inventory_lease(tmp_path: Path) -> None:
+    root = tmp_path / 'inventory'
+    first = opened_store(root)
+    first.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    assert first.lease_next(NAMESPACE, NOW, 30) is not None
+    first.close()
+
+    restarted = opened_store(root)
+    try:
+        assert restarted.recover_expired_leases(NOW + timedelta(seconds=30)) == 1
+        assert restarted.counts(NAMESPACE).pending == 1
+    finally:
+        restarted.close()
 
 
 def test_completed_history_prunes_only_old_terminal_roasts(
@@ -1083,6 +1263,179 @@ def test_completed_history_prunes_only_old_terminal_roasts(
     )
     store.enqueue_reserve(NAMESPACE, later_request, 'Lot', NOW + timedelta(days=30))
     assert store.counts(NAMESPACE).complete == 0
+
+
+_CROSS_PROCESS_SCRIPT = r'''
+from datetime import UTC, datetime, timedelta
+import hashlib
+import json
+from pathlib import Path
+import sys
+import time
+from uuid import UUID
+
+from artisanlib.roastserver.contract import Namespace
+from artisanlib.roastserver.inventory_contract import (
+    BeanLot, build_finalize_request, build_release_request, build_reserve_request,
+)
+from artisanlib.roastserver.inventory_store import InventoryStore, InventoryStoreError
+
+root = Path(sys.argv[1])
+action = sys.argv[2]
+label = sys.argv[3]
+gate = Path(sys.argv[4])
+now = datetime(2026, 8, 5, 12, 0, 0, 123456, tzinfo=UTC)
+later = now + timedelta(hours=1)
+lot_id = UUID('11111111-1111-4111-8111-111111111111')
+organization_id = UUID('33333333-3333-4333-8333-333333333333')
+roast_id = UUID('55555555-5555-4555-8555-555555555555')
+reservation_id = UUID('66666666-6666-4666-8666-666666666666')
+client_id = UUID('77777777-7777-4777-8777-777777777777')
+origin = 'https://archive.example'
+digest = hashlib.sha256(f'{origin}\n{organization_id}'.encode()).hexdigest()
+namespace = Namespace(origin, organization_id, f'namespace-sha256:{digest}')
+reserve = build_reserve_request(
+    client_instance_uuid=client_id, reservation_uuid=reservation_id,
+    roast_uuid=roast_id, lot_id=lot_id, planned_grams=1_250, occurred_at=now,
+)
+finalize = build_finalize_request(
+    client_instance_uuid=client_id, reservation_uuid=reservation_id,
+    roast_uuid=roast_id, lot_id=lot_id, planned_grams=1_250,
+    actual_grams=1_200, occurred_at=later,
+)
+release = build_release_request(
+    client_instance_uuid=client_id, reservation_uuid=reservation_id,
+    roast_uuid=roast_id, lot_id=lot_id, planned_grams=1_250, occurred_at=later,
+)
+store = InventoryStore(root)
+store.open()
+Path(f'{gate}.{label}.ready').touch()
+while not gate.exists():
+    time.sleep(0.001)
+try:
+    if action == 'replace':
+        amount = 2_000 if label == 'first' else 3_000
+        store.replace_lots(
+            namespace,
+            (BeanLot(lot_id, label, None, (), None, None, amount, 0, amount, 0),),
+            now,
+        )
+        result = label
+    elif action == 'reserve':
+        result = store.enqueue_reserve(namespace, reserve, 'Lot', now).reservation_uuid.hex
+    elif action == 'finalize':
+        store.enqueue_finalize(namespace, finalize, 1_200, later)
+        result = 'finalize'
+    elif action == 'release':
+        store.enqueue_release(namespace, release, later)
+        result = 'release'
+    elif action == 'lease':
+        command = store.lease_next(namespace, now, 30)
+        result = None if command is None else command.id
+    else:
+        raise AssertionError(action)
+except InventoryStoreError:
+    result = 'rejected'
+finally:
+    store.close()
+print(json.dumps(result))
+'''
+
+
+def run_cross_process_pair(
+    root: Path, first_action: str, second_action: str
+) -> tuple[object, object]:
+    gate = root.parent / f'{first_action}-{second_action}.gate'
+    environment = os.environ.copy()
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                '-c',
+                textwrap.dedent(_CROSS_PROCESS_SCRIPT),
+                str(root),
+                action,
+                label,
+                str(gate),
+            ],
+            cwd=Path.cwd(),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for action, label in ((first_action, 'first'), (second_action, 'second'))
+    ]
+    deadline = time.monotonic() + 10
+    ready = tuple(Path(f'{gate}.{label}.ready') for label in ('first', 'second'))
+    while not all(path.exists() for path in ready):
+        if time.monotonic() >= deadline:
+            for process in processes:
+                process.kill()
+            outputs = [process.communicate() for process in processes]
+            raise AssertionError(f'cross-process workers did not become ready: {outputs!r}')
+        time.sleep(0.005)
+    gate.touch()
+    results: list[object] = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == 0, stderr
+        results.append(__import__('json').loads(stdout.strip().splitlines()[-1]))
+    return results[0], results[1]
+
+
+def test_cross_process_cache_replacement_publishes_one_complete_generation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'inventory'
+    bootstrap = opened_store(root)
+    bootstrap.close()
+
+    assert set(run_cross_process_pair(root, 'replace', 'replace')) == {'first', 'second'}
+
+    reopened = opened_store(root)
+    try:
+        snapshot = reopened.cache_snapshot(NAMESPACE)
+        assert len(snapshot.lots) == 1
+        cached = snapshot.lots[0]
+        assert (cached.name, cached.on_hand_grams) in {('first', 2_000), ('second', 3_000)}
+        assert cached.available_grams == cached.on_hand_grams
+    finally:
+        reopened.close()
+
+
+def test_cross_process_reserve_lease_recovery_and_terminal_intent_are_serialized(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'inventory'
+    bootstrap = opened_store(root)
+    bootstrap.close()
+
+    reserve_results = run_cross_process_pair(root, 'reserve', 'reserve')
+    assert reserve_results == (RESERVATION_UUID.hex, RESERVATION_UUID.hex)
+
+    lease_result, rejected_lease = run_cross_process_pair(root, 'lease', 'lease')
+    assert sorted((lease_result is None, rejected_lease is None)) == [False, True]
+    reopened = opened_store(root)
+    try:
+        assert reopened.recover_expired_leases(NOW + timedelta(seconds=30)) == 1
+        assert reopened.counts(NAMESPACE).pending == 1
+    finally:
+        reopened.close()
+
+    terminal_results = run_cross_process_pair(root, 'finalize', 'release')
+    assert sorted(cast(tuple[str, str], terminal_results)) in [
+        ['finalize', 'rejected'],
+        ['rejected', 'release'],
+    ]
+    reopened = opened_store(root)
+    try:
+        state = reopened.roast_state(NAMESPACE, ROAST_UUID)
+        assert state is not None
+        assert state.terminal_intent in {'finalize', 'release'}
+        assert reopened.counts(NAMESPACE).pending == 2
+    finally:
+        reopened.close()
 
 
 def test_two_store_reserve_and_terminal_intent_races_are_serialized(
