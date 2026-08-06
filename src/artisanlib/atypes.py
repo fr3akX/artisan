@@ -164,6 +164,10 @@ class ProfileData(TypedDict, total=False):
     plus_blend_label: str
     plus_blend_spec: 'BlendList'
     plus_blend_spec_labels: list[str]
+    roastServerInventoryOrigin: str
+    roastServerInventoryOrganizationUUID: str
+    roastServerBeanLotUUID: str
+    roastServerBeanLotName: str
     beans: str
     weight: list[float|str] # NOTE: internally weight is a typed tuple
     end_weight_est: int

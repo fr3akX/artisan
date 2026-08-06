@@ -36,8 +36,8 @@ from datetime import UTC, datetime
 import logging
 import os
 from pathlib import Path
-from typing import Final, Protocol, cast, override
-from uuid import UUID
+from typing import Final, Literal, Protocol, cast, override
+from uuid import UUID, uuid4
 
 from PyQt6.QtCore import QByteArray, QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 
@@ -62,6 +62,23 @@ from artisanlib.roastserver.contract import (
     ServerProfileSource,
     validate_archive_filters,
 )
+from artisanlib.roastserver.inventory import (
+    InventoryContext,
+    InventoryCoordinator,
+    InventoryCoordinatorError,
+    InventoryNotice,
+    PreparedInventoryCharge,
+)
+from artisanlib.roastserver.inventory_contract import BeanLot, InventoryProfileLink
+from artisanlib.roastserver.inventory_store import (
+    FailedInventoryCommand,
+    InterruptedReservation,
+    InventoryQueueCounts,
+    InventoryRoastState,
+    InventoryStore,
+    InventoryStoreError,
+    LotCacheSnapshot,
+)
 from artisanlib.roastserver.origin import SettingsError, canonical_origin
 from artisanlib.roastserver.outbox import FailedJob, Outbox, QueueCounts
 from artisanlib.roastserver.protection import ProtectionRegistry, ProtectionToken
@@ -81,6 +98,8 @@ from artisanlib.roastserver.worker import (
     ConfigurationFence,
     ConnectionTestRequest,
     OnlineOpenRequest,
+    InventoryRefreshRequest,
+    InventoryWorkerEvent,
     OpenCancellationToken,
     OpaqueVault,
     PendingConnectionRecovery,
@@ -110,6 +129,7 @@ _SETTLEMENT_MESSAGE: Final[str] = 'Roast Server credential rollback is still set
 _ROLLBACK_SETTLEMENT_TIMEOUT_MS: Final[int] = 15_000
 _MAX_ARCHIVE_ROWS: Final[int] = 5_000
 _MAX_READY_CACHE_PATHS: Final[int] = 8
+_MAX_STALE_INVENTORY_REFRESHES: Final[int] = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +201,8 @@ class _Signal(Protocol):
 type WorkerFactory = Callable[..., QObject]
 type OutboxFactory = Callable[[Path, Callable[[], datetime]], Outbox]
 type CacheFactory = Callable[[Path], CacheStore]
+type InventoryStoreFactory = Callable[[Path], InventoryStore]
+type InventoryCoordinatorFactory = Callable[..., InventoryCoordinator]
 
 
 class RoastServerController(QObject):
@@ -196,6 +218,13 @@ class RoastServerController(QObject):
     operationFailed = pyqtSignal(str, object)
     onlineChanged = pyqtSignal(bool)
     profileReady = pyqtSignal(str, object)
+    inventoryLotsChanged = pyqtSignal(object)
+    inventoryRefreshFinished = pyqtSignal(str)
+    inventoryStateChanged = pyqtSignal(object)
+    inventoryQueueChanged = pyqtSignal(object)
+    inventoryFailedChanged = pyqtSignal(object)
+    inventoryRecoveryRequired = pyqtSignal(object)
+    inventoryConflict = pyqtSignal(object)
 
     _configureWorker = pyqtSignal(object)
     _testWorker = pyqtSignal(str)
@@ -216,6 +245,9 @@ class RoastServerController(QObject):
     _discardWorker = pyqtSignal(str)
     _protectWorker = pyqtSignal(str)
     _clearWorker = pyqtSignal(str)
+    _refreshInventoryWorker = pyqtSignal(str)
+    _retryInventoryWorker = pyqtSignal(str)
+    _wakeInventoryWorker = pyqtSignal()
     _stopWorker = pyqtSignal()
 
     def __init__(
@@ -233,6 +265,8 @@ class RoastServerController(QObject):
         worker_factory: WorkerFactory = RoastServerWorker,
         outbox_factory: OutboxFactory = Outbox,
         cache_factory: CacheFactory = CacheStore,
+        inventory_store_factory: InventoryStoreFactory = InventoryStore,
+        inventory_coordinator_factory: InventoryCoordinatorFactory = InventoryCoordinator,
         clock: Callable[[], datetime] | None = None,
         parent: QObject | None = None,
     ) -> None:
@@ -278,6 +312,10 @@ class RoastServerController(QObject):
         self._open_cache_paths: set[Path] = set()
         self._current_open_cache_path: Path | None = None
         self._current_open_cache_source: ServerProfileSource | None = None
+        self._inventory_generation: int | None = None
+        self._inventory_refresh_requests: dict[str, tuple[int, Namespace]] = {}
+        self._stale_inventory_refresh_requests: OrderedDict[str, None] = OrderedDict()
+        self._inventory_store_open = False
         self._started = False
         self._stop_requested = False
         self._shutdown_complete = False
@@ -285,9 +323,19 @@ class RoastServerController(QObject):
         root = _absolute_path(data_root)
         outbox = outbox_factory(root / 'outbox', self._clock)
         cache = cache_factory(root / 'cache')
+        inventory_root = root / 'inventory'
+        self._inventory_store = inventory_store_factory(inventory_root)
+        worker_inventory_store = inventory_store_factory(inventory_root)
+        self._inventory_coordinator = inventory_coordinator_factory(
+            self._inventory_store,
+            clock=self._clock,
+            uuid_factory=uuid4,
+            wake=self._wakeInventoryWorker.emit,
+        )
         worker_object = worker_factory(
             outbox=outbox,
             cache=cache,
+            inventory_store=worker_inventory_store,
             credentials=credentials,
             client_factory=client_factory,
             clock=self._clock,
@@ -344,6 +392,9 @@ class RoastServerController(QObject):
         _connect(self._discardWorker, worker.discard_staged, queued)
         _connect(self._protectWorker, worker.update_protected_paths, queued)
         _connect(self._clearWorker, worker.clear_unused, queued)
+        _connect(self._refreshInventoryWorker, worker.refresh_inventory, queued)
+        _connect(self._retryInventoryWorker, worker.retry_inventory_command, queued)
+        _connect(self._wakeInventoryWorker, worker.wake_inventory, queued)
         _connect(self._stopWorker, worker.stop, queued)
 
         _connect(worker.connectionTested, self._on_connection_tested, queued)
@@ -372,6 +423,19 @@ class RoastServerController(QObject):
         _connect(worker.cachedFallbackReady, self._on_cached_fallback, queued)
         _connect(worker.cachePublished, self._on_cache_published, queued)
         _connect(worker.onlineChanged, self._on_online_changed, queued)
+        _connect(worker.inventoryLotsChanged, self._on_inventory_lots_changed, queued)
+        _connect(worker.inventoryQueueChanged, self._on_inventory_queue_changed, queued)
+        _connect(worker.inventoryFailedChanged, self._on_inventory_failed_changed, queued)
+        _connect(
+            worker.inventoryReservationChanged,
+            self._on_inventory_reservation_changed,
+            queued,
+        )
+        _connect(
+            worker.inventoryRecoveryChanged,
+            self._on_inventory_recovery_changed,
+            queued,
+        )
         _connect(worker.stopped, worker_object.deleteLater, direct)
         _connect(worker.stopped, self._thread.quit, direct)
         self._thread.started.connect(worker.start)
@@ -380,8 +444,19 @@ class RoastServerController(QObject):
         self._require_ui_thread()
         if self._started or self._shutdown_complete or self._stop_requested:
             return
+        try:
+            self._inventory_store.open()
+        except InventoryStoreError:
+            raise ControllerError('inventory_storage_failed') from None
+        self._inventory_store_open = True
+        self._emit_inventory_snapshots()
         self._started = True
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception as error:
+            self._started = False
+            self._close_inventory_store()
+            raise ControllerError('worker_start_failed') from error
         self._queue_configuration(self._configuration(), authorize_startup=True)
         self.settingsChanged.emit(self._settings)
         self.identityChanged.emit(self._identity)
@@ -390,15 +465,18 @@ class RoastServerController(QObject):
         self._require_ui_thread()
         if type(timeout_ms) is not int or timeout_ms < 0:
             raise ControllerError(_INVALID_REQUEST_MESSAGE)
-        if self._shutdown_complete or (self._started and not self._thread.isRunning()):
-            self._shutdown_complete = True
+        if self._shutdown_complete:
             return True
+        if self._started and not self._thread.isRunning():
+            closed = self._close_inventory_store()
+            self._shutdown_complete = closed
+            return closed
         if not self._started:
             self._credential_vault.clear()
             self._profile_vault.clear()
             self._command_vault.clear()
-            self._shutdown_complete = True
-            return True
+            self._shutdown_complete = self._close_inventory_store()
+            return self._shutdown_complete
         if not self._stop_requested:
             self._stop_requested = True
             self._thread.requestInterruption()
@@ -412,8 +490,183 @@ class RoastServerController(QObject):
         if not stopped:
             _log.error(SHUTDOWN_TIMEOUT_MESSAGE)
             return False
+        if not self._close_inventory_store():
+            return False
         self._shutdown_complete = True
         return True
+
+    def inventory_context(self) -> InventoryContext:
+        self._require_ui_thread()
+        namespace = self._configured_namespace(require_enabled=False)
+        return InventoryContext(
+            origin=self._settings.origin,
+            namespace=namespace,
+            enabled=(
+                self._settings.enabled
+                and self._settings.pending_connection is None
+            ),
+            previously_authenticated=namespace is not None,
+            client_instance_uuid=self._settings.client_instance_uuid,
+        )
+
+    def inventory_cache_snapshot(self) -> LotCacheSnapshot | None:
+        self._require_ui_thread()
+        namespace = self.inventory_context().namespace
+        if namespace is None:
+            return None
+        try:
+            return self._inventory_store.cache_snapshot(namespace)
+        except InventoryStoreError:
+            raise ControllerError('inventory_storage_failed') from None
+
+    def inventory_lots(self) -> tuple[BeanLot, ...]:
+        snapshot = self.inventory_cache_snapshot()
+        return () if snapshot is None else snapshot.lots
+
+    def refresh_inventory_lots(self) -> str:
+        self._require_command_state()
+        context = self.inventory_context()
+        generation = self._inventory_generation
+        if not context.enabled:
+            raise ControllerError('connector_disabled')
+        if (
+            context.namespace is None
+            or not context.previously_authenticated
+            or generation is None
+        ):
+            raise ControllerError('inventory_namespace_inactive')
+        refresh_context = (generation, context.namespace)
+        for request_id, tracked_context in self._inventory_refresh_requests.items():
+            if tracked_context == refresh_context:
+                return request_id
+        self._invalidate_inventory_refreshes()
+        request_id = self._put_command(
+            InventoryRefreshRequest(context.namespace, generation)
+        )
+        self._inventory_refresh_requests[request_id] = (
+            generation,
+            context.namespace,
+        )
+        self._refreshInventoryWorker.emit(request_id)
+        return request_id
+
+    def inventory_lot_locked(
+        self,
+        link: InventoryProfileLink | None,
+        roast_uuid: UUID | None,
+        profile_has_charge: bool,
+    ) -> bool:
+        self._require_ui_thread()
+        if link is None:
+            return False
+        try:
+            return self._inventory_coordinator.is_locked(
+                link.namespace, roast_uuid, profile_has_charge
+            )
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def prepare_inventory_charge(
+        self,
+        link: InventoryProfileLink | None,
+        roast_uuid: UUID | None,
+        weight: object,
+        unit: object,
+    ) -> PreparedInventoryCharge:
+        self._require_command_state()
+        try:
+            return self._inventory_coordinator.prepare_charge(
+                self.inventory_context(), link, roast_uuid, weight, unit
+            )
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def commit_inventory_charge(
+        self, prepared: PreparedInventoryCharge
+    ) -> InventoryNotice:
+        self._require_command_state()
+        try:
+            notice = self._inventory_coordinator.commit_charge(prepared)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+        self._emit_inventory_notice_state(notice)
+        self._emit_inventory_snapshots()
+        return notice
+
+    def finalize_inventory_profile(
+        self, profile: ProfileData
+    ) -> InventoryNotice | None:
+        self._require_command_state()
+        try:
+            notice = self._inventory_coordinator.finalize_saved_profile(
+                self.inventory_context(), profile
+            )
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+        if notice is not None:
+            self._emit_inventory_notice_state(notice)
+            self._emit_inventory_snapshots()
+        return notice
+
+    def release_inventory_roast(
+        self, roast_uuid: UUID | None
+    ) -> InventoryNotice | None:
+        self._require_command_state()
+        try:
+            notice = self._inventory_coordinator.release_for_reset(
+                self.inventory_context(), roast_uuid
+            )
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+        if notice is not None:
+            self._emit_inventory_notice_state(notice)
+            self._emit_inventory_snapshots()
+        return notice
+
+    def resolve_interrupted_inventory(
+        self,
+        roast_uuid: UUID,
+        action: Literal['finalize', 'release', 'keep'],
+    ) -> InventoryNotice:
+        self._require_command_state()
+        context = self.inventory_context()
+        if context.namespace is None or not context.enabled:
+            raise ControllerError('inventory_namespace_inactive')
+        try:
+            active = tuple(
+                item
+                for item in self._inventory_store.interrupted_reservations()
+                if item.roast_uuid == roast_uuid
+                and item.namespace == context.namespace
+            )
+            if len(active) != 1:
+                raise ControllerError('inventory_recovery_unavailable')
+            notice = self._inventory_coordinator.resolve_interrupted(
+                context, roast_uuid, action
+            )
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+        except InventoryStoreError:
+            raise ControllerError('inventory_storage_failed') from None
+        self._emit_inventory_notice_state(notice)
+        self._emit_inventory_snapshots()
+        return notice
+
+    def retry_inventory_command(self, command_id: str) -> None:
+        self._require_command_state()
+        context = self.inventory_context()
+        if context.namespace is None or not context.enabled:
+            raise ControllerError('inventory_namespace_inactive')
+        try:
+            actionable = any(
+                item.id == command_id
+                for item in self._inventory_store.failed_commands(context.namespace)
+            )
+        except InventoryStoreError:
+            raise ControllerError('inventory_storage_failed') from None
+        if not actionable:
+            raise ControllerError('inventory_command_unavailable')
+        self._retryInventoryWorker.emit(command_id)
 
     def test_connection(self, origin: str, candidate: str) -> str:
         self._require_command_state()
@@ -1239,6 +1492,23 @@ class RoastServerController(QObject):
     def _on_operation_failed(self, operation: str, value: object) -> None:
         if self._stop_requested:
             return
+        if isinstance(value, InventoryWorkerEvent):
+            context = self.inventory_context()
+            if (
+                value.generation != self._inventory_generation
+                or value.namespace != context.namespace
+            ):
+                return
+            value = value.value
+        if operation in self._stale_inventory_refresh_requests:
+            self._stale_inventory_refresh_requests.pop(operation, None)
+            return
+        refresh = self._inventory_refresh_requests.pop(operation, None)
+        if refresh is not None and refresh != (
+            self._inventory_generation,
+            self.inventory_context().namespace,
+        ):
+            return
         if not isinstance(value, PublicFailure):
             failure = _failure(FailureKind.INVALID_RESPONSE)
         else:
@@ -1531,6 +1801,95 @@ class RoastServerController(QObject):
         if not self._stop_requested and type(value) is bool:
             self.onlineChanged.emit(value)
 
+    @pyqtSlot(object)
+    def _on_inventory_lots_changed(self, value: object) -> None:
+        if self._stop_requested or not isinstance(value, InventoryWorkerEvent):
+            return
+        snapshot = value.value
+        if not isinstance(snapshot, LotCacheSnapshot):
+            return
+        context = self.inventory_context()
+        if (
+            value.generation != self._inventory_generation
+            or value.namespace != context.namespace
+            or snapshot.namespace != value.namespace
+        ):
+            return
+        completed_refresh = self._complete_inventory_refresh(value)
+        self.inventoryLotsChanged.emit(snapshot.lots)
+        if completed_refresh is not None:
+            self.inventoryRefreshFinished.emit(completed_refresh)
+
+    @pyqtSlot(object)
+    def _on_inventory_queue_changed(self, value: object) -> None:
+        if (
+            self._stop_requested
+            or not isinstance(value, InventoryWorkerEvent)
+            or not isinstance(value.value, InventoryQueueCounts)
+        ):
+            return
+        namespace = self.inventory_context().namespace
+        try:
+            counts = (
+                InventoryQueueCounts(0, 0, 0, 0, 0)
+                if namespace is None
+                else self._inventory_store.counts(namespace)
+            )
+        except InventoryStoreError:
+            return
+        self.inventoryQueueChanged.emit(counts)
+
+    @pyqtSlot(object)
+    def _on_inventory_failed_changed(self, value: object) -> None:
+        if (
+            self._stop_requested
+            or not isinstance(value, InventoryWorkerEvent)
+            or not isinstance(value.value, tuple)
+            or not all(
+                isinstance(item, FailedInventoryCommand) for item in value.value
+            )
+        ):
+            return
+        try:
+            current = self._inventory_store.all_failed_commands()
+        except InventoryStoreError:
+            return
+        self.inventoryFailedChanged.emit(current)
+
+    @pyqtSlot(object)
+    def _on_inventory_reservation_changed(self, value: object) -> None:
+        if self._stop_requested or not isinstance(value, InventoryWorkerEvent):
+            return
+        state = value.value
+        if not isinstance(state, InventoryRoastState):
+            return
+        if (
+            value.generation != self._inventory_generation
+            or value.namespace != self.inventory_context().namespace
+            or state.namespace != value.namespace
+        ):
+            return
+        self.inventoryStateChanged.emit(state)
+        if state.conflict_id is not None:
+            self.inventoryConflict.emit(state)
+
+    @pyqtSlot(object)
+    def _on_inventory_recovery_changed(self, value: object) -> None:
+        if (
+            self._stop_requested
+            or not isinstance(value, InventoryWorkerEvent)
+            or not isinstance(value.value, tuple)
+            or not all(
+                isinstance(item, InterruptedReservation) for item in value.value
+            )
+        ):
+            return
+        try:
+            recovery = self._inventory_store.interrupted_reservations()
+        except InventoryStoreError:
+            return
+        self.inventoryRecoveryRequired.emit(recovery)
+
     def _emit_profile_ready(self, cached: CachedRevision, *, stale: bool) -> None:
         source = replace(cached.source, stale=stale)
         path = _absolute_path(cached.path)
@@ -1627,18 +1986,21 @@ class RoastServerController(QObject):
         authorize_startup: bool = False,
         generation: int | None = None,
     ) -> None:
+        self._invalidate_inventory_refreshes()
         selected_generation = (
             self._configuration_fence.advance()
             if generation is None
             else generation
         )
         queued = replace(configuration, generation=selected_generation)
+        self._inventory_generation = selected_generation
         self._latest_configuration_validation = queued.validation_id
         self._authorized_startup_validation = (
             queued.validation_id if authorize_startup else None
         )
         self._configureWorker.emit(queued)
         self._queue_protected_paths(queued.namespace)
+        self._emit_inventory_snapshots()
 
     def _queue_current_protected_paths(self) -> None:
         configuration = self._configuration()
@@ -1834,12 +2196,75 @@ class RoastServerController(QObject):
         )
 
     def _invalidate_requests(self) -> None:
+        self._invalidate_inventory_refreshes()
         self._connection_tests.clear()
         self._active_connection_test = None
         self._credential_removals.clear()
         self._activation_previous.clear()
         self._rollback_settlements.clear()
         self._invalidate_archive_state()
+
+    def _invalidate_inventory_refreshes(self) -> None:
+        for request_id in tuple(self._inventory_refresh_requests):
+            self._take_queued_command(request_id)
+            self._stale_inventory_refresh_requests[request_id] = None
+            self._stale_inventory_refresh_requests.move_to_end(request_id)
+        self._inventory_refresh_requests.clear()
+        while len(self._stale_inventory_refresh_requests) > _MAX_STALE_INVENTORY_REFRESHES:
+            self._stale_inventory_refresh_requests.popitem(last=False)
+
+    def _complete_inventory_refresh(self, event: InventoryWorkerEvent) -> str | None:
+        request_id = event.refresh_id
+        if request_id is None:
+            return None
+        tracked = self._inventory_refresh_requests.get(request_id)
+        if tracked != (event.generation, event.namespace):
+            return None
+        self._inventory_refresh_requests.pop(request_id, None)
+        return request_id
+
+    def _emit_inventory_notice_state(self, notice: InventoryNotice) -> None:
+        namespace = self.inventory_context().namespace
+        roast_uuid = notice.roast_uuid
+        if namespace is None or roast_uuid is None:
+            return
+        try:
+            state = self._inventory_store.roast_state(namespace, roast_uuid)
+        except (InventoryStoreError, ValueError):
+            return
+        if state is not None:
+            self.inventoryStateChanged.emit(state)
+            if state.conflict_id is not None:
+                self.inventoryConflict.emit(state)
+
+    def _emit_inventory_snapshots(self) -> None:
+        namespace = self.inventory_context().namespace
+        try:
+            recovery = self._inventory_store.interrupted_reservations()
+            failed = self._inventory_store.all_failed_commands()
+            if namespace is None:
+                lots: tuple[BeanLot, ...] = ()
+                counts = InventoryQueueCounts(0, 0, 0, 0, 0)
+            else:
+                lots = self._inventory_store.cached_lots(namespace)
+                counts = self._inventory_store.counts(namespace)
+        except InventoryStoreError:
+            return
+        self.inventoryLotsChanged.emit(lots)
+        self.inventoryQueueChanged.emit(counts)
+        self.inventoryFailedChanged.emit(failed)
+        self.inventoryRecoveryRequired.emit(recovery)
+
+    def _close_inventory_store(self) -> bool:
+        if not self._inventory_store_open:
+            return True
+        try:
+            self._inventory_store.close()
+        except InventoryStoreError:
+            _log.error('Roast Server inventory store did not close cleanly.')
+            return False
+        self._inventory_store_open = False
+        return True
 
     def _disallow_configuration_proof(self) -> None:
         self._latest_configuration_validation = None

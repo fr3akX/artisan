@@ -21,6 +21,14 @@ from artisanlib.main import ApplicationWindow
 from artisanlib.santoker_warmup import SantokerWarmupController
 from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
+INVENTORY_SELECTION = (
+    'https://inventory.example.test',
+    '11111111111141118111111111111111',
+    '22222222222242228222222222222222',
+    'Fixture lot',
+)
+INVENTORY_ROAST_UUID = '33333333333343338333333333333333'
+
 
 def parse_ini_array(value: str) -> list[str]:
     return next(csv.reader([value], skipinitialspace=True))
@@ -252,6 +260,8 @@ def compact_window(
         buttonStates=[],
         setExtraEventButtonStyleSignal=Mock(),
         reportSantokerWarmupResult=Mock(),
+        prepareRoastServerInventoryCharge=Mock(return_value=object()),
+        commitRoastServerInventoryCharge=Mock(return_value=''),
         sendmessage=Mock(),
     )
     window.santokerWarmupButtonStateSignal = ImmediateBoolSignal(
@@ -346,6 +356,7 @@ def successful_reset_canvas(
     window.updatePlusStatus = Mock()
     window.announce_current_ui_mode = Mock()
     window.autoAdjustAxis = Mock()
+    window.releaseRoastServerInventory = Mock(return_value=True)
 
     canvas = SimpleNamespace(
         aw=window,
@@ -359,6 +370,11 @@ def successful_reset_canvas(
         flagKeepON=False,
         weight=(0.0, 0.0, 'g'),
         volume=(0.0, 0.0, 'l'),
+        roastServerInventoryOrigin=INVENTORY_SELECTION[0],
+        roastServerInventoryOrganizationUUID=INVENTORY_SELECTION[1],
+        roastServerBeanLotUUID=INVENTORY_SELECTION[2],
+        roastServerBeanLotName=INVENTORY_SELECTION[3],
+        roastUUID=INVENTORY_ROAST_UUID,
         density_roasted=(0.0, 0.0, 1, 0.0),
         timex=[],
         timeindex=[0],
@@ -941,6 +957,13 @@ def test_successful_reset_clears_charge_latch_after_profile_unlock(
     assert not controller.is_charge_latched()
     assert controls.button.isEnabled() is enabled_after_reset
     assert not controls.button.isChecked()
+    assert (
+        canvas.roastServerInventoryOrigin,
+        canvas.roastServerInventoryOrganizationUUID,
+        canvas.roastServerBeanLotUUID,
+        canvas.roastServerBeanLotName,
+    ) == INVENTORY_SELECTION
+    canvas.aw.releaseRoastServerInventory.assert_called_once_with(INVENTORY_ROAST_UUID)
     canvas.adderror.assert_not_called()
 
 
@@ -970,6 +993,13 @@ def test_caught_reset_exception_does_not_clear_charge_latch(
     assert controller.is_charge_latched()
     assert 'reset-charge' not in trace
     assert 'controls-refreshed' not in trace
+    assert (
+        canvas.roastServerInventoryOrigin,
+        canvas.roastServerInventoryOrganizationUUID,
+        canvas.roastServerBeanLotUUID,
+        canvas.roastServerBeanLotName,
+    ) == INVENTORY_SELECTION
+    canvas.aw.releaseRoastServerInventory.assert_called_once_with(INVENTORY_ROAST_UUID)
     canvas.adderror.assert_called_once()
 
 
@@ -1000,6 +1030,13 @@ def test_uncaught_reset_exception_does_not_clear_charge_latch(
     assert controller.is_charge_latched()
     assert 'reset-charge' not in trace
     assert 'controls-refreshed' not in trace
+    assert (
+        canvas.roastServerInventoryOrigin,
+        canvas.roastServerInventoryOrganizationUUID,
+        canvas.roastServerBeanLotUUID,
+        canvas.roastServerBeanLotName,
+    ) == INVENTORY_SELECTION
+    canvas.aw.releaseRoastServerInventory.assert_called_once_with(INVENTORY_ROAST_UUID)
 
 
 def test_cancelled_reset_does_not_clear_charge_latch(
@@ -1105,6 +1142,8 @@ def test_rejected_charge_does_not_set_latch(
         ser=SimpleNamespace(NONE=Mock(return_value=manual_reading)),
         santokerWarmupController=controller,
         updateSantokerWarmupControls=Mock(),
+        prepareRoastServerInventoryCharge=Mock(return_value=object()),
+        commitRoastServerInventoryCharge=Mock(return_value=''),
         sendmessage=Mock(),
     )
     canvas = SimpleNamespace(

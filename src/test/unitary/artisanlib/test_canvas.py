@@ -71,8 +71,9 @@ modules with Qt dependencies and complex canvas/graphics operations.
 import os
 import sys
 from collections.abc import Generator
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import hypothesis.strategies as st
 import numpy as np
@@ -1159,6 +1160,406 @@ class TestEventValueConversions:
 
         # Act & Assert
         assert canvas.str2eventsvalue('  10  ') == 2.0  # Should strip whitespace
+
+
+class ChargeSemaphore:
+    def __init__(self, acquired: bool = False) -> None:
+        self.acquired = acquired
+        self.acquire_calls = 0
+        self.release_calls = 0
+
+    def acquire(self, _count: int) -> None:
+        self.acquire_calls += 1
+        self.acquired = True
+
+    def available(self) -> int:
+        return 0 if self.acquired else 1
+
+    def release(self, _count: int) -> None:
+        self.release_calls += 1
+        self.acquired = False
+
+
+class ChargeCurve:
+    def __init__(self, x_values: list[float], y_values: list[float]) -> None:
+        self.data = (list(x_values), list(y_values))
+
+    def get_data(self) -> tuple[list[float], list[float]]:
+        return self.data
+
+    def set_data(self, x_values: list[float], y_values: list[float]) -> None:
+        self.data = (list(x_values), list(y_values))
+
+
+def inventory_charge_canvas() -> SimpleNamespace:
+    aw = MagicMock()
+    aw.ntb._nav_stack.return_value = False
+    aw.buttonCHARGE.isFlat.return_value = False
+    aw.arabicReshape.side_effect = lambda text: text
+    aw.eventslidervisibilities = [False, False, False, False]
+    aw.simulator = None
+    aw.pidcontrol.pidOnCHARGE = False
+    prepared = object()
+    aw.prepareRoastServerInventoryCharge.return_value = prepared
+    aw.commitRoastServerInventoryCharge.return_value = (
+        '33333333333343338333333333333333')
+    return SimpleNamespace(
+        aw=aw,
+        profileDataSemaphore=ChargeSemaphore(),
+        flagstart=True,
+        fileDirtySignal=MagicMock(),
+        timeindex=[-1, 0, 0, 0, 0, 0, 0, 0],
+        autoChargeIdx=-1,
+        device=0,
+        timex=[0.0],
+        temp1=[100.0],
+        temp2=[90.0],
+        roastUUID=None,
+        roastServerInventoryOrigin='https://archive.example',
+        roastServerInventoryOrganizationUUID='11111111111141118111111111111111',
+        roastServerBeanLotUUID='22222222222242228222222222222222',
+        roastServerBeanLotName='Historical lot',
+        chargeTimerPeriod=0,
+        locktimex=False,
+        locktimex_start=0.0,
+        chargemintime=0.0,
+        startofx=0.0,
+        fixmaxtime=False,
+        endofx=100.0,
+        resetmaxtime=100.0,
+        BTcurve=False,
+        ETcurve=False,
+        updateProjection=Mock(),
+        xaxistosm=Mock(),
+        EventRecordAction=Mock(),
+        timealign=Mock(),
+        buttonactions=[0],
+        buttonactionstrings=[''],
+        LCDdecimalplaces=False,
+        mode='C',
+        roastpropertiesAutoOpenFlag=False,
+        l_annotations=[],
+        l_annotations_dict={},
+        ystep_down=0,
+        ystep_up=0,
+        adderror=Mock(),
+        _tgraphcanvas__dijkstra_to_ascii=lambda text: text,
+    )
+
+
+def inventory_reset_canvas() -> SimpleNamespace:
+    aw = MagicMock()
+    aw.centralWidget.return_value = None
+    aw.releaseRoastServerInventory.return_value = True
+    return SimpleNamespace(
+        aw=aw,
+        checkSaved=Mock(return_value=True),
+        roastUUID='33333333333343338333333333333333',
+        roastServerInventoryOrigin='https://archive.example',
+        roastServerInventoryOrganizationUUID='11111111111141118111111111111111',
+        roastServerBeanLotUUID='22222222222242228222222222222222',
+        roastServerBeanLotName='Historical lot',
+    )
+
+
+def successful_inventory_reset_canvas() -> MagicMock:
+    canvas = MagicMock()
+    canvas.aw = MagicMock()
+    canvas.aw.centralWidget.return_value = None
+    canvas.aw.releaseRoastServerInventory.return_value = True
+    canvas.aw.qmc = canvas
+    canvas.checkSaved.return_value = True
+    canvas.roastUUID = '33333333333343338333333333333333'
+    canvas.roastServerInventoryOrigin = 'https://archive.example'
+    canvas.roastServerInventoryOrganizationUUID = '11111111111141118111111111111111'
+    canvas.roastServerBeanLotUUID = '22222222222242228222222222222222'
+    canvas.roastServerBeanLotName = 'Historical lot'
+    canvas.designerflag = False
+    canvas.profileDataSemaphore.available.return_value = 1
+    canvas.batchprefix = ''
+    canvas.roastpropertiesflag = False
+    canvas.weight = (1.25, 0.5, 'Kg')
+    canvas.volume = (1.0, 0.5, 'l')
+    canvas.density_roasted = (0.0, 'g', 1, 'l')
+    canvas.timex = []
+    canvas.flagon = True
+    canvas.meterreads_default = {}
+    canvas.flavorlabels = []
+    canvas.analyzer_connect_id = None
+    canvas.crossmarker = False
+    canvas.backgroundprofile = None
+    canvas.alarmflag = []
+    canvas.autotimex = True
+    canvas.background = True
+    canvas.endofx = 60.0
+    return canvas
+
+
+class TestInventoryReset:
+    def test_inventory_reset_cancel_does_not_release(self) -> None:
+        canvas = inventory_reset_canvas()
+        canvas.checkSaved.return_value = False
+
+        assert not tgraphcanvas.reset(canvas)
+
+        canvas.aw.releaseRoastServerInventory.assert_not_called()
+        assert canvas.roastUUID == '33333333333343338333333333333333'
+
+    def test_inventory_reset_release_failure_blocks_before_profile_mutation(
+        self,
+    ) -> None:
+        canvas = inventory_reset_canvas()
+        canvas.aw.releaseRoastServerInventory.return_value = False
+
+        assert not tgraphcanvas.reset(canvas)
+
+        canvas.aw.releaseRoastServerInventory.assert_called_once_with(
+            '33333333333343338333333333333333')
+        assert canvas.roastUUID == '33333333333343338333333333333333'
+        assert canvas.roastServerBeanLotUUID == '22222222222242228222222222222222'
+        canvas.aw.restoreExtraDeviceSettingsBackup.assert_not_called()
+        canvas.aw.sendmessage.assert_called_once_with(
+            'Inventory release could not be stored. Reset was canceled.')
+
+    def test_inventory_reset_retains_selection_but_clears_roast_uuid(self) -> None:
+        canvas = successful_inventory_reset_canvas()
+
+        def release(roast_uuid: str) -> bool:
+            assert roast_uuid == '33333333333343338333333333333333'
+            assert canvas.roastUUID == roast_uuid
+            return True
+
+        canvas.aw.releaseRoastServerInventory.side_effect = release
+        assert tgraphcanvas.reset(
+            canvas, redraw=False, soundOn=False, fireResetAction=False)
+
+        canvas.aw.releaseRoastServerInventory.assert_called_once_with(
+            '33333333333343338333333333333333')
+        assert canvas.roastUUID is None
+        assert canvas.roastServerInventoryOrigin == 'https://archive.example'
+        assert (
+            canvas.roastServerInventoryOrganizationUUID
+            == '11111111111141118111111111111111'
+        )
+        assert canvas.roastServerBeanLotUUID == '22222222222242228222222222222222'
+        assert canvas.roastServerBeanLotName == 'Historical lot'
+
+
+class TestInventoryCharge:
+    def test_inventory_charge_commit_precedes_event(self) -> None:
+        canvas = inventory_charge_canvas()
+        ordered = Mock(return_value=None)
+        canvas.aw.commitRoastServerInventoryCharge.side_effect = (
+            lambda _prepared: ordered('inventory', canvas.timeindex[0])
+            or '33333333333343338333333333333333')
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert ordered.call_args.args == ('inventory', -1)
+        assert canvas.timeindex[0] == 0
+        assert canvas.roastUUID == '33333333333343338333333333333333'
+        canvas.aw.prepareRoastServerInventoryCharge.assert_called_once_with()
+
+    def test_inventory_charge_prepare_precedes_profile_semaphore(self) -> None:
+        canvas = inventory_charge_canvas()
+
+        def acquire(_count: int) -> None:
+            canvas.aw.prepareRoastServerInventoryCharge.assert_called_once_with()
+            canvas.profileDataSemaphore.acquire_calls += 1
+            canvas.profileDataSemaphore.acquired = True
+
+        canvas.profileDataSemaphore.acquire = acquire
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        canvas.aw.commitRoastServerInventoryCharge.assert_called_once_with(
+            canvas.aw.prepareRoastServerInventoryCharge.return_value)
+        assert canvas.profileDataSemaphore.release_calls == 1
+
+    def test_inventory_charge_blocked_prepare_does_not_release_preheld_semaphore(
+        self,
+    ) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.profileDataSemaphore = ChargeSemaphore(acquired=True)
+        canvas.aw.prepareRoastServerInventoryCharge.return_value = None
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.profileDataSemaphore.acquire_calls == 0
+        assert canvas.profileDataSemaphore.release_calls == 0
+
+    def test_inventory_charge_no_data_releases_acquired_semaphore_once(self) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.timex = []
+        canvas.temp1 = []
+        canvas.temp2 = []
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == -1
+        assert canvas.profileDataSemaphore.acquire_calls == 1
+        assert canvas.profileDataSemaphore.release_calls == 1
+        canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
+        canvas.aw.sendmessage.assert_called_once_with(
+            'Not enough data collected yet. Try again in a few seconds')
+
+    def test_inventory_charge_manual_cancel_returns_without_commit(self) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.aw.ser.NONE.return_value = (0.0, -1.0, 1.0)
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == -1
+        canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
+
+    def test_inventory_charge_manual_array_precondition_blocks_before_commit(
+        self,
+    ) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.temp1 = []
+        canvas.aw.ser.NONE.return_value = (1.0, 101.0, 91.0)
+
+        tgraphcanvas._markCharge(canvas)
+
+        assert canvas.timex == [0.0]
+        assert canvas.temp1 == []
+        assert canvas.temp2 == [90.0]
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID is None
+        canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
+        assert canvas.profileDataSemaphore.release_calls == 1
+        canvas.aw.buttonCHARGE.setFlat.assert_not_called()
+        canvas.aw.buttonCHARGE.stopAnimation.assert_not_called()
+        canvas.aw.eventactionx.assert_not_called()
+        canvas.aw.openPropertiesSignal.emit.assert_not_called()
+
+    def test_inventory_charge_commit_failure_leaves_event_unmarked(self) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.aw.commitRoastServerInventoryCharge.return_value = None
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID is None
+        canvas.aw.santokerWarmupController.mark_charge.assert_not_called()
+        canvas.aw.pidcontrol.pidOn.assert_not_called()
+
+    def test_inventory_charge_manual_commit_failure_rolls_back_sample_and_curves(
+        self,
+    ) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.ETcurve = True
+        canvas.BTcurve = True
+        canvas.l_temp1 = ChargeCurve(canvas.timex, canvas.temp1)
+        canvas.l_temp2 = ChargeCurve(canvas.timex, canvas.temp2)
+        canvas.drawmanual = lambda et, bt, tx: tgraphcanvas.drawmanual(
+            canvas, et, bt, tx)
+        canvas.aw.ser.NONE.return_value = (1.0, 101.0, 91.0)
+        canvas.aw.commitRoastServerInventoryCharge.return_value = None
+        profile_before = (
+            list(canvas.timex), list(canvas.temp1), list(canvas.temp2))
+        curves_before = (canvas.l_temp1.data, canvas.l_temp2.data)
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert (canvas.timex, canvas.temp1, canvas.temp2) == profile_before
+        assert (canvas.l_temp1.data, canvas.l_temp2.data) == curves_before
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID is None
+
+    def test_inventory_charge_manual_commit_precedes_sample_append(self) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.ETcurve = True
+        canvas.BTcurve = True
+        canvas.l_temp1 = ChargeCurve(canvas.timex, canvas.temp1)
+        canvas.l_temp2 = ChargeCurve(canvas.timex, canvas.temp2)
+        canvas.drawmanual = lambda et, bt, tx: tgraphcanvas.drawmanual(
+            canvas, et, bt, tx)
+        canvas.aw.ser.NONE.return_value = (1.0, 101.0, 91.0)
+
+        def commit(_prepared: object) -> str:
+            assert canvas.timex == [0.0]
+            assert canvas.temp1 == [100.0]
+            assert canvas.temp2 == [90.0]
+            return '33333333333343338333333333333333'
+
+        canvas.aw.commitRoastServerInventoryCharge.side_effect = commit
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == 1
+        assert canvas.timex == [0.0, 1.0]
+        assert canvas.temp1 == [100.0, 101.0]
+        assert canvas.temp2 == [90.0, 91.0]
+        assert canvas.l_temp1.data == (canvas.timex, canvas.temp1)
+        assert canvas.l_temp2.data == (canvas.timex, canvas.temp2)
+        assert canvas.profileDataSemaphore.release_calls == 1
+
+    def test_inventory_charge_manual_postcondition_failure_rolls_back_and_links(
+        self,
+    ) -> None:
+        canvas = inventory_charge_canvas()
+        canvas.device = 18
+        canvas.ETcurve = True
+        canvas.BTcurve = True
+        canvas.l_temp1 = ChargeCurve(canvas.timex, canvas.temp1)
+        canvas.l_temp2 = ChargeCurve(canvas.timex, canvas.temp2)
+        profile_before = (
+            list(canvas.timex), list(canvas.temp1), list(canvas.temp2))
+        curves_before = (canvas.l_temp1.data, canvas.l_temp2.data)
+
+        def invalid_drawmanual(et: float, bt: float, tx: float) -> None:
+            tgraphcanvas.drawmanual(canvas, et, bt, tx)
+            canvas.timex.append(tx + 1)
+
+        canvas.drawmanual = invalid_drawmanual
+        canvas.aw.ser.NONE.return_value = (1.0, 101.0, 91.0)
+
+        tgraphcanvas._markCharge(canvas)
+
+        assert (canvas.timex, canvas.temp1, canvas.temp2) == profile_before
+        assert (canvas.l_temp1.data, canvas.l_temp2.data) == curves_before
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID == '33333333333343338333333333333333'
+        canvas.aw.buttonCHARGE.setFlat.assert_not_called()
+        canvas.aw.buttonCHARGE.stopAnimation.assert_not_called()
+        canvas.aw.eventactionx.assert_not_called()
+        canvas.aw.openPropertiesSignal.emit.assert_not_called()
+
+    def test_inventory_charge_undo_and_remark_reuse_roast_uuid_and_link(self) -> None:
+        canvas = inventory_charge_canvas()
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+        roast_uuid = canvas.roastUUID
+        inventory_link = (
+            canvas.roastServerInventoryOrigin,
+            canvas.roastServerInventoryOrganizationUUID,
+            canvas.roastServerBeanLotUUID,
+            canvas.roastServerBeanLotName,
+        )
+        canvas.aw.buttonCHARGE.isFlat.return_value = True
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.timeindex[0] == -1
+        assert canvas.roastUUID == roast_uuid
+        assert (
+            canvas.roastServerInventoryOrigin,
+            canvas.roastServerInventoryOrganizationUUID,
+            canvas.roastServerBeanLotUUID,
+            canvas.roastServerBeanLotName,
+        ) == inventory_link
+        canvas.aw.releaseRoastServerInventory.assert_not_called()
+
+        canvas.aw.buttonCHARGE.isFlat.return_value = False
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        assert canvas.roastUUID == roast_uuid
+        assert canvas.aw.prepareRoastServerInventoryCharge.call_count == 2
+        assert canvas.aw.commitRoastServerInventoryCharge.call_count == 2
 
 
 class TestHeatConversion:

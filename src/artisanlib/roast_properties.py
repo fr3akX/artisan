@@ -25,12 +25,17 @@
 # AUTHOR
 # Marko Luther, 2023
 
+# Widgets are initialized synchronously by initializeInventoryLotSelection() from __init__.
+# pyright: reportUninitializedInstanceVariable=false
+
 import sys
 import math
 import platform
 import logging
 from collections.abc import Callable
+from datetime import datetime
 from typing import override, Final, cast, Any, TYPE_CHECKING
+from uuid import UUID
 
 if TYPE_CHECKING:
     from artisanlib.main import ApplicationWindow # noqa: F401 # pylint: disable=unused-import
@@ -57,6 +62,17 @@ from artisanlib.util import (deltaLabelUTF8, stringfromseconds,stringtoseconds, 
         convertWeight, convertVolume, float2str)
 from artisanlib.dialogs import ArtisanDialog, ArtisanResizeablDialog, tareDlg
 from artisanlib.widgets import MyQComboBox, ClickableQLabel, ClickableTextEdit, MyTableWidgetItemNumber
+from artisanlib.roastserver.contract import ContractError, Namespace, PublicFailure
+from artisanlib.roastserver.inventory_contract import (
+    BeanLot,
+    InventoryProfileLink,
+    parse_profile_link,
+    profile_link_fields,
+)
+from artisanlib.roastserver.inventory_dialogs import (
+    InventoryLotDialog,
+    InventoryLotDialogController,
+)
 
 
 from uic import EnergyWidget # pyright: ignore[attr-defined] # pylint: disable=no-name-in-module
@@ -67,7 +83,7 @@ _log: Final[logging.Logger] = logging.getLogger(__name__)
 
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QRegularExpression, QSettings, QTimer, QEvent, QLocale, QSignalBlocker
 from PyQt6.QtGui import QColor, QIntValidator, QRegularExpressionValidator, QKeySequence, QPalette
-from PyQt6.QtWidgets import (QApplication, QWidget, QCheckBox, QComboBox, QDialogButtonBox, QGridLayout,
+from PyQt6.QtWidgets import (QApplication, QWidget, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
                              QHBoxLayout, QVBoxLayout, QHeaderView, QLabel, QLineEdit, QTextEdit, QListView,
                              QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QSizePolicy,
                              QGroupBox, QToolButton, QFrame)
@@ -547,6 +563,25 @@ class editGraphDlg(ArtisanResizeablDialog):
     connectScaleSignal = pyqtSignal()
     readScaleSignal = pyqtSignal()
 
+    _original_inventory_link:InventoryProfileLink|None
+    _inventory_link:InventoryProfileLink|None
+    _inventory_selection_staged:bool
+    _inventory_lots:tuple[BeanLot, ...]
+    _inventory_cached_at:datetime|None
+    _inventory_snapshot_failed:bool
+    _inventory_context_revision:int
+    _inventory_refresh_request:str|None
+    _inventory_signals_connected:bool
+    _inventory_status_override:str|None
+    inventoryLotDialog:InventoryLotDialog|None
+    inventoryLotNameLabel:QLabel
+    inventoryLotBalanceLabel:QLabel
+    inventoryLotStatusLabel:QLabel
+    inventoryLotChooseButton:QPushButton
+    inventoryLotClearButton:QPushButton
+    inventoryLotRefreshButton:QPushButton
+    inventoryLotLayout:QHBoxLayout
+
     # if start_recording_on_exit is set, on leaving the dialog with OK, the recording is started in case plus is connected and beans have been set
     # and the flags "Open on CHARGE" and "Open on DROP" are not set
     def __init__(self, parent:QWidget, aw:'ApplicationWindow', activeTab:int = 0, start_recording_on_exit:bool = False) -> None:
@@ -904,6 +939,7 @@ class editGraphDlg(ArtisanResizeablDialog):
         self.beansedit.editingFinished.connect(self.beansEdited)
 
         self.beansedit.setNewPlainText(self.aw.qmc.beans)
+        self.initializeInventoryLotSelection()
 
         #weight
         green_label = QLabel('<b>' + QApplication.translate('Label', 'Green') + '</b>')
@@ -1448,6 +1484,12 @@ class editGraphDlg(ArtisanResizeablDialog):
         textLayout.addLayout(titleLine,3,1)
         textLayout.addWidget(beanslabel,4+textLayoutPlusOffset,0)
         textLayout.addWidget(self.beansedit,4+textLayoutPlusOffset,1)
+        inventoryLotLabel = QLabel(
+            '<b>' + QApplication.translate('Label', 'Inventory lot') + '</b>'
+        )
+        inventoryLotLabel.setBuddy(self.inventoryLotChooseButton)
+        textLayout.addWidget(inventoryLotLabel,5+textLayoutPlusOffset,0)
+        textLayout.addLayout(self.inventoryLotLayout,5+textLayoutPlusOffset,1)
 
         beanSizeLayout = QHBoxLayout()
         beanSizeLayout.setSpacing(2)
@@ -2003,6 +2045,365 @@ class editGraphDlg(ArtisanResizeablDialog):
             self.plus_selected_line.setText(line)
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
+
+    def initializeInventoryLotSelection(self) -> None:
+        profile_fields = {
+            'roastServerInventoryOrigin': self.aw.qmc.roastServerInventoryOrigin,
+            'roastServerInventoryOrganizationUUID': self.aw.qmc.roastServerInventoryOrganizationUUID,
+            'roastServerBeanLotUUID': self.aw.qmc.roastServerBeanLotUUID,
+            'roastServerBeanLotName': self.aw.qmc.roastServerBeanLotName,
+        }
+        try:
+            original_link = parse_profile_link(profile_fields)
+        except ContractError:
+            original_link = None
+        self._original_inventory_link = original_link
+        self._inventory_link = original_link
+        self._inventory_selection_staged = False
+        self._inventory_lots = ()
+        self._inventory_cached_at = None
+        self._inventory_snapshot_failed = False
+        self._inventory_context_revision = 0
+        self._inventory_refresh_request = None
+        self._inventory_signals_connected = False
+        self._inventory_status_override = None
+        self.inventoryLotDialog = None
+
+        self.inventoryLotNameLabel = QLabel()
+        self.inventoryLotNameLabel.setTextFormat(Qt.TextFormat.PlainText)
+        self.inventoryLotNameLabel.setAccessibleName(
+            QApplication.translate('Label', 'Selected inventory lot'))
+        self.inventoryLotBalanceLabel = QLabel()
+        self.inventoryLotBalanceLabel.setTextFormat(Qt.TextFormat.PlainText)
+        self.inventoryLotBalanceLabel.setAccessibleName(
+            QApplication.translate('Label', 'Available inventory'))
+        self.inventoryLotStatusLabel = QLabel()
+        self.inventoryLotStatusLabel.setTextFormat(Qt.TextFormat.PlainText)
+        self.inventoryLotStatusLabel.setAccessibleName(
+            QApplication.translate('Label', 'Inventory lot status'))
+
+        self.inventoryLotChooseButton = QPushButton(
+            QApplication.translate('Button', 'Choose…'))
+        self.inventoryLotChooseButton.setAccessibleName(
+            QApplication.translate('Button', 'Choose inventory lot'))
+        self.inventoryLotChooseButton.clicked.connect(self.openInventoryLotDialog)
+        self.inventoryLotClearButton = QPushButton(
+            QApplication.translate('Button', 'Clear'))
+        self.inventoryLotClearButton.setAccessibleName(
+            QApplication.translate('Button', 'Clear inventory lot'))
+        self.inventoryLotClearButton.clicked.connect(self.clearInventoryLot)
+        self.inventoryLotRefreshButton = QPushButton(
+            QApplication.translate('Button', 'Refresh'))
+        self.inventoryLotRefreshButton.setAccessibleName(
+            QApplication.translate('Button', 'Refresh inventory lots'))
+        self.inventoryLotRefreshButton.clicked.connect(self.refreshInventoryLots)
+
+        self.inventoryLotLayout = QHBoxLayout()
+        self.inventoryLotLayout.setContentsMargins(0, 0, 0, 0)
+        self.inventoryLotLayout.setSpacing(4)
+        self.inventoryLotLayout.addWidget(self.inventoryLotNameLabel, 2)
+        self.inventoryLotLayout.addWidget(self.inventoryLotBalanceLabel)
+        self.inventoryLotLayout.addWidget(self.inventoryLotStatusLabel, 2)
+        self.inventoryLotLayout.addWidget(self.inventoryLotChooseButton)
+        self.inventoryLotLayout.addWidget(self.inventoryLotClearButton)
+        self.inventoryLotLayout.addWidget(self.inventoryLotRefreshButton)
+
+        controller = self.aw.roastserver_controller
+        if controller is not None:
+            self._readInventoryCacheSnapshot()
+            controller.inventoryLotsChanged.connect(self._inventoryLotsChanged)
+            controller.inventoryRefreshFinished.connect(self._inventoryRefreshFinished)
+            controller.operationFailed.connect(self._inventoryOperationFailed)
+            controller.onlineChanged.connect(self._inventoryOnlineChanged)
+            controller.settingsChanged.connect(self._inventoryContextChanged)
+            controller.identityChanged.connect(self._inventoryContextChanged)
+            self._inventory_signals_connected = True
+        self.updateInventoryLotRow()
+
+    def _readInventoryCacheSnapshot(self, *, retain_on_failure:bool = False) -> bool:
+        controller = self.aw.roastserver_controller
+        if controller is None:
+            self._inventory_lots = ()
+            self._inventory_cached_at = None
+            return True
+        try:
+            snapshot = controller.inventory_cache_snapshot()
+        except RuntimeError:
+            self._inventory_snapshot_failed = True
+            self._inventory_status_override = QApplication.translate(
+                'RoastServerInventory',
+                ('Inventory is unavailable. Previous cached inventory was retained.'
+                    if retain_on_failure else 'Inventory is unavailable.'))
+            return False
+        self._inventory_snapshot_failed = False
+        self._inventory_lots = () if snapshot is None else snapshot.lots
+        self._inventory_cached_at = None if snapshot is None else snapshot.refreshed_at
+        return True
+
+    def _inventoryNamespace(self) -> Namespace|None:
+        controller = self.aw.roastserver_controller
+        if controller is None:
+            return None
+        try:
+            return controller.inventory_context().namespace
+        except RuntimeError:
+            return None
+
+    def _inventoryRoastUUID(self) -> UUID|None:
+        value = self.aw.qmc.roastUUID
+        if not isinstance(value, str):
+            return None
+        try:
+            return UUID(value)
+        except ValueError:
+            return None
+
+    def _inventoryProfileHasCharge(self) -> bool:
+        timeindex = self.aw.qmc.timeindex
+        return bool(timeindex) and timeindex[0] >= 0
+
+    def _inventoryLotLocked(self) -> bool:
+        if self._inventoryProfileHasCharge():
+            return True
+        controller = self.aw.roastserver_controller
+        if controller is None:
+            return False
+        try:
+            return controller.inventory_lot_locked(
+                self._inventory_link,
+                self._inventoryRoastUUID(),
+                False,
+            )
+        except RuntimeError:
+            return True
+
+    def _inventorySelectedLot(self) -> BeanLot|None:
+        link = self._inventory_link
+        if link is None or link.namespace != self._inventoryNamespace():
+            return None
+        return next((lot for lot in self._inventory_lots if lot.lot_id == link.lot_id), None)
+
+    def updateInventoryLotRow(self) -> None:
+        link = self._inventory_link
+        controller = self.aw.roastserver_controller
+        current_namespace = self._inventoryNamespace()
+        lot = self._inventorySelectedLot()
+        if link is None:
+            name = QApplication.translate('Label', 'None')
+            balance = ''
+            status = QApplication.translate(
+                'RoastServerInventory', 'No inventory lot selected.')
+        else:
+            name = link.lot_name
+            if link.namespace != current_namespace:
+                balance = ''
+                status = QApplication.translate(
+                    'RoastServerInventory',
+                    'This historical inventory lot is unavailable in the current server organization.')
+            elif lot is None:
+                balance = ''
+                status = QApplication.translate(
+                    'RoastServerInventory', 'Selected inventory lot is unavailable.')
+            else:
+                balance = render_weight(float(lot.available_grams), 0, 0)
+                warnings:list[str] = []
+                if lot.available_grams < 0:
+                    warnings.append(QApplication.translate(
+                        'RoastServerInventory', 'Available inventory is negative.'))
+                elif lot.available_grams == 0:
+                    warnings.append(QApplication.translate(
+                        'RoastServerInventory', 'No inventory is currently available.'))
+                if lot.unresolved_conflict_count:
+                    warnings.append(QApplication.translate(
+                        'RoastServerInventory',
+                        '{count} unresolved inventory conflict(s).').format(
+                            count=lot.unresolved_conflict_count))
+                status = ' '.join(warnings)
+        if self._inventory_status_override is not None:
+            status = self._inventory_status_override
+        if controller is not None:
+            if self._inventory_cached_at is None:
+                cached_status = QApplication.translate(
+                    'RoastServerInventory', 'Cached inventory timestamp is unavailable.')
+            else:
+                cached_status = QApplication.translate(
+                    'RoastServerInventory', 'Cached inventory from {timestamp}.').format(
+                        timestamp=self._inventory_cached_at.astimezone().strftime(
+                            '%Y-%m-%d %H:%M'))
+            status = f'{status} {cached_status}'.strip()
+        self.inventoryLotNameLabel.setText(name)
+        self.inventoryLotBalanceLabel.setText(balance)
+        self.inventoryLotStatusLabel.setText(status)
+        locked = self._inventoryLotLocked()
+        self.inventoryLotChooseButton.setEnabled(controller is not None and not locked)
+        self.inventoryLotClearButton.setEnabled(link is not None and not locked)
+        self.inventoryLotRefreshButton.setEnabled(
+            controller is not None and self._inventory_refresh_request is None)
+
+    @pyqtSlot()
+    def openInventoryLotDialog(self) -> None:
+        controller = self.aw.roastserver_controller
+        if controller is None or self._inventoryLotLocked():
+            return
+        selection_namespace = self._inventoryNamespace()
+        selection_revision = self._inventory_context_revision
+        dialog = InventoryLotDialog(
+            self,
+            cast(InventoryLotDialogController, controller),
+            selected_lot_id=(
+                None if self._inventory_link is None else self._inventory_link.lot_id),
+        )
+        self.inventoryLotDialog = dialog
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                if (
+                    selection_revision != self._inventory_context_revision
+                    or selection_namespace != self._inventoryNamespace()
+                ):
+                    self._inventory_status_override = QApplication.translate(
+                        'RoastServerInventory',
+                        'The inventory selection was not changed because the server organization changed.')
+                    self.updateInventoryLotRow()
+                    return
+                lot = dialog.selected_lot
+                if lot is None:
+                    self.clearInventoryLot()
+                else:
+                    self.chooseInventoryLot(lot)
+        finally:
+            dialog.clean_up()
+            self.inventoryLotDialog = None
+            dialog.deleteLater()
+
+    def chooseInventoryLot(self, lot:BeanLot) -> None:
+        if self._inventoryLotLocked():
+            return
+        namespace = self._inventoryNamespace()
+        if namespace is None:
+            self._inventory_status_override = QApplication.translate(
+                'RoastServerInventory', 'Inventory is unavailable.')
+            self.updateInventoryLotRow()
+            return
+        self._inventory_link = InventoryProfileLink(namespace, lot.lot_id, lot.name)
+        self._inventory_selection_staged = True
+        self._inventory_status_override = None
+        if not self.beansedit.toPlainText().strip():
+            self.beansedit.setPlainText(lot.name)
+            self.modified_beans = lot.name
+        self.updateInventoryLotRow()
+
+    @pyqtSlot()
+    def clearInventoryLot(self) -> None:
+        if self._inventoryLotLocked():
+            return
+        self._inventory_link = None
+        self._inventory_selection_staged = True
+        self._inventory_status_override = None
+        self.updateInventoryLotRow()
+
+    @pyqtSlot()
+    def refreshInventoryLots(self) -> None:
+        controller = self.aw.roastserver_controller
+        if controller is None or self._inventory_refresh_request is not None:
+            return
+        self.inventoryLotRefreshButton.setEnabled(False)
+        self._inventory_snapshot_failed = False
+        try:
+            self._inventory_refresh_request = controller.refresh_inventory_lots()
+        except RuntimeError:
+            self._inventory_status_override = QApplication.translate(
+                'RoastServerInventory', 'Inventory refresh could not be started.')
+            self._inventory_refresh_request = None
+        self.updateInventoryLotRow()
+
+    @pyqtSlot(object)
+    def _inventoryLotsChanged(self, value:object) -> None:
+        if not isinstance(value, tuple) or not all(isinstance(lot, BeanLot) for lot in value):
+            return
+        self._readInventoryCacheSnapshot(retain_on_failure=True)
+        self.updateInventoryLotRow()
+
+    @pyqtSlot(str)
+    def _inventoryRefreshFinished(self, operation:str) -> None:
+        if operation != self._inventory_refresh_request:
+            return
+        self._inventory_refresh_request = None
+        if not self._inventory_snapshot_failed:
+            self._inventory_status_override = QApplication.translate(
+                'RoastServerInventory', 'Inventory refreshed.')
+        self.updateInventoryLotRow()
+
+    @pyqtSlot(str, object)
+    def _inventoryOperationFailed(self, operation:str, value:object) -> None:
+        if operation != self._inventory_refresh_request:
+            return
+        self._inventory_refresh_request = None
+        message = (value.message if isinstance(value, PublicFailure) else
+            QApplication.translate('RoastServerInventory',
+                'The operation could not be completed.'))
+        self._inventory_status_override = QApplication.translate(
+            'RoastServerInventory',
+            '{message} Previous cached inventory was retained.').format(message=message)
+        self.updateInventoryLotRow()
+
+    @pyqtSlot(bool)
+    def _inventoryOnlineChanged(self, online:bool) -> None:
+        if not online:
+            self._inventory_status_override = QApplication.translate(
+                'RoastServerInventory', 'Offline. Cached inventory remains available.')
+        elif self._inventory_status_override == QApplication.translate(
+                'RoastServerInventory', 'Offline. Cached inventory remains available.'):
+            self._inventory_status_override = None
+        self.updateInventoryLotRow()
+
+    @pyqtSlot(object)
+    def _inventoryContextChanged(self, _value:object) -> None:
+        self._inventory_context_revision += 1
+        self._synchronizeInventoryContext()
+
+    def _synchronizeInventoryContext(self) -> None:
+        if (self._inventory_selection_staged and self._inventory_link is not None and
+                self._inventory_link.namespace != self._inventoryNamespace()):
+            self._inventory_link = None
+            self._inventory_status_override = QApplication.translate(
+                'RoastServerInventory',
+                'The staged inventory lot was cleared because the server organization changed.')
+        self._readInventoryCacheSnapshot()
+        self._inventory_refresh_request = None
+        self.updateInventoryLotRow()
+
+    def commitInventoryLotSelection(self) -> None:
+        self._synchronizeInventoryContext()
+        fields:dict[str, str|None] = {
+            'roastServerInventoryOrigin': None,
+            'roastServerInventoryOrganizationUUID': None,
+            'roastServerBeanLotUUID': None,
+            'roastServerBeanLotName': None,
+        }
+        if self._inventory_link is not None:
+            fields.update(profile_link_fields(self._inventory_link))
+        self.aw.qmc.roastServerInventoryOrigin = fields['roastServerInventoryOrigin']
+        self.aw.qmc.roastServerInventoryOrganizationUUID = fields[
+            'roastServerInventoryOrganizationUUID']
+        self.aw.qmc.roastServerBeanLotUUID = fields['roastServerBeanLotUUID']
+        self.aw.qmc.roastServerBeanLotName = fields['roastServerBeanLotName']
+
+    def cleanUpInventoryLotSelection(self) -> None:
+        controller = self.aw.roastserver_controller
+        if controller is None or not self._inventory_signals_connected:
+            return
+        self._inventory_signals_connected = False
+        for signal, slot in (
+                (controller.inventoryLotsChanged, self._inventoryLotsChanged),
+                (controller.inventoryRefreshFinished, self._inventoryRefreshFinished),
+                (controller.operationFailed, self._inventoryOperationFailed),
+                (controller.onlineChanged, self._inventoryOnlineChanged),
+                (controller.settingsChanged, self._inventoryContextChanged),
+                (controller.identityChanged, self._inventoryContextChanged)):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
 
     @pyqtSlot()
     def beansEdited(self) -> None:
@@ -2745,6 +3146,7 @@ class editGraphDlg(ArtisanResizeablDialog):
         settings.setValue('RoastGeometry',self.saveGeometry())
         self.aw.editGraphDlg_activeTab = self.TabWidget.currentIndex()
         self.aw.editgraphdialog = None
+        self.cleanUpInventoryLotSelection()
         if self.stockWorker is not None and self.updateStockSignalConnection is not None:
             self.stockWorker.updatedSignal.disconnect(self.updateStockSignalConnection)
 
@@ -5540,6 +5942,9 @@ class editGraphDlg(ArtisanResizeablDialog):
                     self.aw.qmc.plus_blend_spec_labels = None
             # always update as a completed items properties might have changed, but also the weight unit
             self.aw.updateScheduleSignal.emit()
+
+        # Commit the staged Roast Server inventory link only on OK.
+        self.commitInventoryLotSelection()
 
         # Update beans
         self.aw.qmc.beans = self.beansedit.toPlainText()

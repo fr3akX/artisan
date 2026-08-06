@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from proto import artisan_roast_pb2 # pylint: disable=unused-import
 
 from artisanlib.atypes import ProfileData
+from artisanlib.weight import convertWeight, weight_units
 
 ##
 
@@ -721,7 +722,6 @@ def comma2dot(s:str) -> str:
 
 #--- weight / volume
 
-weight_units:Final[tuple[str,str,str,str]] = ('g','Kg','lb','oz')
 weight_units_lower:Final[tuple[str,str,str,str]] = ('g','kg','lb','oz') # just for display use
 volume_units:Final[tuple[str,str,str,str,str,str]] = ('l','gal','qt','pt','cup','ml')
 
@@ -769,19 +769,6 @@ def float2float(f:float|str, n:int=1) -> float:
 # removes trailing zeros like f'{n:g}'
 def float2str(n:float) -> str:
     return f'{n}'.rstrip('0').rstrip('.')
-
-# i/o: 0:g, 1:Kg, 2:lb (pound), 3:oz (ounce)
-def convertWeight(v:float, i:int, o:int) -> float:
-    #                g,                         kg,                     lb,                  oz,
-    convtable:list[list[float]] = [
-                    [1.,                        0.001,                  2.20462262185/1000,  (2.20462262185*16) / 1000],  # g
-                    [1000,                      1.,                     2.20462262185,       2.20462262185*16],           # kg
-                    [1/(2.20462262185/1000),    1/2.20462262185,        1.,                  16.],                        # lb
-                    [1000 / (2.20462262185*16), 1/(2.20462262185*16),   1/16,                1.]                          # oz
-                ]
-    if 0 <= i < len(convtable) and 0 <= o < len(convtable):
-        return v*convtable[i][o]
-    raise IndexError(f'index error in convertWeight({v},{i},{o})')
 
 # i/o: 0:l (liter), 1:gal (gallons US), 2:qt, 3:pt, 4:cup, 5:cm^3/ml
 def convertVolume(v:float, i:int, o:int) -> float:

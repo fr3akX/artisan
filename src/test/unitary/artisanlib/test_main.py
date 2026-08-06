@@ -167,7 +167,7 @@ def ensure_main_qt_isolation() -> Generator[None, None, None]:
 # Set up QApplication before importing artisanlib modules
 # Use PyQt6 only as requested (ignore PyQt5)
 try:
-    from PyQt6.QtCore import QLocale, QSettings, Qt, QTime
+    from PyQt6.QtCore import QLocale, QObject, QSettings, Qt, QTime, pyqtSignal
     from PyQt6.QtGui import QAction, QColor
     from PyQt6.QtWidgets import (
         QApplication,
@@ -176,6 +176,7 @@ try:
         QLayout,
         QLCDNumber,
         QLineEdit,
+        QMainWindow,
         QMenu,
         QSlider,
         QTableWidget,
@@ -192,9 +193,31 @@ if not QApplication.instance():
 from artisanlib import main as main_module
 from artisanlib import util as util_module
 from artisanlib.atypes import ProfileData, RecentRoast
+from artisanlib.canvas import tgraphcanvas
 from artisanlib.main import ApplicationWindow, UI_MODE
 from artisanlib.roastserver import dialogs as roastserver_dialogs
+from artisanlib.roastserver import inventory_dialogs
 from artisanlib.roastserver.contract import MAX_PROFILE_BYTES, Namespace, ServerProfileSource
+from artisanlib.roastserver.controller import ControllerError
+from artisanlib.roastserver.inventory import (
+    InventoryContext,
+    InventoryCoordinator,
+    InventoryCoordinatorError,
+    InventoryNotice,
+    PreparedInventoryCharge,
+)
+from artisanlib.roastserver.inventory_contract import (
+    BeanLot,
+    InventoryBalance,
+    InventoryProfileLink,
+    parse_profile_link,
+)
+from artisanlib.roastserver.inventory_store import (
+    InterruptedReservation,
+    InventoryRoastState,
+    InventoryStore,
+    InventoryStoreError,
+)
 from artisanlib.util import FileDestinationTransaction
 from artisanlib.util import deserialize as util_deserialize
 from artisanlib.util import serialize_with_timestamp as util_serialize_with_timestamp
@@ -3907,6 +3930,389 @@ ROASTSERVER_PROFILE: dict[str, Any] = {
     'plus_blend_spec': [{'coffee': 'coffee-1', 'ratio': 1.0}],
     'computed': {'nested': [1.0, 2.0]},
 }
+INVENTORY_PROFILE_LINK: dict[str, str] = {
+    'roastServerInventoryOrigin': 'https://archive.example',
+    'roastServerInventoryOrganizationUUID': '11111111111141118111111111111111',
+    'roastServerBeanLotUUID': '22222222222242228222222222222222',
+    'roastServerBeanLotName': 'Historical lot',
+}
+INVENTORY_QMC_FIELDS = (
+    'roastServerInventoryOrigin',
+    'roastServerInventoryOrganizationUUID',
+    'roastServerBeanLotUUID',
+    'roastServerBeanLotName',
+)
+
+
+def qmc_inventory_profile_link(qmc: object) -> dict[str, object]:
+    return {name: getattr(qmc, name) for name in INVENTORY_QMC_FIELDS}
+
+
+def set_qmc_inventory_profile_link(qmc: object, values: dict[str, str]) -> None:
+    for name in INVENTORY_QMC_FIELDS:
+        setattr(qmc, name, values[name])
+
+
+class InventoryChargeSemaphore:
+    def __init__(self) -> None:
+        self.release_calls = 0
+
+    def acquire(self, _count: int) -> None:
+        pass
+
+    def release(self, _count: int) -> None:
+        self.release_calls += 1
+
+
+class InventoryChargeCurve:
+    def __init__(self, x_values: list[float], y_values: list[float]) -> None:
+        self.data = (list(x_values), list(y_values))
+        self.fail_next_update = False
+
+    def get_data(self) -> tuple[list[float], list[float]]:
+        return self.data
+
+    def set_data(self, x_values: list[float], y_values: list[float]) -> None:
+        self.data = (list(x_values), list(y_values))
+        if self.fail_next_update:
+            self.fail_next_update = False
+            raise RuntimeError('injected curve update failure')
+
+
+def coordinator_inventory_charge_canvas(window: ApplicationWindow) -> SimpleNamespace:
+    window.ntb = MagicMock()
+    window.ntb._nav_stack.return_value = False
+    window.buttonCHARGE = MagicMock()
+    window.buttonCHARGE.isFlat.return_value = False
+    window.soundpopSignal = MagicMock()
+    window.arabicReshape = Mock(side_effect=lambda text: text)
+    window.eventslidervisibilities = [False, False, False, False]
+    window.simulator = None
+    window.pidcontrol = MagicMock()
+    window.pidcontrol.pidOnCHARGE = False
+    window.santokerWarmupController = MagicMock()
+    window.updateSantokerWarmupControls = Mock()
+    window.onMarkMoveToNext = Mock()
+    window.openPropertiesSignal = MagicMock()
+    window.sendmessage = Mock()  # type: ignore[method-assign]
+    canvas = SimpleNamespace(
+        aw=window,
+        profileDataSemaphore=InventoryChargeSemaphore(),
+        flagstart=True,
+        fileDirtySignal=MagicMock(),
+        timeindex=[-1, 0, 0, 0, 0, 0, 0, 0],
+        autoChargeIdx=-1,
+        device=0,
+        timex=[0.0],
+        temp1=[100.0],
+        temp2=[90.0],
+        roastUUID=None,
+        weight=(1.25, 0.0, 'Kg'),
+        chargeTimerPeriod=0,
+        locktimex=False,
+        locktimex_start=0.0,
+        chargemintime=0.0,
+        startofx=0.0,
+        fixmaxtime=False,
+        endofx=100.0,
+        resetmaxtime=100.0,
+        BTcurve=False,
+        ETcurve=False,
+        updateProjection=Mock(),
+        xaxistosm=Mock(),
+        EventRecordAction=Mock(),
+        timealign=Mock(),
+        buttonactions=[0],
+        buttonactionstrings=[''],
+        LCDdecimalplaces=False,
+        mode='C',
+        roastpropertiesAutoOpenFlag=False,
+        l_annotations=[],
+        l_annotations_dict={},
+        ystep_down=0,
+        ystep_up=0,
+        adderror=Mock(),
+        _tgraphcanvas__dijkstra_to_ascii=lambda text: text,
+    )
+    set_qmc_inventory_profile_link(canvas, INVENTORY_PROFILE_LINK)
+    window.qmc = canvas
+    return canvas
+
+
+def coordinator_controller(
+    coordinator: InventoryCoordinator, context: InventoryContext
+) -> SimpleNamespace:
+    def prepare_inventory_charge(
+        link: InventoryProfileLink | None,
+        roast_uuid: UUID | None,
+        weight: object,
+        unit: object,
+    ) -> PreparedInventoryCharge:
+        try:
+            return coordinator.prepare_charge(
+                context, link, roast_uuid, weight, unit)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def commit_inventory_charge(
+        prepared: PreparedInventoryCharge,
+    ) -> InventoryNotice:
+        try:
+            return coordinator.commit_charge(prepared)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def inventory_lot_locked(
+        link: InventoryProfileLink | None,
+        roast_uuid: UUID | None,
+        profile_has_charge: bool,
+    ) -> bool:
+        assert link is not None
+        try:
+            return coordinator.is_locked(
+                link.namespace, roast_uuid, profile_has_charge)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def finalize_inventory_profile(profile: ProfileData) -> InventoryNotice | None:
+        try:
+            return coordinator.finalize_saved_profile(context, profile)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    def release_inventory_roast(roast_uuid: UUID | None) -> InventoryNotice | None:
+        try:
+            return coordinator.release_for_reset(context, roast_uuid)
+        except InventoryCoordinatorError as error:
+            raise ControllerError(error.code) from None
+
+    return SimpleNamespace(
+        prepare_inventory_charge=prepare_inventory_charge,
+        commit_inventory_charge=commit_inventory_charge,
+        inventory_context=lambda: context,
+        inventory_lot_locked=inventory_lot_locked,
+        finalize_inventory_profile=finalize_inventory_profile,
+        release_inventory_roast=release_inventory_roast,
+        saved_profile=Mock(),
+    )
+
+
+def test_inventory_recovery_startup_is_deferred_reuses_dialog_and_conflict_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from artisanlib.roastserver.settings import namespace_for
+
+    class Controller(QObject):
+        inventoryRecoveryRequired = pyqtSignal(object)
+        inventoryConflict = pyqtSignal(object)
+
+        def inventory_context(self) -> SimpleNamespace:
+            return SimpleNamespace(namespace=namespace, enabled=True)
+
+    class RecoveryDialog:
+        instances: list[object] = []
+
+        def __init__(self, *args: object) -> None:
+            self.args = args
+            self.show_calls = 0
+            self.hide_calls = 0
+            self.clean_up_calls = 0
+            self.close_calls = 0
+            self.active_namespaces: list[Namespace | None] = []
+            self.__class__.instances.append(self)
+
+        def set_active_namespace(self, value: Namespace | None) -> None:
+            self.active_namespaces.append(value)
+
+        def show(self) -> None:
+            self.show_calls += 1
+
+        def raise_(self) -> None:
+            return
+
+        def activateWindow(self) -> None:
+            return
+
+        def hide(self) -> None:
+            self.hide_calls += 1
+
+        def clean_up(self) -> None:
+            self.clean_up_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    namespace = namespace_for(
+        'https://safe.example', UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))
+    roast_uuid = UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+    lot_id = UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+    reservation_id = UUID('dddddddd-dddd-4ddd-8ddd-dddddddddddd')
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    recovery = InterruptedReservation(
+        namespace, roast_uuid, lot_id, '<b>Safe lot</b>', reservation_id,
+        1_000, 'reserved', now)
+    controller = Controller()
+    recovery_baseline = controller.receivers(controller.inventoryRecoveryRequired)
+    conflict_baseline = controller.receivers(controller.inventoryConflict)
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    QMainWindow.__init__(window)
+    window.roastserver_controller = cast(Any, controller)
+    window.roastserver_inventory_recovery_dialog = None
+    window.roastserver_inventory_recovery_records = ()
+    window.roastserver_inventory_recovery_scheduled = False
+    controller.inventoryRecoveryRequired.connect(window.scheduleInventoryRecovery)
+    controller.inventoryConflict.connect(window.showInventoryConflict)
+    monkeypatch.setattr(
+        inventory_dialogs, 'InterruptedReservationsDialog', RecoveryDialog)
+
+    controller.inventoryRecoveryRequired.emit((recovery,))
+    assert RecoveryDialog.instances == []
+    QApplication.processEvents()
+    assert len(RecoveryDialog.instances) == 1
+    assert RecoveryDialog.instances[0].show_calls == 1
+    controller.inventoryRecoveryRequired.emit((recovery,))
+    QApplication.processEvents()
+    assert len(RecoveryDialog.instances) == 1
+    assert RecoveryDialog.instances[0].show_calls == 2
+
+    conflict = InventoryRoastState(
+        namespace, roast_uuid, lot_id, '<b>Safe lot</b>', reservation_id, None,
+        1_000, None, 'reserved', None, now, None, None, None,
+        InventoryBalance(lot_id, 100, 125, -25, 1), reservation_id,
+        None, None, now, now)
+    message = MagicMock()
+    message_box = MagicMock(return_value=message)
+    message_box.Icon.Warning = object()
+    message_box.StandardButton.Ok = object()
+    monkeypatch.setattr(main_module, 'QMessageBox', message_box)
+    controller.inventoryConflict.emit(conflict)
+    message.setTextFormat.assert_called_once_with(Qt.TextFormat.PlainText)
+    warning = message.setText.call_args.args[0]
+    assert '<b>Safe lot</b>' in warning
+    assert '-25 g' in warning
+    assert 'Reconcile' in warning
+    assert namespace.origin not in warning
+    assert str(namespace.organization_id) not in warning
+    message.exec.assert_called_once()
+
+    dialog = cast(Any, RecoveryDialog.instances[0])
+    window.cleanUpRoastServerInventoryPresentation()
+    window.cleanUpRoastServerInventoryPresentation()
+    assert dialog.hide_calls == 1
+    assert dialog.clean_up_calls == 1
+    assert dialog.close_calls == 1
+    assert controller.receivers(controller.inventoryRecoveryRequired) == recovery_baseline
+    assert controller.receivers(controller.inventoryConflict) == conflict_baseline
+    window.deleteLater()
+
+
+def test_inventory_recovery_cleanup_invalidates_pending_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from artisanlib.roastserver.settings import namespace_for
+
+    class Controller(QObject):
+        inventoryRecoveryRequired = pyqtSignal(object)
+        inventoryConflict = pyqtSignal(object)
+
+        def inventory_context(self) -> SimpleNamespace:
+            return SimpleNamespace(namespace=namespace, enabled=True)
+
+    class RecoveryDialog:
+        instances: list[object] = []
+
+        def __init__(self, *_args: object) -> None:
+            self.__class__.instances.append(self)
+
+        def show(self) -> None:
+            return
+
+        def raise_(self) -> None:
+            return
+
+        def activateWindow(self) -> None:
+            return
+
+    namespace = namespace_for(
+        'https://safe.example', UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))
+    recovery = InterruptedReservation(
+        namespace,
+        UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
+        UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
+        'Safe lot',
+        UUID('dddddddd-dddd-4ddd-8ddd-dddddddddddd'),
+        1_000,
+        'reserved',
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+    )
+    controller = Controller()
+    recovery_baseline = controller.receivers(controller.inventoryRecoveryRequired)
+    conflict_baseline = controller.receivers(controller.inventoryConflict)
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    QMainWindow.__init__(window)
+    window.roastserver_controller = cast(Any, controller)
+    window.roastserver_inventory_recovery_dialog = None
+    window.roastserver_inventory_recovery_records = ()
+    window.roastserver_inventory_recovery_scheduled = False
+    controller.inventoryRecoveryRequired.connect(window.scheduleInventoryRecovery)
+    controller.inventoryConflict.connect(window.showInventoryConflict)
+    monkeypatch.setattr(
+        inventory_dialogs, 'InterruptedReservationsDialog', RecoveryDialog)
+
+    controller.inventoryRecoveryRequired.emit((recovery,))
+    assert window.roastserver_inventory_recovery_scheduled
+    assert window.roastserver_inventory_recovery_records == (recovery,)
+    assert RecoveryDialog.instances == []
+
+    window.cleanUpRoastServerInventoryPresentation()
+    window.cleanUpRoastServerInventoryPresentation()
+    assert not window.roastserver_inventory_recovery_scheduled
+    assert window.roastserver_inventory_recovery_records == ()
+    assert controller.receivers(controller.inventoryRecoveryRequired) == recovery_baseline
+    assert controller.receivers(controller.inventoryConflict) == conflict_baseline
+
+    QApplication.processEvents()
+    assert RecoveryDialog.instances == []
+    assert controller.receivers(controller.inventoryRecoveryRequired) == recovery_baseline
+    assert controller.receivers(controller.inventoryConflict) == conflict_baseline
+    window.deleteLater()
+
+
+def inventory_profile_load_window() -> ApplicationWindow:
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    window.qmc = Mock()
+    window.qmc.extradevices = []
+    window.qmc.etypes = ['Air', 'Drum', 'Damper', 'Burner', '--']
+    window.qmc.flavors = []
+    window.qmc.flavorlabels = []
+    window.qmc.weight = (0.0, 0.0, 'g')
+    window.qmc.volume = (0.0, 0.0, 'l')
+    window.qmc.timex = []
+    window.qmc.temp1 = []
+    window.qmc.temp2 = []
+    window.qmc.extratimex = []
+    window.qmc.extratemp1 = []
+    window.qmc.extratemp2 = []
+    window.qmc.mode = 'C'
+    window.qmc.loadalarmsfromprofile = False
+    window.qmc.loadaxisfromprofile = False
+    window.qmc.locktimex = False
+    window.qmc.timeindex = [-1, 0, 0, 0, 0, 0, 0, 0]
+    window.qmc.phasesbuttonflag = False
+    window.qmc.backgroundUUID = None
+    window.qmc.fileDirtySignal.emit = Mock()
+    window.qmc.updateDeltaSamples = Mock()
+    window.qmc.resetlinecountcaches = Mock()
+    window.nLCDS = 10
+    window.pidcontrol = Mock(loadRampSoakFromProfile=False)
+    window.get_profile_etypes = Mock(return_value=window.qmc.etypes)
+    window.updateLCDproperties = Mock()
+    window.loadEnergyFromProfile = Mock()
+    window.loadBbpFromProfile = Mock()
+    window.autoAdjustAxis = Mock()
+    window.sendmessage = Mock()
+    window.plusAddPath = Mock()
+    return window
 
 
 def roastserver_save_window() -> tuple[ApplicationWindow, Mock, dict[str, Any]]:
@@ -3930,6 +4336,8 @@ def roastserver_save_window() -> tuple[ApplicationWindow, Mock, dict[str, Any]]:
     window.qmc.batchprefix = ''
     window.qmc.autosaveprefix = ''
     window.qmc.plus_file_last_modified = None
+    for name in INVENTORY_QMC_FIELDS:
+        setattr(window.qmc, name, None)
     window.MaxRecentFiles = 20
     window.getProfile = Mock(return_value=profile)
     window.plusAddPath = Mock()
@@ -4095,23 +4503,52 @@ class TestRoastServerMainIntegration:
         assert second_call[2].tzinfo is UTC
         assert destination.read_bytes() == second_call[0]
 
-    def test_roastserver_failed_copy_or_post_save_failure_does_not_enqueue(
+    def test_inventory_save_finalizes_after_upload_with_same_detached_profile(
         self, tmp_path: Path
     ) -> None:
-        window, controller, _profile = roastserver_save_window()
+        window, controller, profile = roastserver_save_window()
+        profile.update({
+            **INVENTORY_PROFILE_LINK,
+            'timeindex': [0, 0, 0, 0, 0, 0, 0, 0],
+            'weight': [1.25, 1.0, 'Kg'],
+        })
+        ordered = Mock()
+        ordered.attach_mock(controller.saved_profile, 'saved_profile')
+        ordered.attach_mock(
+            controller.finalize_inventory_profile, 'finalize_inventory_profile')
+
+        assert window.fileSave(str(tmp_path / 'roast.alog'))
+
+        assert [item[0] for item in ordered.mock_calls] == [
+            'saved_profile', 'finalize_inventory_profile']
+        detached_profile = controller.saved_profile.call_args.args[1]
+        assert controller.finalize_inventory_profile.call_args.args[0] is detached_profile
+
+    def test_inventory_profile_save_copy_preserves_link_without_server_hook(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        profile.update(INVENTORY_PROFILE_LINK)
         with patch(
             'artisanlib.main.serialize_with_timestamp',
             side_effect=OSError('write failed'),
         ):
             assert not window.fileSave(str(tmp_path / 'failed.alog'))
         controller.saved_profile.assert_not_called()
+        controller.finalize_inventory_profile.assert_not_called()
 
+        copy_path = tmp_path / 'copy.alog'
         with patch(
             'artisanlib.main.serialize_with_timestamp',
             wraps=util_serialize_with_timestamp,
         ):
-            assert window.fileSave(str(tmp_path / 'copy.alog'), copy=True)
+            assert window.fileSave(str(copy_path), copy=True)
+        saved_copy = util_deserialize(str(copy_path))
+        assert saved_copy is not None
+        assert {name: saved_copy[name] for name in INVENTORY_QMC_FIELDS} == (
+            INVENTORY_PROFILE_LINK)
         controller.saved_profile.assert_not_called()
+        controller.finalize_inventory_profile.assert_not_called()
 
         window.setCurrentFile.side_effect = RuntimeError('post-save failed')
         with patch(
@@ -4120,6 +4557,151 @@ class TestRoastServerMainIntegration:
         ):
             assert not window.fileSave(str(tmp_path / 'post-save.alog'))
         controller.saved_profile.assert_not_called()
+        controller.finalize_inventory_profile.assert_not_called()
+
+    def test_inventory_save_upload_failure_does_not_suppress_finalization(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        profile.update(INVENTORY_PROFILE_LINK)
+        controller.saved_profile.side_effect = RuntimeError('upload failed')
+
+        assert window.fileSave(str(tmp_path / 'roast.alog'))
+
+        controller.saved_profile.assert_called_once()
+        controller.finalize_inventory_profile.assert_called_once()
+
+    def test_inventory_save_planned_weight_fallback_warns_without_failing_save(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        profile.update(INVENTORY_PROFILE_LINK)
+        controller.finalize_inventory_profile.return_value = InventoryNotice(
+            'inventory_planned_weight_used',
+            UUID(profile['roastUUID']),
+            UUID('44444444-4444-4444-8444-444444444444'),
+            UUID(INVENTORY_PROFILE_LINK['roastServerBeanLotUUID']),
+            None,
+            None,
+        )
+
+        assert window.fileSave(str(tmp_path / 'roast.alog'))
+
+        assert any(
+            'planned green weight' in call_item.args[0]
+            for call_item in window.sendmessage.call_args_list
+        )
+
+    def test_inventory_save_storage_failure_does_not_rollback_profile(
+        self, tmp_path: Path
+    ) -> None:
+        window, controller, profile = roastserver_save_window()
+        profile.update(INVENTORY_PROFILE_LINK)
+        destination = tmp_path / 'roast.alog'
+        controller.finalize_inventory_profile.side_effect = ControllerError(
+            'inventory_storage_failed')
+
+        assert window.fileSave(str(destination))
+
+        assert destination.exists()
+        controller.saved_profile.assert_called_once()
+        assert any(
+            'finalization could not be stored' in call_item.args[0]
+            for call_item in window.sendmessage.call_args_list
+        )
+
+    @pytest.mark.parametrize(
+        ('actual_weight', 'expected_actual_grams', 'expect_warning'),
+        [(1.25, 1250, False), (0.0, None, True)],
+    )
+    def test_inventory_save_coordinator_queues_one_terminal_intent(
+        self,
+        tmp_path: Path,
+        actual_weight: float,
+        expected_actual_grams: int | None,
+        expect_warning: bool,
+    ) -> None:
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        uuid_values = iter((
+            roast_uuid,
+            UUID('44444444-4444-4444-8444-444444444444'),
+        ))
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    lot_id=link.lot_id,
+                    name=link.lot_name,
+                    origin='Ethiopia',
+                    varietals=('Heirloom',),
+                    processing_method='washed',
+                    crop_year=2026,
+                    on_hand_grams=2_000,
+                    reserved_grams=0,
+                    available_grams=2_000,
+                    unresolved_conflict_count=0,
+                ),
+            ),
+            now,
+        )
+        context = InventoryContext(
+            origin=link.namespace.origin,
+            namespace=link.namespace,
+            enabled=True,
+            previously_authenticated=True,
+            client_instance_uuid=UUID(
+                '55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: next(uuid_values),
+            wake=lambda: None,
+        )
+        controller = coordinator_controller(coordinator, context)
+        prepared = coordinator.prepare_charge(context, link, None, 1.5, 'Kg')
+        coordinator.commit_charge(prepared)
+        window, _mock_controller, profile = roastserver_save_window()
+        window.roastserver_controller = controller
+        profile.update({
+            **INVENTORY_PROFILE_LINK,
+            'roastUUID': roast_uuid.hex,
+            'timeindex': [-1, 0, 0, 0, 0, 0, 0, 0],
+            'weight': [actual_weight, 1.0, 'Kg'],
+        })
+
+        try:
+            assert window.fileSave(str(tmp_path / 'no-charge.alog'))
+            assert store.counts(link.namespace).pending == 1
+
+            profile['timeindex'][0] = 0
+            profile['roastUUID'] = '66666666666646668666666666666666'
+            assert window.fileSave(str(tmp_path / 'different-roast.alog'))
+            assert store.counts(link.namespace).pending == 1
+
+            profile['roastUUID'] = roast_uuid.hex
+            assert window.fileSave(str(tmp_path / 'roast.alog'))
+            state = store.roast_state(link.namespace, roast_uuid)
+            assert state is not None
+            assert state.lifecycle == 'finalize_queued'
+            assert state.actual_grams == expected_actual_grams
+            assert store.counts(link.namespace).pending == 2
+
+            assert window.fileSave(str(tmp_path / 'repeat.alog'))
+            assert store.counts(link.namespace).pending == 2
+            assert controller.release_inventory_roast(roast_uuid) is None
+            assert store.counts(link.namespace).pending == 2
+            assert any(
+                'planned green weight' in call_item.args[0]
+                for call_item in window.sendmessage.call_args_list
+            ) is expect_warning
+        finally:
+            store.close()
 
     def test_roastserver_save_as_uses_chosen_path(self, tmp_path: Path) -> None:
         window, controller, profile = roastserver_save_window()
@@ -4131,6 +4713,7 @@ class TestRoastServerMainIntegration:
         window.ArtisanSaveFileDialog.assert_called_once()
         assert chosen.read_bytes() == repr(profile).encode('utf-8')
         controller.saved_profile.assert_called_once()
+        controller.finalize_inventory_profile.assert_called_once()
 
     def test_roastserver_autosave_notifies_only_after_exact_write(
         self, tmp_path: Path
@@ -4154,6 +4737,9 @@ class TestRoastServerMainIntegration:
         assert destination.read_bytes() == repr(profile).encode('utf-8')
         assert [call[0] for call in ordered.mock_calls] == [
             'serialize', 'saved_profile']
+        controller.finalize_inventory_profile.assert_called_once()
+        detached_profile = controller.saved_profile.call_args.args[1]
+        assert controller.finalize_inventory_profile.call_args.args[0] is detached_profile
 
     @pytest.mark.parametrize('failure', ['serialize', 'timestamp'])
     def test_roastserver_autosave_serialization_failure_never_notifies(
@@ -4180,6 +4766,7 @@ class TestRoastServerMainIntegration:
             assert window.automaticsave() == f'{failure}.alog'
 
         controller.saved_profile.assert_not_called()
+        controller.finalize_inventory_profile.assert_not_called()
         assert os.getcwd() == old_directory
 
     @pytest.mark.parametrize('failure', ['post-save', 'plus-status', 'image-export'])
@@ -4559,6 +5146,98 @@ class TestRoastServerMainIntegration:
         window.settingsLoad.assert_called_once_with(redraw=False)
         window.startRoastServer.assert_called_once_with(tmp_path)
 
+    def test_shutdown_after_namespace_change_releases_original_reservation(
+        self, tmp_path: Path
+    ) -> None:
+        from artisanlib.roastserver.settings import namespace_for
+
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    link.lot_id,
+                    link.lot_name,
+                    None,
+                    (),
+                    None,
+                    None,
+                    2_000,
+                    0,
+                    2_000,
+                    0,
+                ),
+            ),
+            now,
+        )
+        context_a = InventoryContext(
+            link.namespace.origin,
+            link.namespace,
+            True,
+            True,
+            UUID('55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: UUID(
+                '44444444-4444-4444-8444-444444444444'
+            ),
+            wake=lambda: None,
+        )
+        coordinator.commit_charge(
+            coordinator.prepare_charge(
+                context_a, link, roast_uuid, 1.5, 'Kg'
+            )
+        )
+        namespace_b = namespace_for(
+            'https://other.example',
+            UUID('66666666-6666-4666-8666-666666666666'),
+        )
+        context_b = InventoryContext(
+            namespace_b.origin,
+            namespace_b,
+            True,
+            True,
+            context_a.client_instance_uuid,
+        )
+        controller = coordinator_controller(coordinator, context_b)
+        controller.shutdown = Mock(return_value=True)
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock(
+            safesaveflag=False,
+            flagKeepON=True,
+            roastUUID=roast_uuid.hex,
+        )
+        window.qmc.checkSaved.return_value = True
+        window.roastserver_controller = controller
+        window.stopActivities = Mock()
+        window.closeEventSettings = Mock()
+        window.sendmessage = Mock()
+
+        try:
+            with patch.object(
+                QApplication,
+                'queryKeyboardModifiers',
+                return_value=Qt.KeyboardModifier.NoModifier,
+            ), patch.object(QApplication, 'exit'):
+                assert window.closeApp()
+
+            state = store.roast_state(link.namespace, roast_uuid)
+            assert state is not None and state.terminal_intent == 'release'
+            assert store.roast_state(namespace_b, roast_uuid) is None
+            assert store.counts(link.namespace).pending == 2
+            assert store.counts(namespace_b).pending == 0
+            controller.shutdown.assert_called_once_with(15_000)
+        finally:
+            store.close()
+
     @pytest.mark.parametrize('stopped', [True, False])
     def test_roastserver_shutdown_is_bounded_and_precedes_device_teardown(
         self, stopped: bool
@@ -4569,12 +5248,17 @@ class TestRoastServerMainIntegration:
         window.qmc.safesaveflag = False
         window.qmc.checkSaved.return_value = True
         window.qmc.flagKeepON = True
+        window.qmc.roastUUID = '33333333333343338333333333333333'
         window.roastserver_controller = Mock()
         window.roastserver_controller.shutdown.return_value = stopped
         window.stopActivities = Mock()
         window.closeEventSettings = Mock()
         window.sendmessage = Mock()
         ordered = Mock()
+        ordered.attach_mock(
+            window.roastserver_controller.release_inventory_roast,
+            'release_inventory_roast',
+        )
         ordered.attach_mock(window.roastserver_controller.shutdown, 'shutdown')
         ordered.attach_mock(window.stopActivities, 'stopActivities')
         ordered.attach_mock(window.closeEventSettings, 'closeEventSettings')
@@ -4586,13 +5270,98 @@ class TestRoastServerMainIntegration:
             assert window.closeApp()
 
         assert [call[0] for call in ordered.mock_calls] == [
-            'shutdown', 'stopActivities', 'closeEventSettings', 'exit']
+            'release_inventory_roast', 'shutdown', 'stopActivities',
+            'closeEventSettings', 'exit']
+        window.roastserver_controller.release_inventory_roast.assert_called_once_with(
+            UUID(window.qmc.roastUUID))
         window.roastserver_controller.shutdown.assert_called_once_with(15_000)
         if stopped:
             window.sendmessage.assert_not_called()
         else:
             assert 'shutdown timeout' in window.sendmessage.call_args.args[0]
         assert '.terminate(' not in inspect.getsource(ApplicationWindow.closeApp)
+
+    def test_inventory_shutdown_cancel_does_not_release_or_interrupt_worker(self) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock(
+            safesaveflag=True,
+            roastUUID='33333333333343338333333333333333',
+        )
+        window.qmc.checkSaved.return_value = False
+        window.roastserver_controller = Mock()
+
+        assert not window.closeApp()
+
+        window.roastserver_controller.release_inventory_roast.assert_not_called()
+        window.roastserver_controller.shutdown.assert_not_called()
+
+    def test_inventory_shutdown_discard_reset_does_not_release_after_worker_stop(
+        self,
+    ) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock(
+            safesaveflag=True,
+            flagKeepON=True,
+            roastUUID='33333333333343338333333333333333',
+            backgroundpath='',
+        )
+        window.qmc.checkSaved.return_value = True
+        window.qmc.reset.side_effect = lambda **_kwargs: (
+            window.roastserver_controller.shutdown.assert_called_once_with(15_000)
+            or window.roastserver_controller.release_inventory_roast.assert_called_once()
+            or window.qmc.roastUUID is None
+        )
+        window.curFile = None
+        window.roastserver_controller = Mock()
+        window.roastserver_controller.shutdown.return_value = True
+        window.stopActivities = Mock()
+        window.closeEventSettings = Mock()
+        window.sendmessage = Mock()
+
+        with patch.object(
+            QApplication, 'queryKeyboardModifiers',
+            return_value=Qt.KeyboardModifier.NoModifier,
+        ), patch.object(QApplication, 'exit'):
+            assert window.closeApp()
+
+        window.qmc.reset.assert_called_once_with(
+            redraw=False,
+            soundOn=False,
+            keepProperties=False,
+            fireResetAction=False,
+        )
+        assert window.qmc.roastUUID is None
+
+    def test_inventory_shutdown_release_failure_warns_and_continues(self) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock(
+            safesaveflag=False,
+            flagKeepON=True,
+            roastUUID='33333333333343338333333333333333',
+        )
+        window.qmc.checkSaved.return_value = True
+        window.roastserver_controller = Mock()
+        window.roastserver_controller.release_inventory_roast.side_effect = (
+            ControllerError('inventory_storage_failed'))
+        window.roastserver_controller.shutdown.return_value = True
+        window.stopActivities = Mock()
+        window.closeEventSettings = Mock()
+        window.sendmessage = Mock()
+
+        with patch.object(
+            QApplication, 'queryKeyboardModifiers',
+            return_value=Qt.KeyboardModifier.NoModifier,
+        ), patch.object(QApplication, 'exit'):
+            assert window.closeApp()
+
+        window.roastserver_controller.shutdown.assert_called_once_with(15_000)
+        assert any(
+            'release could not be stored' in call_item.args[0]
+            for call_item in window.sendmessage.call_args_list
+        )
 
     def test_roastserver_validator_normalizes_without_opening_profile(
         self, tmp_path: Path
@@ -4622,37 +5391,7 @@ class TestRoastServerMainIntegration:
     def test_real_set_profile_server_mode_uses_pure_blend_conversion(
         self,
     ) -> None:
-        window = ApplicationWindow.__new__(ApplicationWindow)
-        window.qmc = Mock()
-        window.qmc.extradevices = []
-        window.qmc.etypes = ['Air', 'Drum', 'Damper', 'Burner', '--']
-        window.qmc.flavors = []
-        window.qmc.flavorlabels = []
-        window.qmc.weight = (0.0, 0.0, 'g')
-        window.qmc.volume = (0.0, 0.0, 'l')
-        window.qmc.timex = []
-        window.qmc.temp1 = []
-        window.qmc.temp2 = []
-        window.qmc.extratimex = []
-        window.qmc.extratemp1 = []
-        window.qmc.extratemp2 = []
-        window.qmc.mode = 'C'
-        window.qmc.loadalarmsfromprofile = False
-        window.qmc.loadaxisfromprofile = False
-        window.qmc.locktimex = False
-        window.qmc.timeindex = [-1, 0, 0, 0, 0, 0, 0, 0]
-        window.qmc.phasesbuttonflag = False
-        window.qmc.backgroundUUID = None
-        window.qmc.fileDirtySignal.emit = Mock()
-        window.qmc.updateDeltaSamples = Mock()
-        window.qmc.resetlinecountcaches = Mock()
-        window.nLCDS = 10
-        window.pidcontrol = Mock(loadRampSoakFromProfile=False)
-        window.get_profile_etypes = Mock(return_value=window.qmc.etypes)
-        window.updateLCDproperties = Mock()
-        window.loadEnergyFromProfile = Mock()
-        window.loadBbpFromProfile = Mock()
-        window.autoAdjustAxis = Mock()
+        window = inventory_profile_load_window()
         profile = ProfileData(
             roastUUID='0123456789abcdef0123456789abcdef',
             plus_blend_spec=['Archive blend', [['coffee-1', 1.0]]],
@@ -4676,13 +5415,464 @@ class TestRoastServerMainIntegration:
         plus_sync.assert_not_called()
         settings.assert_not_called()
 
-    def test_get_profile_read_only_snapshot_is_observationally_pure(self) -> None:
+    @pytest.mark.parametrize(
+        ('profile_fields', 'expected', 'warning'),
+        [
+            ({}, dict.fromkeys(INVENTORY_QMC_FIELDS), False),
+            (INVENTORY_PROFILE_LINK, INVENTORY_PROFILE_LINK, False),
+            (
+                {'roastServerInventoryOrigin': 'https://archive.example'},
+                dict.fromkeys(INVENTORY_QMC_FIELDS),
+                True,
+            ),
+            (
+                {
+                    **INVENTORY_PROFILE_LINK,
+                    'roastServerBeanLotUUID': 'NOT-A-UUID',
+                },
+                dict.fromkeys(INVENTORY_QMC_FIELDS),
+                True,
+            ),
+        ],
+    )
+    def test_inventory_profile_load_is_all_or_none_and_historical(
+        self,
+        profile_fields: dict[str, str],
+        expected: dict[str, object],
+        warning: bool,
+    ) -> None:
+        window = inventory_profile_load_window()
+        set_qmc_inventory_profile_link(window.qmc, {
+            name: f'prior-{name}' for name in INVENTORY_QMC_FIELDS
+        })
+        profile = ProfileData(
+            roastUUID='0123456789abcdef0123456789abcdef',
+            **profile_fields,
+        )
+
+        with patch.object(main_module.plus.register, 'getPath') as register_get, patch.object(
+            main_module.plus.sync, 'sync'
+        ) as plus_sync, patch.object(main_module, 'QSettings') as settings, patch.object(
+            main_module.QMessageBox, 'information'
+        ):
+            assert window.setProfile(
+                'profile.alog', profile, quiet=True, reset=False)
+
+        assert qmc_inventory_profile_link(window.qmc) == expected
+        if warning:
+            window.sendmessage.assert_called_once_with(
+                'Invalid Roast Server inventory lot link ignored.')
+        else:
+            window.sendmessage.assert_not_called()
+        register_get.assert_not_called()
+        plus_sync.assert_not_called()
+        settings.assert_not_called()
+        window.plusAddPath.assert_not_called()
+
+    def test_inventory_profile_typed_keys_are_optional(self) -> None:
+        assert set(INVENTORY_QMC_FIELDS) <= ProfileData.__optional_keys__
+
+    @staticmethod
+    def inventory_charge_window(
+        profile_link: dict[str, str] | None = INVENTORY_PROFILE_LINK,
+    ) -> ApplicationWindow:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.qmc = SimpleNamespace(
+            roastUUID='33333333333343338333333333333333',
+            weight=(1.25, 0.0, 'Kg'),
+        )
+        for name in INVENTORY_QMC_FIELDS:
+            setattr(
+                window.qmc,
+                name,
+                None if profile_link is None else profile_link[name],
+            )
+        window.roastserver_controller = Mock()
+        window.sendmessage = Mock()  # type: ignore[method-assign]
+        return window
+
+    def test_inventory_charge_prepare_builds_link_and_passes_profile_values(
+        self,
+    ) -> None:
+        window = self.inventory_charge_window()
+        prepared = Mock()
+        window.roastserver_controller.prepare_inventory_charge.return_value = prepared
+
+        assert window.prepareRoastServerInventoryCharge() is prepared
+
+        link, roast_uuid, weight, unit = (
+            window.roastserver_controller.prepare_inventory_charge.call_args.args)
+        assert link.namespace.origin == 'https://archive.example'
+        assert link.namespace.organization_id == UUID(
+            '11111111-1111-4111-8111-111111111111')
+        assert link.lot_id == UUID('22222222-2222-4222-8222-222222222222')
+        assert link.lot_name == 'Historical lot'
+        assert roast_uuid == UUID('33333333-3333-4333-8333-333333333333')
+        assert (weight, unit) == (1.25, 'Kg')
+        window.sendmessage.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ('code', 'expected'),
+        [
+            ('connector_disabled', 'Enable Roast Server or clear the selected inventory lot.'),
+            ('inventory_namespace_stale', 'Choose an inventory lot from the current Roast Server organization.'),
+            ('inventory_lot_unavailable', 'Refresh inventory and choose an available lot before CHARGE.'),
+            ('inventory_weight_invalid', 'Enter a valid positive green weight before CHARGE.'),
+            ('inventory_storage_failed', 'Inventory reservation could not be stored. CHARGE was canceled.'),
+        ],
+    )
+    def test_inventory_charge_errors_block_with_plain_status(
+        self, code: str, expected: str
+    ) -> None:
+        window = self.inventory_charge_window()
+        window.roastserver_controller.prepare_inventory_charge.side_effect = (
+            ControllerError(code))
+
+        assert window.prepareRoastServerInventoryCharge() is None
+        window.sendmessage.assert_called_once_with(expected)
+
+    def test_inventory_charge_untracked_warns_only_at_commit(self) -> None:
+        window = self.inventory_charge_window(None)
+        prepared = PreparedInventoryCharge(
+            False, None, None, None, None, None, None, False)
+        window.roastserver_controller.prepare_inventory_charge.return_value = prepared
+        window.roastserver_controller.commit_inventory_charge.return_value = InventoryNotice(
+            'inventory_untracked', None, None, None, None, None)
+        window.roastserver_controller.inventory_context.return_value.enabled = True
+
+        assert window.prepareRoastServerInventoryCharge() is prepared
+        window.sendmessage.assert_not_called()
+        assert window.commitRoastServerInventoryCharge(prepared) == ''
+        window.sendmessage.assert_called_once_with(
+            'No inventory lot selected. This roast will not be tracked in inventory.')
+
+    def test_inventory_charge_commit_returns_durable_roast_uuid(self) -> None:
+        window = self.inventory_charge_window()
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        prepared = PreparedInventoryCharge(
+            True,
+            Namespace(
+                'https://archive.example',
+                UUID('11111111-1111-4111-8111-111111111111'),
+                'https://archive.example|11111111111141118111111111111111',
+            ),
+            roast_uuid,
+            UUID('44444444-4444-4444-8444-444444444444'),
+            UUID('22222222-2222-4222-8222-222222222222'),
+            'Historical lot',
+            1250,
+            False,
+        )
+        window.roastserver_controller.commit_inventory_charge.return_value = InventoryNotice(
+            'inventory_reservation_queued', roast_uuid, prepared.reservation_uuid,
+            prepared.lot_id, None, None)
+
+        assert window.commitRoastServerInventoryCharge(prepared) == roast_uuid.hex
+        window.sendmessage.assert_not_called()
+
+    def test_inventory_charge_coordinator_seam_is_durable_locked_and_idempotent(
+        self, tmp_path: Path
+    ) -> None:
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        reservation_uuid = UUID('44444444-4444-4444-8444-444444444444')
+        uuid_values = iter((roast_uuid, reservation_uuid))
+        wake_calls: list[None] = []
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    lot_id=link.lot_id,
+                    name=link.lot_name,
+                    origin='Ethiopia',
+                    varietals=('Heirloom',),
+                    processing_method='washed',
+                    crop_year=2026,
+                    on_hand_grams=2_000,
+                    reserved_grams=0,
+                    available_grams=2_000,
+                    unresolved_conflict_count=0,
+                ),
+            ),
+            now,
+        )
+        context = InventoryContext(
+            origin=link.namespace.origin,
+            namespace=link.namespace,
+            enabled=True,
+            previously_authenticated=True,
+            client_instance_uuid=UUID(
+                '55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: next(uuid_values),
+            wake=lambda: wake_calls.append(None),
+        )
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        canvas = coordinator_inventory_charge_canvas(window)
+        controller = coordinator_controller(coordinator, context)
+        window.roastserver_controller = controller
+        enqueue_reserve = store.enqueue_reserve
+
+        def checked_enqueue(*args: Any, **kwargs: Any) -> Any:
+            assert canvas.timeindex[0] == -1
+            return enqueue_reserve(*args, **kwargs)
+
+        try:
+            with patch.object(
+                store, 'enqueue_reserve', side_effect=checked_enqueue
+            ) as enqueue:
+                tgraphcanvas._markCharge(canvas, noaction=True)
+
+                assert canvas.timeindex[0] == 0
+                assert canvas.roastUUID == roast_uuid.hex
+                state = store.roast_state(link.namespace, roast_uuid)
+                assert state is not None
+                assert state.reservation_uuid == reservation_uuid
+                assert store.counts(link.namespace).pending == 1
+                assert enqueue.call_count == 1
+                assert wake_calls == [None]
+                assert controller.inventory_lot_locked(
+                    link, roast_uuid, False)
+
+                window.buttonCHARGE.isFlat.return_value = True
+                tgraphcanvas._markCharge(canvas, noaction=True)
+                assert canvas.timeindex[0] == -1
+                assert canvas.roastUUID == roast_uuid.hex
+
+                window.buttonCHARGE.isFlat.return_value = False
+                tgraphcanvas._markCharge(canvas, noaction=True)
+
+                repeated_state = store.roast_state(link.namespace, roast_uuid)
+                assert repeated_state is not None
+                assert repeated_state.reservation_uuid == reservation_uuid
+                assert canvas.roastUUID == roast_uuid.hex
+                assert store.counts(link.namespace).pending == 1
+                assert enqueue.call_count == 1
+                assert wake_calls == [None]
+        finally:
+            store.close()
+
+    def test_inventory_charge_coordinator_manual_append_failure_retries_exactly(
+        self, tmp_path: Path
+    ) -> None:
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        reservation_uuid = UUID('44444444-4444-4444-8444-444444444444')
+        uuid_values = iter((roast_uuid, reservation_uuid))
+        wake_calls: list[None] = []
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    lot_id=link.lot_id,
+                    name=link.lot_name,
+                    origin='Ethiopia',
+                    varietals=('Heirloom',),
+                    processing_method='washed',
+                    crop_year=2026,
+                    on_hand_grams=2_000,
+                    reserved_grams=0,
+                    available_grams=2_000,
+                    unresolved_conflict_count=0,
+                ),
+            ),
+            now,
+        )
+        context = InventoryContext(
+            origin=link.namespace.origin,
+            namespace=link.namespace,
+            enabled=True,
+            previously_authenticated=True,
+            client_instance_uuid=UUID(
+                '55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: next(uuid_values),
+            wake=lambda: wake_calls.append(None),
+        )
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        canvas = coordinator_inventory_charge_canvas(window)
+        window.roastserver_controller = coordinator_controller(
+            coordinator, context)
+        window.eventactionx = Mock()
+        canvas.device = 18
+        canvas.ETcurve = True
+        canvas.BTcurve = True
+        canvas.roastpropertiesAutoOpenFlag = True
+        canvas.l_temp1 = InventoryChargeCurve(canvas.timex, canvas.temp1)
+        canvas.l_temp2 = InventoryChargeCurve(canvas.timex, canvas.temp2)
+        canvas.l_temp2.fail_next_update = True
+        canvas.drawmanual = lambda et, bt, tx: tgraphcanvas.drawmanual(
+            canvas, et, bt, tx)
+        window.ser = MagicMock()
+        window.ser.NONE.return_value = (1.0, 101.0, 91.0)
+        profile_before = (
+            list(canvas.timex), list(canvas.temp1), list(canvas.temp2))
+        curves_before = (canvas.l_temp1.data, canvas.l_temp2.data)
+        enqueue_reserve = store.enqueue_reserve
+
+        def checked_enqueue(*args: Any, **kwargs: Any) -> Any:
+            assert canvas.timeindex[0] == -1
+            return enqueue_reserve(*args, **kwargs)
+
+        try:
+            with patch.object(
+                store, 'enqueue_reserve', side_effect=checked_enqueue
+            ) as enqueue:
+                tgraphcanvas._markCharge(canvas)
+
+                state = store.roast_state(link.namespace, roast_uuid)
+                assert state is not None
+                assert state.reservation_uuid == reservation_uuid
+                assert store.counts(link.namespace).pending == 1
+                assert enqueue.call_count == 1
+                assert wake_calls == [None]
+                assert canvas.roastUUID == roast_uuid.hex
+                assert canvas.timeindex[0] == -1
+                assert (canvas.timex, canvas.temp1, canvas.temp2) == profile_before
+                assert (canvas.l_temp1.data, canvas.l_temp2.data) == curves_before
+                window.buttonCHARGE.setFlat.assert_not_called()
+                window.buttonCHARGE.stopAnimation.assert_not_called()
+                window.santokerWarmupController.mark_charge.assert_not_called()
+                window.eventactionx.assert_not_called()
+                window.sendmessage.assert_not_called()
+                window.openPropertiesSignal.emit.assert_not_called()
+                canvas.timealign.assert_not_called()
+
+                tgraphcanvas._markCharge(canvas)
+
+                repeated_state = store.roast_state(link.namespace, roast_uuid)
+                assert repeated_state is not None
+                assert repeated_state.reservation_uuid == reservation_uuid
+                assert store.counts(link.namespace).pending == 1
+                assert enqueue.call_count == 1
+                assert wake_calls == [None]
+                assert canvas.roastUUID == roast_uuid.hex
+                assert canvas.timeindex[0] == 1
+                assert canvas.timex == [0.0, 1.0]
+                assert canvas.temp1 == [100.0, 101.0]
+                assert canvas.temp2 == [90.0, 91.0]
+                window.buttonCHARGE.setFlat.assert_called_once_with(True)
+                window.buttonCHARGE.stopAnimation.assert_called_once_with()
+                window.santokerWarmupController.mark_charge.assert_called_once_with()
+                window.eventactionx.assert_called_once_with(0, '')
+                window.openPropertiesSignal.emit.assert_called_once_with()
+                assert canvas.timealign.call_count == 1
+        finally:
+            store.close()
+
+    def test_inventory_charge_coordinator_store_failure_preserves_profile(
+        self, tmp_path: Path
+    ) -> None:
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        uuid_values = iter((
+            roast_uuid,
+            UUID('44444444-4444-4444-8444-444444444444'),
+        ))
+        wake_calls: list[None] = []
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    lot_id=link.lot_id,
+                    name=link.lot_name,
+                    origin='Ethiopia',
+                    varietals=('Heirloom',),
+                    processing_method='washed',
+                    crop_year=2026,
+                    on_hand_grams=2_000,
+                    reserved_grams=0,
+                    available_grams=2_000,
+                    unresolved_conflict_count=0,
+                ),
+            ),
+            now,
+        )
+        context = InventoryContext(
+            origin=link.namespace.origin,
+            namespace=link.namespace,
+            enabled=True,
+            previously_authenticated=True,
+            client_instance_uuid=UUID(
+                '55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: next(uuid_values),
+            wake=lambda: wake_calls.append(None),
+        )
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        canvas = coordinator_inventory_charge_canvas(window)
+        window.roastserver_controller = coordinator_controller(
+            coordinator, context)
+        profile_before = (
+            list(canvas.timeindex),
+            list(canvas.timex),
+            list(canvas.temp1),
+            list(canvas.temp2),
+            canvas.roastUUID,
+        )
+
+        try:
+            with patch.object(
+                store,
+                'enqueue_reserve',
+                side_effect=InventoryStoreError('injected failure'),
+            ):
+                tgraphcanvas._markCharge(canvas, noaction=True)
+
+            assert (
+                canvas.timeindex,
+                canvas.timex,
+                canvas.temp1,
+                canvas.temp2,
+                canvas.roastUUID,
+            ) == profile_before
+            assert store.roast_state(link.namespace, roast_uuid) is None
+            assert store.counts(link.namespace).pending == 0
+            assert wake_calls == []
+            window.sendmessage.assert_called_once_with(
+                'Inventory reservation could not be stored. CHARGE was canceled.')
+        finally:
+            store.close()
+
+    def test_inventory_charge_commit_storage_failure_blocks(self) -> None:
+        window = self.inventory_charge_window()
+        prepared = Mock()
+        window.roastserver_controller.commit_inventory_charge.side_effect = (
+            ControllerError('inventory_storage_failed'))
+
+        assert window.commitRoastServerInventoryCharge(prepared) is None
+        window.sendmessage.assert_called_once_with(
+            'Inventory reservation could not be stored. CHARGE was canceled.')
+
+    def test_inventory_profile_get_and_copy_are_observationally_pure(self) -> None:
         window = ApplicationWindow.__new__(ApplicationWindow)
         window.qmc = MagicMock()
         window.app = MagicMock(artisanviewerMode=False)
         window.pidcontrol = MagicMock()
         window.ser = MagicMock(externalprogram='', externaloutprogram='')
         window.get_os = Mock(return_value=('Linux', 'test', 'x86_64'))
+        window.plusAddPath = Mock()
         window.locale_str = 'en'
         window.nLCDS = 4
         window.recording_version = 'recording-version'
@@ -4721,6 +5911,7 @@ class TestRoastServerMainIntegration:
         qmc.plus_store = None
         qmc.plus_coffee = None
         qmc.plus_blend_spec = None
+        set_qmc_inventory_profile_link(qmc, INVENTORY_PROFILE_LINK)
         qmc.beans = ''
         qmc.weight = (0.0, 0.0, 'g')
         qmc.volume = (0.0, 0.0, 'l')
@@ -4811,12 +6002,28 @@ class TestRoastServerMainIntegration:
 
         assert profile
         assert 'roastUUID' not in profile
+        assert {name: profile[name] for name in INVENTORY_QMC_FIELDS} == (
+            INVENTORY_PROFILE_LINK)
         assert copy.deepcopy(observed_state()) == before
         window.consolidateSpecialEvents.assert_not_called()
         window.ensureCorrectExtraDeviceListLength.assert_not_called()
         window.computedProfileInformation.assert_not_called()
         assert 'computed' not in profile
         qmc.adderror.assert_not_called()
+
+        window.consolidateSpecialEvents = Mock()
+        window.ensureCorrectExtraDeviceListLength = Mock()
+        window.computedProfileInformation = Mock(return_value={})
+        copy_profile = window.getProfile(copy=True)
+
+        assert {name: copy_profile[name] for name in INVENTORY_QMC_FIELDS} == (
+            INVENTORY_PROFILE_LINK)
+        assert copy_profile['roastUUID'] != qmc.roastUUID
+        window.plusAddPath.assert_not_called()
+
+        qmc.roastServerBeanLotName = None
+        incomplete_profile = window.getProfile(server_read_only=True)
+        assert not set(INVENTORY_QMC_FIELDS) & incomplete_profile.keys()
 
     def test_canvas_server_reset_skips_dirty_external_and_presentation_hooks_on_failure(
         self,
@@ -5034,6 +6241,8 @@ class TestRoastServerReadOnlyLoad:
         window.qmc.safesaveflag = True
         window.qmc.plus_file_last_modified = datetime(2025, 1, 1, tzinfo=UTC)
         window.qmc.plus_sync_record_hash = 'previous-plus-hash'
+        for name in INVENTORY_QMC_FIELDS:
+            setattr(window.qmc, name, None)
         window.qmc.backgroundprofile = None
         window.qmc.hideBgafterprofileload = False
         window.qmc.background = False
@@ -6014,6 +7223,22 @@ class TestRoastServerReadOnlySaveTransition:
         window.roastServerWriteRecentFiles = Mock()
         window.ArtisanSaveFileDialog.return_value = str(destination)
         return window, controller, cache_file, destination
+
+    def test_inventory_profile_read_only_save_rollback_restores_all_fields(
+        self, tmp_path: Path
+    ) -> None:
+        window, _controller, cache_file, _destination = self.source_window(tmp_path)
+        source = window.roastserver_open_source
+        assert source is not None
+        set_qmc_inventory_profile_link(window.qmc, INVENTORY_PROFILE_LINK)
+        state = window.snapshotRoastServerSaveState()
+        set_qmc_inventory_profile_link(window.qmc, {
+            name: f'mutated-{name}' for name in INVENTORY_QMC_FIELDS
+        })
+
+        window.restoreRoastServerSaveState(state, (cache_file, SERVER_SOURCE))
+
+        assert qmc_inventory_profile_link(window.qmc) == INVENTORY_PROFILE_LINK
 
     def test_save_after_server_open_forces_save_as_and_resumes_normal_hooks(
         self, tmp_path: Path
