@@ -27,6 +27,9 @@
 
 from __future__ import annotations
 
+# HTTP boundary code intentionally normalizes unexpected client and transport failures.
+# pylint: disable=broad-exception-caught
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta

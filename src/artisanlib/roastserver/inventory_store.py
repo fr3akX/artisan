@@ -27,6 +27,9 @@
 
 from __future__ import annotations
 
+# Storage boundaries pass domain errors through before normalizing backend failures.
+# pylint: disable=try-except-raise
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass

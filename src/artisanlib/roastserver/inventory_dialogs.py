@@ -507,6 +507,7 @@ class _BeanLotFilterModel(QSortFilterProxyModel):
         source_row: int,
         source_parent: QModelIndex,
     ) -> bool:
+        del source_parent
         model = self.sourceModel()
         if not isinstance(model, BeanLotTableModel):
             return False
@@ -782,7 +783,9 @@ class InventoryLotDialog(QDialog):
     def _selection_changed(self) -> None:
         lot = self._selected_lot()
         self.chooseButton.setEnabled(lot is not None)
-        self.warningLabel.setText('' if lot is None else BeanLotTableModel._warning(lot))
+        self.warningLabel.setText(
+            '' if lot is None else BeanLotTableModel._warning(lot)  # pylint: disable=protected-access
+        )
 
     @pyqtSlot()
     def _choose(self) -> None:

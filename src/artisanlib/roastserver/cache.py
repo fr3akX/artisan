@@ -27,6 +27,9 @@
 
 from __future__ import annotations
 
+# Cache boundaries preserve arbitrary worker failures and normalize storage errors.
+# pylint: disable=broad-exception-caught,try-except-raise
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass

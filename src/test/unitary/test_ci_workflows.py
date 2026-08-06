@@ -33,3 +33,4 @@ def test_mypy_workflow_checks_production_sources() -> None:
     mypy_step = next(step for step in steps if step.get('uses') == 'tsuyoshicho/action-mypy@v5')
     assert mypy_step['with']['workdir'] == 'src'
     assert mypy_step['with']['target'] == '*.py artisanlib plus'
+    assert mypy_step['with']['install_types'] == 'false'

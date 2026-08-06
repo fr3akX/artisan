@@ -27,6 +27,10 @@
 
 from __future__ import annotations
 
+# Portable Win32 ABI tests intentionally consume private filesystem shims and imports.
+# Storage boundaries pass domain errors through before normalizing backend failures.
+# pylint: disable=protected-access,try-except-raise,unused-import
+
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import ctypes  # noqa: F401  # compatibility seam for portable Win32 ABI tests

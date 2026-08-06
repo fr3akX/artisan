@@ -4722,13 +4722,13 @@ class ApplicationWindow(QMainWindow):
             dialog = None
         hide = getattr(dialog, 'hide', None)
         if callable(hide):
-            hide()
+            cast(Callable[[], None], hide)()  # pylint: disable=not-callable
         clean_up = getattr(dialog, 'clean_up', None)
         if callable(clean_up):
-            clean_up()
+            cast(Callable[[], None], clean_up)()  # pylint: disable=not-callable
         close = getattr(dialog, 'close', None)
         if callable(close):
-            close()
+            cast(Callable[[], None], close)()  # pylint: disable=not-callable
         controller = self.roastserver_controller
         if controller is None:
             return
@@ -4736,12 +4736,12 @@ class ApplicationWindow(QMainWindow):
             ('inventoryRecoveryRequired', self.scheduleInventoryRecovery),
             ('inventoryConflict', self.showInventoryConflict),
         ):
-            signal = getattr(controller, signal_name, None)
-            disconnect = getattr(signal, 'disconnect', None)
+            qt_signal = getattr(controller, signal_name, None)
+            disconnect = getattr(qt_signal, 'disconnect', None)
             if not callable(disconnect):
                 continue
             try:
-                disconnect(slot)
+                cast(Callable[[object], None], disconnect)(slot)  # pylint: disable=not-callable
             except (RuntimeError, TypeError):
                 pass
 

@@ -53,6 +53,7 @@ jobs:
           # mypy command reads setup.cfg or other settings file in this path.
           workdir: src
           target: '*.py artisanlib plus'
+          install_types: false
 
           reviewdog_flags: -filter-mode=file -fail-on-error
           filter_mode: nofilter
