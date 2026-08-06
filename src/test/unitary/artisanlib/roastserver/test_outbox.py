@@ -2082,23 +2082,72 @@ def _windows_acl_layer(
     return layer, expected_sid
 
 
+def test_windows_private_acl_selects_exact_sddl_by_object_type() -> None:
+    layer_type = outbox_module._WindowsNativeLayer
+    sid = 'S-1-5-21'
+
+    assert not layer_type._is_directory(0)
+    assert layer_type._is_directory(stat.FILE_ATTRIBUTE_DIRECTORY)
+    assert not layer_type._is_directory(stat.FILE_ATTRIBUTE_READONLY)
+    assert layer_type._private_acl_sddl(sid, directory=False) == (
+        'D:P(A;;FA;;;S-1-5-21)'
+    )
+    assert layer_type._private_acl_sddl(sid, directory=True) == (
+        'D:P(A;OICI;FA;;;S-1-5-21)'
+    )
+
+
 def test_windows_private_acl_parser_requires_exact_valid_sid_ace() -> None:
     assert ctypes.sizeof(outbox_module._WindowsAceHeader) == 4
     assert outbox_module._WindowsAccessAllowedAce.SidStart.offset == 8
     assert ctypes.sizeof(outbox_module._WindowsAccessAllowedAce) == 12
 
     layer_type = outbox_module._WindowsNativeLayer
-    good = (
+    directory_flags = (
+        layer_type._OBJECT_INHERIT_ACE | layer_type._CONTAINER_INHERIT_ACE
+    )
+    directory_ace = (
         layer_type._ACCESS_ALLOWED_ACE_TYPE,
-        layer_type._OBJECT_INHERIT_ACE | layer_type._CONTAINER_INHERIT_ACE,
+        directory_flags,
         layer_type._FILE_ALL_ACCESS,
         True,
         0,
         True,
     )
-    layer, expected_sid = _windows_acl_layer((good,))
-    layer._verify_private_dacl(ctypes.c_void_p(1), expected_sid, protected=True)
+    file_ace = (
+        layer_type._ACCESS_ALLOWED_ACE_TYPE,
+        0,
+        layer_type._FILE_ALL_ACCESS,
+        True,
+        0,
+        True,
+    )
+    for ace, expected_flags in (
+        (directory_ace, directory_flags),
+        (file_ace, 0),
+    ):
+        layer, expected_sid = _windows_acl_layer((ace,))
+        layer._verify_private_dacl(
+            ctypes.c_void_p(1),
+            expected_sid,
+            protected=True,
+            expected_flags=expected_flags,
+        )
 
+    for ace, expected_flags in (
+        (directory_ace, 0),
+        (file_ace, directory_flags),
+    ):
+        layer, expected_sid = _windows_acl_layer((ace,))
+        with pytest.raises(OSError, match='ACL'):
+            layer._verify_private_dacl(
+                ctypes.c_void_p(1),
+                expected_sid,
+                protected=True,
+                expected_flags=expected_flags,
+            )
+
+    good = directory_ace
     bad_acls = (
         (),
         (good, good),
@@ -2115,10 +2164,19 @@ def test_windows_private_acl_parser_requires_exact_valid_sid_ace() -> None:
         bad_layer, bad_expected_sid = _windows_acl_layer(specs)
         with pytest.raises(OSError, match='ACL'):
             bad_layer._verify_private_dacl(
-                ctypes.c_void_p(1), bad_expected_sid, protected=True
+                ctypes.c_void_p(1),
+                bad_expected_sid,
+                protected=True,
+                expected_flags=directory_flags,
             )
+    layer, expected_sid = _windows_acl_layer((directory_ace,))
     with pytest.raises(OSError, match='ACL'):
-        layer._verify_private_dacl(ctypes.c_void_p(1), expected_sid, protected=False)
+        layer._verify_private_dacl(
+            ctypes.c_void_p(1),
+            expected_sid,
+            protected=False,
+            expected_flags=directory_flags,
+        )
 
 
 def test_windows_native_reparse_and_flush_failure_seams_are_causal(
@@ -2227,6 +2285,24 @@ def test_windows_native_failure_seams_fail_closed_without_sensitive_text(
         outbox_module._open_path_readonly(tmp_path / 'source.alog')
     assert reparse.value.__cause__ is None
     assert private_path not in repr(reparse.value)
+
+
+@pytest.mark.win32
+def test_windows_runtime_private_acl_accepts_normalized_file_flags(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / 'private'
+    directory.mkdir()
+    regular_file = directory / 'lock'
+    regular_file.touch()
+    native = outbox_module._WINDOWS_NATIVE
+    assert native is not None
+
+    native.set_private_permissions(directory, 0o700)
+    native.set_private_permissions(regular_file, 0o600)
+
+    native.verify_private_permissions(directory, 0o700)
+    native.verify_private_permissions(regular_file, 0o600)
 
 
 @pytest.mark.win32

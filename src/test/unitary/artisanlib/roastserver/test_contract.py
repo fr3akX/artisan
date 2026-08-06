@@ -424,6 +424,19 @@ def test_detail_accepts_state_matrix_canonicalizes_metadata_and_detaches_source(
     assert failed.current_revision.parse_state == 'failed'
 
 
+def test_detail_accepts_distinct_current_and_revision_metadata() -> None:
+    detail = parse_roast_detail(
+        valid_roast_detail_payload(
+            current_metadata={'source': 'desktop'},
+            revision_metadata={'source': 'profile'},
+        )
+    )
+
+    assert detail.current_revision is not None
+    assert detail.current_metadata == (('source', 'desktop'),)
+    assert detail.current_revision.metadata == (('source', 'profile'),)
+
+
 def test_frozen_json_tags_arrays_without_changing_object_tuple_contract() -> None:
     payload = valid_roast_detail_payload(
         current_metadata=ambiguous_container_metadata(),
@@ -549,6 +562,35 @@ def test_revision_upload_rejects_awaiting_state_bad_revision_state_and_each_cont
     links[field] = value
     with pytest.raises(ContractError, match='invalid server response'):
         parse_revision_upload(payload)
+
+
+def test_roast_page_accepts_fractional_duration_seconds() -> None:
+    payload = valid_roast_page_payload()
+    items = payload['items']
+    assert isinstance(items, list)
+    item = items[0]
+    assert isinstance(item, dict)
+    item['duration_seconds'] = 621.357
+
+    page = parse_roast_page(payload)
+
+    assert page.items[0].duration_seconds == pytest.approx(621.357)
+
+
+@pytest.mark.parametrize(
+    'field', ('title', 'batch_prefix', 'operator', 'machine', 'machine_setup')
+)
+def test_roast_page_accepts_empty_optional_text_fields(field: str) -> None:
+    payload = valid_roast_page_payload()
+    items = payload['items']
+    assert isinstance(items, list)
+    item = items[0]
+    assert isinstance(item, dict)
+    item[field] = ''
+
+    page = parse_roast_page(payload)
+
+    assert getattr(page.items[0], field) == ''
 
 
 def test_numeric_fields_reject_bool_unsafe_integer_nonfinite_and_overflow() -> None:
@@ -696,6 +738,37 @@ def test_error_parser_accepts_exact_multibyte_limit_and_rejects_501_code_points(
         ensure_ascii=False,
     ).encode('utf-8')
     assert parse_error_envelope(too_long) is None
+
+
+def test_aroast_ack_accepts_bounded_compatibility_result_fields() -> None:
+    payload = valid_aroast_ack_payload()
+    result = payload['result']
+    assert isinstance(result, dict)
+    result.update(
+        {
+            'label': 'Archive Fixture Batch',
+            'amount': 1.23,
+            'end_weight_est': False,
+            'coffee': {'hr_id': 'coffee-1', 'label': 'Ethiopia Worka'},
+        }
+    )
+
+    ack = parse_aroast_ack(payload)
+
+    assert ack.success is True
+    assert ack.result.roast_id == ROAST_UUID
+
+
+def test_aroast_ack_accepts_unlimited_limit_and_remaining_sentinels() -> None:
+    payload = valid_aroast_ack_payload()
+    payload['rlimit'] = -1
+    payload['rremaining'] = -1
+
+    ack = parse_aroast_ack(payload)
+
+    assert ack.rlimit == -1
+    assert ack.rusage == 5
+    assert ack.rremaining == -1
 
 
 def test_aroast_ack_requires_success_matching_uuid_and_safe_counters() -> None:

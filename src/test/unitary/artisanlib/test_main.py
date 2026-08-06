@@ -118,7 +118,7 @@ import stat
 import tempfile
 from pathlib import Path
 from collections.abc import Generator
-from typing import Any
+from typing import Any, cast
 from unittest.mock import ANY, MagicMock, Mock, call, patch
 from uuid import UUID
 
@@ -5416,6 +5416,69 @@ class TestRoastServerReadOnlyLoad:
         window.roastserver_controller.record_open_source.assert_not_called()
         window.qmc.reset.assert_not_called()
         window.setProfile.assert_not_called()
+
+    def test_server_load_snapshot_captures_coordinates_without_copying_graph_artists(
+        self,
+    ) -> None:
+        class UncopyableArtist:
+            def __init__(self, xyann: tuple[float, float]) -> None:
+                self.xyann = xyann
+
+            def __deepcopy__(self, _memo: dict[int, object]) -> object:
+                raise TypeError("cannot pickle 'tgraphcanvas' object")
+
+        class SnapshotCanvas:
+            def __getattr__(self, _name: str) -> None:
+                return None
+
+        window, _previous = self.load_window()
+        window.qmc = cast(Any, SnapshotCanvas())
+        foreground_temp = UncopyableArtist((1.0, 2.0))
+        foreground_time = UncopyableArtist((3.0, 4.0))
+        background_temp = UncopyableArtist((5.0, 6.0))
+        background_time = UncopyableArtist((7.0, 8.0))
+        flag = UncopyableArtist((9.0, 10.0))
+        window.qmc.l_annotations = [foreground_temp]
+        window.qmc.l_background_annotations = [background_temp]
+        window.qmc.l_annotations_dict = {
+            0: [foreground_temp, foreground_time],
+            7: [background_temp, background_time],
+        }
+        window.qmc.l_event_flags_dict = {3: flag}
+        window.qmc.l_timeline = foreground_time
+        window.qmc.legend = flag
+        window.qmc.l_annotations_pos_dict = {11: ((11.0, 12.0), (13.0, 14.0))}
+        window.qmc.l_event_flags_pos_dict = {12: (15.0, 16.0)}
+        window.qmc.startofx = 0.0
+        window.qmc.endofx = 600.0
+        window.qmc.ylimit = 250.0
+        window.qmc.ylimit_min = 0.0
+        window.qmc.zlimit = 50.0
+        window.qmc.zlimit_min = -50.0
+        window.qmc.legendloc_pos = None
+
+        state = window.snapshotRoastServerLoad()
+
+        background = state['background']
+        axis = state['axis']
+        exact_qmc = state['exact']['qmc']
+        assert 'l_annotations_dict' not in background
+        assert 'l_background_annotations' not in background
+        assert 'legend' not in axis
+        assert 'legend' not in exact_qmc
+        assert 'l_annotations' not in exact_qmc
+        assert 'l_annotations_dict' not in exact_qmc
+        assert 'l_event_flags_dict' not in exact_qmc
+        assert 'l_timeline' not in exact_qmc
+        assert exact_qmc['l_annotations_pos_dict'] == {
+            0: ((1.0, 2.0), (3.0, 4.0)),
+            7: ((5.0, 6.0), (7.0, 8.0)),
+            11: ((11.0, 12.0), (13.0, 14.0)),
+        }
+        assert exact_qmc['l_event_flags_pos_dict'] == {
+            3: (9.0, 10.0),
+            12: (15.0, 16.0),
+        }
 
     @pytest.mark.parametrize('plus_connected', [False, True])
     def test_server_load_prevalidates_real_file_and_skips_all_plus_recent_hooks(

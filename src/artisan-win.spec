@@ -99,13 +99,18 @@ def del_file(file_path, fatal=True):
 ###################################
 # Setup the environment
 ###################################
-if os.environ.get('APPVEYOR'):
+if os.environ.get('GITHUB_ACTIONS'):
+    ARTISAN_SRC = os.getcwd()
+    PYTHON = os.environ.get('PYTHON_PATH')
+    PYQT = os.environ.get('PYQT')
+    QT_TRANSL = os.environ.get('QT_TRANSL')
+elif os.environ.get('APPVEYOR'):
     ARTISAN_SRC = r'C:\projects\artisan\src'
     PYTHON = os.environ.get('PYTHON_PATH')
     PYQT = os.environ.get('PYQT')
     QT_TRANSL = os.environ.get('QT_TRANSL')
 else:
-    msg =f'artisan-win.spec is intended only to run on Appveyor CI.'
+    msg =f'artisan-win.spec is intended only to run on Appveyor or GitHub Actions CI.'
     logging.error(msg)
     sys.exit('Fatal Error')
 
