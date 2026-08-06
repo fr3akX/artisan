@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta, timezone
 import json
 import math
-from types import MappingProxyType
+import sys
+from types import MappingProxyType, ModuleType
 from uuid import UUID
 
 import pytest
@@ -527,6 +528,20 @@ def test_green_weight_supports_every_unit_and_rounds_half_up() -> None:
     assert green_weight_grams(1, 'lb') == 454
     assert green_weight_grams(1, 'oz') == 28
     assert green_weight_grams(0.0004, 'Kg') is None
+
+
+def test_green_weight_conversion_ignores_collection_time_module_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replacement = ModuleType('artisanlib.util')
+    replacement.weight_units = ['g', 'kg', 'oz', 'lb']  # type: ignore[attr-defined]
+    replacement.convertWeight = lambda *_args: 500.0  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, 'artisanlib.util', replacement)
+
+    assert green_weight_grams(1, 'g') == 1
+    assert green_weight_grams(1.0005, 'Kg') == 1001
+    assert green_weight_grams(1, 'lb') == 454
+    assert green_weight_grams(1, 'oz') == 28
 
 
 @pytest.mark.parametrize(

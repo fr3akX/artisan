@@ -63,6 +63,12 @@ _MAX_DESCRIPTOR_CODE_POINTS: Final[int] = 100
 _MAX_DESCRIPTOR_BYTES: Final[int] = 400
 _MAX_VARIETALS: Final[int] = 16
 _MIN_SIGNED_GRAMS: Final[int] = -POSTGRESQL_INTEGER_MAX
+_GRAMS_PER_WEIGHT_UNIT: Final[dict[str, float]] = {
+    'g': 1.0,
+    'Kg': 1000.0,
+    'lb': 1 / (2.20462262185 / 1000),
+    'oz': 1000 / (2.20462262185 * 16),
+}
 _CANONICAL_TIMESTAMP_RE: Final[re.Pattern[str]] = re.compile(
     r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$'
 )
@@ -712,17 +718,20 @@ def profile_link_fields(link: InventoryProfileLink) -> dict[str, str]:
 
 
 def green_weight_grams(value: object, unit: object) -> int | None:
-    from artisanlib.util import convertWeight, weight_units
-
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     try:
         number = float(value)
     except OverflowError:
         return None
-    if not math.isfinite(number) or number <= 0 or unit not in weight_units:
+    if (
+        not math.isfinite(number)
+        or number <= 0
+        or not isinstance(unit, str)
+        or unit not in _GRAMS_PER_WEIGHT_UNIT
+    ):
         return None
-    grams = convertWeight(number, weight_units.index(unit), 0)
+    grams = number * _GRAMS_PER_WEIGHT_UNIT[unit]
     try:
         rounded = int(
             Decimal(str(grams)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)

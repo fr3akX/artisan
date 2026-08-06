@@ -167,7 +167,7 @@ def ensure_main_qt_isolation() -> Generator[None, None, None]:
 # Set up QApplication before importing artisanlib modules
 # Use PyQt6 only as requested (ignore PyQt5)
 try:
-    from PyQt6.QtCore import QLocale, QSettings, Qt, QTime
+    from PyQt6.QtCore import QLocale, QObject, QSettings, Qt, QTime, pyqtSignal
     from PyQt6.QtGui import QAction, QColor
     from PyQt6.QtWidgets import (
         QApplication,
@@ -196,6 +196,7 @@ from artisanlib.atypes import ProfileData, RecentRoast
 from artisanlib.canvas import tgraphcanvas
 from artisanlib.main import ApplicationWindow, UI_MODE
 from artisanlib.roastserver import dialogs as roastserver_dialogs
+from artisanlib.roastserver import inventory_dialogs
 from artisanlib.roastserver.contract import MAX_PROFILE_BYTES, Namespace, ServerProfileSource
 from artisanlib.roastserver.controller import ControllerError
 from artisanlib.roastserver.inventory import (
@@ -4099,8 +4100,6 @@ def coordinator_controller(
 def test_inventory_recovery_startup_is_deferred_reuses_dialog_and_conflict_is_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from PyQt6.QtCore import QObject, pyqtSignal
-    from artisanlib.roastserver import inventory_dialogs
     from artisanlib.roastserver.settings import namespace_for
 
     class Controller(QObject):
@@ -4210,8 +4209,6 @@ def test_inventory_recovery_startup_is_deferred_reuses_dialog_and_conflict_is_sa
 def test_inventory_recovery_cleanup_invalidates_pending_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from PyQt6.QtCore import QObject, pyqtSignal
-    from artisanlib.roastserver import inventory_dialogs
     from artisanlib.roastserver.settings import namespace_for
 
     class Controller(QObject):
