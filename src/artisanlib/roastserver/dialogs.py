@@ -84,6 +84,10 @@ from artisanlib.roastserver.contract import (
     ServerProfileSource,
 )
 from artisanlib.roastserver.controller import ArchivePageView, ArchiveRow
+from artisanlib.roastserver.inventory_store import (
+    FailedInventoryCommand,
+    InterruptedReservation,
+)
 from artisanlib.roastserver.origin import SettingsError, canonical_origin
 from artisanlib.roastserver.settings import (
     KEYRING_FAILURE_MESSAGE,
@@ -130,6 +134,11 @@ class _QueueCounts(Protocol):
     failed: int
 
 
+class _InventoryContext(Protocol):
+    namespace: object | None
+    enabled: bool
+
+
 class _CacheStats(Protocol):
     byte_count: int
     revision_count: int
@@ -164,6 +173,10 @@ class RoastServerDialogController(Protocol):
     identityChanged: _Signal
     queueChanged: _Signal
     failedJobsChanged: _Signal
+    inventoryQueueChanged: _Signal
+    inventoryFailedChanged: _Signal
+    inventoryRecoveryRequired: _Signal
+    inventoryRefreshFinished: _Signal
     cacheStatsChanged: _Signal
     operationFailed: _Signal
 
@@ -183,6 +196,8 @@ class RoastServerDialogController(Protocol):
     def refresh_queue(self) -> None: ...
     def retry_job(self, job_id: str) -> None: ...
     def remove_job(self, job_id: str) -> None: ...
+    def retry_inventory_command(self, command_id: str) -> None: ...
+    def inventory_context(self) -> _InventoryContext: ...
     def clear_unused_cache(self) -> None: ...
     def save_configuration_geometry(self, geometry: QByteArray) -> None: ...
 
@@ -504,6 +519,95 @@ class FailedJobsModel(QAbstractTableModel):
         return str(cast(_FailedJob, self._jobs[row]).roast_uuid)
 
 
+class FailedInventoryCommandsModel(QAbstractTableModel):
+    _HEADERS: Final[tuple[str, ...]] = (
+        'Namespace',
+        'Roast UUID',
+        'Operation',
+        'Attempts',
+        'Category',
+        'Message',
+        'Retry',
+    )
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._commands: tuple[FailedInventoryCommand, ...] = ()
+
+    @override
+    def rowCount(self, parent: QModelIndex = _ROOT_INDEX) -> int:
+        return 0 if parent.isValid() else len(self._commands)
+
+    @override
+    def columnCount(self, parent: QModelIndex = _ROOT_INDEX) -> int:
+        return 0 if parent.isValid() else len(self._HEADERS)
+
+    @override
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if (
+            role == Qt.ItemDataRole.DisplayRole
+            and orientation is Qt.Orientation.Horizontal
+            and 0 <= section < len(self._HEADERS)
+        ):
+            return _tr(self._HEADERS[section])
+        return None
+
+    @override
+    def data(
+        self,
+        index: QModelIndex,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        command = self.command_at(index.row()) if index.isValid() else None
+        if command is None:
+            return None
+        values = self._display_values(command)
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            return ', '.join(values[:-1])
+        if role == Qt.ItemDataRole.DisplayRole and 0 <= index.column() < len(values):
+            return values[index.column()]
+        if role == Qt.ItemDataRole.TextAlignmentRole and index.column() in {3}:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    @override
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    def set_commands(self, commands: tuple[FailedInventoryCommand, ...]) -> None:
+        self.beginResetModel()
+        self._commands = tuple(commands)
+        self.endResetModel()
+
+    def command_at(self, row: int) -> FailedInventoryCommand | None:
+        if 0 <= row < len(self._commands):
+            return self._commands[row]
+        return None
+
+    @staticmethod
+    def _display_values(command: FailedInventoryCommand) -> tuple[str, ...]:
+        namespace = _tr('{origin} — organization {organization}').format(
+            origin=command.namespace.origin,
+            organization=str(command.namespace.organization_id),
+        )
+        return (
+            namespace,
+            str(command.roast_uuid),
+            _tr(command.operation.capitalize()),
+            str(command.attempts),
+            command.error_code,
+            command.error_message,
+            '',
+        )
+
+
 class RoastServerConfigDialog(QDialog):
     server_label: QLabel
     server_edit: QLineEdit
@@ -523,6 +627,14 @@ class RoastServerConfigDialog(QDialog):
     failed_model: FailedJobsModel
     failed_view: QTableView
     refresh_button: QPushButton
+    inventory_pending_count_label: QLabel
+    inventory_retrying_count_label: QLabel
+    inventory_paused_count_label: QLabel
+    inventory_failed_count_label: QLabel
+    inventory_interrupted_count_label: QLabel
+    inventory_failed_model: FailedInventoryCommandsModel
+    inventory_failed_view: QTableView
+    inventory_status_label: QLabel
     cache_label: QLabel
     clear_cache_button: QPushButton
     error_label: QLabel
@@ -543,12 +655,13 @@ class RoastServerConfigDialog(QDialog):
         self._ignored_operations: set[str] = set()
         self._connection_dirty = False
         self._rendering = False
+        self._inventory_unsupported_context: object | None = None
 
         self.setWindowTitle(_tr('Roast Server'))
         self.setModal(False)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-        self.setMinimumSize(680, 500)
-        self.resize(920, 700)
+        self.setMinimumSize(680, 560)
+        self.resize(980, 820)
         self._build_ui()
         self._connect_controller()
         self._render_settings(settings, update_origin=True)
@@ -641,6 +754,42 @@ class RoastServerConfigDialog(QDialog):
         queue_layout.addWidget(self.refresh_button, 0, Qt.AlignmentFlag.AlignRight)
         layout.addWidget(queue_group, 1)
 
+        inventory_group = QGroupBox(_tr('Inventory queue'), self)
+        inventory_layout = QVBoxLayout(inventory_group)
+        inventory_counts = QHBoxLayout()
+        self.inventory_pending_count_label = self._add_count(inventory_counts, 'Pending')
+        self.inventory_retrying_count_label = self._add_count(inventory_counts, 'Retrying')
+        self.inventory_paused_count_label = self._add_count(inventory_counts, 'Paused')
+        self.inventory_failed_count_label = self._add_count(inventory_counts, 'Failed')
+        self.inventory_interrupted_count_label = self._add_count(inventory_counts, 'Interrupted')
+        inventory_counts.addStretch(1)
+        inventory_layout.addLayout(inventory_counts)
+
+        self.inventory_failed_model = FailedInventoryCommandsModel(self)
+        self.inventory_failed_view = QTableView(inventory_group)
+        self.inventory_failed_view.setModel(self.inventory_failed_model)
+        self.inventory_failed_view.setAccessibleName(_tr('Failed inventory commands'))
+        self.inventory_failed_view.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.inventory_failed_view.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.inventory_failed_view.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        inventory_vertical_header = self.inventory_failed_view.verticalHeader()
+        if inventory_vertical_header is not None:
+            inventory_vertical_header.setVisible(False)
+        inventory_horizontal_header = self.inventory_failed_view.horizontalHeader()
+        if inventory_horizontal_header is not None:
+            inventory_horizontal_header.setStretchLastSection(True)
+        inventory_layout.addWidget(self.inventory_failed_view, 1)
+        self.inventory_status_label = QLabel('', inventory_group)
+        self.inventory_status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.inventory_status_label.setOpenExternalLinks(False)
+        self.inventory_status_label.setWordWrap(True)
+        self.inventory_status_label.setAccessibleName(_tr('Inventory queue status'))
+        inventory_layout.addWidget(self.inventory_status_label)
+        layout.addWidget(inventory_group, 1)
+
         cache_row = QHBoxLayout()
         cache_caption = QLabel(_tr('Cached profiles:'), self)
         self.cache_label = QLabel(_format_cache(0, 0), self)
@@ -707,6 +856,12 @@ class RoastServerConfigDialog(QDialog):
         self._controller.identityChanged.connect(self._on_identity_changed)
         self._controller.queueChanged.connect(self._on_queue_changed)
         self._controller.failedJobsChanged.connect(self._on_failed_jobs_changed)
+        self._controller.inventoryQueueChanged.connect(self._on_inventory_queue_changed)
+        self._controller.inventoryFailedChanged.connect(self._on_inventory_failed_changed)
+        self._controller.inventoryRecoveryRequired.connect(self._on_inventory_recovery_required)
+        self._controller.inventoryRefreshFinished.connect(
+            self._on_inventory_refresh_finished
+        )
         self._controller.cacheStatsChanged.connect(self._on_cache_stats_changed)
         self._controller.operationFailed.connect(self._on_operation_failed)
 
@@ -880,10 +1035,12 @@ class RoastServerConfigDialog(QDialog):
             return
         settings = cast(ConnectorSettings, value)
         self._settings = settings
+        self._clear_inventory_unsupported_if_context_changed()
         update_origin = self._testing_operation is None and not self._connection_dirty
         self._render_settings(settings, update_origin=update_origin)
         if self._proof_origin != settings.origin:
             self._invalidate_proof(persist_automatic_off=False)
+        self._render_inventory_failed_actions()
 
     def _render_settings(
         self, settings: ConnectorSettings, *, update_origin: bool
@@ -905,6 +1062,7 @@ class RoastServerConfigDialog(QDialog):
 
     @pyqtSlot(object)
     def _on_identity_changed(self, value: object) -> None:
+        self._clear_inventory_unsupported_if_context_changed()
         if value is None:
             self._invalidate_proof(persist_automatic_off=False)
             return
@@ -938,6 +1096,7 @@ class RoastServerConfigDialog(QDialog):
         finally:
             self._rendering = False
         self._set_error('')
+        self._render_inventory_failed_actions()
 
     @pyqtSlot(object)
     def _on_queue_changed(self, value: object) -> None:
@@ -986,6 +1145,69 @@ class RoastServerConfigDialog(QDialog):
             self._set_error(_tr(_GENERIC_OPERATION_FAILURE))
 
     @pyqtSlot(object)
+    def _on_inventory_queue_changed(self, value: object) -> None:
+        if not all(hasattr(value, name) for name in ('pending', 'retrying', 'paused', 'failed')):
+            return
+        counts = cast(_QueueCounts, value)
+        self.inventory_pending_count_label.setText(str(counts.pending))
+        self.inventory_retrying_count_label.setText(str(counts.retrying))
+        self.inventory_paused_count_label.setText(str(counts.paused))
+        self.inventory_failed_count_label.setText(str(counts.failed))
+
+    @pyqtSlot(object)
+    def _on_inventory_failed_changed(self, value: object) -> None:
+        if not isinstance(value, tuple) or not all(
+            isinstance(command, FailedInventoryCommand) for command in value
+        ):
+            return
+        commands = cast('tuple[FailedInventoryCommand, ...]', value)
+        self.inventory_failed_model.set_commands(commands)
+        self._render_inventory_failed_actions()
+
+    @pyqtSlot(object)
+    def _on_inventory_recovery_required(self, value: object) -> None:
+        if not isinstance(value, tuple) or not all(
+            isinstance(record, InterruptedReservation) for record in value
+        ):
+            return
+        records = cast('tuple[InterruptedReservation, ...]', value)
+        self.inventory_interrupted_count_label.setText(str(len(records)))
+
+    def _render_inventory_failed_actions(self) -> None:
+        try:
+            context = self._controller.inventory_context()
+        except RuntimeError:
+            active_namespace = None
+            enabled = False
+        else:
+            active_namespace = context.namespace
+            enabled = context.enabled
+        for row in range(self.inventory_failed_model.rowCount()):
+            command = self.inventory_failed_model.command_at(row)
+            if command is None:
+                continue
+            retry = QPushButton(_tr('Retry same command'), self.inventory_failed_view)
+            retry.setAccessibleName(
+                _tr('Retry same inventory command for roast {roast}').format(
+                    roast=str(command.roast_uuid)))
+            retry.setEnabled(enabled and command.namespace == active_namespace)
+            retry.clicked.connect(partial(self._retry_inventory_command, command.id))
+            self.inventory_failed_view.setIndexWidget(
+                self.inventory_failed_model.index(row, 6), retry)
+        self.inventory_failed_view.resizeColumnsToContents()
+
+    def _retry_inventory_command(self, command_id: str) -> None:
+        try:
+            self._controller.retry_inventory_command(command_id)
+        except RuntimeError:
+            self.inventory_status_label.setText(
+                _tr('Inventory command could not be retried.'))
+
+    @pyqtSlot(str)
+    def _on_inventory_refresh_finished(self, _request_id: str) -> None:
+        self._clear_inventory_unsupported()
+
+    @pyqtSlot(object)
     def _on_cache_stats_changed(self, value: object) -> None:
         if not hasattr(value, 'byte_count') or not hasattr(value, 'revision_count'):
             return
@@ -1000,6 +1222,11 @@ class RoastServerConfigDialog(QDialog):
             self._set_error(_tr(_GENERIC_OPERATION_FAILURE))
             return
         failure = cast(PublicFailure, value)
+        if failure.kind is FailureKind.INVENTORY_UNSUPPORTED:
+            self._inventory_unsupported_context = self._inventory_context_key()
+            self.inventory_status_label.setText(
+                _tr('Server does not support inventory.'))
+            return
         if failure.kind is FailureKind.KEYRING:
             self._set_error(_tr(KEYRING_FAILURE_MESSAGE))
         else:
@@ -1011,6 +1238,30 @@ class RoastServerConfigDialog(QDialog):
             self._testing_operation = None
             self._clear_candidate()
             self._invalidate_proof(persist_automatic_off=False)
+
+    def _inventory_context_key(self) -> object:
+        try:
+            namespace = self._controller.inventory_context().namespace
+        except RuntimeError:
+            namespace = None
+        return self._settings.origin, namespace
+
+    def _clear_inventory_unsupported_if_context_changed(self) -> None:
+        unsupported_context = self._inventory_unsupported_context
+        if (
+            unsupported_context is not None
+            and unsupported_context != self._inventory_context_key()
+        ):
+            self._clear_inventory_unsupported()
+
+    def _clear_inventory_unsupported(self) -> None:
+        if self._inventory_unsupported_context is None:
+            return
+        self._inventory_unsupported_context = None
+        if self.inventory_status_label.text() == _tr(
+            'Server does not support inventory.'
+        ):
+            self.inventory_status_label.clear()
 
     def _has_current_proof(self) -> bool:
         return self._identity is not None and self._proof_origin == self._settings.origin
@@ -1798,6 +2049,7 @@ def _looks_like_failure(value: object) -> bool:
 __all__ = [
     'ArchivePageView',
     'ArchiveRow',
+    'FailedInventoryCommandsModel',
     'FailedJobsModel',
     'RoastServerBrowserDialog',
     'RoastServerConfigDialog',

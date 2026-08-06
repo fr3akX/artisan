@@ -27,6 +27,10 @@
 
 from __future__ import annotations
 
+# Portable Win32 ABI shims expose dynamic ctypes fields and platform-constant branches.
+# Filesystem boundaries pass domain errors through before normalizing OS failures.
+# pylint: disable=no-member,redefined-outer-name,try-except-raise,using-constant-test
+
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import ctypes

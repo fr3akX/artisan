@@ -63,6 +63,7 @@ from artisanlib.roastserver.controller import (
     ControllerError,
     RoastServerController,
 )
+from artisanlib.roastserver.inventory_store import InventoryStore
 from artisanlib.roastserver.metadata import project_profile
 from artisanlib.roastserver.outbox import FailedJob, Job, Outbox, QueueCounts
 from artisanlib.roastserver.settings import (
@@ -563,6 +564,11 @@ class FakeWorker(QObject):
     cachedFallbackReady = pyqtSignal(str, object)
     cachePublished = pyqtSignal(str, object)
     onlineChanged = pyqtSignal(bool)
+    inventoryLotsChanged = pyqtSignal(object)
+    inventoryQueueChanged = pyqtSignal(object)
+    inventoryFailedChanged = pyqtSignal(object)
+    inventoryReservationChanged = pyqtSignal(object)
+    inventoryRecoveryChanged = pyqtSignal(object)
     stopped = pyqtSignal()
 
     def __init__(self, **_kwargs: object) -> None:
@@ -700,6 +706,18 @@ class FakeWorker(QObject):
     def clear_unused(self, request_id: str) -> None:
         self.clear_ids.append(request_id)
         self._record('clear_unused', request_id)
+
+    @pyqtSlot(str)
+    def refresh_inventory(self, request_id: str) -> None:
+        self._record('refresh_inventory', request_id)
+
+    @pyqtSlot(str)
+    def retry_inventory_command(self, command_id: str) -> None:
+        self._record('retry_inventory_command', command_id)
+
+    @pyqtSlot()
+    def wake_inventory(self) -> None:
+        self._record('wake_inventory')
 
     @pyqtSlot()
     def stop(self) -> None:
@@ -850,7 +868,7 @@ class ControllerHarness:
         self.validator_failure: Exception | None = None
         self.validator_callback: Callable[[Path], None] | None = None
         self.worker = cast(FakeWorker, None)
-        self.worker_protection_registry:object|None = None
+        self.worker_protection_registry: object = cast(object, None)
         self.relay = WorkerRelay()
 
         def validate(path: Path) -> None:
@@ -865,6 +883,8 @@ class ControllerHarness:
             assert repr(kwargs['configuration_fence']) == '<ConfigurationFence>'
             assert kwargs['profile_vault'] is self.profile_vault
             assert kwargs['command_vault'] is self.command_vault
+            inventory_store = cast(InventoryStore, kwargs['inventory_store'])
+            assert inventory_store.root == self.tmp_path / 'data' / 'inventory'
             self.worker_protection_registry = kwargs['protection_registry']
             self.worker = FakeWorker(**kwargs)
             self.relay.connection.connect(self.worker.relay_connection)
@@ -3848,8 +3868,11 @@ def test_real_blocked_worker_queues_two_exact_revisions_from_same_save_target(
     def guarded_sha256(
         content: bytes = b'', *, usedforsecurity: bool = True
     ) -> Any:
-        if int(QThread.currentThreadId()) == ui_thread:
-            raise AssertionError('save hook hashed bytes on the UI thread')
+        if (
+            int(QThread.currentThreadId()) == ui_thread
+            and content in {first_bytes, second_bytes}
+        ):
+            raise AssertionError('save hook hashed profile bytes on the UI thread')
         return original_sha256(content, usedforsecurity=usedforsecurity)
 
     controller = RoastServerController(

@@ -580,6 +580,21 @@ def test_validate_requires_strict_canonical_sidecar_bytes(
         cache.validate(cached_revision)
 
 
+def test_validate_accepts_schema_v1_integral_duration_sidecar(
+    cache: CacheStore, cached_revision: CachedRevision
+) -> None:
+    parsed = json.loads(cached_revision.sidecar_path.read_bytes())
+    assert isinstance(parsed['roast']['duration_seconds'], float)
+    parsed['roast']['duration_seconds'] = 600
+    cached_revision.sidecar_path.write_bytes(
+        json.dumps(parsed, sort_keys=True, separators=(',', ':')).encode()
+    )
+
+    validated = cache.validate(cached_revision)
+
+    assert validated.roast.duration_seconds == 600.0
+
+
 def test_validate_rejects_sidecar_replacement_during_the_same_operation(
     cache: CacheStore,
     cached_revision: CachedRevision,

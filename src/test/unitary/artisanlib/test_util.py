@@ -1239,6 +1239,27 @@ def test_float2floatWeightVolume(value: float, expected: float) -> None:
     assert float2floatWeightVolume(value) == expected
 
 
+def test_util_weight_conversion_names_are_canonical() -> None:
+    from artisanlib import util, weight
+
+    assert util.weight_units is weight.weight_units
+    assert util.convertWeight is weight.convertWeight
+
+
+@pytest.mark.parametrize(
+    ('from_unit', 'to_unit'),
+    ((0.5, 0), (0, 0.5)),
+    ids=('from-unit', 'to-unit'),
+)
+def test_convertWeight_preserves_non_integer_index_type_error(
+    from_unit: Any, to_unit: Any
+) -> None:
+    with pytest.raises(TypeError) as raised:
+        convertWeight(1, from_unit, to_unit)
+
+    assert str(raised.value) == 'list indices must be integers or slices, not float'
+
+
 @pytest.mark.parametrize(
     'amount,from_unit,to_unit,expected_result,tolerance',
     [

@@ -34,6 +34,7 @@ from artisanlib import __release_sponsor_url__
 
 #import gc
 import time as libtime
+from copy import copy
 import os
 import sys  # @UnusedImport
 import ast
@@ -306,7 +307,8 @@ class tgraphcanvas(QObject):
         'organization_setup', 'operator_setup', 'roastertype_setup', 'roastersize_setup', 'roastersize_setup_default', 'roasterheating_setup', 'roasterheating_setup_default', 'drumspeed_setup', 'last_batchsize', 'machinesetup_energy_ratings',
         'machinesetup', 'roastingnotes', 'cuppingnotes', 'roastdate', 'roastepoch', 'roastepoch_timeout', 'lastroastepoch', 'batchcounter', 'batchsequence', 'batchprefix', 'neverUpdateBatchCounter',
         'roastbatchnr', 'roastbatchprefix', 'roastbatchpos', 'roasttzoffset', 'roastUUID', 'scheduleID', 'scheduleDate', 'plus_default_store', 'plus_store', 'plus_store_label', 'plus_coffee',
-        'plus_coffee_label', 'plus_blend_spec', 'plus_blend_spec_labels', 'plus_blend_label', 'plus_custom_blend', 'plus_sync_record_hash', 'plus_file_last_modified', 'beans', 'ETprojectFlag', 'BTprojectFlag', 'curveVisibilityCache', 'ETcurve', 'BTcurve',
+        'plus_coffee_label', 'plus_blend_spec', 'plus_blend_spec_labels', 'plus_blend_label', 'plus_custom_blend', 'plus_sync_record_hash', 'plus_file_last_modified',
+        'roastServerInventoryOrigin', 'roastServerInventoryOrganizationUUID', 'roastServerBeanLotUUID', 'roastServerBeanLotName', 'beans', 'ETprojectFlag', 'BTprojectFlag', 'curveVisibilityCache', 'ETcurve', 'BTcurve',
         'ETlcd', 'BTlcd', 'swaplcds', 'LCDdecimalplaces', 'foregroundShowFullflag', 'interpolateDropsflag', 'DeltaETflag', 'DeltaBTflag', 'DeltaETlcdflag', 'DeltaBTlcdflag',
         'swapdeltalcds', 'PIDbuttonflag', 'Controlbuttonflag', 'deltaETfilter', 'deltaBTfilter', 'curvefilter', 'deltaETspan', 'deltaBTspan',
         'deltaETsamples', 'deltaBTsamples', 'profile_sampling_interval', 'background_profile_sampling_interval', 'profile_meter', 'optimalSmoothing', 'polyfitRoRcalc',
@@ -1659,6 +1661,10 @@ class tgraphcanvas(QObject):
         self.plus_custom_blend:CustomBlend|None = None # holds the one custom blend, an instance of plus.blend.Blend, or None
         self.plus_sync_record_hash:str|None = None
         self.plus_file_last_modified:float|None = None # holds the last_modified timestamp of the loaded profile as EPOCH (float incl. milliseconds as returned by time.time())
+        self.roastServerInventoryOrigin:str|None = None
+        self.roastServerInventoryOrganizationUUID:str|None = None
+        self.roastServerBeanLotUUID:str|None = None
+        self.roastServerBeanLotName:str|None = None
         # plus_file_last_modified is set on load, reset on RESET, and updated on save. It is also update, if not None and new data is received from the server (sync:applyServerUpdates)
         # this timestamp is used in sync:fetchServerUpdate to ask server for updated data
 
@@ -8005,8 +8011,21 @@ class tgraphcanvas(QObject):
             except Exception as e: # pylint: disable=broad-except
                 _log.exception(e)
 
-        if not server_read_only and not self.checkSaved():
-            return False
+        inventory_profile_link:tuple[str|None,str|None,str|None,str|None]|None = None
+        if not server_read_only:
+            if not self.checkSaved():
+                return False
+            inventory_profile_link = (
+                self.roastServerInventoryOrigin,
+                self.roastServerInventoryOrganizationUUID,
+                self.roastServerBeanLotUUID,
+                self.roastServerBeanLotName,
+            )
+            if not self.aw.releaseRoastServerInventory(self.roastUUID):
+                self.aw.sendmessage(QApplication.translate(
+                    'Message',
+                    'Inventory release could not be stored. Reset was canceled.')) # pyright: ignore[reportUnknownArgumentType]
+                return False
 
         # restore and clear extra device settings which might have been created on loading a profile with different extra devices settings configuration
         if not server_read_only:
@@ -8103,6 +8122,17 @@ class tgraphcanvas(QObject):
             # reset plus sync
             self.plus_sync_record_hash = None
             self.plus_file_last_modified = None
+            self.roastServerInventoryOrigin = None
+            self.roastServerInventoryOrganizationUUID = None
+            self.roastServerBeanLotUUID = None
+            self.roastServerBeanLotName = None
+            if inventory_profile_link is not None:
+                (
+                    self.roastServerInventoryOrigin,
+                    self.roastServerInventoryOrganizationUUID,
+                    self.roastServerBeanLotUUID,
+                    self.roastServerBeanLotName,
+                ) = inventory_profile_link
             # clear also the cached sync record and sync record hash used to detect changes in the loaded profile
             if not server_read_only:
                 clearSyncRecordHash()
@@ -14410,8 +14440,19 @@ class tgraphcanvas(QObject):
         except Exception: # pylint: disable=broad-except
             pass
         removed = False
+        charge_marked = False
+        semaphore_acquired = False
         try:
+            prepared_inventory_charge = None
+            if (
+                self.flagstart
+                and not self.aw.buttonCHARGE.isFlat()
+            ):
+                prepared_inventory_charge = self.aw.prepareRoastServerInventoryCharge()
+                if prepared_inventory_charge is None:
+                    return
             self.profileDataSemaphore.acquire(1)
+            semaphore_acquired = True
             if self.flagstart:
                 try:
                     self.aw.soundpopSignal.emit()
@@ -14442,29 +14483,82 @@ class tgraphcanvas(QObject):
                         self.xaxistosm(redraw=False, set_xlim=not zoomed_in) # need to fix uneven x-axis labels like -0:13
                     elif not self.aw.buttonCHARGE.isFlat():
                         _log.debug('EVENT: CHARGE')
+                        manual_charge_values = None
+                        manual_array_snapshots = None
+                        manual_curve_snapshots:list[tuple[Line2D,Any,Any]] = []
                         if self.device == 18 and self.aw.simulator is None: #manual mode
                             tx,et,bt = self.aw.ser.NONE()
                             if bt != 1 and et != -1:  #cancel
-                                self.drawmanual(et,bt,tx)
-                                self.timeindex[0] = len(self.timex)-1
+                                if not len(self.timex) == len(self.temp1) == len(self.temp2):
+                                    _log.error('manual CHARGE arrays have incompatible lengths')
+                                    return
+                                manual_charge_values = (tx,et,bt)
+                                manual_array_snapshots = (
+                                    list(self.timex), list(self.temp1), list(self.temp2))
+                                if self.ETcurve and self.l_temp1 is not None:
+                                    curve_x,curve_y = self.l_temp1.get_data()
+                                    manual_curve_snapshots.append((
+                                        self.l_temp1, copy(curve_x), copy(curve_y)))
+                                if self.BTcurve and self.l_temp2 is not None:
+                                    curve_x,curve_y = self.l_temp2.get_data()
+                                    manual_curve_snapshots.append((
+                                        self.l_temp2, copy(curve_x), copy(curve_y)))
+                                charge_idx = len(self.timex)
                             else:
                                 return
                         elif self.autoChargeIdx > 0:
                             # prevent CHARGE out of index:
                             if len(self.timex) > self.autoChargeIdx:
-                                self.timeindex[0] = self.autoChargeIdx
+                                charge_idx = self.autoChargeIdx
                             elif len(self.timex) > self.autoChargeIdx - 1:
                                 # not yet enough readings
-                                self.timeindex[0] = self.autoChargeIdx - 1
+                                charge_idx = self.autoChargeIdx - 1
                             else:
                                 return
                         elif len(self.timex) > 0:
-                            self.timeindex[0] = len(self.timex)-1
+                            charge_idx = len(self.timex)-1
                         else:
                             self.autoChargeIdx = 1 # set CHARGE on next (first) reading
                             message = QApplication.translate('Message','Not enough data collected yet. Try again in a few seconds')
                             self.aw.sendmessage(message)
                             return
+                        if prepared_inventory_charge is None:
+                            return
+                        inventory_roast_uuid = self.aw.commitRoastServerInventoryCharge(
+                            prepared_inventory_charge)
+                        if inventory_roast_uuid is None:
+                            return
+                        if inventory_roast_uuid:
+                            self.roastUUID = inventory_roast_uuid
+                        if manual_charge_values is not None:
+                            if manual_array_snapshots is None:
+                                raise ValueError('manual CHARGE snapshots are missing')
+                            tx,et,bt = manual_charge_values
+                            projected_charge_idx = charge_idx
+                            try:
+                                self.drawmanual(et,bt,tx)
+                                charge_idx = len(self.timex)-1
+                                if not (
+                                    charge_idx == projected_charge_idx
+                                    and len(self.timex) == projected_charge_idx + 1
+                                    and len(self.temp1) == projected_charge_idx + 1
+                                    and len(self.temp2) == projected_charge_idx + 1
+                                ):
+                                    raise ValueError('manual CHARGE sample was not appended')
+                            except Exception: # pylint: disable=broad-except
+                                timex_snapshot,temp1_snapshot,temp2_snapshot = (
+                                    manual_array_snapshots)
+                                self.timex[:] = timex_snapshot
+                                self.temp1[:] = temp1_snapshot
+                                self.temp2[:] = temp2_snapshot
+                                for curve,curve_x,curve_y in manual_curve_snapshots:
+                                    try:
+                                        curve.set_data(curve_x,curve_y)
+                                    except Exception as restore_error: # pylint: disable=broad-except
+                                        _log.exception(restore_error)
+                                raise
+                        self.timeindex[0] = charge_idx
+                        charge_marked = True
                         self.aw.santokerWarmupController.mark_charge()
                         self.aw.updateSantokerWarmupControls()
                         if ((self.device != 18 or self.aw.simulator is not None) and
@@ -14524,6 +14618,8 @@ class tgraphcanvas(QObject):
                                     # we don't take another lock in EventRecordAction as we already hold that lock!
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
+                    if not charge_marked and not removed:
+                        return
             else:
                 message = QApplication.translate('Message','CHARGE: Scope is not recording')
                 self.aw.sendmessage(message)
@@ -14532,7 +14628,7 @@ class tgraphcanvas(QObject):
             _, _, exc_tb = sys.exc_info()
             self.adderror((QApplication.translate('Error Message', 'Exception:') + ' markCharge() {0}').format(str(ex)),getattr(exc_tb, 'tb_lineno', '?'))
         finally:
-            if self.profileDataSemaphore.available() < 1:
+            if semaphore_acquired:
                 self.profileDataSemaphore.release(1)
         if self.flagstart:
             # redraw (within timealign) should not be called if semaphore is hold!

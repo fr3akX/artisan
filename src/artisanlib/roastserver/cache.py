@@ -27,6 +27,9 @@
 
 from __future__ import annotations
 
+# Cache boundaries preserve arbitrary worker failures and normalize storage errors.
+# pylint: disable=broad-exception-caught,try-except-raise
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -886,7 +889,15 @@ class CacheStore:
             sidecar_path=sidecar_path,
             downloaded_at=downloaded_at,
         )
-        if content != _sidecar_bytes(namespace, roast, revision, downloaded_at):
+        if content != _sidecar_bytes(
+            namespace, roast, revision, downloaded_at
+        ) and content != _sidecar_bytes(
+            namespace,
+            roast,
+            revision,
+            downloaded_at,
+            legacy_integral_duration=True,
+        ):
             raise CacheError
         return cached
 
@@ -1410,12 +1421,16 @@ def _sidecar_bytes(
     roast: RoastSummary,
     revision: Revision,
     downloaded_at: datetime,
+    *,
+    legacy_integral_duration: bool = False,
 ) -> bytes:
     value = {
         'schema_version': _SCHEMA_VERSION,
         'origin': namespace.origin,
         'organization_uuid': str(namespace.organization_id),
-        'roast': _roast_value(roast),
+        'roast': _roast_value(
+            roast, legacy_integral_duration=legacy_integral_duration
+        ),
         'revision': _revision_value(revision),
         'downloaded_at': _datetime_text(downloaded_at),
     }
@@ -1434,7 +1449,14 @@ def _sidecar_bytes(
     return result
 
 
-def _roast_value(roast: RoastSummary) -> dict[str, object]:
+def _roast_value(
+    roast: RoastSummary, *, legacy_integral_duration: bool = False
+) -> dict[str, object]:
+    duration_seconds: int | float | None = roast.duration_seconds
+    if duration_seconds is not None:
+        duration_seconds = float(duration_seconds)
+        if legacy_integral_duration and duration_seconds.is_integer():
+            duration_seconds = int(duration_seconds)
     return {
         'roast_uuid': roast.roast_uuid.hex,
         'state': roast.state,
@@ -1447,7 +1469,7 @@ def _roast_value(roast: RoastSummary) -> dict[str, object]:
         'machine': roast.machine,
         'machine_setup': roast.machine_setup,
         'temperature_unit': roast.temperature_unit,
-        'duration_seconds': roast.duration_seconds,
+        'duration_seconds': duration_seconds,
         'green_weight_kg': roast.green_weight_kg,
         'roasted_weight_kg': roast.roasted_weight_kg,
         'revision_count': roast.revision_count,
