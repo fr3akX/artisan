@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -77,8 +78,11 @@ from artisanlib.roastserver.contract import (
 if TYPE_CHECKING:
     from artisanlib.roastserver.api import DownloadReceipt
 
+_log = logging.getLogger(__name__)
+
 _SCHEMA_VERSION: Final[int] = 1
 _COPY_CHUNK_BYTES: Final[int] = 1024 * 1024
+_ENTRY_CTIME_RELIABLE: bool = os.name != 'nt'
 _LOCK_NAME: Final[str] = '.cache.lock'
 _NAMESPACE_KEY_RE: Final[re.Pattern[str]] = re.compile(r'^namespace-sha256:([0-9a-f]{64})$')
 _NAMESPACE_DIRECTORY_RE: Final[re.Pattern[str]] = re.compile(r'^[0-9a-f]{64}$')
@@ -603,16 +607,19 @@ class CacheStore:
         published_sidecar_identity: tuple[int, int] | None = None
         result: CachedRevision | None = None
         operation_error: BaseException | None = None
+        phase = 'close_stage'
         try:
             if not stage.output.closed:
                 stage.output.flush()
                 stage.output.close()
+            phase = 'create_copy'
             copy_descriptor = secure_filesystem.create_generated_file(
                 self.root, copy_path, 0o600
             )
             copy_stat = os.fstat(copy_descriptor)
             copy_identity = (copy_stat.st_dev, copy_stat.st_ino)
             try:
+                phase = 'copy_profile'
                 self._copy_and_verify_staged(
                     staged_path,
                     stage.identity,
@@ -623,17 +630,21 @@ class CacheStore:
                 )
             finally:
                 os.close(copy_descriptor)
+            phase = 'check_existing'
             profile_exists = os.path.lexists(destination)
             sidecar_exists = os.path.lexists(sidecar_path)
             if profile_exists or sidecar_exists:
                 if not profile_exists or not sidecar_exists:
                     raise CacheError
+                phase = 'load_existing'
                 existing = self._load_pair(namespace, destination, sidecar_path)
                 if existing.roast != roast or existing.revision != revision:
                     raise CacheError
                 result = existing
             else:
+                phase = 'encode_sidecar'
                 sidecar_bytes = _sidecar_bytes(namespace, roast, revision, downloaded_at)
+                phase = 'create_sidecar'
                 sidecar_descriptor = secure_filesystem.create_generated_file(
                     self.root, sidecar_temporary_path, 0o600
                 )
@@ -643,15 +654,18 @@ class CacheStore:
                     sidecar_temporary_stat.st_ino,
                 )
                 try:
+                    phase = 'write_sidecar'
                     self._write_temporary(
                         sidecar_temporary_path, sidecar_descriptor, sidecar_bytes
                     )
                 finally:
                     os.close(sidecar_descriptor)
                 published_profile_identity = copy_identity
+                phase = 'publish_profile'
                 _replace_generated(self.root, copy_path, destination)
                 secure_filesystem.set_private_permissions(destination, 0o600)
                 published_sidecar_identity = sidecar_temporary_identity
+                phase = 'publish_sidecar'
                 _replace_generated(self.root, sidecar_temporary_path, sidecar_path)
                 secure_filesystem.set_private_permissions(sidecar_path, 0o600)
                 expected = CachedRevision(
@@ -662,6 +676,7 @@ class CacheStore:
                     sidecar_path=sidecar_path,
                     downloaded_at=downloaded_at,
                 )
+                phase = 'verify_published'
                 result = self._load_pair(
                     namespace, destination, sidecar_path, expected=expected
                 )
@@ -699,6 +714,12 @@ class CacheStore:
         ):
             cleanup_failed = True
         if operation_error is not None or cleanup_failed or release_failed:
+            _log.error(
+                'Roast Server cache publication failure: phase=%s cleanup=%s release=%s',
+                phase if operation_error is not None else 'cleanup',
+                'failed' if cleanup_failed else 'ok',
+                'failed' if release_failed else 'ok',
+            )
             if operation_error is not None and not isinstance(
                 operation_error,
                 (
@@ -726,39 +747,53 @@ class CacheStore:
         expected_sha256: str,
         expected_byte_count: int,
     ) -> None:
-        source = secure_filesystem.open_generated_file(self.root, staged_path)
+        phase = 'open_source'
         try:
-            before = os.fstat(source)
-            if not stat.S_ISREG(before.st_mode):
-                raise CacheError
-            if (before.st_dev, before.st_ino) != expected_identity:
-                raise CacheError
-            secure_filesystem.verify_private_permissions(staged_path, 0o600)
-            digest = hashlib.sha256()
-            byte_count = 0
-            while True:
-                chunk = _read_chunk(source)
-                if not chunk:
-                    break
-                byte_count += len(chunk)
-                if byte_count > MAX_PROFILE_BYTES:
+            source = secure_filesystem.open_generated_file(self.root, staged_path)
+            try:
+                phase = 'stat_source'
+                before = os.fstat(source)
+                if not stat.S_ISREG(before.st_mode):
                     raise CacheError
-                digest.update(chunk)
-                secure_filesystem.write_all(destination, chunk)
-            if byte_count < 1 or byte_count != expected_byte_count:
-                raise CacheError
-            if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
-                raise CacheError
-            after = os.fstat(source)
-            if _file_identity(before) != _file_identity(after):
-                raise CacheError
-            entry = secure_filesystem.generated_entry_stat(self.root, staged_path)
-            if _file_identity(after) != _file_identity(entry):
-                raise CacheError
-            _fsync_descriptor(destination)
-            secure_filesystem.set_private_permissions(copy_path, 0o600)
-        finally:
-            os.close(source)
+                phase = 'verify_source_identity'
+                if (before.st_dev, before.st_ino) != expected_identity:
+                    raise CacheError
+                phase = 'verify_source_permissions'
+                secure_filesystem.verify_private_permissions(staged_path, 0o600)
+                digest = hashlib.sha256()
+                byte_count = 0
+                phase = 'copy_bytes'
+                while True:
+                    chunk = _read_chunk(source)
+                    if not chunk:
+                        break
+                    byte_count += len(chunk)
+                    if byte_count > MAX_PROFILE_BYTES:
+                        raise CacheError
+                    digest.update(chunk)
+                    secure_filesystem.write_all(destination, chunk)
+                phase = 'verify_content'
+                if byte_count < 1 or byte_count != expected_byte_count:
+                    raise CacheError
+                if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+                    raise CacheError
+                phase = 'verify_source_stability'
+                after = os.fstat(source)
+                if _file_identity(before) != _file_identity(after):
+                    raise CacheError
+                phase = 'verify_source_entry'
+                entry = secure_filesystem.generated_entry_stat(self.root, staged_path)
+                if not _same_file_entry(after, entry):
+                    raise CacheError
+                phase = 'flush_copy'
+                _fsync_descriptor(destination)
+                phase = 'set_copy_permissions'
+                secure_filesystem.set_private_permissions(copy_path, 0o600)
+            finally:
+                os.close(source)
+        except (CacheError, OSError, secure_filesystem.FilesystemError):
+            _log.error('Roast Server cache copy failure: phase=%s', phase)
+            raise
 
     @staticmethod
     def _write_temporary(path: Path, descriptor: int, content: bytes) -> None:
@@ -874,7 +909,7 @@ class CacheStore:
             if _file_identity(before) != _file_identity(after):
                 raise CacheError
             entry = secure_filesystem.generated_entry_stat(self.root, path)
-            if _file_identity(after) != _file_identity(entry):
+            if not _same_file_entry(after, entry):
                 raise CacheError
         finally:
             os.close(descriptor)
@@ -901,7 +936,7 @@ class CacheStore:
             if _file_identity(before) != _file_identity(after):
                 raise CacheError
             entry = secure_filesystem.generated_entry_stat(self.root, path)
-            if _file_identity(after) != _file_identity(entry):
+            if not _same_file_entry(after, entry):
                 raise CacheError
         finally:
             os.close(descriptor)
@@ -1516,6 +1551,23 @@ def _sha256(value: object) -> str:
 
 def _file_identity(value: os.stat_result) -> _FileIdentity:
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+def _same_file_entry(opened: os.stat_result, entry: os.stat_result) -> bool:
+    stable = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_mtime_ns,
+    ) == (
+        entry.st_dev,
+        entry.st_ino,
+        entry.st_size,
+        entry.st_mtime_ns,
+    )
+    return stable and (
+        not _ENTRY_CTIME_RELIABLE or opened.st_ctime_ns == entry.st_ctime_ns
+    )
 
 
 def _read_chunk(descriptor: int) -> bytes:

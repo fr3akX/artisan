@@ -5,13 +5,15 @@ from datetime import UTC, datetime, timedelta
 import errno
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
 import threading
-from typing import Any, BinaryIO
+from types import SimpleNamespace
+from typing import Any, BinaryIO, cast
 from uuid import UUID
 
 import pytest
@@ -1484,7 +1486,9 @@ def test_replace_generated_closes_source_descriptor_when_destination_open_fails(
 
 
 def test_cache_error_redacts_os_paths_controls_and_server_strings(
-    cache: CacheStore, monkeypatch: pytest.MonkeyPatch
+    cache: CacheStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     staged = stage_bytes(cache, NAMESPACE, PROFILE_BYTES)
 
@@ -1492,13 +1496,86 @@ def test_cache_error_redacts_os_paths_controls_and_server_strings(
         raise OSError('/private/customer/server-name\ncontrol')
 
     monkeypatch.setattr(cache_module, '_replace_generated', fail_replace)
+    caplog.set_level(logging.ERROR, logger='artisanlib.roastserver.cache')
     with pytest.raises(CacheError) as raised:
         cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
+    assert caplog.messages == [
+        'Roast Server cache publication failure: phase=publish_profile '
+        'cleanup=ok release=ok'
+    ]
     assert raised.value.failure == cache_module.CACHE_FAILURE
     assert str(raised.value) == FAILURE_MESSAGES[FailureKind.CACHE_CORRUPT]
     assert raised.value.__cause__ is None
     assert '/private' not in repr(raised.value)
     assert 'server-name' not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    ('changed_field', 'accepted'),
+    (('st_ctime_ns', True), ('st_mtime_ns', False)),
+)
+def test_windows_cache_entry_comparison_ignores_only_ctime_discrepancy(
+    cache: CacheStore,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str,
+    accepted: bool,
+) -> None:
+    original_entry_stat = filesystem_module.generated_entry_stat
+
+    def shifted_entry_stat(root: Path, path: Path) -> os.stat_result:
+        value = original_entry_stat(root, path)
+        fields = {
+            'st_dev': value.st_dev,
+            'st_ino': value.st_ino,
+            'st_size': value.st_size,
+            'st_mtime_ns': value.st_mtime_ns,
+            'st_ctime_ns': value.st_ctime_ns,
+        }
+        fields[changed_field] += 1
+        return cast(os.stat_result, SimpleNamespace(**fields))
+
+    monkeypatch.setattr(cache_module, '_ENTRY_CTIME_RELIABLE', False, raising=False)
+    monkeypatch.setattr(
+        filesystem_module, 'generated_entry_stat', shifted_entry_stat
+    )
+    staged = stage_bytes(cache, NAMESPACE, PROFILE_BYTES)
+
+    if accepted:
+        cached = cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
+        assert cache.validate(cached) == cached
+    else:
+        with pytest.raises(CacheError):
+            cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
+
+
+def test_cache_copy_failure_logs_fixed_subphase(
+    cache: CacheStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    staged = stage_bytes(cache, NAMESPACE, PROFILE_BYTES)
+    original_verify = filesystem_module.verify_private_permissions
+
+    def fail_stage_permissions(path: Path, mode: int) -> None:
+        if path == staged:
+            raise filesystem_module.FilesystemError('/private/customer/profile')
+        original_verify(path, mode)
+
+    monkeypatch.setattr(
+        filesystem_module, 'verify_private_permissions', fail_stage_permissions
+    )
+    caplog.set_level(logging.ERROR, logger='artisanlib.roastserver.cache')
+
+    with pytest.raises(CacheError):
+        cache.publish(NAMESPACE, DETAIL, RECEIPT, staged, NOW)
+
+    assert caplog.messages == [
+        'Roast Server cache copy failure: phase=verify_source_permissions',
+        'Roast Server cache publication failure: phase=copy_profile '
+        'cleanup=ok release=ok',
+    ]
+    assert '/private' not in caplog.text
+    assert 'customer' not in caplog.text
 
 
 def test_portable_windows_seam_runs_complete_cache_publish_validate_and_remove_flow(

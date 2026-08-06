@@ -202,7 +202,7 @@ class RoastSummary:
     machine: str | None
     machine_setup: str | None
     temperature_unit: Literal['C', 'F'] | None
-    duration_seconds: int | None
+    duration_seconds: float | None
     green_weight_kg: float | None
     roasted_weight_kg: float | None
     revision_count: int
@@ -236,7 +236,7 @@ class RoastDetail:
     machine: str | None
     machine_setup: str | None
     temperature_unit: Literal['C', 'F'] | None
-    duration_seconds: int | None
+    duration_seconds: float | None
     green_weight_kg: float | None
     roasted_weight_kg: float | None
     revision_count: int
@@ -301,6 +301,18 @@ def _exact_object(value: object, keys: frozenset[str]) -> dict[str, object]:
     return cast(dict[str, object], mapping)
 
 
+def _object_with_required_keys(
+    value: object, keys: frozenset[str]
+) -> dict[str, object]:
+    _validate_json_graph(value, reject_string_controls=False)
+    if not isinstance(value, dict):
+        _fail()
+    mapping = cast(dict[str, object], value)
+    if not keys.issubset(mapping):
+        _fail()
+    return mapping
+
+
 def _has_prohibited_string_code_point(text: str, *, reject_controls: bool) -> bool:
     for char in text:
         code_point = ord(char)
@@ -333,11 +345,17 @@ def _parse_optional_string(
     value: object,
     *,
     max_length: int | None = None,
+    allow_empty: bool = False,
     reject_controls: bool = False,
 ) -> str | None:
     if value is None:
         return None
-    return _parse_required_string(value, max_length=max_length, reject_controls=reject_controls)
+    return _parse_required_string(
+        value,
+        allow_empty=allow_empty,
+        max_length=max_length,
+        reject_controls=reject_controls,
+    )
 
 
 def _parse_bool(value: object) -> bool:
@@ -362,7 +380,12 @@ def _parse_optional_int(value: object, *, minimum: int | None = None, maximum: i
     return _parse_safe_int(value, minimum=minimum, maximum=maximum)
 
 
-def _parse_optional_float(value: object) -> float | None:
+def _parse_optional_float(
+    value: object,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -376,7 +399,11 @@ def _parse_optional_float(value: object) -> float | None:
             raise ContractError from exc
     else:
         number = value
-    if not math.isfinite(number):
+    if (
+        not math.isfinite(number)
+        or (minimum is not None and number < minimum)
+        or (maximum is not None and number > maximum)
+    ):
         _fail()
     return number
 
@@ -754,15 +781,17 @@ def _parse_roast_summary(value: object) -> RoastSummary:
         roast_uuid=_parse_hex_uuid(mapping['roast_uuid']),
         state=state,
         roast_at=_parse_aware_datetime(mapping['roast_at']),
-        title=_parse_optional_string(mapping['title']),
-        batch_prefix=_parse_optional_string(mapping['batch_prefix']),
+        title=_parse_optional_string(mapping['title'], allow_empty=True),
+        batch_prefix=_parse_optional_string(mapping['batch_prefix'], allow_empty=True),
         batch_number=_parse_optional_int(mapping['batch_number'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
         batch_position=_parse_optional_int(mapping['batch_position'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
-        operator=_parse_optional_string(mapping['operator']),
-        machine=_parse_optional_string(mapping['machine']),
-        machine_setup=_parse_optional_string(mapping['machine_setup']),
+        operator=_parse_optional_string(mapping['operator'], allow_empty=True),
+        machine=_parse_optional_string(mapping['machine'], allow_empty=True),
+        machine_setup=_parse_optional_string(mapping['machine_setup'], allow_empty=True),
         temperature_unit=_parse_temperature_unit(mapping['temperature_unit']),
-        duration_seconds=_parse_optional_int(mapping['duration_seconds'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
+        duration_seconds=_parse_optional_float(
+            mapping['duration_seconds'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX
+        ),
         green_weight_kg=_parse_optional_float(mapping['green_weight_kg']),
         roasted_weight_kg=_parse_optional_float(mapping['roasted_weight_kg']),
         revision_count=revision_count,
@@ -891,8 +920,6 @@ def parse_roast_detail(value: object) -> RoastDetail:
             _fail()
         if current_revision.parse_state != expected_revision_state:
             _fail()
-        if current_revision.metadata != current_metadata:
-            _fail()
     return RoastDetail(
         roast_uuid=summary.roast_uuid,
         state=summary.state,
@@ -950,16 +977,20 @@ def parse_aroast_ack(value: object) -> AroastAck:
     mapping = _exact_object(value, frozenset({'success', 'result', 'rlimit', 'rusage', 'rremaining'}))
     if mapping['success'] is not True:
         _fail()
-    result_mapping = _exact_object(mapping['result'], frozenset({'roast_id', 'modified_at'}))
+    result_mapping = _object_with_required_keys(
+        mapping['result'], frozenset({'roast_id', 'modified_at'})
+    )
     return AroastAck(
         success=True,
         result=AroastResult(
             roast_id=_parse_hex_uuid(result_mapping['roast_id']),
             modified_at=_parse_aware_datetime(result_mapping['modified_at']),
         ),
-        rlimit=_parse_safe_int(mapping['rlimit'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
+        rlimit=_parse_safe_int(mapping['rlimit'], minimum=-1, maximum=POSTGRESQL_INTEGER_MAX),
         rusage=_parse_safe_int(mapping['rusage'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
-        rremaining=_parse_safe_int(mapping['rremaining'], minimum=0, maximum=POSTGRESQL_INTEGER_MAX),
+        rremaining=_parse_safe_int(
+            mapping['rremaining'], minimum=-1, maximum=POSTGRESQL_INTEGER_MAX
+        ),
     )
 
 
