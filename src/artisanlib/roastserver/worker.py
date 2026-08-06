@@ -1940,7 +1940,7 @@ class RoastServerWorker(QObject):
                     )
                 except (InventoryStoreError, ValueError):
                     failure = _failure(FailureKind.LOCAL_INVENTORY)
-                self._stop_timer()
+                self._schedule_next(value.namespace)
             elif failure.retryable:
                 self.onlineChanged.emit(False)
             self._emit_failure(request_id, failure)

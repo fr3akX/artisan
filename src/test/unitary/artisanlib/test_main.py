@@ -5146,6 +5146,98 @@ class TestRoastServerMainIntegration:
         window.settingsLoad.assert_called_once_with(redraw=False)
         window.startRoastServer.assert_called_once_with(tmp_path)
 
+    def test_shutdown_after_namespace_change_releases_original_reservation(
+        self, tmp_path: Path
+    ) -> None:
+        from artisanlib.roastserver.settings import namespace_for
+
+        link = parse_profile_link(INVENTORY_PROFILE_LINK)
+        assert link is not None
+        roast_uuid = UUID('33333333-3333-4333-8333-333333333333')
+        now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+        store = InventoryStore(tmp_path / 'inventory')
+        store.open()
+        store.replace_lots(
+            link.namespace,
+            (
+                BeanLot(
+                    link.lot_id,
+                    link.lot_name,
+                    None,
+                    (),
+                    None,
+                    None,
+                    2_000,
+                    0,
+                    2_000,
+                    0,
+                ),
+            ),
+            now,
+        )
+        context_a = InventoryContext(
+            link.namespace.origin,
+            link.namespace,
+            True,
+            True,
+            UUID('55555555-5555-4555-8555-555555555555'),
+        )
+        coordinator = InventoryCoordinator(
+            store,
+            clock=lambda: now,
+            uuid_factory=lambda: UUID(
+                '44444444-4444-4444-8444-444444444444'
+            ),
+            wake=lambda: None,
+        )
+        coordinator.commit_charge(
+            coordinator.prepare_charge(
+                context_a, link, roast_uuid, 1.5, 'Kg'
+            )
+        )
+        namespace_b = namespace_for(
+            'https://other.example',
+            UUID('66666666-6666-4666-8666-666666666666'),
+        )
+        context_b = InventoryContext(
+            namespace_b.origin,
+            namespace_b,
+            True,
+            True,
+            context_a.client_instance_uuid,
+        )
+        controller = coordinator_controller(coordinator, context_b)
+        controller.shutdown = Mock(return_value=True)
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.quitAction = Mock()
+        window.qmc = Mock(
+            safesaveflag=False,
+            flagKeepON=True,
+            roastUUID=roast_uuid.hex,
+        )
+        window.qmc.checkSaved.return_value = True
+        window.roastserver_controller = controller
+        window.stopActivities = Mock()
+        window.closeEventSettings = Mock()
+        window.sendmessage = Mock()
+
+        try:
+            with patch.object(
+                QApplication,
+                'queryKeyboardModifiers',
+                return_value=Qt.KeyboardModifier.NoModifier,
+            ), patch.object(QApplication, 'exit'):
+                assert window.closeApp()
+
+            state = store.roast_state(link.namespace, roast_uuid)
+            assert state is not None and state.terminal_intent == 'release'
+            assert store.roast_state(namespace_b, roast_uuid) is None
+            assert store.counts(link.namespace).pending == 2
+            assert store.counts(namespace_b).pending == 0
+            controller.shutdown.assert_called_once_with(15_000)
+        finally:
+            store.close()
+
     @pytest.mark.parametrize('stopped', [True, False])
     def test_roastserver_shutdown_is_bounded_and_precedes_device_teardown(
         self, stopped: bool

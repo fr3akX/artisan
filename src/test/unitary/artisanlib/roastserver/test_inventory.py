@@ -61,6 +61,13 @@ CONTEXT = InventoryContext(
     previously_authenticated=True,
     client_instance_uuid=CLIENT_UUID,
 )
+OTHER_CONTEXT = InventoryContext(
+    origin=OTHER_NAMESPACE.origin,
+    namespace=OTHER_NAMESPACE,
+    enabled=True,
+    previously_authenticated=True,
+    client_instance_uuid=CLIENT_UUID,
+)
 
 
 def bean_lot() -> BeanLot:
@@ -536,6 +543,75 @@ def test_finalize_requires_matching_link_canonical_uuid_charge_and_local_state(
     assert coordinator.finalize_saved_profile(CONTEXT, noncanonical) is None
     assert coordinator.finalize_saved_profile(CONTEXT, uncharged) is None
     assert coordinator.finalize_saved_profile(CONTEXT, other) is None
+
+
+def test_save_after_namespace_change_finalizes_original_profile_namespace(
+    coordinator: InventoryCoordinator,
+    store: InventoryStore,
+) -> None:
+    coordinator.commit_charge(
+        coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg')
+    )
+
+    notice = coordinator.finalize_saved_profile(OTHER_CONTEXT, profile())
+
+    assert notice is not None
+    assert notice.code == 'inventory_finalization_queued'
+    state = store.roast_state(NAMESPACE, ROAST_UUID)
+    assert state is not None and state.terminal_intent == 'finalize'
+    assert store.roast_state(OTHER_NAMESPACE, ROAST_UUID) is None
+    assert store.counts(NAMESPACE).pending == 2
+    assert store.counts(OTHER_NAMESPACE).pending == 0
+
+
+def test_reset_after_namespace_change_releases_unique_original_reservation(
+    coordinator: InventoryCoordinator,
+    store: InventoryStore,
+) -> None:
+    coordinator.commit_charge(
+        coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg')
+    )
+
+    notice = coordinator.release_for_reset(OTHER_CONTEXT, ROAST_UUID)
+
+    assert notice is not None
+    assert notice.code == 'inventory_release_queued'
+    state = store.roast_state(NAMESPACE, ROAST_UUID)
+    assert state is not None and state.terminal_intent == 'release'
+    assert store.roast_state(OTHER_NAMESPACE, ROAST_UUID) is None
+    assert store.counts(NAMESPACE).pending == 2
+    assert store.counts(OTHER_NAMESPACE).pending == 0
+
+
+def test_reset_fails_closed_when_roast_uuid_exists_in_two_namespaces(
+    coordinator: InventoryCoordinator,
+    store: InventoryStore,
+) -> None:
+    coordinator.commit_charge(
+        coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg')
+    )
+    store.replace_lots(OTHER_NAMESPACE, (bean_lot(),), LATER)
+    other_link = InventoryProfileLink(OTHER_NAMESPACE, LOT_UUID, 'Other Lot')
+    other_coordinator = InventoryCoordinator(
+        store,
+        clock=Clock(),
+        uuid_factory=SequenceFactory(SECOND_RESERVATION_UUID),
+        wake=lambda: None,
+    )
+    other_coordinator.commit_charge(
+        other_coordinator.prepare_charge(
+            OTHER_CONTEXT, other_link, ROAST_UUID, 1.25, 'Kg'
+        )
+    )
+
+    assert_error(
+        'inventory_reservation_ambiguous',
+        lambda: coordinator.release_for_reset(OTHER_CONTEXT, ROAST_UUID),
+    )
+    state_a = store.roast_state(NAMESPACE, ROAST_UUID)
+    state_b = store.roast_state(OTHER_NAMESPACE, ROAST_UUID)
+    assert state_a is not None and state_a.terminal_intent is None
+    assert state_b is not None and state_b.terminal_intent is None
 
 
 def test_release_for_reset_queues_once_and_terminal_intents_are_exclusive(

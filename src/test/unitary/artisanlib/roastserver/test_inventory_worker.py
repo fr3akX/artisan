@@ -1215,6 +1215,49 @@ def test_refresh_bounds_retain_old_cache(pages: list[BeanLotPage]) -> None:
     worker.stop()
 
 
+def test_unsupported_refresh_rearms_due_profile_delivery_without_spin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = ApiFailure(
+        _failure_value(
+            FailureKind.INVENTORY_UNSUPPORTED,
+            'inventory_unsupported',
+            False,
+        ),
+        404,
+        None,
+    )
+    worker, inventory, outbox, _fence, vault = make_delivery_worker(
+        FakeInventoryClient(failure=failure)
+    )
+    inventory.due = None
+    outbox.due = NOW
+    delivered: list[Job] = []
+    monkeypatch.setattr(
+        worker,
+        '_deliver_job',
+        lambda _configuration, job: delivered.append(job),
+    )
+    generation = cast(WorkerConfiguration, worker._configuration).generation
+    timer = cast(FakeTimer, worker._timer)
+
+    worker.refresh_inventory(
+        vault.put(InventoryRefreshRequest(NAMESPACE, generation))
+    )
+
+    assert inventory.pause_calls[-1][2] == 'inventory_unsupported'
+    assert outbox.pause_calls == []
+    assert timer.delays[-1] == 0
+
+    worker.process_queue_once()
+
+    assert len(outbox.lease_calls) == 1
+    assert inventory.lease_calls == []
+    assert len(delivered) == 1
+    assert timer.delays.count(0) == 1
+    worker.stop()
+
+
 def test_refresh_partial_api_error_retains_old_cache() -> None:
     failure = ApiFailure(
         PublicFailure(

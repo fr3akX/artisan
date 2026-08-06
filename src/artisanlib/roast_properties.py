@@ -2247,14 +2247,15 @@ class editGraphDlg(ArtisanResizeablDialog):
             return
         selection_namespace = self._inventoryNamespace()
         selection_revision = self._inventory_context_revision
-        self.inventoryLotDialog = InventoryLotDialog(
+        dialog = InventoryLotDialog(
             self,
             cast(InventoryLotDialogController, controller),
             selected_lot_id=(
                 None if self._inventory_link is None else self._inventory_link.lot_id),
         )
+        self.inventoryLotDialog = dialog
         try:
-            if self.inventoryLotDialog.exec() == QDialog.DialogCode.Accepted:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
                 if (
                     selection_revision != self._inventory_context_revision
                     or selection_namespace != self._inventoryNamespace()
@@ -2264,13 +2265,15 @@ class editGraphDlg(ArtisanResizeablDialog):
                         'The inventory selection was not changed because the server organization changed.')
                     self.updateInventoryLotRow()
                     return
-                lot = self.inventoryLotDialog.selected_lot
+                lot = dialog.selected_lot
                 if lot is None:
                     self.clearInventoryLot()
                 else:
                     self.chooseInventoryLot(lot)
         finally:
+            dialog.clean_up()
             self.inventoryLotDialog = None
+            dialog.deleteLater()
 
     def chooseInventoryLot(self, lot:BeanLot) -> None:
         if self._inventoryLotLocked():

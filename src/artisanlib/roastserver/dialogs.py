@@ -176,6 +176,7 @@ class RoastServerDialogController(Protocol):
     inventoryQueueChanged: _Signal
     inventoryFailedChanged: _Signal
     inventoryRecoveryRequired: _Signal
+    inventoryRefreshFinished: _Signal
     cacheStatsChanged: _Signal
     operationFailed: _Signal
 
@@ -654,6 +655,7 @@ class RoastServerConfigDialog(QDialog):
         self._ignored_operations: set[str] = set()
         self._connection_dirty = False
         self._rendering = False
+        self._inventory_unsupported_context: object | None = None
 
         self.setWindowTitle(_tr('Roast Server'))
         self.setModal(False)
@@ -857,6 +859,9 @@ class RoastServerConfigDialog(QDialog):
         self._controller.inventoryQueueChanged.connect(self._on_inventory_queue_changed)
         self._controller.inventoryFailedChanged.connect(self._on_inventory_failed_changed)
         self._controller.inventoryRecoveryRequired.connect(self._on_inventory_recovery_required)
+        self._controller.inventoryRefreshFinished.connect(
+            self._on_inventory_refresh_finished
+        )
         self._controller.cacheStatsChanged.connect(self._on_cache_stats_changed)
         self._controller.operationFailed.connect(self._on_operation_failed)
 
@@ -1030,6 +1035,7 @@ class RoastServerConfigDialog(QDialog):
             return
         settings = cast(ConnectorSettings, value)
         self._settings = settings
+        self._clear_inventory_unsupported_if_context_changed()
         update_origin = self._testing_operation is None and not self._connection_dirty
         self._render_settings(settings, update_origin=update_origin)
         if self._proof_origin != settings.origin:
@@ -1056,6 +1062,7 @@ class RoastServerConfigDialog(QDialog):
 
     @pyqtSlot(object)
     def _on_identity_changed(self, value: object) -> None:
+        self._clear_inventory_unsupported_if_context_changed()
         if value is None:
             self._invalidate_proof(persist_automatic_off=False)
             return
@@ -1196,6 +1203,10 @@ class RoastServerConfigDialog(QDialog):
             self.inventory_status_label.setText(
                 _tr('Inventory command could not be retried.'))
 
+    @pyqtSlot(str)
+    def _on_inventory_refresh_finished(self, _request_id: str) -> None:
+        self._clear_inventory_unsupported()
+
     @pyqtSlot(object)
     def _on_cache_stats_changed(self, value: object) -> None:
         if not hasattr(value, 'byte_count') or not hasattr(value, 'revision_count'):
@@ -1212,6 +1223,7 @@ class RoastServerConfigDialog(QDialog):
             return
         failure = cast(PublicFailure, value)
         if failure.kind is FailureKind.INVENTORY_UNSUPPORTED:
+            self._inventory_unsupported_context = self._inventory_context_key()
             self.inventory_status_label.setText(
                 _tr('Server does not support inventory.'))
             return
@@ -1226,6 +1238,30 @@ class RoastServerConfigDialog(QDialog):
             self._testing_operation = None
             self._clear_candidate()
             self._invalidate_proof(persist_automatic_off=False)
+
+    def _inventory_context_key(self) -> object:
+        try:
+            namespace = self._controller.inventory_context().namespace
+        except RuntimeError:
+            namespace = None
+        return self._settings.origin, namespace
+
+    def _clear_inventory_unsupported_if_context_changed(self) -> None:
+        unsupported_context = self._inventory_unsupported_context
+        if (
+            unsupported_context is not None
+            and unsupported_context != self._inventory_context_key()
+        ):
+            self._clear_inventory_unsupported()
+
+    def _clear_inventory_unsupported(self) -> None:
+        if self._inventory_unsupported_context is None:
+            return
+        self._inventory_unsupported_context = None
+        if self.inventory_status_label.text() == _tr(
+            'Server does not support inventory.'
+        ):
+            self.inventory_status_label.clear()
 
     def _has_current_proof(self) -> bool:
         return self._identity is not None and self._proof_origin == self._settings.origin

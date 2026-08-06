@@ -224,14 +224,9 @@ class InventoryCoordinator:
     ) -> InventoryNotice | None:
         mapping = cast(Mapping[str, object], profile)
         link = self._profile_link(mapping)
-        namespace = context.namespace
-        if (
-            link is None
-            or namespace is None
-            or context.origin != namespace.origin
-            or link.namespace != namespace
-        ):
+        if link is None:
             return None
+        namespace = link.namespace
         roast_uuid = self._canonical_profile_roast_uuid(mapping.get('roastUUID'))
         if roast_uuid is None or not self._profile_has_charge(mapping):
             return None
@@ -274,15 +269,10 @@ class InventoryCoordinator:
         context: InventoryContext,
         roast_uuid: UUID | None,
     ) -> InventoryNotice | None:
-        namespace = context.namespace
-        if namespace is None or roast_uuid is None or context.origin != namespace.origin:
+        if roast_uuid is None:
             return None
-        state = self._roast_state(namespace, roast_uuid)
-        if (
-            state is None
-            or state.terminal_intent is not None
-            or state.lifecycle in {'finalized', 'released'}
-        ):
+        state = self._unique_nonterminal_state(roast_uuid)
+        if state is None:
             return None
         updated = self._enqueue_release(context.client_instance_uuid, state)
         self._wake()
@@ -373,6 +363,23 @@ class InventoryCoordinator:
             return self._store.roast_state(namespace, roast_uuid)
         except (InventoryStoreError, ValueError):
             raise InventoryCoordinatorError('inventory_storage_failed') from None
+
+    def _unique_nonterminal_state(
+        self, roast_uuid: UUID
+    ) -> InventoryRoastState | None:
+        try:
+            matches = tuple(
+                item
+                for item in self._store.interrupted_reservations()
+                if item.roast_uuid == roast_uuid
+            )
+        except (InventoryStoreError, ValueError):
+            raise InventoryCoordinatorError('inventory_storage_failed') from None
+        if len(matches) > 1:
+            raise InventoryCoordinatorError('inventory_reservation_ambiguous')
+        if not matches:
+            return None
+        return self._roast_state(matches[0].namespace, roast_uuid)
 
     def _new_uuid(self) -> UUID:
         value = self._uuid_factory()

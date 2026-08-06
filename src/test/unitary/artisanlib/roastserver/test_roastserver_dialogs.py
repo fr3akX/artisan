@@ -238,6 +238,7 @@ class FakeController(QObject):
     inventoryQueueChanged = pyqtSignal(object)
     inventoryFailedChanged = pyqtSignal(object)
     inventoryRecoveryRequired = pyqtSignal(object)
+    inventoryRefreshFinished = pyqtSignal(str)
     cacheStatsChanged = pyqtSignal(object)
     operationFailed = pyqtSignal(str, object)
 
@@ -649,6 +650,41 @@ def test_inventory_old_namespace_retry_disabled_and_unsupported_is_inventory_onl
     assert dialog.inventory_status_label.text() == 'Server does not support inventory.'
     assert dialog.inventory_status_label.textFormat() is Qt.TextFormat.PlainText
     assert dialog.error_label.text() == ''
+
+
+def test_inventory_unsupported_status_clears_on_context_change_and_refresh_success(
+    dialog: RoastServerConfigDialog,
+    controller: FakeController,
+    settings: ConnectorSettings,
+) -> None:
+    unsupported = PublicFailure(
+        FailureKind.INVENTORY_UNSUPPORTED,
+        'inventory_unsupported',
+        'ignored unsafe server detail',
+        False,
+    )
+    controller.operationFailed.emit('inventory-a', unsupported)
+    assert dialog.inventory_status_label.text() == 'Server does not support inventory.'
+
+    new_identity = replace(
+        IDENTITY,
+        organization=replace(
+            IDENTITY.organization,
+            id=UUID('88888888-8888-4888-8888-888888888888'),
+        ),
+    )
+    new_settings = replace(settings, origin=NEW_ORIGIN, identity=new_identity)
+    controller.inventory_namespace = namespace_for(
+        NEW_ORIGIN, new_identity.organization.id
+    )
+    controller.settingsChanged.emit(new_settings)
+
+    assert dialog.inventory_status_label.text() == ''
+
+    controller.operationFailed.emit('inventory-b', unsupported)
+    assert dialog.inventory_status_label.text() == 'Server does not support inventory.'
+    controller.inventoryRefreshFinished.emit('refresh-b')
+    assert dialog.inventory_status_label.text() == ''
 
 
 def test_failed_table_per_row_retry_remove_and_refresh_are_controller_only(

@@ -29,7 +29,7 @@ from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
-from PyQt6.QtCore import QDateTime, QObject, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QCoreApplication, QDateTime, QEvent, QObject, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDoubleValidator
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
@@ -996,6 +996,35 @@ def test_roast_properties_refresh_is_correlated_and_snapshot_failures_are_contai
         )
         assert dialog._inventory_refresh_request is None
         assert 'retained' in dialog.inventoryLotStatusLabel.text().lower()
+    finally:
+        dialog.cleanUpInventoryLotSelection()
+        QDialog.reject(dialog)
+
+
+def test_repeated_roast_properties_chooser_open_deletes_closed_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = FakeController((LOT,))
+    dialog, _qmc = _staging_dialog(controller)
+    receiver_baseline = _inventory_receiver_counts(controller)
+    destroyed: list[None] = []
+
+    def reject_immediately(chooser: InventoryLotDialog) -> QDialog.DialogCode:
+        chooser.destroyed.connect(lambda: destroyed.append(None))
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(InventoryLotDialog, 'exec', reject_immediately)
+    try:
+        for _ in range(2):
+            dialog.openInventoryLotDialog()
+            QCoreApplication.sendPostedEvents(
+                None, QEvent.Type.DeferredDelete
+            )
+            QCoreApplication.processEvents()
+            assert dialog.inventoryLotDialog is None
+            assert dialog.findChildren(InventoryLotDialog) == []
+            assert _inventory_receiver_counts(controller) == receiver_baseline
+        assert destroyed == [None, None]
     finally:
         dialog.cleanUpInventoryLotSelection()
         QDialog.reject(dialog)
