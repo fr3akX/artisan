@@ -1343,45 +1343,85 @@ print(json.dumps(result))
 
 
 def run_cross_process_pair(
-    root: Path, first_action: str, second_action: str
+    root: Path,
+    first_action: str,
+    second_action: str,
+    *,
+    child_script: str = _CROSS_PROCESS_SCRIPT,
+    ready_timeout: float = 10,
+    processes_out: list[subprocess.Popen[str]] | None = None,
 ) -> tuple[object, object]:
     gate = root.parent / f'{first_action}-{second_action}.gate'
     environment = os.environ.copy()
-    processes = [
-        subprocess.Popen(
-            [
-                sys.executable,
-                '-c',
-                textwrap.dedent(_CROSS_PROCESS_SCRIPT),
-                str(root),
-                action,
-                label,
-                str(gate),
-            ],
-            cwd=Path.cwd(),
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for action, label in ((first_action, 'first'), (second_action, 'second'))
-    ]
-    deadline = time.monotonic() + 10
-    ready = tuple(Path(f'{gate}.{label}.ready') for label in ('first', 'second'))
-    while not all(path.exists() for path in ready):
-        if time.monotonic() >= deadline:
-            for process in processes:
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        for action, label in ((first_action, 'first'), (second_action, 'second')):
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    '-c',
+                    textwrap.dedent(child_script),
+                    str(root),
+                    action,
+                    label,
+                    str(gate),
+                ],
+                cwd=Path.cwd(),
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            processes.append(process)
+            if processes_out is not None:
+                processes_out.append(process)
+        deadline = time.monotonic() + ready_timeout
+        ready = tuple(Path(f'{gate}.{label}.ready') for label in ('first', 'second'))
+        while not all(path.exists() for path in ready):
+            if time.monotonic() >= deadline:
+                raise AssertionError('cross-process workers did not become ready')
+            time.sleep(0.005)
+        gate.touch()
+        results: list[object] = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=15)
+            assert process.returncode == 0, stderr
+            results.append(__import__('json').loads(stdout.strip().splitlines()[-1]))
+        return results[0], results[1]
+    finally:
+        for process in processes:
+            if process.poll() is None:
                 process.kill()
-            outputs = [process.communicate() for process in processes]
-            raise AssertionError(f'cross-process workers did not become ready: {outputs!r}')
-        time.sleep(0.005)
-    gate.touch()
-    results: list[object] = []
-    for process in processes:
-        stdout, stderr = process.communicate(timeout=15)
-        assert process.returncode == 0, stderr
-        results.append(__import__('json').loads(stdout.strip().splitlines()[-1]))
-    return results[0], results[1]
+        for process in processes:
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+
+def test_cross_process_timeout_kills_and_drains_every_child(tmp_path: Path) -> None:
+    children: list[subprocess.Popen[str]] = []
+    sleeping_script = 'import time; time.sleep(60)'
+
+    with pytest.raises(AssertionError, match='did not become ready'):
+        run_cross_process_pair(
+            tmp_path / 'inventory',
+            'reserve',
+            'reserve',
+            child_script=sleeping_script,
+            ready_timeout=0.05,
+            processes_out=children,
+        )
+
+    assert len(children) == 2
+    assert all(process.poll() is not None for process in children)
+    assert all(process.stdout is not None and process.stdout.closed for process in children)
+    assert all(process.stderr is not None and process.stderr.closed for process in children)
 
 
 def test_cross_process_cache_replacement_publishes_one_complete_generation(
