@@ -1729,7 +1729,17 @@ class RoastServerWorker(QObject):
                 self._emit_inventory_reservation(
                     command.namespace, command.roast_uuid
                 )
-                self._emit_failure('queue', failure)
+                if failure.kind is FailureKind.INVENTORY_UNSUPPORTED:
+                    self.operationFailed.emit(
+                        'queue',
+                        InventoryWorkerEvent(
+                            configuration.generation,
+                            command.namespace,
+                            _failure(FailureKind.INVENTORY_UNSUPPORTED),
+                        ),
+                    )
+                else:
+                    self._emit_failure('queue', failure)
                 self._emit_aggregates(command.namespace)
             except (InventoryStoreError, TypeError, ValueError):
                 self._emit_failure(

@@ -1492,6 +1492,14 @@ class RoastServerController(QObject):
     def _on_operation_failed(self, operation: str, value: object) -> None:
         if self._stop_requested:
             return
+        if isinstance(value, InventoryWorkerEvent):
+            context = self.inventory_context()
+            if (
+                value.generation != self._inventory_generation
+                or value.namespace != context.namespace
+            ):
+                return
+            value = value.value
         if operation in self._stale_inventory_refresh_requests:
             self._stale_inventory_refresh_requests.pop(operation, None)
             return

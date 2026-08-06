@@ -47,6 +47,7 @@ from artisanlib.roastserver.inventory_contract import (
     parse_profile_link,
 )
 from artisanlib.roastserver.inventory_store import (
+    InventoryReservationAmbiguousError,
     InventoryRoastState,
     InventoryStore,
     InventoryStoreError,
@@ -271,10 +272,18 @@ class InventoryCoordinator:
     ) -> InventoryNotice | None:
         if roast_uuid is None:
             return None
-        state = self._unique_nonterminal_state(roast_uuid)
-        if state is None:
+        try:
+            updated = self._store.enqueue_unique_release(
+                context.client_instance_uuid, roast_uuid, self._clock()
+            )
+        except InventoryReservationAmbiguousError:
+            raise InventoryCoordinatorError(
+                'inventory_reservation_ambiguous'
+            ) from None
+        except (InventoryStoreError, ValueError):
+            raise InventoryCoordinatorError('inventory_storage_failed') from None
+        if updated is None:
             return None
-        updated = self._enqueue_release(context.client_instance_uuid, state)
         self._wake()
         return self._notice('inventory_release_queued', updated)
 
@@ -363,23 +372,6 @@ class InventoryCoordinator:
             return self._store.roast_state(namespace, roast_uuid)
         except (InventoryStoreError, ValueError):
             raise InventoryCoordinatorError('inventory_storage_failed') from None
-
-    def _unique_nonterminal_state(
-        self, roast_uuid: UUID
-    ) -> InventoryRoastState | None:
-        try:
-            matches = tuple(
-                item
-                for item in self._store.interrupted_reservations()
-                if item.roast_uuid == roast_uuid
-            )
-        except (InventoryStoreError, ValueError):
-            raise InventoryCoordinatorError('inventory_storage_failed') from None
-        if len(matches) > 1:
-            raise InventoryCoordinatorError('inventory_reservation_ambiguous')
-        if not matches:
-            return None
-        return self._roast_state(matches[0].namespace, roast_uuid)
 
     def _new_uuid(self) -> UUID:
         value = self._uuid_factory()

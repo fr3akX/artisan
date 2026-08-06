@@ -1101,6 +1101,41 @@ def test_delivery_classifies_retry_terminal_and_unsupported_failures(
     worker.stop()
 
 
+def test_unsupported_mutation_failure_carries_immutable_source_context() -> None:
+    failure = ApiFailure(
+        PublicFailure(
+            FailureKind.INVENTORY_UNSUPPORTED,
+            'inventory_unsupported',
+            FAILURE_MESSAGES[FailureKind.INVENTORY_UNSUPPORTED],
+            False,
+        ),
+        404,
+        None,
+    )
+    worker, _inventory, _outbox, _fence, _vault = make_delivery_worker(
+        FakeInventoryClient(failure=failure)
+    )
+    failures = QSignalSpy(worker.operationFailed)
+    configuration = cast(WorkerConfiguration, worker._configuration)
+
+    worker.process_queue_once()
+
+    assert len(failures) == 1
+    assert failures[0][0] == 'queue'
+    event = cast(InventoryWorkerEvent, failures[0][1])
+    assert event == InventoryWorkerEvent(
+        configuration.generation,
+        NAMESPACE,
+        PublicFailure(
+            FailureKind.INVENTORY_UNSUPPORTED,
+            'inventory_unsupported',
+            FAILURE_MESSAGES[FailureKind.INVENTORY_UNSUPPORTED],
+            False,
+        ),
+    )
+    worker.stop()
+
+
 def test_credential_failure_pauses_both_queues_and_clears_authorization() -> None:
     failure = ApiFailure(
         PublicFailure(

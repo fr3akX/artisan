@@ -926,6 +926,65 @@ def test_inventory_signal_namespace_filtering_and_safe_frozen_payloads(
     assert b'request_json' not in repr(lots).encode()
 
 
+@pytest.mark.parametrize('context_change', ['origin', 'organization'])
+def test_queued_unsupported_mutation_is_suppressed_after_context_change(
+    harness: Harness, context_change: str
+) -> None:
+    harness.start()
+    failures = QSignalSpy(harness.controller.operationFailed)
+    generation = harness.controller._inventory_generation
+    assert generation is not None
+    unsupported = PublicFailure(
+        FailureKind.INVENTORY_UNSUPPORTED,
+        'inventory_unsupported',
+        FAILURE_MESSAGES[FailureKind.INVENTORY_UNSUPPORTED],
+        False,
+    )
+    harness.worker.operationFailed.emit(
+        'queue', InventoryWorkerEvent(generation, NAMESPACE, unsupported)
+    )
+
+    if context_change == 'origin':
+        harness.controller.apply_options(
+            OTHER_ORIGIN, False, False, 64 * 1024 * 1024
+        )
+    else:
+        harness.controller._settings = harness.settings.save_connection(
+            ORIGIN, OTHER_IDENTITY
+        )
+        harness.controller._known_namespace = namespace_for(
+            ORIGIN, OTHER_ORGANIZATION_ID
+        )
+        harness.controller._identity = OTHER_IDENTITY
+        harness.controller._proof = (ORIGIN, OTHER_ORGANIZATION_ID)
+        harness.controller._queue_configuration(harness.controller._configuration())
+
+    harness.app.processEvents()
+    assert len(failures) == 0
+
+
+def test_current_unsupported_mutation_is_unwrapped_for_public_failure_signal(
+    harness: Harness,
+) -> None:
+    harness.start()
+    failures = QSignalSpy(harness.controller.operationFailed)
+    generation = harness.controller._inventory_generation
+    assert generation is not None
+    unsupported = PublicFailure(
+        FailureKind.INVENTORY_UNSUPPORTED,
+        'inventory_unsupported',
+        FAILURE_MESSAGES[FailureKind.INVENTORY_UNSUPPORTED],
+        False,
+    )
+
+    harness.worker.operationFailed.emit(
+        'queue', InventoryWorkerEvent(generation, NAMESPACE, unsupported)
+    )
+
+    harness.wait(lambda: len(failures) == 1)
+    assert list(failures[0]) == ['queue', unsupported]
+
+
 def test_same_namespace_old_generation_events_are_rejected_and_refresh_is_exact(
     harness: Harness,
 ) -> None:

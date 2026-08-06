@@ -332,6 +332,10 @@ class InventoryStoreError(RuntimeError):
     pass
 
 
+class InventoryReservationAmbiguousError(InventoryStoreError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class InventoryCommand:
     id: str
@@ -679,6 +683,59 @@ class InventoryStore:
         request_value = _validated_command_request(request, 'release')
         return self._enqueue_terminal(namespace, request_value, None, now)
 
+    def enqueue_unique_release(
+        self,
+        client_instance_uuid: UUID,
+        roast_uuid: UUID,
+        now: datetime,
+    ) -> InventoryRoastState | None:
+        if not isinstance(roast_uuid, UUID):
+            raise ValueError('inventory roast UUID is invalid')
+        now_text = _datetime_text(now)
+        with (
+            self._storage_boundary(),
+            self._filesystem_lock(),
+            self._transaction() as connection,
+        ):
+            rows = connection.execute(
+                '''SELECT roast.*, namespace.origin,
+                          namespace.organization_uuid, namespace.namespace_key
+                   FROM roast_inventory AS roast
+                   JOIN namespaces AS namespace ON namespace.id = roast.namespace_id
+                   WHERE roast.roast_uuid = ?
+                     AND roast.terminal_intent IS NULL
+                     AND roast.lifecycle NOT IN ('finalized', 'released')
+                   ORDER BY namespace.namespace_key''',
+                (roast_uuid.hex,),
+            ).fetchall()
+            if len(rows) > 1:
+                raise InventoryReservationAmbiguousError(
+                    'inventory reservation is ambiguous'
+                )
+            if not rows:
+                return None
+            row = rows[0]
+            namespace = _row_namespace(row)
+            state = _row_to_roast(row, namespace)
+            request = build_release_request(
+                client_instance_uuid=client_instance_uuid,
+                reservation_uuid=state.reservation_uuid,
+                roast_uuid=state.roast_uuid,
+                lot_id=state.lot_id,
+                planned_grams=state.planned_grams,
+                occurred_at=now,
+            )
+            return self._enqueue_terminal_in_transaction(
+                connection,
+                cast(int, row['namespace_id']),
+                namespace,
+                request,
+                None,
+                now,
+                now_text,
+                row,
+            )
+
     def _enqueue_terminal(
         self,
         namespace: Namespace,
@@ -705,69 +762,91 @@ class InventoryStore:
             ).fetchone()
             if row is None:
                 raise InventoryStoreError('inventory reservation is unavailable')
-            _require_request_matches_roast(row, request)
-            terminal_intent = cast(str | None, row['terminal_intent'])
-            if terminal_intent is not None and terminal_intent != request.operation:
-                raise InventoryStoreError('inventory terminal intent conflicts')
-            reserve = connection.execute(
-                '''SELECT * FROM inventory_commands
-                   WHERE namespace_id = ? AND reservation_uuid = ?
-                     AND operation = 'reserve' ''',
-                (namespace_id, request.reservation_uuid.hex),
-            ).fetchone()
-            if reserve is None:
-                raise InventoryStoreError('inventory reserve dependency is unavailable')
-            existing = connection.execute(
-                '''SELECT * FROM inventory_commands
-                   WHERE namespace_id = ? AND reservation_uuid = ? AND operation = ?''',
-                (namespace_id, request.reservation_uuid.hex, request.operation),
-            ).fetchone()
-            occurred_column = (
-                'finalize_occurred_at'
-                if request.operation == 'finalize'
-                else 'release_occurred_at'
-            )
-            if existing is not None:
-                if not _command_body_matches(existing, request):
-                    raise InventoryStoreError('inventory immutable command conflicts')
-                if row['actual_grams'] != actual_grams:
-                    raise InventoryStoreError('inventory immutable command conflicts')
-                return _row_to_roast(row, namespace)
-            if terminal_intent is not None or row['server_state'] in {'finalized', 'released'}:
-                raise InventoryStoreError('inventory terminal intent conflicts')
-            lifecycle = f'{request.operation}_queued'
-            connection.execute(
-                f'''UPDATE roast_inventory
-                    SET actual_grams = ?, lifecycle = ?, terminal_intent = ?,
-                        {occurred_column} = ?, error_code = NULL,
-                        error_message = NULL, updated_at = ?
-                    WHERE namespace_id = ? AND roast_uuid = ?''',
-                (
-                    actual_grams,
-                    lifecycle,
-                    request.operation,
-                    _datetime_text(request.occurred_at),
-                    now_text,
-                    namespace_id,
-                    request.roast_uuid.hex,
-                ),
-            )
-            self._insert_command(
+            return self._enqueue_terminal_in_transaction(
                 connection,
                 namespace_id,
+                namespace,
                 request,
-                _stored_uuid_hex(reserve['id']),
+                actual_grams,
+                now,
                 now_text,
+                row,
             )
-            self._prune_completed(connection, now)
-            updated = connection.execute(
-                '''SELECT * FROM roast_inventory
-                   WHERE namespace_id = ? AND roast_uuid = ?''',
-                (namespace_id, request.roast_uuid.hex),
-            ).fetchone()
-            if updated is None:
-                raise InventoryStoreError('inventory roast was not persisted')
-            return _row_to_roast(updated, namespace)
+
+    def _enqueue_terminal_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        namespace_id: int,
+        namespace: Namespace,
+        request: InventoryCommandRequest,
+        actual_grams: int | None,
+        now: datetime,
+        now_text: str,
+        row: sqlite3.Row,
+    ) -> InventoryRoastState:
+        _require_request_matches_roast(row, request)
+        terminal_intent = cast(str | None, row['terminal_intent'])
+        if terminal_intent is not None and terminal_intent != request.operation:
+            raise InventoryStoreError('inventory terminal intent conflicts')
+        reserve = connection.execute(
+            '''SELECT * FROM inventory_commands
+               WHERE namespace_id = ? AND reservation_uuid = ?
+                 AND operation = 'reserve' ''',
+            (namespace_id, request.reservation_uuid.hex),
+        ).fetchone()
+        if reserve is None:
+            raise InventoryStoreError('inventory reserve dependency is unavailable')
+        existing = connection.execute(
+            '''SELECT * FROM inventory_commands
+               WHERE namespace_id = ? AND reservation_uuid = ? AND operation = ?''',
+            (namespace_id, request.reservation_uuid.hex, request.operation),
+        ).fetchone()
+        occurred_column = (
+            'finalize_occurred_at'
+            if request.operation == 'finalize'
+            else 'release_occurred_at'
+        )
+        if existing is not None:
+            if not _command_body_matches(existing, request):
+                raise InventoryStoreError('inventory immutable command conflicts')
+            if row['actual_grams'] != actual_grams:
+                raise InventoryStoreError('inventory immutable command conflicts')
+            return _row_to_roast(row, namespace)
+        if terminal_intent is not None or row['server_state'] in {'finalized', 'released'}:
+            raise InventoryStoreError('inventory terminal intent conflicts')
+        lifecycle = f'{request.operation}_queued'
+        connection.execute(
+            f'''UPDATE roast_inventory
+                SET actual_grams = ?, lifecycle = ?, terminal_intent = ?,
+                    {occurred_column} = ?, error_code = NULL,
+                    error_message = NULL, updated_at = ?
+                WHERE namespace_id = ? AND roast_uuid = ?''',
+            (
+                actual_grams,
+                lifecycle,
+                request.operation,
+                _datetime_text(request.occurred_at),
+                now_text,
+                namespace_id,
+                request.roast_uuid.hex,
+            ),
+        )
+        self._insert_command(
+            connection,
+            namespace_id,
+            request,
+            _stored_uuid_hex(reserve['id']),
+            now_text,
+        )
+        self._prune_completed(connection, now)
+        updated = connection.execute(
+            '''SELECT * FROM roast_inventory
+               WHERE namespace_id = ? AND roast_uuid = ?''',
+            (namespace_id, request.roast_uuid.hex),
+        ).fetchone()
+        if updated is None:
+            raise InventoryStoreError('inventory roast was not persisted')
+        return _row_to_roast(updated, namespace)
 
     def lease_next(
         self, namespace: Namespace, now: datetime, lease_seconds: int

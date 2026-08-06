@@ -31,6 +31,7 @@ from artisanlib.roastserver.contract import (
 from artisanlib.roastserver.inventory_contract import (
     BeanLot,
     InventoryBalance,
+    InventoryCommandRequest,
     InventoryConflict,
     InventoryMutationResult,
     InventoryReservation,
@@ -39,6 +40,7 @@ from artisanlib.roastserver.inventory_contract import (
     build_reserve_request,
 )
 from artisanlib.roastserver.inventory_store import (
+    InventoryReservationAmbiguousError,
     InventoryStore,
     InventoryStoreError,
     LotCacheSnapshot,
@@ -108,6 +110,45 @@ NAMESPACE = namespace_for_test()
 OTHER_NAMESPACE = namespace_for_test(
     'https://other.example', OTHER_ORGANIZATION_UUID
 )
+
+
+_COMPETING_RESERVE_SCRIPT = '''
+from datetime import UTC, datetime
+from pathlib import Path
+import sys
+from uuid import UUID
+
+from artisanlib.roastserver.inventory_contract import build_reserve_request
+from artisanlib.roastserver.inventory_store import InventoryStore
+from artisanlib.roastserver.settings import namespace_for
+
+root = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+gate = Path(sys.argv[3])
+attempting = Path(sys.argv[4])
+namespace = namespace_for(
+    'https://other.example', UUID('44444444-4444-4444-8444-444444444444'))
+store = InventoryStore(root)
+store.open()
+try:
+    ready.write_text('ready', encoding='utf-8')
+    while not gate.exists():
+        import time
+        time.sleep(0.001)
+    attempting.write_text('attempting', encoding='utf-8')
+    request = build_reserve_request(
+        client_instance_uuid=UUID('77777777-7777-4777-8777-777777777777'),
+        reservation_uuid=UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
+        roast_uuid=UUID('55555555-5555-4555-8555-555555555555'),
+        lot_id=UUID('11111111-1111-4111-8111-111111111111'),
+        planned_grams=1250,
+        occurred_at=datetime(2026, 8, 5, 13, 0, tzinfo=UTC),
+    )
+    store.enqueue_reserve(namespace, request, 'Lot', request.occurred_at)
+    print('inserted', flush=True)
+finally:
+    store.close()
+'''
 
 
 def lot(
@@ -585,6 +626,154 @@ def test_cache_snapshot_uses_one_generation_across_concurrent_publication(
         [LotCacheSnapshot(NAMESPACE, old_lots, NOW)],
         [LotCacheSnapshot(NAMESPACE, new_lots, LATER)],
     ]
+
+
+def test_unique_release_preserves_exact_request_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    store = opened_store(tmp_path / 'inventory')
+    store.replace_lots(NAMESPACE, (lot(),), NOW)
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+
+    state = store.enqueue_unique_release(CLIENT_UUID, ROAST_UUID, LATER)
+
+    assert state is not None and state.terminal_intent == 'release'
+    assert state.release_occurred_at == LATER
+    assert store.enqueue_unique_release(CLIENT_UUID, ROAST_UUID, LATER) is None
+    reserve = store.lease_next(NAMESPACE, NOW, 30)
+    assert reserve is not None and reserve.lease_token is not None
+    store.mark_complete(reserve.id, reserve.lease_token, mutation_result(), NOW)
+    release = store.lease_next(NAMESPACE, LATER, 30)
+    assert release is not None
+    assert release.request_json == RELEASE_REQUEST.request_json
+    assert release.idempotency_key == RELEASE_REQUEST.idempotency_key
+    store.close()
+
+
+def test_unique_release_fails_closed_for_static_cross_namespace_ambiguity(
+    tmp_path: Path,
+) -> None:
+    store = opened_store(tmp_path / 'inventory')
+    store.replace_lots(NAMESPACE, (lot(),), NOW)
+    store.replace_lots(OTHER_NAMESPACE, (lot(),), NOW)
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    other_request = build_reserve_request(
+        client_instance_uuid=CLIENT_UUID,
+        reservation_uuid=OTHER_SERVER_RESERVATION_UUID,
+        roast_uuid=ROAST_UUID,
+        lot_id=LOT_UUID,
+        planned_grams=1_250,
+        occurred_at=LATER,
+    )
+    store.enqueue_reserve(OTHER_NAMESPACE, other_request, 'Lot', LATER)
+
+    with pytest.raises(InventoryReservationAmbiguousError):
+        store.enqueue_unique_release(CLIENT_UUID, ROAST_UUID, LATER)
+
+    state_a = store.roast_state(NAMESPACE, ROAST_UUID)
+    state_b = store.roast_state(OTHER_NAMESPACE, ROAST_UUID)
+    assert state_a is not None and state_a.terminal_intent is None
+    assert state_b is not None and state_b.terminal_intent is None
+    store.close()
+
+
+def test_unique_release_serializes_competing_independent_process_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'inventory'
+    store = opened_store(root)
+    store.replace_lots(NAMESPACE, (lot(),), NOW)
+    store.replace_lots(OTHER_NAMESPACE, (lot(),), NOW)
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    ready = tmp_path / 'competitor.ready'
+    gate = tmp_path / 'competitor.go'
+    attempting = tmp_path / 'competitor.attempting'
+    process = subprocess.Popen(
+        [sys.executable, '-c', textwrap.dedent(_COMPETING_RESERVE_SCRIPT),
+         str(root), str(ready), str(gate), str(attempting)],
+        cwd=Path.cwd(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    release_entered = threading.Event()
+    finish_release = threading.Event()
+    result: queue.Queue[object] = queue.Queue()
+    original_insert = store._insert_command
+
+    def pausing_insert(
+        connection: sqlite3.Connection,
+        namespace_id: int,
+        request: InventoryCommandRequest,
+        dependency_id: str | None,
+        now_text: str,
+    ) -> None:
+        if getattr(request, 'operation', None) == 'release':
+            release_entered.set()
+            if not finish_release.wait(timeout=5):
+                raise RuntimeError('timed out pausing atomic release')
+        original_insert(
+            connection,
+            namespace_id,
+            request,
+            dependency_id,
+            now_text,
+        )
+
+    monkeypatch.setattr(store, '_insert_command', pausing_insert)
+
+    def release() -> None:
+        try:
+            result.put(store.enqueue_unique_release(CLIENT_UUID, ROAST_UUID, LATER))
+        except BaseException as error:
+            result.put(error)
+
+    thread = threading.Thread(target=release, name='atomic-release')
+    thread_started = False
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            if process.poll() is not None or time.monotonic() >= deadline:
+                stdout, stderr = process.communicate(timeout=5)
+                raise AssertionError(
+                    f'competitor did not become ready: {stdout!r} {stderr!r}'
+                )
+            time.sleep(0.001)
+        thread.start()
+        thread_started = True
+        assert release_entered.wait(timeout=5)
+        gate.write_text('go', encoding='utf-8')
+        deadline = time.monotonic() + 5
+        while not attempting.exists():
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError('competitor did not attempt its insertion')
+            time.sleep(0.001)
+        assert process.poll() is None
+        finish_release.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == 'inserted'
+    finally:
+        finish_release.set()
+        if thread_started:
+            thread.join(timeout=5)
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+    outcome = result.get_nowait()
+    assert not isinstance(outcome, BaseException)
+    state_a = store.roast_state(NAMESPACE, ROAST_UUID)
+    state_b = store.roast_state(OTHER_NAMESPACE, ROAST_UUID)
+    assert state_a is not None and state_a.terminal_intent == 'release'
+    assert state_b is not None and state_b.terminal_intent is None
+    store.close()
 
 
 def test_replace_lots_waits_for_another_instances_process_lock(
