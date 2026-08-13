@@ -30,7 +30,9 @@ import logging
 
 from pymodbus.framer.rtu import FramerRTU
 from collections.abc import Callable, Awaitable
-from typing import override, Final, TYPE_CHECKING
+from typing import Final, TYPE_CHECKING, override
+
+from artisanlib.santoker_diagnostics import DiagnosticField, SantokerDiagnosticsSession, TransportKind
 
 if TYPE_CHECKING:
     from artisanlib.atypes import SerialSettings # pylint: disable=unused-import
@@ -78,12 +80,18 @@ class SantokerCube_BLE(ClientBLE):
     @override
     def on_connect(self) -> None: # pylint: disable=no-self-use
         if self._connected_handler is not None:
-            self._connected_handler()
+            try:
+                self._connected_handler()
+            except Exception as e: # pylint: disable=broad-except
+                _log.exception(e)
 
     @override
     def on_disconnect(self) -> None: # pylint: disable=no-self-use
         if self._disconnected_handler is not None:
-            self._disconnected_handler()
+            try:
+                self._disconnected_handler()
+            except Exception as e: # pylint: disable=broad-except
+                _log.exception(e)
 
     async def reader(self) -> None:
         self._read_queue = asyncio.Queue(maxsize=200) # queue needs to be started in the current async event loop!
@@ -138,11 +146,13 @@ class Santoker(AsyncComm):
     BT_CALIB = b'\x87'
     ET_CALIB = b'\x88'
 
-    __slots__ = [ 'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler', '_warmup_handler', '_warmup_temp_handler',
-                    '_ready_handler', '_board', '_bt', '_et', '_bt_ror', '_et_ror', '_ir',
-                    '_power', '_air', '_drum', '_CHARGE', '_DRY', '_FCs', '_SCs', '_DROP',
-                    '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
-                    '_connect_using_ble', '_ble_client' ]
+    __slots__ = [
+        'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler',
+        '_warmup_handler', '_warmup_temp_handler', '_ready_handler', '_board', '_bt', '_et',
+        '_bt_ror', '_et_ror', '_ir', '_power', '_air', '_drum', '_CHARGE', '_DRY', '_FCs',
+        '_SCs', '_DROP', '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
+        '_desired_warmup', '_connect_using_ble', '_ble_client', '_diagnostics', '_frame_handler'
+    ]
 
     def __init__(self, host:str = '127.0.0.1', port:int = 8080, serial:'SerialSettings|None' = None,
                 connect_using_ble:bool = False,
@@ -156,17 +166,43 @@ class Santoker(AsyncComm):
                 warmup_handler:Callable[[bool | None], None]|None = None,
                 warmup_temp_handler:Callable[[float], None]|None = None,
                 warmup_target: float = DEFAULT_WARMUP_TEMP_C,
-                ready_handler:Callable[[bool], None]|None = None) -> None:
+                ready_handler:Callable[[bool], None]|None = None,
+                diagnostics:SantokerDiagnosticsSession|None = None,
+                frame_handler:Callable[[bytes], None]|None = None) -> None:
 
-        def on_disconnected() -> None:
+        if diagnostics is None:
+            if serial is not None:
+                transport: TransportKind = 'serial'
+            elif connect_using_ble:
+                transport = 'BLE'
+            else:
+                transport = 'Wi-Fi'
+            diagnostics = SantokerDiagnosticsSession(transport)
+
+        self._diagnostics:SantokerDiagnosticsSession = diagnostics
+        self._frame_handler:Callable[[bytes], None]|None = frame_handler
+        self._desired_warmup:bool | None = None
+
+        def _connected() -> None:
+            self._record_connected()
+            if connected_handler is not None:
+                try:
+                    connected_handler()
+                except Exception as e: # pylint: disable=broad-except
+                    _log.exception(e)
+
+        def _disconnected() -> None:
             self.resetProtocolState()
+            self._record_disconnected()
             if disconnected_handler is not None:
-                disconnected_handler()
+                try:
+                    disconnected_handler()
+                except Exception as e: # pylint: disable=broad-except
+                    _log.exception(e)
 
-        super().__init__(host, port, serial, connected_handler, on_disconnected)
+        super().__init__(host, port, serial, _connected, _disconnected)
 
         self.HEADER:bytes = (self.HEADER_BT if connect_using_ble else self.HEADER_WIFI)
-
         self._connect_using_ble:bool = connect_using_ble
 
         # handlers
@@ -205,7 +241,7 @@ class Santoker(AsyncComm):
         self._DROP:bool = False
 
         self._ble_client:SantokerCube_BLE|None = \
-                (SantokerCube_BLE(self.read_msg, connected_handler, on_disconnected) if self._connect_using_ble else None)
+                (SantokerCube_BLE(self.read_msg, _connected, _disconnected) if self._connect_using_ble else None)
 
 
     # external API to access machine state
@@ -235,9 +271,56 @@ class Santoker(AsyncComm):
     def getWarmupTarget(self) -> float:
         return self._warmup_target
 
+    def getReportedWarmupTarget(self) -> float | None:
+        return self._reported_warmup_target
+
+    def _safe_record(self, callback: Callable[[], None]) -> None:
+        try:
+            callback()
+        except Exception as e: # pylint: disable=broad-except
+            _log.exception(e)
+
+    def _record_connected(self) -> None:
+        self._safe_record(self._diagnostics.record_connected)
+
+    def _record_disconnected(self) -> None:
+        self._safe_record(self._diagnostics.record_disconnected)
+
+    def _record_protocol(self, ready: bool, header: bytes | None) -> None:
+        self._safe_record(lambda: self._diagnostics.record_protocol(ready, header[1:2] if header is not None else None))
+
+    def _record_rx(self, packet: bytes, description: str, accepted: bool) -> None:
+        self._safe_record(lambda: self._diagnostics.record_rx(packet, description, accepted=accepted))
+
+    def _record_tx(self, packet: bytes, target: bytes, value: int) -> None:
+        self._safe_record(lambda: self._diagnostics.record_tx(
+            packet,
+            f'{target.hex()}={value}',
+        ))
+
+    def _record_decoded(self, field: DiagnosticField, value: float | int | bool) -> None:
+        self._safe_record(lambda: self._diagnostics.record_decoded(field, value))
+
+    def _record_desired_warmup(self) -> None:
+        self._safe_record(lambda: self._diagnostics.record_desired_warmup(self._desired_warmup, self._warmup_target))
+
+    def _record_reported_warmup(self) -> None:
+        self._safe_record(lambda: self._diagnostics.record_reported_warmup(self._warmup))
+
+    def _record_reported_target(self) -> None:
+        self._safe_record(lambda: self._diagnostics.record_reported_target(self._reported_warmup_target))
+
+    def _record_frame(self, packet: bytes) -> None:
+        if self._frame_handler is not None:
+            try:
+                self._frame_handler(packet)
+            except Exception as e: # pylint: disable=broad-except
+                _log.exception(e)
+
     def _setHeaderReady(self, ready: bool) -> None:
         if ready != self._header_ready:
             self._header_ready = ready
+            self._record_protocol(ready, self.HEADER if ready else None)
             if self._ready_handler is not None:
                 try:
                     self._ready_handler(ready)
@@ -247,17 +330,28 @@ class Santoker(AsyncComm):
     def _setWarmupState(self, enabled: bool | None) -> None:
         if enabled != self._warmup:
             self._warmup = enabled
+            self._record_reported_warmup()
             if self._warmup_handler is not None:
                 try:
                     self._warmup_handler(enabled)
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
 
+    def requestWarmupOn(self, temp_c: float) -> bool:
+        if not self._header_ready:
+            return False
+        if not self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
+            return False
+        self.send_msg(self.WARMUP_TEMP, int(round(temp_c * 10)))
+        self.send_msg(self.WARMUP, 1)
+        return True
+
     def setWarmupTarget(self, temp_c: float) -> bool:
         if not self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
             return False
         self._warmup_target = temp_c
-        if self._warmup is True:
+        self._record_desired_warmup()
+        if self._desired_warmup is True:
             if not self._header_ready:
                 return False
             self.send_msg(self.WARMUP_TEMP, int(round(temp_c * 10)))
@@ -266,12 +360,11 @@ class Santoker(AsyncComm):
     def setWarmup(self, enabled: bool) -> bool:
         if not self._header_ready:
             return False
+        self._desired_warmup = enabled
+        self._record_desired_warmup()
         if enabled:
-            self.send_msg(self.WARMUP_TEMP, int(round(self._warmup_target * 10)))
-            self.send_msg(self.WARMUP, 1)
-        else:
-            self.send_msg(self.WARMUP, 0)
-        self._setWarmupState(enabled)
+            return self.requestWarmupOn(self._warmup_target)
+        self.send_msg(self.WARMUP, 0)
         return True
 
     def resetReadings(self) -> None:
@@ -293,7 +386,7 @@ class Santoker(AsyncComm):
     # message decoder
 
     def register_reading(self, target:bytes, data:bytes) -> None:
-        #if self._logging:
+        # if self._logging:
         value:int
         # convert data into the integer data
         if target in {self.BT_ROR, self.ET_ROR}:
@@ -307,33 +400,56 @@ class Santoker(AsyncComm):
                 value = - value
         else:
             value = int.from_bytes(data, 'big')
-#        if self._logging:
-#            _log.debug('register_reading(%s,%s)',target,value)
+
         if target == self.BOARD:
-            self._board = value / 10.0
+            board_c = value / 10.0
+            if board_c != self._board:
+                self._board = board_c
+                self._record_decoded('board_c', board_c)
         elif target in {self.BT, self.OLD_BT}:
-            BT = value / 10.0
-            self._bt = (BT if self._bt == -1 else (2*BT + self._bt)/3)
+            bt_c = value / 10.0
+            bt = (bt_c if self._bt == -1 else (2*bt_c + self._bt)/3)
+            if bt != self._bt:
+                self._bt = bt
+                self._record_decoded('bt_c', bt)
             if self._logging:
                 _log.debug('BT: %s',self._bt)
         elif target in {self.ET, self.OLD_ET}:
-            ET = value / 10.0
-            self._et = (ET if self._et == -1 else (2*ET + self._et)/3)
+            et_c = value / 10.0
+            et = (et_c if self._et == -1 else (2*et_c + self._et)/3)
+            if et != self._et:
+                self._et = et
+                self._record_decoded('et_c', et)
             if self._logging:
                 _log.debug('ET: %s',self._et)
         elif target == self.BT_ROR:
-            self._bt_ror = value / 10.0
+            bt_ror_c = value / 10.0
+            if bt_ror_c != self._bt_ror:
+                self._bt_ror = bt_ror_c
+                self._record_decoded('bt_ror_c', bt_ror_c)
         elif target == self.ET_ROR:
-            self._et_ror = value / 10.0
+            et_ror_c = value / 10.0
+            if et_ror_c != self._et_ror:
+                self._et_ror = et_ror_c
+                self._record_decoded('et_ror_c', et_ror_c)
         elif target == self.IR:
-            self._ir = value / 10.0
+            ir_c = value / 10.0
+            if ir_c != self._ir:
+                self._ir = ir_c
+                self._record_decoded('ir_c', ir_c)
         elif target == self.POWER:
-            self._power = value
+            if value != self._power:
+                self._power = value
+                self._record_decoded('power', value)
         elif target == self.AIR:
-            self._air = value
+            if value != self._air:
+                self._air = value
+                self._record_decoded('fan', value)
         elif target == self.DRUM:
-            self._drum = value
-        #
+            if value != self._drum:
+                self._drum = value
+                self._record_decoded('drum', value)
+
         elif target == self.CHARGE:
             b = bool(value)
             if b and b != self._CHARGE and self._charge_handler is not None:
@@ -341,7 +457,9 @@ class Santoker(AsyncComm):
                     self._charge_handler()
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
-            self._CHARGE = b
+            if b != self._CHARGE:
+                self._CHARGE = b
+                self._record_decoded('charge', b)
         elif target == self.DRY:
             b = bool(value)
             if b and b != self._DRY and self._dry_handler is not None:
@@ -349,7 +467,9 @@ class Santoker(AsyncComm):
                     self._dry_handler()
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
-            self._DRY = b
+            if b != self._DRY:
+                self._DRY = b
+                self._record_decoded('dry', b)
         elif target == self.FCs:
             b = bool(value)
             if b and b != self._FCs and self._fcs_handler is not None:
@@ -357,7 +477,9 @@ class Santoker(AsyncComm):
                     self._fcs_handler()
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
-            self._FCs = b
+            if b != self._FCs:
+                self._FCs = b
+                self._record_decoded('fcs', b)
         elif target == self.SCs:
             b = bool(value)
             if b and b != self._SCs and self._scs_handler is not None:
@@ -365,7 +487,9 @@ class Santoker(AsyncComm):
                     self._scs_handler()
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
-            self._SCs = b
+            if b != self._SCs:
+                self._SCs = b
+                self._record_decoded('scs', b)
         elif target == self.DROP:
             b = bool(value)
             if b and b != self._DROP and self._drop_handler is not None:
@@ -373,7 +497,9 @@ class Santoker(AsyncComm):
                     self._drop_handler()
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
-            self._DROP = b
+            if b != self._DROP:
+                self._DROP = b
+                self._record_decoded('drop', b)
         elif target == self.WARMUP:
             if value in {0, 1}:
                 self._setWarmupState(bool(value))
@@ -382,17 +508,14 @@ class Santoker(AsyncComm):
         elif target == self.WARMUP_TEMP:
             temp_c = value / 10.0
             if self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
-                changed = (
-                    temp_c != self._reported_warmup_target
-                    or temp_c != self._warmup_target
-                )
-                self._reported_warmup_target = temp_c
-                self._warmup_target = temp_c
-                if changed and self._warmup_temp_handler is not None:
-                    try:
-                        self._warmup_temp_handler(temp_c)
-                    except Exception as e: # pylint: disable=broad-except
-                        _log.exception(e)
+                if temp_c != self._reported_warmup_target:
+                    self._reported_warmup_target = temp_c
+                    if self._warmup_temp_handler is not None:
+                        try:
+                            self._warmup_temp_handler(temp_c)
+                        except Exception as e: # pylint: disable=broad-except
+                            _log.exception(e)
+                    self._record_reported_target()
             elif self._logging:
                 _log.debug('invalid warm-up target: %s', temp_c)
 #        elif self._logging and target in {self.MIN_POWER, self.MAX_POWER, self.BT_CALIB, self.ET_CALIB}:
@@ -406,50 +529,100 @@ class Santoker(AsyncComm):
     # https://www.oreilly.com/library/view/using-asyncio-in/9781492075325/ch04.html
     @override
     async def read_msg(self, stream: asyncio.StreamReader|IteratorReader) -> None:
+        candidate:bytearray
+        read_bytes:bytearray
+
+        async def read_candidate(size: int) -> bytes:
+            nonlocal candidate
+            try:
+                data = await stream.readexactly(size)
+                candidate.extend(data)
+                return data
+            except asyncio.IncompleteReadError as exc:
+                partial = bytes(exc.partial)
+                if partial:
+                    candidate.extend(partial)
+                if candidate:
+                    self._record_rx(bytes(candidate), 'truncated frame', accepted=False)
+                    self._record_frame(bytes(candidate))
+                return b''
+
         # look for the first header byte
-        await stream.readuntil(self.HEADER[0:1])
+        try:
+            read_bytes = bytearray(await stream.readuntil(self.HEADER[0:1]))
+        except asyncio.IncompleteReadError as exc:
+            if exc.partial:
+                self._record_rx(bytes(exc.partial), 'truncated frame', accepted=False)
+            return
+
+        candidate = bytearray(read_bytes[-1:]) # keep only bytes from first header byte
+
         # check for the second header byte
-#        if await stream.readexactly(1) != self.HEADER[1:2]:
-#            return
-#        if await stream.readexactly(1) not in {self.HEADER_BT[1:2], self.HEADER_WIFI[1:2]}: # we always accept both headers, the one for WiFi and the one for BT
-#            return
-        # we accept both headers, BT and WiFi and adjust the self.HEADER to be used on sending messages accordingly
-        # as it seems that some machines connected via bluetooth still send data using the WiFi header and expect that header also on read
-        # so we adjust to the header we receive and use that on sending our messages as well
-        snd_header_byte = await stream.readexactly(1)
+        snd_header_byte = await read_candidate(1)
+        if len(snd_header_byte) != 1:
+            return
         if snd_header_byte == self.HEADER_BT[1:2]:
             candidate_header = self.HEADER_BT
         elif snd_header_byte == self.HEADER_WIFI[1:2]:
             candidate_header = self.HEADER_WIFI
         else:
+            self._record_rx(bytes(candidate), 'invalid second header', accepted=False)
+            self._record_frame(bytes(candidate))
             return
+
         # read the data target (BT, ET,..)
-        target = await stream.readexactly(1)
-        # read code header
-        code2 = await stream.readexactly(2)
-        if code2 != self.CODE_HEADER:
-            if self._logging:
-                _log.debug('unexpected CODE_HEADER: %s', code2)
+        target = await read_candidate(1)
+        if len(target) != 1:
             return
+
+        # read code header
+        code2 = await read_candidate(2)
+        if len(code2) != 2:
+            return
+        if code2 != self.CODE_HEADER:
+            self._record_rx(bytes(candidate), 'invalid code header', accepted=False)
+            self._record_frame(bytes(candidate))
+            return
+
         # read the data length
-        data_len = await stream.readexactly(1)
-        data = await stream.readexactly(int.from_bytes(data_len, 'big'))
-        # compute and check the CRC over the code header, length and data
-        crc = await stream.readexactly(2)
+        data_len = await read_candidate(1)
+        if len(data_len) != 1:
+            return
+        data = await read_candidate(int.from_bytes(data_len, 'big'))
+        if len(data) != int.from_bytes(data_len, 'big'):
+            return
+
+        if data_len != b'\x03':
+            self._record_rx(bytes(candidate), 'invalid data length', accepted=False)
+            self._record_frame(bytes(candidate))
+            return
+
+        # read and check CRC over code header+length+data
+        crc = await read_candidate(2)
+        if len(crc) != 2:
+            return
         calculated_crc = FramerRTU.compute_CRC(self.CODE_HEADER + data_len + data).to_bytes(2, 'big')
-#        if self._verify_crc and crc != calculated_crc: # for whatever reason, the first byte of the received CRC is often wrongly just \x00
-#        if self._verify_crc and crc != calculated_crc and crc[0] != 0: # we accept a 0 as first CRC bit always!
         if self._verify_crc and crc[1] != calculated_crc[1]: # we only check the second CRC bit!
+            self._record_rx(bytes(candidate), 'CRC mismatch', accepted=False)
+            self._record_frame(bytes(candidate))
             if self._logging:
                 _log.debug('CRC error')
             return
+
         # check tail
-        tail = await stream.readexactly(4)
-        if tail != self.TAIL:
+        tail = await read_candidate(4)
+        if len(tail) != 4:
             return
+        if tail != self.TAIL:
+            self._record_rx(bytes(candidate), 'invalid tail', accepted=False)
+            self._record_frame(bytes(candidate))
+            return
+
         # full message decoded
         self.HEADER = candidate_header
         self._setHeaderReady(True)
+        self._record_rx(bytes(candidate), 'accepted frame', accepted=True)
+        self._record_frame(bytes(candidate))
         self.register_reading(target, data)
 
     # send message interface
@@ -462,14 +635,16 @@ class Santoker(AsyncComm):
         return self.HEADER + target + data + crc + self.TAIL
 
     def send_msg(self, target:bytes, value: int) -> None:
+        packet:bytes = self.create_msg(target, value)
+        self._record_tx(packet, target, value)
         if self._connect_using_ble and hasattr(self, '_ble_client') and self._ble_client is not None:
             # send via BLE
             if self._logging:
-                _log.debug('send_msg(%s,%s): %s',target,value,self.create_msg(target, value))
-            self._ble_client.send(self.create_msg(target, value))
+                _log.debug('send_msg(%s,%s): %s',target,value,packet)
+            self._ble_client.send(packet)
         else:
             # send via socket
-            self.send(self.create_msg(target, value))
+            self.send(packet)
 
 
     @override
