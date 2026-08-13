@@ -259,11 +259,11 @@ class SantokerDiagnosticsDialog(QDialog):
 
         copy_button = QPushButton(QApplication.translate('Button', 'Copy All'))
         copy_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        copy_button.clicked.connect(self.copyAll)
+        copy_button.clicked.connect(self._copy_all)
 
         save_button = QPushButton(QApplication.translate('Button', 'Save as Text…'))
         save_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        save_button.clicked.connect(self.saveAsText)
+        save_button.clicked.connect(self._save_as_text)
 
         close_button = QPushButton(QApplication.translate('Button', 'Close'))
         close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -476,7 +476,7 @@ class SantokerDiagnosticsDialog(QDialog):
             raise RuntimeError('No Santoker diagnostics session available')
         return session.format_report()
 
-    def copyAll(self) -> None:
+    def _copy_all(self) -> None:
         try:
             report = self._resolve_report()
             clipboard = QApplication.clipboard()
@@ -490,7 +490,7 @@ class SantokerDiagnosticsDialog(QDialog):
                 exc,
             )
 
-    def saveAsText(self) -> None:
+    def _save_as_text(self) -> None:
         path_text, _ = QFileDialog.getSaveFileName(self, QApplication.translate('Button', 'Save as Text…'))
         if not path_text:
             return

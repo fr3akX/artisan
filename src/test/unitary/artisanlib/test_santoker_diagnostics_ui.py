@@ -1,4 +1,7 @@
 import os
+
+os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+
 from pathlib import Path
 from typing import cast
 from unittest.mock import Mock
@@ -13,9 +16,6 @@ from artisanlib.santoker_diagnostics_ui import (
     SantokerDiagnosticsDialog,
     create_santoker_diagnostics_button,
 )
-
-
-os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 
 def _normalize_text(value: str) -> str:
@@ -44,6 +44,11 @@ def _format_event_lines(session: SantokerDiagnosticsSession) -> list[str]:
                 line += f' {packet_text}'
         lines.append(line)
     return lines
+
+
+class _SessionViewFailure:
+    def view(self, _after_sequence: int = 0) -> None:
+        raise RuntimeError('view failed')
 
 
 @pytest.fixture(scope='module')
@@ -181,9 +186,27 @@ def test_refresh_handles_session_provider_exception(qapplication: QApplication) 
         parent,
         lambda: (_ for _ in ()).throw(RuntimeError('provider failed')),
     )
+    dialog.show()
     dialog.refresh()
 
-    assert 'Diagnostics unavailable' in dialog.history.toPlainText()
+    assert QApplication.translate('Message', 'Diagnostics unavailable') in dialog.history.toPlainText()
+    assert dialog.isVisible()
+
+
+def test_refresh_handles_view_failure(qapplication: QApplication) -> None:
+    _ = qapplication
+    parent = QWidget()
+
+    def session_provider() -> _SessionViewFailure:
+        return _SessionViewFailure()
+
+    dialog = SantokerDiagnosticsDialog(parent, session_provider)
+    dialog.show()
+    dialog.refresh()
+
+    assert QApplication.translate('Message', 'Diagnostics unavailable') in dialog.history.toPlainText()
+    assert dialog.isVisible()
+    assert all(child.isEnabled() for child in dialog.findChildren(QPushButton))
 
 
 def test_copy_all_writes_normalized_report_to_clipboard(
@@ -199,7 +222,7 @@ def test_copy_all_writes_normalized_report_to_clipboard(
     clipboard = Mock(spec=QClipboard)
 
     monkeypatch.setattr(QApplication, 'clipboard', lambda: clipboard)
-    dialog.copyAll()
+    dialog._copy_all()
 
     clipboard.setText.assert_called_once_with(expected)
 
@@ -220,7 +243,7 @@ def test_copy_reports_error_on_formatter_failure(
 
     parent = QWidget()
     dialog = SantokerDiagnosticsDialog(parent, lambda: session)
-    dialog.copyAll()
+    dialog._copy_all()
     warning.assert_called_once()
 
 
@@ -240,7 +263,7 @@ def test_save_as_text_is_cancelled_without_writes(
     )
     monkeypatch.setattr(Path, 'write_text', write_mock)
 
-    dialog.saveAsText()
+    dialog._save_as_text()
 
     write_mock.assert_not_called()
 
@@ -267,9 +290,11 @@ def test_save_as_text_writes_utf8_normalized_report(
 
     parent = QWidget()
     dialog = SantokerDiagnosticsDialog(parent, lambda: session)
-    dialog.saveAsText()
+    dialog._save_as_text()
 
-    assert target.read_text(encoding='utf-8') == expected
+    saved_bytes = target.read_bytes()
+    assert saved_bytes == expected.encode()
+    assert b'\r' not in saved_bytes
 
 
 def test_save_as_text_reports_disk_full_without_losing_session(
@@ -293,6 +318,6 @@ def test_save_as_text_reports_disk_full_without_losing_session(
 
     parent = QWidget()
     dialog = SantokerDiagnosticsDialog(parent, lambda: session)
-    dialog.saveAsText()
+    dialog._save_as_text()
     warning.assert_called_once()
     assert session.format_report() == initial
