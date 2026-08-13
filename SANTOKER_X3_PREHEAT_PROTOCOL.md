@@ -97,6 +97,17 @@ The tracked Santoker presets include `src/includes/Machines/Santoker/Q_+_X_Serie
 - Existing fire, airflow, drum, and event target numbers agree with the app analysis.
 - Warm-up support now names `0x7E` and `0x7F`, validates the target range, gates semantic warm-up writes on observed header readiness, limits warm-up enablement to pre-`CHARGE`, and reconciles echoed warm-up state/target reports.
 
+### Reconnect restoration behavior in Artisan
+
+- During one monitoring session, automatic reconnect loss across BLE, Wi-Fi, or serial transport keeps the desired warm-up enable intent (`0x7E`) and desired warm-up target intent (`0x7F`) in memory until the session ends.
+- After a reconnect, restoration does not start on transport callback alone. It waits until a complete accepted Santoker frame is seen with valid CRC, valid header, valid code/header/length, and valid tail bytes.
+- When restoration is due, Artisan sends warm-up target first (`0x7F`) and then warm-up enable ON (`0x7E = 1`).
+- Reconciliation/retry is bounded to one attempt per second and only evaluates on accepted frames; there is no timer-based retry loop without new valid data.
+- Any explicit warm-up OFF request, CHARGE handling, or monitoring stop clears pending warm-up restoration intent before completion.
+- The diagnostics path is read-only, holds at most 5,000 events for one monitoring session, and is available in **Config → Device → Santoker → Diagnostics…**.
+- `santoker` transmission is recorded as requests; outgoing frames are not acknowledged by protocol evidence captured here, and success is not inferred from request generation alone.
+- `v26.7.7` findings are from static analysis of the Android app only; physical X3 behavior and verification remain pending.
+
 ### Functional and safety gaps
 
 1. **Physical verification is limited.** Warm-up activation on an X3 from Artisan has been observed by the user, and static analysis plus tests cover the compact-control warm-up path. A live X3 capture is still needed to confirm outbound BLE header selection, target writes, OFF behavior, echoed reports, acknowledgements, and full hardware behavior.
