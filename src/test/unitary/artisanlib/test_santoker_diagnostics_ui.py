@@ -475,7 +475,7 @@ def test_refresh_rebuilds_retained_history_when_evicted(qapplication: QApplicati
     qapplication.processEvents()
     dialog.refresh()
 
-    assert '[older entries discarded: 2]' in _value_label_text(dialog, 'valueDiscarded')
+    assert _value_label_text(dialog, 'valueDiscarded') == '[older entries discarded: 2]'
     assert _normalize_text(dialog.history.toPlainText()).splitlines() == _format_event_lines(session)
 
 

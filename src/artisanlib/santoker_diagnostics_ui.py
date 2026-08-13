@@ -443,9 +443,8 @@ class SantokerDiagnosticsDialog(QDialog):
             self._history_discarded.setText('')
         else:
             self._history_discarded.setText(
-                QApplication.translate(
-                    'Message',
-                    f'[older entries discarded: {view.state.discarded_event_count}]',
+                QApplication.translate('Message', '[older entries discarded: %1]').replace(
+                    '%1', str(view.state.discarded_event_count)
                 )
             )
 
