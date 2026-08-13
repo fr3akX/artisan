@@ -2,15 +2,26 @@ import os
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
+import inspect
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
 
 import pytest
 
 from PyQt6.QtGui import QClipboard
-from PyQt6.QtWidgets import QApplication, QLineEdit, QMessageBox, QPushButton, QWidget
+from PyQt6.QtWidgets import (
+    QApplication,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QWidget,
+)
 
+from artisanlib.devices import DeviceAssignmentDlg
+from artisanlib.main import ApplicationWindow
 from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
 from artisanlib.santoker_diagnostics_ui import (
     SantokerDiagnosticsDialog,
@@ -80,12 +91,143 @@ def test_no_session_dialog_is_read_only(qapplication: QApplication) -> None:
     }
 
 
-def test_button_factory_invokes_callback_once() -> None:
+def test_button_factory_invokes_callback_once(qapplication: QApplication) -> None:
+    _ = qapplication
     callback = Mock()
     button = create_santoker_diagnostics_button(callback)
     button.click()
 
     callback.assert_called_once_with()
+
+
+def test_diagnostics_ownership_reuses_and_reopens_completed_session(
+    qapplication: QApplication,
+) -> None:
+    window = QMainWindow()
+    window.santokerDiagnosticsSession = None
+    window.santokerDiagnosticsDialog = None
+
+    ApplicationWindow.showSantokerDiagnostics(window)
+    first_dialog = window.santokerDiagnosticsDialog
+    assert first_dialog is not None
+    assert first_dialog.isVisible()
+
+    ApplicationWindow.showSantokerDiagnostics(window)
+    assert window.santokerDiagnosticsDialog is first_dialog
+    assert first_dialog.isVisible()
+
+    first_dialog.close()
+    qapplication.processEvents()
+    assert not first_dialog.isVisible()
+
+    session = SantokerDiagnosticsSession('Wi-Fi')
+    session.record_event('state', 'completed session history')
+    session.stop()
+    window.santokerDiagnosticsSession = session
+
+    ApplicationWindow.showSantokerDiagnostics(window)
+    qapplication.processEvents()
+
+    assert window.santokerDiagnosticsDialog is first_dialog
+    assert first_dialog.isVisible()
+    assert 'completed session history' in first_dialog.history.toPlainText()
+
+
+def test_diagnostics_ownership_follows_new_session(qapplication: QApplication) -> None:
+    first_session = SantokerDiagnosticsSession('serial')
+    window = QMainWindow()
+    window.santokerDiagnosticsSession = first_session
+    window.santokerDiagnosticsDialog = None
+
+    ApplicationWindow.showSantokerDiagnostics(window)
+    dialog = window.santokerDiagnosticsDialog
+
+    second_session = SantokerDiagnosticsSession('BLE')
+    second_session.record_event('state', 'new session history')
+    window.santokerDiagnosticsSession = second_session
+    dialog.refresh()
+    qapplication.processEvents()
+
+    assert window.santokerDiagnosticsDialog is dialog
+    assert _value_label_text(dialog, 'valueTransport') == 'BLE'
+    assert 'new session history' in dialog.history.toPlainText()
+
+
+def test_diagnostics_entry_button_does_not_close_device_config(
+    qapplication: QApplication,
+) -> None:
+    _ = qapplication
+    device_dialog = QWidget()
+    device_dialog.okEvent = Mock()
+    device_dialog.cancelEvent = Mock()
+    device_dialog.accept = Mock()
+    device_dialog.reject = Mock()
+    aw = SimpleNamespace(showSantokerDiagnostics=Mock())
+
+    button = create_santoker_diagnostics_button(aw.showSantokerDiagnostics, device_dialog)
+    button.click()
+
+    aw.showSantokerDiagnostics.assert_called_once_with()
+    device_dialog.okEvent.assert_not_called()
+    device_dialog.cancelEvent.assert_not_called()
+    device_dialog.accept.assert_not_called()
+    device_dialog.reject.assert_not_called()
+
+
+def test_diagnostics_entry_is_only_in_santoker_group() -> None:
+    source = inspect.getsource(DeviceAssignmentDlg.__init__)
+
+    assert 'self.aw.showSantokerDiagnostics' in source
+    assert 'santokerVBox.addWidget(self.santokerDiagnosticsButton)' in source
+    assert source.count('addWidget(self.santokerDiagnosticsButton)') == 1
+
+
+def test_diagnostics_shutdown_closes_timer_and_preserves_completed_session(
+    qapplication: QApplication,
+) -> None:
+    session = SantokerDiagnosticsSession('Wi-Fi')
+    session.stop()
+    window = QMainWindow()
+    window.santokerDiagnosticsSession = session
+    window.santokerDiagnosticsDialog = SantokerDiagnosticsDialog(window, lambda: session)
+    window.santokerDiagnosticsDialog.show()
+    qapplication.processEvents()
+    assert window.santokerDiagnosticsDialog._refresh_timer.isActive()
+
+    window.scale_manager = SimpleNamespace(
+        disconnect_all_signal=SimpleNamespace(emit=Mock()),
+        disconnect_all_slot=Mock(),
+    )
+    window.full_screen_mode_active = False
+    window.qmc = SimpleNamespace(
+        device=-1,
+        flagon=False,
+        flagsamplingthreadrunning=False,
+        phidgetManager=None,
+    )
+    window.simulator = object()
+    window.WebLCDs = False
+    window.taskWebDisplayGreenActive = False
+    window.taskWebDisplayRoastedActive = False
+    window.scheduleFlag = False
+    window.schedule_window = None
+    window.LargeLCDsFlag = False
+    window.LargeDeltaLCDsFlag = False
+    window.LargePIDLCDsFlag = False
+    window.LargeScaleLCDsFlag = False
+    window.LargeExtraLCDsFlag = False
+    window.LargePhasesLCDsFlag = False
+    window.comparator = None
+    window.ser = SimpleNamespace(R1=None)
+    window.closeserialports = Mock()
+
+    ApplicationWindow.stopActivities(window)
+    qapplication.processEvents()
+
+    assert not window.santokerDiagnosticsDialog.isVisible()
+    assert not window.santokerDiagnosticsDialog._refresh_timer.isActive()
+    assert window.santokerDiagnosticsSession is session
+    assert session.view().state.session_ended_utc is not None
 
 
 def test_refresh_appends_history_incrementally(qapplication: QApplication) -> None:

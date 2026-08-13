@@ -46,6 +46,7 @@ from artisanlib.util import (deltaLabelUTF8, setDeviceDebugLogLevel, argb_colorn
 from artisanlib.dialogs import ArtisanResizeablDialog, tareDlg
 from artisanlib.widgets import MyContentLimitedQComboBox, MyQComboBox, MyQDoubleSpinBox
 from artisanlib.scale import SUPPORTED_SCALES
+from artisanlib.santoker_diagnostics_ui import create_santoker_diagnostics_button
 
 
 _log: Final[logging.Logger] = logging.getLogger(__name__)
@@ -1194,6 +1195,10 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
             if len(self.aw.santokerEventFlags) > i:
                 cb.setChecked(self.aw.santokerEventFlags[i])
 
+        self.santokerDiagnosticsButton = create_santoker_diagnostics_button(
+            self.aw.showSantokerDiagnostics,
+            self,
+        )
 
         self.santokerSerialFlag = QCheckBox(QApplication.translate('Label','Serial'))
         self.santokerSerialFlag.setChecked(self.aw.santokerSerial and not self.aw.santokerBLE)
@@ -1325,6 +1330,8 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
         santokerVBox.addLayout(santokerHBox)
         santokerVBox.addSpacing(15)
         santokerVBox.addLayout(santokerEventFlagHBox)
+        santokerVBox.addStretch()
+        santokerVBox.addWidget(self.santokerDiagnosticsButton)
         santokerVBox.addStretch()
         santokerVBox.setSpacing(5)
         santokerVBox.setContentsMargins(7,5,7,5) # left, top, right, bottom

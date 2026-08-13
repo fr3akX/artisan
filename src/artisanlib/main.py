@@ -232,6 +232,7 @@ from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, en
 
 from artisanlib.qtsingleapplication import QtSingleApplication
 from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession, TransportKind
+from artisanlib.santoker_diagnostics_ui import SantokerDiagnosticsDialog
 from artisanlib.santoker_warmup import (
     ReconcileOutcome,
     SantokerWarmupController,
@@ -1878,7 +1879,7 @@ class ApplicationWindow(QMainWindow):
         self.santoker:Santoker|None = None # holds the Santoker instance created on connect; reset to None on disconnect
         self.santokerWarmupController:SantokerWarmupController = SantokerWarmupController()
         self.santokerDiagnosticsSession:SantokerDiagnosticsSession|None = None
-        self.santokerDiagnosticsDialog:Any|None = None
+        self.santokerDiagnosticsDialog:SantokerDiagnosticsDialog|None = None
 
         # Santoker R
         self.santokerR:SantokerR|None = None # holds the Santoker R instance created on connect; reset to None on disconnect
@@ -19702,6 +19703,18 @@ class ApplicationWindow(QMainWindow):
         self.santokerWarmupController.attach_diagnostics(session)
         return session
 
+    @pyqtSlot()
+    def showSantokerDiagnostics(self) -> None:
+        if self.santokerDiagnosticsDialog is None:
+            self.santokerDiagnosticsDialog = SantokerDiagnosticsDialog(
+                self,
+                lambda: self.santokerDiagnosticsSession,
+            )
+        self.santokerDiagnosticsDialog.refresh()
+        self.santokerDiagnosticsDialog.show()
+        self.santokerDiagnosticsDialog.raise_()
+        self.santokerDiagnosticsDialog.activateWindow()
+
     def stopSantokerMonitoring(self) -> None:
         self.santokerWarmupController.stop_monitoring(self.santoker)
         if self.santoker is not None:
@@ -23373,6 +23386,8 @@ class ApplicationWindow(QMainWindow):
             tmp_LargeLCDs = self.LargePhasesLCDsFlag # we keep the state to properly store it in the settings
             self.largePhasesLCDs_dialog.close()
             self.LargePhasesLCDsFlag = tmp_LargeLCDs
+        if self.santokerDiagnosticsDialog is not None:
+            self.santokerDiagnosticsDialog.close()
         if self.comparator:
             self.comparator.close()
         # now wait until the current sampling thread is terminated
