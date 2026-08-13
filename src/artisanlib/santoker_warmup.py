@@ -155,7 +155,9 @@ class SantokerWarmupController:
         self._safe_record(lambda: diagnostics.record_charge_latch(self._charge_latched))
 
     def _set_reported_target(self, temp_c: float | None) -> None:
-        if temp_c is not None and _is_valid_temp(temp_c):
+        if temp_c is None or not _is_valid_temp(temp_c):
+            self._reported_target_c = None
+        else:
             self._reported_target_c = temp_c
         self._record_reported_state()
 
@@ -291,16 +293,28 @@ class SantokerWarmupController:
                     self._reported_enabled = device.getWarmup()
                 self._record_reported_state()
 
-                was_forced_off = False
+                reconcile_outcome = ReconcileOutcome.NONE
                 if self._safety_off_pending or self._reported_enabled is True:
                     if device is not None and device.isHeaderReady():
-                        self._safety_off_pending = False
-                        device.setWarmup(False)
-                    was_forced_off = True
+                        if device.setWarmup(False):
+                            self._safety_off_pending = False
+                            reconcile_outcome = ReconcileOutcome.FORCED_OFF
+                            self._record_restoration_state(RestorationState.BLOCKED_BY_CHARGE)
+                        else:
+                            self._record_restoration_state(
+                                RestorationState.WAITING_FOR_DATA,
+                            )
+                            reconcile_outcome = ReconcileOutcome.WAITING
+                    else:
+                        self._record_restoration_state(
+                            RestorationState.WAITING_FOR_DATA,
+                        )
+                        reconcile_outcome = ReconcileOutcome.WAITING
+                else:
+                    self._record_restoration_state(RestorationState.BLOCKED_BY_CHARGE)
                 self._desired_enabled = False
                 self._record_desired_state()
-                self._record_restoration_state(RestorationState.BLOCKED_BY_CHARGE)
-                return ReconcileOutcome.FORCED_OFF if was_forced_off else ReconcileOutcome.NONE
+                return reconcile_outcome
 
             if self._desired_enabled is not True:
                 self._record_restoration_state(RestorationState.IDLE)
