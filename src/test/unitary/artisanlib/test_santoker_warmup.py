@@ -46,6 +46,7 @@ def qapplication() -> QApplication:
 class FakeWarmupDevice:
     ready: bool = True
     warmup: bool | None = False
+    reported_target: float | None = None
     calls: list[tuple[str, object]] = field(default_factory=list)
 
     def isHeaderReady(self) -> bool:
@@ -53,6 +54,9 @@ class FakeWarmupDevice:
 
     def getWarmup(self) -> bool | None:
         return self.warmup
+
+    def getReportedWarmupTarget(self) -> float | None:
+        return self.reported_target
 
     def setWarmupTarget(self, temp_c: float) -> bool:
         self.calls.append(('target', temp_c))
@@ -63,6 +67,12 @@ class FakeWarmupDevice:
         self.warmup = enabled
         return self.ready
 
+    def requestWarmupOn(self, temp_c: float) -> bool:
+        if not self.ready:
+            return False
+        if not self.setWarmupTarget(temp_c):
+            return False
+        return self.setWarmup(True)
 
 @dataclass
 class ParserWarmupDevice(FakeWarmupDevice):
@@ -177,21 +187,252 @@ def test_controller_does_not_send_redundant_off_while_inactive() -> None:
     assert device.calls == []
 
 
-@pytest.mark.parametrize(
-    ('reported_temp_c', 'expected_temp_c'),
-    [(99.9, 190.0), (300.1, 190.0), (100.0, 100.0), (225.5, 225.5), (300.0, 300.0)],
-)
-def test_accept_reported_target_validates_inclusive_range(
-    reported_temp_c: float, expected_temp_c: float
-) -> None:
+def test_accept_reported_target_only_updates_reported() -> None:
     from artisanlib.santoker_warmup import SantokerWarmupController
+
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+
+    controller.accept_reported_target(190.0)
+    controller.accept_reported_target(225.5)
+    controller.accept_reported_target(99.0)
+
+    assert controller.desired_temp_c == 205.0
+    assert controller.reported_target() == 225.5
+
+
+def test_reconnect_restores_target_then_on_after_valid_frame() -> None:
+    from artisanlib.santoker_warmup import (
+        ReconcileOutcome,
+        RestorationState,
+        SantokerWarmupController,
+        WarmupResult,
+    )
+
+    now = [10.0]
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=190.0)
+    controller = SantokerWarmupController(
+        desired_temp_c=205.0,
+        monotonic_clock=lambda: now[0],
+    )
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    device.ready = False
+    controller.note_transport_loss()
+    assert controller.desired_enabled() is True
+    assert controller.restoration_state() is RestorationState.WAITING_FOR_DATA
+    assert device.calls == []
+
+    device.ready = True
+    device.warmup = False
+    device.reported_target = 190.0
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+
+
+def test_reconnect_readiness_notification_without_reconcile_sends_nothing() -> None:
+    from artisanlib.santoker_warmup import RestorationState, SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True, warmup=True)
+    controller = SantokerWarmupController()
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    device.ready = False
+    controller.note_transport_loss()
+    device.ready = True
+
+    assert controller.desired_enabled() is True
+    assert controller.restoration_state() is RestorationState.WAITING_FOR_DATA
+    assert device.calls == []
+
+
+def test_reconcile_after_frame_attempts_on_unknown_reports() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=None)
+    controller = SantokerWarmupController(
+        desired_temp_c=205.0,
+    )
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+
+
+def test_reconcile_after_frame_throttles_duplicate_frames() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    calls = [10.0]
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=190.0)
+    controller = SantokerWarmupController(
+        desired_temp_c=205.0,
+        monotonic_clock=lambda: calls[0],
+    )
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    calls[0] = 10.0
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+    device.calls.clear()
+
+    calls[0] = 10.2
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.THROTTLED
+    assert device.calls == []
+
+    calls[0] = 11.0
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+
+
+def test_reconcile_after_frame_matching_target_and_report_converges() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True, warmup=True, reported_target=190.0)
+    controller = SantokerWarmupController(desired_temp_c=190.0)
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.CONVERGED
+    assert device.calls == []
+
+
+def test_reconcile_after_frame_no_blind_timer_activity() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
+
+    monotonic_calls: list[float] = []
+
+    def monotonic_clock() -> float:
+        monotonic_calls.append(1.0)
+        return 10.0
+
+    device = FakeWarmupDevice(ready=True)
+    controller = SantokerWarmupController(monotonic_clock=monotonic_clock)
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    controller.note_transport_loss()
+    assert monotonic_calls == []
+
+
+def test_off_without_device_keeps_state() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 
     controller = SantokerWarmupController()
 
-    controller.accept_reported_target(reported_temp_c)
+    assert controller.set_enabled(False, -1, None) is WarmupResult.OK
+    assert controller.desired_enabled() is False
 
-    assert controller.desired_temp_c == expected_temp_c
 
+def test_off_unready_cancels_waiting_restoration() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True)
+    controller = SantokerWarmupController()
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    controller.note_transport_loss()
+    device.ready = False
+
+    assert controller.set_enabled(False, -1, device) is WarmupResult.OK
+    assert controller.desired_enabled() is False
+    assert device.calls == [('target', 190.0), ('enabled', True)]
+
+
+def test_mark_charge_records_safety_off_requirement() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=190.0)
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+
+    assert controller.set_enabled(True, -1, device) is not None
+    device.calls.clear()
+    controller.mark_charge()
+
+    assert controller.desired_enabled() is False
+    assert controller.restoration_state().value == 'blocked by CHARGE'
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+    assert device.calls == [('enabled', False)]
+
+
+def test_mark_charge_failed_race_retains_safety_off() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=190.0)
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+
+    assert controller.set_enabled(True, -1, device) is not None
+    controller.mark_charge()
+    device.ready = False
+    assert controller.set_enabled(False, -1, device) is not None
+
+    device.ready = True
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+
+
+def test_reset_charge_only_clears_charge_latch_not_intent() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True)
+    controller = SantokerWarmupController()
+
+    controller.set_enabled(True, -1, device)
+    controller.mark_charge()
+    controller.reset_charge()
+
+    assert not controller.is_charge_latched()
+    assert controller.desired_enabled() is False
+
+
+def test_stop_monitoring_clears_state_after_safe_off() -> None:
+    from artisanlib.santoker_warmup import RestorationState, SantokerWarmupController
+
+    class FailingWarmupDevice(FakeWarmupDevice):
+        @override
+        def setWarmup(self, enabled: bool) -> bool:  # type: ignore[override]
+            self.calls.append(('enabled', enabled))
+            self.warmup = enabled
+            return bool(enabled)
+
+    device = FailingWarmupDevice(ready=True, warmup=True)
+    controller = SantokerWarmupController()
+
+    assert controller.set_enabled(True, -1, device) is not None
+    controller.stop_monitoring(device)
+
+    assert controller.desired_enabled() is None
+    assert controller.restoration_state() is RestorationState.IDLE
+    assert ('enabled', False) in device.calls
+
+
+def test_diagnostics_failures_do_not_change_command_results_or_state() -> None:
+    from unittest.mock import Mock
+
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    class FailingDiagnostics:
+        def __init__(self) -> None:
+            for method in (
+                'record_desired_warmup',
+                'record_reported_warmup',
+                'record_reported_target',
+                'record_restoration',
+                'record_charge_latch',
+            ):
+                setattr(self, method, Mock(side_effect=RuntimeError('recorder failed')))
+
+    device = FakeWarmupDevice(ready=True)
+    controller = SantokerWarmupController()
+    controller.attach_diagnostics(FailingDiagnostics())
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    assert controller.desired_enabled() is True
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
 
 def test_post_charge_on_report_is_forced_off() -> None:
     from artisanlib.santoker_warmup import SantokerWarmupController
@@ -441,8 +682,9 @@ def test_reported_target_updates_spinbox_without_command(
         cast(ApplicationWindow, window), 205.0
     )
 
-    assert controls.target.value() == 205
-    assert controller.desired_temp_c == 205.0
+    assert controls.target.value() == 190.0
+    assert controller.desired_temp_c == 190.0
+    assert controller.reported_target() == 205.0
     changed.assert_not_called()
     assert device.calls == []
 
