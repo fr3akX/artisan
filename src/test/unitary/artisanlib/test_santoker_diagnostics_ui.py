@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QWidget,
 )
@@ -445,16 +446,44 @@ def test_refresh_appends_history_incrementally(qapplication: QApplication) -> No
     dialog.refresh()
     baseline = _normalize_text(dialog.history.toPlainText())
 
+    set_plain_text = MagicMock(wraps=dialog.history.setPlainText)
+    read_plain_text = MagicMock(wraps=dialog.history.toPlainText)
+    dialog.history.setPlainText = set_plain_text
+    dialog.history.toPlainText = read_plain_text
+
     session.record_event('state', 'second state change')
     dialog.refresh()
 
-    after = _normalize_text(dialog.history.toPlainText())
+    set_plain_text.assert_not_called()
+    read_plain_text.assert_not_called()
+    after = _normalize_text(QPlainTextEdit.toPlainText(dialog.history))
     baseline_lines = baseline.splitlines()
     after_lines = after.splitlines()
 
     assert len(after_lines) == len(baseline_lines) + 1
     assert len([line for line in after_lines if 'first state change' in line]) == 1
     assert len([line for line in after_lines if 'second state change' in line]) == 1
+
+
+def test_refresh_progresses_through_eviction_without_rebuilding_history(
+    qapplication: QApplication,
+) -> None:
+    _ = qapplication
+    session = SantokerDiagnosticsSession('serial', max_events=3)
+    parent = QWidget()
+    dialog = SantokerDiagnosticsDialog(parent, lambda: session)
+    dialog.refresh()
+    set_plain_text = MagicMock(wraps=dialog.history.setPlainText)
+    dialog.history.setPlainText = set_plain_text
+
+    for value in range(6):
+        session.record_event('state', f'value={value}')
+        dialog.refresh()
+
+    set_plain_text.assert_not_called()
+    assert dialog.history.document().maximumBlockCount() == 3
+    assert _normalize_text(QPlainTextEdit.toPlainText(dialog.history)).splitlines() == _format_event_lines(session)
+    assert _value_label_text(dialog, 'valueDiscarded') == '[older entries discarded: 4]'
 
 
 def test_refresh_rebuilds_retained_history_when_evicted(qapplication: QApplication) -> None:
@@ -485,6 +514,7 @@ def test_dialog_shows_all_sections_and_unknown_fields(qapplication: QApplication
     dialog = SantokerDiagnosticsDialog(parent, lambda: session)
     dialog.refresh()
 
+    assert _value_label_text(dialog, 'valueDiscarded') == ''
     assert _value_label_text(dialog, 'valueMonitoring')
     assert _value_label_text(dialog, 'valueTransport') == 'Wi-Fi'
     assert _value_label_text(dialog, 'valueConnected')

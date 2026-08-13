@@ -28,7 +28,7 @@ from enum import Enum
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QCloseEvent, QShowEvent
+from PyQt6.QtGui import QCloseEvent, QShowEvent, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -380,21 +380,17 @@ class SantokerDiagnosticsDialog(QDialog):
         try:
             if session is self._session and self._last_sequence > 0:
                 view = session.view(self._last_sequence)
-                rebuild = False
-
-                if self._first_retained_sequence is not None:
-                    if view.first_retained_sequence is not None:
-                        if view.first_retained_sequence > self._first_retained_sequence:
-                            rebuild = True
-                    else:
-                        rebuild = True
-                else:
-                    rebuild = True
-
+                rebuild = (
+                    view.first_retained_sequence is not None
+                    and view.first_retained_sequence > self._last_sequence + 1
+                )
                 if rebuild:
                     view = session.view()
                 self._load_view(view, replace=rebuild)
             else:
+                document = self._history.document()
+                assert document is not None
+                document.setMaximumBlockCount(session.max_events)
                 view = session.view()
                 self._load_view(view, replace=True)
         except Exception:
@@ -417,13 +413,15 @@ class SantokerDiagnosticsDialog(QDialog):
         text = '\n'.join(lines)
         if replace:
             self._history.setPlainText(text)
-        else:
-            current = self._history.toPlainText()
-            if text:
-                if current:
-                    self._history.setPlainText(current + '\n' + text)
-                else:
-                    self._history.setPlainText(text)
+        elif text:
+            cursor = self._history.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            document = self._history.document()
+            assert document is not None
+            if not document.isEmpty():
+                cursor.insertBlock()
+            cursor.insertText(text)
+            self._history.setTextCursor(cursor)
 
     @staticmethod
     def _format_event_line(event: SantokerDiagnosticEvent) -> str:
@@ -464,7 +462,7 @@ class SantokerDiagnosticsDialog(QDialog):
         self._restoration_value.setText(self._render_value(state.restoration_state))
         self._charge_latch_value.setText(self._render_value(state.charge_latched))
 
-        if view.first_retained_sequence is None:
+        if view.state.discarded_event_count == 0:
             self._history_discarded.setText('')
         else:
             self._history_discarded.setText(

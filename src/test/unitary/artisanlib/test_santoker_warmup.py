@@ -94,6 +94,22 @@ def test_controller_converts_fahrenheit_and_updates_device() -> None:
     assert controller.target_for_display('F') == pytest.approx(374.0)
 
 
+def test_fahrenheit_target_is_canonical_and_converges_without_resend() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True, warmup=True, reported_target=190.6)
+    controller = SantokerWarmupController()
+
+    assert controller.set_target(375.0, 'F', None) is WarmupResult.OK
+    assert controller.desired_temp_c == 190.6
+    assert controller.target_for_display('F') == pytest.approx(375.08)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.CONVERGED
+    assert device.calls == []
+
+
 @pytest.mark.parametrize(('value', 'unit'), [(99.0, 'C'), (573.0, 'F')])
 def test_controller_rejects_out_of_range_target(value: float, unit: str) -> None:
     from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
@@ -163,6 +179,28 @@ def test_charge_latch_blocks_on_until_reset() -> None:
     controller.reset_charge()
     assert not controller.is_charge_latched()
     assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+
+
+def test_real_santoker_active_target_edit_sends_only_target_and_keeps_diagnostics_on() -> None:
+    from artisanlib.santoker import Santoker
+    from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
+
+    diagnostics = SantokerDiagnosticsSession('Wi-Fi')
+    device = Santoker(diagnostics=diagnostics)
+    device._header_ready = True
+    controller = SantokerWarmupController()
+    controller.attach_diagnostics(diagnostics)
+
+    with patch.object(Santoker, 'send_msg') as send_msg:
+        assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+        device.register_reading(Santoker.WARMUP, b'\x00\x00\x01')
+        send_msg.reset_mock()
+        assert controller.set_target(205.0, 'C', device) is WarmupResult.OK
+
+    send_msg.assert_called_once_with(Santoker.WARMUP_TEMP, 2050)
+    state = diagnostics.view().state
+    assert state.desired_warmup is True
+    assert state.desired_target_c == 205.0
 
 
 def test_controller_starts_with_desired_target() -> None:
@@ -394,6 +432,29 @@ def test_mark_charge_failed_race_retains_safety_off() -> None:
     assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
 
 
+def test_charge_safety_off_is_immediate_then_throttled_until_reported_off() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    now = [10.0]
+    device = FakeWarmupDevice(ready=True, warmup=True, reported_target=190.0)
+    controller = SantokerWarmupController(monotonic_clock=lambda: now[0])
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    controller.mark_charge()
+
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+    assert device.calls == [('enabled', False)]
+
+    device.warmup = True
+    now[0] = 10.2
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.THROTTLED
+    assert device.calls == [('enabled', False)]
+
+    now[0] = 11.0
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+    assert device.calls == [('enabled', False), ('enabled', False)]
+
+
 def test_mark_charge_retries_failed_off_until_success() -> None:
     from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
 
@@ -437,6 +498,24 @@ def test_reset_charge_only_clears_charge_latch_not_intent() -> None:
 
     assert not controller.is_charge_latched()
     assert controller.desired_enabled() is False
+
+
+def test_stop_monitoring_retries_pending_safety_off_after_readiness_recovers() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True, warmup=True)
+    controller = SantokerWarmupController()
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    controller.mark_charge()
+    device.ready = False
+    assert controller.set_enabled(False, 0, device) is WarmupResult.OK
+    device.calls.clear()
+
+    device.ready = True
+    device.warmup = False
+    controller.stop_monitoring(device)
+
+    assert device.calls == [('enabled', False)]
 
 
 def test_stop_monitoring_clears_state_after_safe_off() -> None:
@@ -1040,6 +1119,61 @@ def test_queued_stop_callbacks_do_not_leak_into_replacement_session(
     )
 
 
+def test_queued_old_generation_callbacks_cannot_mutate_replacement_device(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    from artisanlib.santoker_warmup import RestorationState
+
+    controls = SantokerWarmupControls()
+    replacement = FakeWarmupDevice(ready=True, warmup=True, reported_target=205.0)
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    assert controller.set_enabled(True, -1, replacement) is WarmupResult.OK
+    replacement.calls.clear()
+
+    window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
+    QMainWindow.__init__(window)
+    window.app = SimpleNamespace(artisanviewerMode=False)
+    window.qmc = SimpleNamespace(
+        mode_tempsliders='C', timeindex=[-1], flagon=True, flagstart=False
+    )
+    window.santokerWarmup = True
+    window.santoker = replacement
+    window.santokerWarmupController = controller
+    window.santokerWarmupControls = controls
+    window.pushbuttonstyles = {'OFF': 'off-style', 'ON': 'on-style'}
+    window.sendmessage = Mock()
+    window.santokerMonitoringGeneration = 2
+    window.santokerWarmupReadyGenerationSignal.connect(
+        window.santokerWarmupReadyChangedForGeneration,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    window.santokerWarmupStateGenerationSignal.connect(
+        window.santokerWarmupStateChangedForGeneration,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    window.santokerFrameGenerationSignal.connect(
+        window.santokerFrameAcceptedForGeneration,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    window.santokerCallbackGenerationSignal.connect(
+        window.santokerCallbackForGeneration,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    stale_device_callback = Mock()
+
+    window.santokerWarmupReadyGenerationSignal.emit(1, False)
+    window.santokerWarmupStateGenerationSignal.emit(1, False)
+    window.santokerFrameGenerationSignal.emit(1)
+    window.santokerCallbackGenerationSignal.emit(1, stale_device_callback)
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+
+    stale_device_callback.assert_not_called()
+    assert controller.desired_enabled() is True
+    assert controller.restoration_state() is RestorationState.IDLE
+    assert replacement.calls == []
+
+
 def test_transport_connected_records_without_frame_signal_or_restoration() -> None:
     from artisanlib.santoker import Santoker
     from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
@@ -1304,7 +1438,8 @@ def test_warmup_on_and_charge_are_serialized(
     controls = SantokerWarmupControls()
     controls.setState(True)
     controls.button.setEnabled(True)
-    controller = BarrierWarmupController()
+    safety_now = [10.0]
+    controller = BarrierWarmupController(monotonic_clock=lambda: safety_now[0])
     device = BlockingWarmupDevice()
     window = compact_window(controls, controller, device)
     window.santokerWarmupButtonStateSignal = Mock()
@@ -1431,6 +1566,7 @@ def test_warmup_on_and_charge_are_serialized(
     assert call_order == before_rejected_on
 
     device.warmup = True
+    safety_now[0] = 11.0
     window.refreshSantokerWarmupControls = lambda: (
         ApplicationWindow.refreshSantokerWarmupControls(cast(ApplicationWindow, window))
     )

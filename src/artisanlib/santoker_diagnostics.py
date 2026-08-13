@@ -160,6 +160,8 @@ class SantokerDiagnosticsSession:
         now_utc: Callable[[], datetime] = utc_now,
         max_events: int = 5000,
     ) -> None:
+        if not isinstance(max_events, int) or isinstance(max_events, bool):
+            raise ValueError('max_events must be an actual integer')
         if not 1 <= max_events <= 5000:
             raise ValueError('max_events must be between 1 and 5000')
 
@@ -212,6 +214,10 @@ class SantokerDiagnosticsSession:
     @property
     def transport(self) -> TransportKind:
         return self._transport
+
+    @property
+    def max_events(self) -> int:
+        return self._max_events
 
     def _utc_now(self) -> datetime:
         timestamp = self._now_utc()

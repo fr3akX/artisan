@@ -211,7 +211,7 @@ class Santoker(AsyncComm):
         self._warmup_target:float = self.DEFAULT_WARMUP_TEMP_C
         self._reported_warmup_target:float | None = None
         if self.MIN_WARMUP_TEMP_C <= warmup_target <= self.MAX_WARMUP_TEMP_C:
-            self._warmup_target = warmup_target
+            self._warmup_target = self._canonicalWarmupTarget(warmup_target)
 
         # current readings
         self._board:float = -1  # board temperature in °C
@@ -355,26 +355,31 @@ class Santoker(AsyncComm):
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
 
+    @staticmethod
+    def _canonicalWarmupTarget(temp_c: float) -> float:
+        return round(temp_c * 10) / 10.0
+
     def requestWarmupOn(self, temp_c: float) -> bool:
         if not self._header_ready:
             return False
         if not self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
             return False
-        self._warmup_target = temp_c
+        self._warmup_target = self._canonicalWarmupTarget(temp_c)
+        self._desired_warmup = True
         self._record_desired_warmup()
-        self.send_msg(self.WARMUP_TEMP, int(round(temp_c * 10)))
+        self.send_msg(self.WARMUP_TEMP, int(round(self._warmup_target * 10)))
         self.send_msg(self.WARMUP, 1)
         return True
 
     def setWarmupTarget(self, temp_c: float) -> bool:
         if not self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
             return False
-        self._warmup_target = temp_c
+        self._warmup_target = self._canonicalWarmupTarget(temp_c)
         self._record_desired_warmup()
         if self._desired_warmup is True:
             if not self._header_ready:
                 return False
-            self.send_msg(self.WARMUP_TEMP, int(round(temp_c * 10)))
+            self.send_msg(self.WARMUP_TEMP, int(round(self._warmup_target * 10)))
         return True
 
     def setWarmup(self, enabled: bool) -> bool:
@@ -612,7 +617,12 @@ class Santoker(AsyncComm):
         # full message decoded
         self.HEADER = candidate_header
         self._setHeaderReady(True)
-        self._record_rx(bytes(candidate), 'accepted frame', accepted=True)
+        decoded_value = int.from_bytes(data, 'big')
+        self._record_rx(
+            bytes(candidate),
+            f'accepted frame target={target.hex().upper()} value={decoded_value}',
+            accepted=True,
+        )
         self.register_reading(target, data)
         self._record_frame()
 

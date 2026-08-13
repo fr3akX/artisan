@@ -133,6 +133,10 @@ def test_max_events_is_bounded_to_5000() -> None:
         SantokerDiagnosticsSession('Wi-Fi', max_events=0)
     with pytest.raises(ValueError, match='between 1 and 5000'):
         SantokerDiagnosticsSession('Wi-Fi', max_events=5001)
+    with pytest.raises(ValueError, match='actual integer'):
+        SantokerDiagnosticsSession('Wi-Fi', max_events=True)
+    with pytest.raises(ValueError, match='actual integer'):
+        SantokerDiagnosticsSession('Wi-Fi', max_events=2.0)  # type: ignore[arg-type]
 
 
 def test_reconnect_count_tracks_disconnected_to_connected_transitions_only_after_first_connect() -> None:
@@ -327,11 +331,16 @@ def test_canvas_monitoring_lifecycle_branch_selection(qapplication: Any) -> None
     assert 'else None' in selection
     assert helper_index < simulator_branch < device_branch
     assert device_branch < attempt < construction < start
-    assert source[attempt:construction].strip() == (
-        'santoker_diagnostics_session.record_connection_attempt()'
-    )
-    assert 'diagnostics=santoker_diagnostics_session' in source[construction:start]
-    assert 'frame_handler=self.aw.santokerFrameSignal.emit' in source[construction:start]
+    preparation = source[attempt:construction]
+    assert preparation.count('santoker_diagnostics_session.record_connection_attempt()') == 1
+    assert 'santoker_generation = self.aw.santokerMonitoringGeneration' in preparation
+    assert 'santokerCallbackGenerationSignal.emit' in preparation
+    construction_source = source[construction:start]
+    assert 'diagnostics=santoker_diagnostics_session' in construction_source
+    assert 'santokerFrameGenerationSignal.emit(santoker_generation)' in construction_source
+    assert 'santokerWarmupStateGenerationSignal.emit(santoker_generation, state)' in construction_source
+    assert 'santokerWarmupTargetGenerationSignal.emit(santoker_generation, temp_c)' in construction_source
+    assert 'santokerWarmupReadyGenerationSignal.emit(santoker_generation, ready)' in construction_source
     assert 'getWarmupTarget()' not in source
 
     stop_source = inspect.getsource(tgraphcanvas.OffMonitorCloseDown)

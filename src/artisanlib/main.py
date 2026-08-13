@@ -1464,6 +1464,11 @@ class ApplicationWindow(QMainWindow):
     santokerWarmupButtonStateSignal = pyqtSignal(bool)
     santokerWarmupControlsRefreshSignal = pyqtSignal()
     santokerFrameSignal = pyqtSignal()
+    santokerWarmupStateGenerationSignal = pyqtSignal(int, object)
+    santokerWarmupTargetGenerationSignal = pyqtSignal(int, float)
+    santokerWarmupReadyGenerationSignal = pyqtSignal(int, bool)
+    santokerFrameGenerationSignal = pyqtSignal(int)
+    santokerCallbackGenerationSignal = pyqtSignal(int, object)
     kaleidoSendMessageSignal = pyqtSignal(str,str)
     kaleidoSendMessageAwaitSignal = pyqtSignal(str,str,int,int)
     orbiterSendMessageSignal = pyqtSignal(bytes,bytes,bytes,int)
@@ -1501,7 +1506,7 @@ class ApplicationWindow(QMainWindow):
         'userprofilepath', 'printer', 'main_widget', 'defaultdpi', 'dpi', 'qmc', 'HottopControlActive', 'AsyncSamplingTimer', 'wheeldialog',
         'simulator', 'simulatorpath', 'comparator', 'eventsbuttonflag', 'minieventsflags', 'seriallogflag',
         'seriallog', 'ser', 'modbus', 'extraMODBUStemps', 'extraMODBUStx', 's7', 'extraS7tx', 'ws', 'extraser', 'extracomport', 'extrabaudrate',
-        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerWarmup', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerDiagnosticsSession', 'santokerDiagnosticsDialog', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
+        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerWarmup', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerDiagnosticsSession', 'santokerDiagnosticsDialog', 'santokerMonitoringGeneration', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
         'mugmaHost','mugmaPort', 'mugma', 'mugma_default_host', 'shelly_3EMPro_host', 'shelly_PlusPlug_host',
         'kaleido_default_host', 'kaleidoHost', 'kaleidoPort', 'kaleidoSerial', 'kaleidoPID', 'kaleido', 'kaleidoEventFlags', 'colorTrack_mean_window_size', 'colorTrack_median_window_size', 'ikawa',
         'lcdpaletteB', 'lcdpaletteF', 'extraeventsbuttonsflags', 'extraeventslabels', 'extraeventbuttoncolor', 'extraeventsactionstrings',
@@ -1880,6 +1885,7 @@ class ApplicationWindow(QMainWindow):
         self.santokerWarmupController:SantokerWarmupController = SantokerWarmupController()
         self.santokerDiagnosticsSession:SantokerDiagnosticsSession|None = None
         self.santokerDiagnosticsDialog:SantokerDiagnosticsDialog|None = None
+        self.santokerMonitoringGeneration:int = 0
 
         # Santoker R
         self.santokerR:SantokerR|None = None # holds the Santoker R instance created on connect; reset to None on disconnect
@@ -4374,6 +4380,26 @@ class ApplicationWindow(QMainWindow):
         )
         self.santokerFrameSignal.connect(
             self.santokerFrameAccepted,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
+        self.santokerWarmupStateGenerationSignal.connect(
+            self.santokerWarmupStateChangedForGeneration,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
+        self.santokerWarmupTargetGenerationSignal.connect(
+            self.santokerWarmupTargetChangedForGeneration,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
+        self.santokerWarmupReadyGenerationSignal.connect(
+            self.santokerWarmupReadyChangedForGeneration,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
+        self.santokerFrameGenerationSignal.connect(
+            self.santokerFrameAcceptedForGeneration,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
+        self.santokerCallbackGenerationSignal.connect(
+            self.santokerCallbackForGeneration,
             type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
         )
         self.santokerWarmupButtonStateSignal.connect(self.setSantokerWarmupButtonState, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
@@ -19693,6 +19719,7 @@ class ApplicationWindow(QMainWindow):
             ApplicationWindow.refreshSantokerWarmupControls(self)
 
     def startSantokerDiagnosticsSession(self) -> SantokerDiagnosticsSession:
+        self.santokerMonitoringGeneration = getattr(self, 'santokerMonitoringGeneration', 0) + 1
         transport:TransportKind = (
             'BLE' if self.santokerBLE
             else 'serial' if self.santokerSerial
@@ -19716,12 +19743,42 @@ class ApplicationWindow(QMainWindow):
         self.santokerDiagnosticsDialog.activateWindow()
 
     def stopSantokerMonitoring(self) -> None:
+        self.santokerMonitoringGeneration = getattr(self, 'santokerMonitoringGeneration', 0) + 1
         self.santokerWarmupController.stop_monitoring(self.santoker)
         if self.santoker is not None:
             self.santoker.stop()
             self.santoker = None
         if self.santokerDiagnosticsSession is not None:
             self.santokerDiagnosticsSession.stop()
+
+    @pyqtSlot(int, object)
+    def santokerCallbackForGeneration(
+        self,
+        generation:int,
+        callback:object,
+    ) -> None:
+        if generation == self.santokerMonitoringGeneration and callable(callback):
+            callback()
+
+    @pyqtSlot(int, bool)
+    def santokerWarmupReadyChangedForGeneration(self, generation:int, ready:bool) -> None:
+        if generation == self.santokerMonitoringGeneration:
+            self.santokerWarmupReadyChanged(ready)
+
+    @pyqtSlot(int, float)
+    def santokerWarmupTargetChangedForGeneration(self, generation:int, temp_c:float) -> None:
+        if generation == self.santokerMonitoringGeneration:
+            self.santokerWarmupTargetChanged(temp_c)
+
+    @pyqtSlot(int, object)
+    def santokerWarmupStateChangedForGeneration(self, generation:int, state:object) -> None:
+        if generation == self.santokerMonitoringGeneration:
+            self.santokerWarmupStateChanged(state)
+
+    @pyqtSlot(int)
+    def santokerFrameAcceptedForGeneration(self, generation:int) -> None:
+        if generation == self.santokerMonitoringGeneration:
+            self.santokerFrameAccepted()
 
     @pyqtSlot(float)
     def santokerWarmupTargetChanged(self, temp_c:float) -> None:

@@ -57,6 +57,10 @@ def _is_valid_temp(temp_c: float) -> bool:
     return MIN_WARMUP_TEMP_C <= temp_c <= MAX_WARMUP_TEMP_C
 
 
+def _canonical_temp_c(temp_c: float) -> float:
+    return round(temp_c * 10) / 10.0
+
+
 class WarmupResult(Enum):
     OK = 'ok'
     NO_CONNECTION = 'no_connection'
@@ -100,9 +104,15 @@ class SantokerWarmupController:
     _reported_target_c: float | None = field(default=None, init=False, repr=False, compare=False)
     _restoration_state: RestorationState = field(default=RestorationState.IDLE, init=False)
     _last_attempt_monotonic: float | None = field(default=None, init=False, repr=False, compare=False)
+    _last_safety_off_attempt_monotonic: float | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     _safety_off_pending: bool = field(default=False, init=False, repr=False, compare=False)
     monotonic_clock: Callable[[], float] = field(default=monotonic, repr=False, compare=False)
     _diagnostics: SantokerDiagnosticsSession | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.desired_temp_c = _canonical_temp_c(self.desired_temp_c)
 
     @contextmanager
     def serialized(self) -> Iterator[None]:
@@ -195,8 +205,9 @@ class SantokerWarmupController:
             temp_c = _from_f_to_cstrict(display_temp) if unit == 'F' else display_temp
             if not _is_valid_temp(temp_c):
                 return WarmupResult.OUT_OF_RANGE
-            self.desired_temp_c = temp_c
-            if device is not None and not device.setWarmupTarget(temp_c):
+            canonical_temp_c = _canonical_temp_c(temp_c)
+            self.desired_temp_c = canonical_temp_c
+            if device is not None and not device.setWarmupTarget(canonical_temp_c):
                 return WarmupResult.OUT_OF_RANGE
             self._record_desired_state()
             return WarmupResult.OK
@@ -231,13 +242,14 @@ class SantokerWarmupController:
                 requires_off = device.getWarmup() is True
             self._desired_enabled = False
             self._record_desired_state()
-            if (
-                device is not None
-                and device.isHeaderReady()
-                and requires_off
-                and device.setWarmup(False)
-            ):
-                self._safety_off_pending = False
+            if device is not None and device.isHeaderReady() and requires_off:
+                safety_request = self._safety_off_pending
+                if device.setWarmup(False):
+                    if safety_request:
+                        self._last_safety_off_attempt_monotonic = self.monotonic_clock()
+                    else:
+                        self._safety_off_pending = False
+                        self._last_safety_off_attempt_monotonic = None
             self._last_attempt_monotonic = None
             self._record_restoration_state(RestorationState.IDLE)
             return WarmupResult.OK
@@ -246,6 +258,7 @@ class SantokerWarmupController:
         with self.serialized():
             if self._desired_enabled is True or self._reported_enabled is True:
                 self._safety_off_pending = True
+                self._last_safety_off_attempt_monotonic = None
             self._desired_enabled = False
             self._charge_latched = True
             self._record_charge_latch()
@@ -262,6 +275,7 @@ class SantokerWarmupController:
             self._reported_enabled = None
             self._reported_target_c = None
             self._last_attempt_monotonic = None
+            self._last_safety_off_attempt_monotonic = None
             self._record_reported_state()
             self._record_restoration_state(RestorationState.WAITING_FOR_DATA)
 
@@ -270,6 +284,7 @@ class SantokerWarmupController:
             requires_off = (
                 self._desired_enabled is True
                 or self._reported_enabled is True
+                or self._safety_off_pending
             )
             if device is not None and device.isHeaderReady() and requires_off:
                 device.setWarmup(False)
@@ -277,6 +292,7 @@ class SantokerWarmupController:
             self._reported_enabled = None
             self._reported_target_c = None
             self._last_attempt_monotonic = None
+            self._last_safety_off_attempt_monotonic = None
             self._safety_off_pending = False
             self._record_desired_state()
             self._record_reported_state()
@@ -294,10 +310,27 @@ class SantokerWarmupController:
                 self._record_reported_state()
 
                 reconcile_outcome = ReconcileOutcome.NONE
-                if self._safety_off_pending or self._reported_enabled is True:
+                if (
+                    self._safety_off_pending
+                    and self._last_safety_off_attempt_monotonic is not None
+                    and self._reported_enabled is not True
+                ):
+                    self._safety_off_pending = False
+                    self._last_safety_off_attempt_monotonic = None
+                if self._reported_enabled is True:
+                    self._safety_off_pending = True
+
+                if self._safety_off_pending:
                     if device is not None and device.isHeaderReady():
-                        if device.setWarmup(False):
-                            self._safety_off_pending = False
+                        now = self.monotonic_clock()
+                        if (
+                            self._last_safety_off_attempt_monotonic is not None
+                            and now - self._last_safety_off_attempt_monotonic < 1.0
+                        ):
+                            self._record_restoration_state(RestorationState.BLOCKED_BY_CHARGE)
+                            reconcile_outcome = ReconcileOutcome.THROTTLED
+                        elif device.setWarmup(False):
+                            self._last_safety_off_attempt_monotonic = now
                             reconcile_outcome = ReconcileOutcome.FORCED_OFF
                             self._record_restoration_state(RestorationState.BLOCKED_BY_CHARGE)
                         else:

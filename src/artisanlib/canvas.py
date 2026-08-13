@@ -13310,23 +13310,31 @@ class tgraphcanvas(QObject):
                                 timeout = self.aw.ser.timeout,
                                 clear_HUPCL = False)
                     santoker_diagnostics_session.record_connection_attempt()
+                    santoker_generation = self.aw.santokerMonitoringGeneration
+
+                    def queue_santoker_callback(callback:Callable[[], None]) -> None:
+                        self.aw.santokerCallbackGenerationSignal.emit(
+                            santoker_generation,
+                            callback,
+                        )
+
                     self.aw.santoker = Santoker(self.aw.santokerHost, self.aw.santokerPort,
                         santoker_serial, self.aw.santokerBLE,
                         diagnostics=santoker_diagnostics_session,
-                        frame_handler=self.aw.santokerFrameSignal.emit,
-                        connected_handler=lambda : self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} connected').format('Santoker'),True,None),
-                        disconnected_handler=lambda : self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} disconnected').format('Santoker'),True,None),
+                        frame_handler=lambda: self.aw.santokerFrameGenerationSignal.emit(santoker_generation),
+                        connected_handler=lambda: queue_santoker_callback(lambda: self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} connected').format('Santoker'),True,None)),
+                        disconnected_handler=lambda: queue_santoker_callback(lambda: self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} disconnected').format('Santoker'),True,None)),
                         # CHARGE handler disactivated to not trigger CHARGE after CHARGE is signalled to the machine by START
                         # NOTE: only after CHARGE the heater
-                        charge_handler=lambda : (self.markChargeDelaySignal.emit(0) if (len(self.aw.santokerEventFlags)>0 and self.aw.santokerEventFlags[0] and self.timeindex[0] == -1) else None),
-                        dry_handler=lambda : (self.markDRYSignal.emit(False) if (len(self.aw.santokerEventFlags)>1 and self.aw.santokerEventFlags[1] and self.timeindex[1] == 0) else None),
-                        fcs_handler=lambda : (self.markFCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>2 and self.aw.santokerEventFlags[2] and self.timeindex[2] == 0) else None),
-                        scs_handler=lambda : (self.markSCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>4 and self.aw.santokerEventFlags[4] and self.timeindex[4] == 0) else None),
-                        drop_handler=lambda : (self.markDropSignal.emit(False) if (len(self.aw.santokerEventFlags)>6 and self.aw.santokerEventFlags[6] and self.timeindex[6] == 0) else None),
-                        warmup_handler=self.aw.santokerWarmupStateSignal.emit,
-                        warmup_temp_handler=self.aw.santokerWarmupTargetSignal.emit,
+                        charge_handler=lambda: queue_santoker_callback(lambda: (self.markChargeDelaySignal.emit(0) if (len(self.aw.santokerEventFlags)>0 and self.aw.santokerEventFlags[0] and self.timeindex[0] == -1) else None)),
+                        dry_handler=lambda: queue_santoker_callback(lambda: (self.markDRYSignal.emit(False) if (len(self.aw.santokerEventFlags)>1 and self.aw.santokerEventFlags[1] and self.timeindex[1] == 0) else None)),
+                        fcs_handler=lambda: queue_santoker_callback(lambda: (self.markFCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>2 and self.aw.santokerEventFlags[2] and self.timeindex[2] == 0) else None)),
+                        scs_handler=lambda: queue_santoker_callback(lambda: (self.markSCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>4 and self.aw.santokerEventFlags[4] and self.timeindex[4] == 0) else None)),
+                        drop_handler=lambda: queue_santoker_callback(lambda: (self.markDropSignal.emit(False) if (len(self.aw.santokerEventFlags)>6 and self.aw.santokerEventFlags[6] and self.timeindex[6] == 0) else None)),
+                        warmup_handler=lambda state: self.aw.santokerWarmupStateGenerationSignal.emit(santoker_generation, state),
+                        warmup_temp_handler=lambda temp_c: self.aw.santokerWarmupTargetGenerationSignal.emit(santoker_generation, temp_c),
                         warmup_target=self.aw.santokerWarmupController.desired_temp_c,
-                        ready_handler=self.aw.santokerWarmupReadySignal.emit)
+                        ready_handler=lambda ready: self.aw.santokerWarmupReadyGenerationSignal.emit(santoker_generation, ready))
                     self.aw.santoker.setLogging(self.device_logging)
                     self.aw.santoker.start()
                 elif self.device == 171:

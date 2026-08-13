@@ -977,6 +977,25 @@ class TestSantokerWarmupProtocol:
         send_msg.assert_called_once_with(Santoker.WARMUP, 0)
         assert santoker.getWarmup() is None
 
+    def test_active_target_edit_sends_only_target_and_preserves_desired_on(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+        from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
+
+        diagnostics = SantokerDiagnosticsSession('Wi-Fi')
+        santoker = Santoker(diagnostics=diagnostics)
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.requestWarmupOn(190.0)
+            send_msg.reset_mock()
+            assert santoker.setWarmupTarget(205.0)
+
+        send_msg.assert_called_once_with(Santoker.WARMUP_TEMP, 2050)
+        state = diagnostics.view().state
+        assert state.desired_warmup is True
+        assert state.desired_target_c == 205.0
+
     def test_warmup_reports_update_state_and_target(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker
@@ -1034,7 +1053,11 @@ class TestSantokerWarmupProtocol:
         assert receiver.getWarmupTarget() == 190.0
         assert receiver.getReportedWarmupTarget() == 190.0
         assert diagnostics.record_reported_target.call_count == 1
-        assert diagnostics.record_rx.call_args_list[-1].args == (packet, 'accepted frame')
+        description = diagnostics.record_rx.call_args_list[-1].args[1]
+        assert 'accepted frame' in description
+        assert 'target=7F' in description
+        assert 'value=1900' in description
+        assert diagnostics.record_rx.call_args_list[-1].args[0] == packet
         assert diagnostics.record_rx.call_args_list[-1].kwargs == {'accepted': True}
         assert frame_handler.call_count == 2
         assert frame_handler.call_args_list == [call(), call()]
