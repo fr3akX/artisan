@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 import threading
 
 import pytest
@@ -105,3 +105,62 @@ def test_record_event_is_thread_safe() -> None:
     assert [event.sequence for event in view.events] == list(range(1, 1002))
     assert len({event.sequence for event in view.events}) == 1001
     assert len(view.events) == 1001
+
+
+def test_max_events_is_bounded_to_5000() -> None:
+    with pytest.raises(ValueError, match='between 1 and 5000'):
+        SantokerDiagnosticsSession('Wi-Fi', max_events=0)
+    with pytest.raises(ValueError, match='between 1 and 5000'):
+        SantokerDiagnosticsSession('Wi-Fi', max_events=5001)
+
+
+def test_reconnect_count_tracks_disconnected_to_connected_transitions_only_after_first_connect() -> None:
+    session = SantokerDiagnosticsSession('Wi-Fi')
+
+    session.record_disconnected()
+    session.record_connected()
+    assert session.view().state.reconnect_count == 0
+
+    session.record_disconnected()
+    session.record_connected()
+    assert session.view().state.reconnect_count == 1
+
+    session.record_disconnected()
+    session.record_connected()
+    assert session.view().state.reconnect_count == 2
+
+
+def test_init_rejects_naive_now_utc_clock() -> None:
+    def now() -> datetime:
+        return datetime(2026, 8, 13, 12, 0)  # noqa: DTZ001
+
+    with pytest.raises(ValueError, match=r'now_utc\(\) must return timezone-aware UTC datetime values'):
+        SantokerDiagnosticsSession('BLE', now_utc=now)
+
+
+def test_init_rejects_non_utc_now_utc_clock() -> None:
+    def now() -> datetime:
+        return datetime(2026, 8, 13, 12, 0, tzinfo=timezone(timedelta(hours=2)))
+
+    with pytest.raises(ValueError, match=r'now_utc\(\) must return timezone-aware UTC datetime values'):
+        SantokerDiagnosticsSession('BLE', now_utc=now)
+
+
+def test_non_utc_clock_rejected_after_initialization() -> None:
+    values: list[datetime] = [
+        datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 13, 12, 0, tzinfo=timezone(timedelta(hours=1))),
+    ]
+    index = 0
+
+    def now() -> datetime:
+        nonlocal index
+        value = values[index]
+        index += 1
+        return value
+
+    session = SantokerDiagnosticsSession('BLE', now_utc=now)
+
+    with pytest.raises(ValueError, match=r'now_utc\(\) must return timezone-aware UTC datetime values'):
+        session.record_connected()

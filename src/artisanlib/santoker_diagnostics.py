@@ -28,7 +28,7 @@
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from threading import RLock
 from typing import Literal
@@ -160,8 +160,8 @@ class SantokerDiagnosticsSession:
         now_utc: Callable[[], datetime] = utc_now,
         max_events: int = 5000,
     ) -> None:
-        if max_events <= 0:
-            raise ValueError('max_events must be a positive integer')
+        if not 1 <= max_events <= 5000:
+            raise ValueError('max_events must be between 1 and 5000')
 
         self._transport = transport
         self._now_utc = now_utc
@@ -173,13 +173,14 @@ class SantokerDiagnosticsSession:
         self._discarded_event_count = 0
 
         self._monitoring_active = True
-        self._session_started_utc = now_utc()
+        self._session_started_utc = self._utc_now()
         self._session_ended_utc: datetime | None = None
         self._connected = False
         self._protocol_ready = False
         self._active_header: str | None = None
         self._reconnect_count = 0
         self._was_disconnected = False
+        self._ever_connected = False
         self._last_packet_utc: datetime | None = None
 
         self._board_c: float | None = None
@@ -212,6 +213,12 @@ class SantokerDiagnosticsSession:
     def transport(self) -> TransportKind:
         return self._transport
 
+    def _utc_now(self) -> datetime:
+        timestamp = self._now_utc()
+        if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+            raise ValueError('now_utc() must return timezone-aware UTC datetime values')
+        return timestamp
+
     def _append_event(
         self,
         *,
@@ -229,7 +236,7 @@ class SantokerDiagnosticsSession:
         self._events.append(
             SantokerDiagnosticEvent(
                 sequence=self._sequence,
-                timestamp_utc=self._now_utc(),
+                timestamp_utc=self._utc_now(),
                 category=category,
                 direction=direction,
                 description=description,
@@ -349,10 +356,11 @@ class SantokerDiagnosticsSession:
                 return
             if self._connected:
                 return
-            if self._was_disconnected:
+            if self._was_disconnected and self._ever_connected:
                 self._reconnect_count += 1
             self._connected = True
             self._was_disconnected = False
+            self._ever_connected = True
             self._append_event(
                 category='connection',
                 description='connected',
@@ -381,7 +389,7 @@ class SantokerDiagnosticsSession:
             self._drum = None
 
             self._decoded_values = {}
-            self._was_disconnected = True
+            self._was_disconnected = self._ever_connected
             self._append_event(
                 category='connection',
                 description='disconnected',
@@ -417,7 +425,7 @@ class SantokerDiagnosticsSession:
             if not self._monitoring_active:
                 return
             if accepted:
-                self._last_packet_utc = self._now_utc()
+                self._last_packet_utc = self._utc_now()
             self._append_event(
                 category='rx',
                 direction='RX',
@@ -526,7 +534,7 @@ class SantokerDiagnosticsSession:
                 return
             self._restoration_state = state
             if attempted:
-                self._last_restoration_attempt_utc = self._now_utc()
+                self._last_restoration_attempt_utc = self._utc_now()
 
             self._append_event(
                 category='restoration',
@@ -561,7 +569,7 @@ class SantokerDiagnosticsSession:
                 packet=None,
             )
             self._monitoring_active = False
-            self._session_ended_utc = self._now_utc()
+            self._session_ended_utc = self._utc_now()
 
 
 __all__ = [
