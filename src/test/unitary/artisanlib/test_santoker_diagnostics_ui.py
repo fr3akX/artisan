@@ -6,13 +6,14 @@ import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
 from PyQt6.QtGui import QClipboard
 from PyQt6.QtWidgets import (
     QApplication,
+    QGroupBox,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -55,6 +56,172 @@ def _format_event_lines(session: SantokerDiagnosticsSession) -> list[str]:
                 line += f' {packet_text}'
         lines.append(line)
     return lines
+
+
+def _device_assignment_app_mock() -> MagicMock:
+    aw = MagicMock()
+    aw.qmc = MagicMock()
+    aw.ser = MagicMock()
+    aw.app.artisanviewerMode = True
+
+    for name in (
+        'santokerSerial',
+        'santokerBLE',
+        'kaleidoSerial',
+        'scale1_dedicated_for_green_only',
+        'scale2_dedicated_for_roasted_only',
+        'taskWebDisplayGreenActive',
+        'taskWebDisplayRoastedActive',
+        'two_bucket_mode',
+    ):
+        setattr(aw, name, False)
+    for name in (
+        'container1_idx',
+        'container2_idx',
+        'scale1_model',
+        'scale2_model',
+        'kaleidoPort',
+        'mugmaPort',
+        'colorTrack_mean_window_size',
+        'colorTrack_median_window_size',
+        'green_task_precision',
+        'automatic_registration_period',
+        'taskWebDisplayGreenPort',
+        'taskWebDisplayRoastedPort',
+    ):
+        setattr(aw, name, 0)
+    for name in (
+        'scale1_name',
+        'scale1_id',
+        'scale2_name',
+        'scale2_id',
+        'kaleidoHost',
+        'mugmaHost',
+        'roasthubs_org_id',
+        'roasthubs_machine_id',
+        'roasthubs_token',
+        'shelly_3EMPro_host',
+        'shelly_PlusPlug_host',
+        'locale_str',
+        'taskWebDisplayRoastedIndexPath',
+    ):
+        setattr(aw, name, '')
+    aw.santokerHost = 'configured.local'
+    aw.santokerPort = 1234
+    aw.santokerEventFlags = [False] * 7
+    aw.kaleidoEventFlags = []
+    aw.nLCDS = 10
+    aw.ETname = 'ET'
+    aw.BTname = 'BT'
+
+    qmc = aw.qmc
+    for name in (
+        'BTcurve',
+        'BTlcd',
+        'Controlbuttonflag',
+        'ETcurve',
+        'ETlcd',
+        'PIDbuttonflag',
+        'device_logging',
+        'phidget1045_async',
+        'phidget1200_async',
+        'phidget1200_2_async',
+        'phidgetRemoteFlag',
+        'phidgetRemoteOnlyFlag',
+        'yoctoRemoteFlag',
+    ):
+        setattr(qmc, name, False)
+    for name in (
+        'ambientHumiditySource',
+        'ambientPressureSource',
+        'ambientTempSource',
+        'ambient_humidity_device',
+        'ambient_pressure_device',
+        'ambient_temperature_device',
+        'device',
+        'elevation',
+        'phidget1045_changeTrigger',
+        'phidget1045_dataRate',
+        'phidget1046_dataRate',
+        'phidget1200_2_changeTrigger',
+        'phidget1200_2_dataRate',
+        'phidget1200_2_formula',
+        'phidget1200_2_wire',
+        'phidget1200_changeTrigger',
+        'phidget1200_dataRate',
+        'phidget1200_formula',
+        'phidget1200_wire',
+        'phidgetDAQ1400_inputMode',
+        'phidgetDAQ1400_powerSupply',
+        'phidgetPort',
+        'YOCTO_dataRate',
+    ):
+        setattr(qmc, name, 0)
+    qmc.phidget1045_emissivity = 0.0
+    qmc.YOCTO_emissivity = 0.0
+    for name in ('BTfunction', 'ETfunction', 'phidgetPassword', 'phidgetServerID', 'yoctoServerID'):
+        setattr(qmc, name, '')
+    qmc.devices = ['Dummy']
+    qmc.extradevices = []
+    qmc.device_name_subst.side_effect = lambda value: value
+
+    string_lists = (
+        'YOCTO_dataRatesStrings',
+        'humiditydevicefunctionlist',
+        'phidget1018_changeTriggersStrings',
+        'phidget1045_changeTriggersStrings',
+        'phidget1046_formulaValues',
+        'phidget1046_gainValues',
+        'phidget1048_changeTriggersStrings',
+        'phidget1200_changeTriggersStrings',
+        'phidget1200_dataRatesStrings',
+        'phidget1200_formulaValues',
+        'phidget1200_wireValues',
+        'phidgetDAQ1400_inputModeStrings',
+        'phidgetDAQ1400_powerSupplyStrings',
+        'phidgetVCP100x_voltageRangeStrings',
+        'phidget_dataRatesStrings',
+        'pressuredevicefunctionlist',
+        'temperaturedevicefunctionlist',
+    )
+    for name in string_lists:
+        setattr(qmc, name, ['0'])
+    value_lists = (
+        'YOCTO_dataRatesValues',
+        'phidget1018_changeTriggersValues',
+        'phidget1045_changeTriggersValues',
+        'phidget1048_changeTriggersValues',
+        'phidget1200_changeTriggersValues',
+        'phidget1200_dataRatesValues',
+        'phidgetVCP100x_voltageRangeValues',
+        'phidget_dataRatesValues',
+    )
+    for name in value_lists:
+        setattr(qmc, name, [0])
+    qmc.phidget1018_async = [False] * 8
+    qmc.phidget1018_ratio = [False] * 8
+    qmc.phidget1018_changeTriggers = [0] * 8
+    qmc.phidget1018_dataRates = [0] * 8
+    qmc.phidgetVCP100x_voltageRanges = [0] * 8
+    qmc.phidget1046_async = [False] * 4
+    qmc.phidget1048_async = [False] * 4
+    qmc.phidget1046_formula = [0] * 4
+    qmc.phidget1046_gain = [1] * 4
+    qmc.phidget1048_types = [1] * 4
+    qmc.YOCTO_async = [False]
+
+    aw.ser.externalprogram = ''
+    aw.ser.externaloutprogram = ''
+    aw.ser.externaloutprogramFlag = False
+    aw.ser.controlETpid = [0, 1]
+    aw.ser.readBTpid = [2, 1]
+    aw.ser.showFujiLCDs = False
+    aw.ser.useModbusPort = False
+    aw.ser.arduinoETChannel = 'None'
+    aw.ser.arduinoBTChannel = 'None'
+    aw.ser.arduinoATChannel = 'None'
+    aw.ser.ArduinoFILT = [0] * 4
+    return aw
 
 
 class _SessionViewFailure:
@@ -155,23 +322,62 @@ def test_diagnostics_ownership_follows_new_session(qapplication: QApplication) -
 
 def test_diagnostics_entry_button_does_not_close_device_config(
     qapplication: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _ = qapplication
-    device_dialog = QWidget()
-    device_dialog.okEvent = Mock()
-    device_dialog.cancelEvent = Mock()
-    device_dialog.accept = Mock()
-    device_dialog.reject = Mock()
-    aw = SimpleNamespace(showSantokerDiagnostics=Mock())
+    ok_event = Mock()
+    cancel_event = Mock()
+    accept = Mock()
+    reject = Mock()
+    monkeypatch.setattr(DeviceAssignmentDlg, 'okEvent', ok_event)
+    monkeypatch.setattr(DeviceAssignmentDlg, 'cancelEvent', cancel_event)
+    monkeypatch.setattr(DeviceAssignmentDlg, 'accept', accept)
+    monkeypatch.setattr(DeviceAssignmentDlg, 'reject', reject)
 
-    button = create_santoker_diagnostics_button(aw.showSantokerDiagnostics, device_dialog)
+    aw = _device_assignment_app_mock()
+    parent = QWidget()
+    device_dialog = DeviceAssignmentDlg(parent, aw)
+    button = device_dialog.santokerDiagnosticsButton
+    santoker_group = next(
+        group for group in device_dialog.findChildren(QGroupBox) if group.title() == 'Santoker'
+    )
+    santoker_layout = santoker_group.layout()
+    assert santoker_layout is not None
+
+    device_dialog.santokerHost.setText('pending.local')
+    device_dialog.santokerPort.setText('9999')
+    device_dialog.santokerEventFlags[0].setChecked(True)
+    transport_buttons = (
+        device_dialog.santokerSerialFlag,
+        device_dialog.santokerNetworkFlag,
+        device_dialog.santokerBLEFlag,
+    )
+    for transport_button in transport_buttons:
+        transport_button.blockSignals(True)
+    device_dialog.santokerSerialFlag.setChecked(True)
+    for transport_button in transport_buttons:
+        transport_button.blockSignals(False)
+
+    assert device_dialog.santokerHost.text() == 'pending.local'
+    assert device_dialog.santokerPort.text() == '9999'
+    assert device_dialog.santokerSerialFlag.isChecked()
+    assert device_dialog.santokerEventFlags[0].isChecked()
+    assert button.isEnabled()
+
     button.click()
 
     aw.showSantokerDiagnostics.assert_called_once_with()
-    device_dialog.okEvent.assert_not_called()
-    device_dialog.cancelEvent.assert_not_called()
-    device_dialog.accept.assert_not_called()
-    device_dialog.reject.assert_not_called()
+    assert button.parentWidget() is santoker_group
+    assert santoker_layout.indexOf(button) >= 0
+    ok_event.assert_not_called()
+    cancel_event.assert_not_called()
+    accept.assert_not_called()
+    reject.assert_not_called()
+    assert aw.santokerHost == 'configured.local'
+    assert aw.santokerPort == 1234
+    assert not aw.santokerSerial
+    assert not aw.santokerBLE
+    assert aw.santokerEventFlags == [False] * 7
 
 
 def test_diagnostics_entry_is_only_in_santoker_group() -> None:
