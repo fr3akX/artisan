@@ -265,6 +265,7 @@ def test_automatic_disconnect_keeps_monitoring_session_and_desired_on(
     stop_monitoring = Mock()
     window = SimpleNamespace(
         santokerWarmup=True,
+        santoker=device,
         santokerWarmupController=controller,
         santokerDiagnosticsSession=session,
         stopSantokerMonitoring=stop_monitoring,

@@ -963,6 +963,83 @@ def test_worker_frame_signal_triggers_frame_reconciliation_on_qt_main_thread(
     assert device.thread_ids[-1] == main_thread
 
 
+def test_queued_stop_callbacks_do_not_leak_into_replacement_session(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    from artisanlib.santoker import Santoker
+    from artisanlib.santoker_warmup import RestorationState
+
+    window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
+    QMainWindow.__init__(window)
+    window.santokerWarmup = True
+    window.santokerWarmupControls = None
+    window.santokerWarmupController = SantokerWarmupController(desired_temp_c=205.0)
+    window.santokerDiagnosticsSession = None
+    window.santokerSerial = False
+    window.santokerBLE = False
+    window.santokerWarmupReadySignal.connect(
+        window.santokerWarmupReadyChanged,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    window.santokerWarmupStateSignal.connect(
+        window.santokerWarmupStateChanged,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+
+    first_session = window.startSantokerDiagnosticsSession()
+    first_santoker = Santoker(
+        ready_handler=window.santokerWarmupReadySignal.emit,
+        warmup_handler=window.santokerWarmupStateSignal.emit,
+        diagnostics=first_session,
+    )
+    window.santoker = first_santoker
+    first_santoker._setHeaderReady(True)
+    first_santoker._setWarmupState(True)
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+    assert window.santokerWarmupController.set_enabled(
+        True, -1, first_santoker
+    ) is WarmupResult.OK
+
+    window.stopSantokerMonitoring()
+
+    assert window.santoker is None
+    assert window.santokerWarmupController.restoration_state() is RestorationState.IDLE
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+    assert window.santokerWarmupController.restoration_state() is RestorationState.IDLE
+
+    replacement_session = window.startSantokerDiagnosticsSession()
+    assert replacement_session is not first_session
+    assert replacement_session.view().state.restoration_state is RestorationState.IDLE
+
+    replacement_santoker = Santoker(
+        ready_handler=window.santokerWarmupReadySignal.emit,
+        warmup_handler=window.santokerWarmupStateSignal.emit,
+        diagnostics=replacement_session,
+    )
+    window.santoker = replacement_santoker
+    replacement_santoker._setHeaderReady(True)
+    replacement_santoker._setWarmupState(True)
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+    assert window.santokerWarmupController.set_enabled(
+        True, -1, replacement_santoker
+    ) is WarmupResult.OK
+
+    replacement_santoker.resetProtocolState()
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+
+    assert window.santoker is replacement_santoker
+    assert window.santokerWarmupController.desired_enabled() is True
+    assert (
+        window.santokerWarmupController.restoration_state()
+        is RestorationState.WAITING_FOR_DATA
+    )
+    assert (
+        replacement_session.view().state.restoration_state
+        is RestorationState.WAITING_FOR_DATA
+    )
+
+
 def test_transport_connected_records_without_frame_signal_or_restoration() -> None:
     from artisanlib.santoker import Santoker
     from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession

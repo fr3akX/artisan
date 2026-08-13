@@ -19668,11 +19668,9 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot(bool)
     def santokerWarmupReadyChanged(self, ready:bool) -> None:
         if bool(getattr(self, 'santokerWarmup', False)):
-            if ready:
-                ApplicationWindow.refreshSantokerWarmupControls(self)
-            else:
+            if not ready and getattr(self, 'santoker', None) is not None:
                 self.santokerWarmupController.note_transport_loss()
-                ApplicationWindow.refreshSantokerWarmupControls(self)
+            ApplicationWindow.refreshSantokerWarmupControls(self)
 
     @pyqtSlot(bool)
     def setSantokerWarmupButtonState(self, enabled:bool) -> None:
@@ -19722,6 +19720,9 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot(object)
     def santokerWarmupStateChanged(self, state:object) -> None:
         if not bool(getattr(self, 'santokerWarmup', False)):
+            return
+        if getattr(self, 'santoker', None) is None:
+            ApplicationWindow.refreshSantokerWarmupControls(self)
             return
         if not isinstance(state, bool | None):
             return
