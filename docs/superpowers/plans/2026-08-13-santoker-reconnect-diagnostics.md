@@ -622,7 +622,7 @@ _diagnostics: SantokerDiagnosticsSession | None = field(default=None, init=False
 
 `reconcile_after_frame()` performs this ordered decision:
 
-1. if CHARGE is latched/indexed, clear desired ON, force OFF when `_safety_off_pending` or reported ON requires it, and return `FORCED_OFF` or `NONE`; 
+1. if CHARGE is latched/indexed, clear desired ON, force OFF when `_safety_off_pending` or reported ON requires it, and return `FORCED_OFF` or `NONE`;
 2. if desired is not ON, set `IDLE` and return `NONE`;
 3. if device is absent/unready, set `WAITING_FOR_DATA` and return `WAITING`;
 4. read reported warm-up and target from the device into controller report fields;

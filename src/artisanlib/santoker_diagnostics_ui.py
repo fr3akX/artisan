@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QWidget,
 )
-from typing import override, final
+from typing import cast, override, final
 
 from artisanlib.santoker_diagnostics import (
     SantokerDiagnosticEvent,
@@ -84,6 +84,31 @@ class SantokerDiagnosticsDialog(QDialog):
         self._last_sequence = 0
         self._first_retained_sequence: int | None = None
         self._last_refresh_failed = False
+
+        self._monitoring_value = cast(QLabel, None)
+        self._transport_value = cast(QLabel, None)
+        self._connected_value = cast(QLabel, None)
+        self._ready_value = cast(QLabel, None)
+        self._header_value = cast(QLabel, None)
+        self._reconnect_count_value = cast(QLabel, None)
+        self._last_packet_value = cast(QLabel, None)
+        self._board_value = cast(QLabel, None)
+        self._bean_value = cast(QLabel, None)
+        self._environment_value = cast(QLabel, None)
+        self._infrared_value = cast(QLabel, None)
+        self._bean_ror_value = cast(QLabel, None)
+        self._environment_ror_value = cast(QLabel, None)
+        self._power_value = cast(QLabel, None)
+        self._fan_value = cast(QLabel, None)
+        self._drum_value = cast(QLabel, None)
+        self._desired_warmup_value = cast(QLabel, None)
+        self._desired_warmup_target_value = cast(QLabel, None)
+        self._reported_warmup_value = cast(QLabel, None)
+        self._reported_warmup_target_value = cast(QLabel, None)
+        self._restoration_value = cast(QLabel, None)
+        self._charge_latch_value = cast(QLabel, None)
+        self._history_discarded = cast(QLabel, None)
+        self._history = cast(QPlainTextEdit, None)
 
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setModal(False)
@@ -332,17 +357,17 @@ class SantokerDiagnosticsDialog(QDialog):
         self._history.setPlainText(QApplication.translate('Message', 'No Santoker monitoring session captured'))
 
     @override
-    def showEvent(self, event: QShowEvent | None = None) -> None:
-        super().showEvent(event)
+    def showEvent(self, a0: QShowEvent | None = None) -> None:
+        super().showEvent(a0)
         self.refresh()
         self._refresh_timer.start()
 
     @override
-    def closeEvent(self, event: QCloseEvent | None = None) -> None:
+    def closeEvent(self, a0: QCloseEvent | None = None) -> None:
         self._refresh_timer.stop()
         self.hide()
-        if event is not None:
-            event.ignore()
+        if a0 is not None:
+            a0.ignore()
 
     def refresh(self) -> None:
         session = self._resolve_session()

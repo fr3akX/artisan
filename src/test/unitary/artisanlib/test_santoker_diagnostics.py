@@ -16,11 +16,13 @@ from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
+from PyQt6.QtWidgets import QApplication
+
+from artisanlib.main import ApplicationWindow
+
 
 @pytest.fixture(scope='module')
 def qapplication() -> Any:
-    from PyQt6.QtWidgets import QApplication
-
     app = QApplication.instance()
     if app is None:
         return QApplication([])
@@ -200,8 +202,6 @@ def test_monitoring_session_lifecycle_selects_transport_without_endpoint(
     ble: bool,
     expected_transport: str,
 ) -> None:
-    from artisanlib.main import ApplicationWindow
-
     del qapplication
     controller = Mock(spec=SantokerWarmupController)
     window = SimpleNamespace(
@@ -225,8 +225,6 @@ def test_monitoring_session_lifecycle_selects_transport_without_endpoint(
 def test_monitoring_session_replacement_preserves_completed_snapshot(
     qapplication: Any,
 ) -> None:
-    from artisanlib.main import ApplicationWindow
-
     del qapplication
     previous = SantokerDiagnosticsSession('serial')
     previous.stop()
@@ -252,8 +250,6 @@ def test_monitoring_session_replacement_preserves_completed_snapshot(
 def test_automatic_disconnect_keeps_monitoring_session_and_desired_on(
     qapplication: Any,
 ) -> None:
-    from artisanlib.main import ApplicationWindow
-
     del qapplication
     device = Mock()
     device.isHeaderReady.return_value = True
@@ -283,8 +279,6 @@ def test_automatic_disconnect_keeps_monitoring_session_and_desired_on(
 
 
 def test_stop_monitoring_lifecycle_orders_and_is_idempotent(qapplication: Any) -> None:
-    from artisanlib.main import ApplicationWindow
-
     del qapplication
     trace: list[str] = []
     controller = Mock(spec=SantokerWarmupController)
@@ -313,7 +307,6 @@ def test_stop_monitoring_lifecycle_orders_and_is_idempotent(qapplication: Any) -
 
 def test_canvas_monitoring_lifecycle_branch_selection(qapplication: Any) -> None:
     from artisanlib.canvas import tgraphcanvas
-    from artisanlib.main import ApplicationWindow
 
     del qapplication
     source = inspect.getsource(tgraphcanvas.OnMonitor)

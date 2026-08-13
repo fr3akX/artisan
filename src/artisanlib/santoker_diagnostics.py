@@ -163,7 +163,7 @@ class SantokerDiagnosticsSession:
         if not 1 <= max_events <= 5000:
             raise ValueError('max_events must be between 1 and 5000')
 
-        self._transport = transport
+        self._transport: TransportKind = transport
         self._now_utc = now_utc
         self._max_events = max_events
         self._lock = RLock()
@@ -292,7 +292,7 @@ class SantokerDiagnosticsSession:
     def format_report(self) -> str:
         with self._lock:
             state = self._snapshot_state()
-            event_lines = []
+            event_lines: list[str] = []
             for event in self._events:
                 line = f'{event.sequence:>6} {event.timestamp_utc.isoformat()} '
                 line += f'{event.category}'

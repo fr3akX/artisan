@@ -14,6 +14,7 @@ from PyQt6.QtGui import QClipboard
 from PyQt6.QtWidgets import (
     QApplication,
     QGroupBox,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -35,8 +36,6 @@ def _normalize_text(value: str) -> str:
 
 
 def _value_label_text(dialog: SantokerDiagnosticsDialog, object_name: str) -> str:
-    from PyQt6.QtWidgets import QLabel
-
     label = dialog.findChild(QLabel, object_name)
     if label is None:
         raise AssertionError(f'expected label: {object_name}')
