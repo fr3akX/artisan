@@ -32,7 +32,7 @@ from pymodbus.framer.rtu import FramerRTU
 from collections.abc import Callable, Awaitable
 from typing import Final, TYPE_CHECKING, override
 
-from artisanlib.santoker_diagnostics import DiagnosticField, SantokerDiagnosticsSession, TransportKind
+from artisanlib.santoker_diagnostics import DiagnosticField, SantokerDiagnosticsSession
 
 if TYPE_CHECKING:
     from artisanlib.atypes import SerialSettings # pylint: disable=unused-import
@@ -167,20 +167,11 @@ class Santoker(AsyncComm):
                 warmup_temp_handler:Callable[[float], None]|None = None,
                 warmup_target: float = DEFAULT_WARMUP_TEMP_C,
                 ready_handler:Callable[[bool], None]|None = None,
-                diagnostics:SantokerDiagnosticsSession|None = None,
-                frame_handler:Callable[[bytes], None]|None = None) -> None:
+                diagnostics: SantokerDiagnosticsSession | None = None,
+                frame_handler:Callable[[], None]|None = None) -> None:
 
-        if diagnostics is None:
-            if serial is not None:
-                transport: TransportKind = 'serial'
-            elif connect_using_ble:
-                transport = 'BLE'
-            else:
-                transport = 'Wi-Fi'
-            diagnostics = SantokerDiagnosticsSession(transport)
-
-        self._diagnostics:SantokerDiagnosticsSession = diagnostics
-        self._frame_handler:Callable[[bytes], None]|None = frame_handler
+        self._diagnostics: SantokerDiagnosticsSession | None = diagnostics
+        self._frame_handler:Callable[[], None]|None = frame_handler
         self._desired_warmup:bool | None = None
 
         def _connected() -> None:
@@ -275,45 +266,72 @@ class Santoker(AsyncComm):
         return self._reported_warmup_target
 
     def _safe_record(self, callback: Callable[[], None]) -> None:
+        if self._diagnostics is None:
+            return
         try:
             callback()
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
 
     def _record_connected(self) -> None:
+        if self._diagnostics is None:
+            return
         self._safe_record(self._diagnostics.record_connected)
 
     def _record_disconnected(self) -> None:
+        if self._diagnostics is None:
+            return
         self._safe_record(self._diagnostics.record_disconnected)
 
     def _record_protocol(self, ready: bool, header: bytes | None) -> None:
-        self._safe_record(lambda: self._diagnostics.record_protocol(ready, header[1:2] if header is not None else None))
+        diagnostics = self._diagnostics
+        if diagnostics is None:
+            return
+        self._safe_record(lambda: diagnostics.record_protocol(ready, header[1:2] if header is not None else None))
 
     def _record_rx(self, packet: bytes, description: str, accepted: bool) -> None:
-        self._safe_record(lambda: self._diagnostics.record_rx(packet, description, accepted=accepted))
+        diagnostics = self._diagnostics
+        if diagnostics is None:
+            return
+        self._safe_record(lambda: diagnostics.record_rx(packet, description, accepted=accepted))
 
     def _record_tx(self, packet: bytes, target: bytes, value: int) -> None:
-        self._safe_record(lambda: self._diagnostics.record_tx(
+        diagnostics = self._diagnostics
+        if diagnostics is None:
+            return
+        self._safe_record(lambda: diagnostics.record_tx(
             packet,
             f'{target.hex()}={value}',
         ))
 
     def _record_decoded(self, field: DiagnosticField, value: float | int | bool) -> None:
-        self._safe_record(lambda: self._diagnostics.record_decoded(field, value))
+        diagnostics = self._diagnostics
+        if diagnostics is None:
+            return
+        self._safe_record(lambda: diagnostics.record_decoded(field, value))
 
     def _record_desired_warmup(self) -> None:
-        self._safe_record(lambda: self._diagnostics.record_desired_warmup(self._desired_warmup, self._warmup_target))
+        diagnostics = self._diagnostics
+        if diagnostics is None:
+            return
+        self._safe_record(lambda: diagnostics.record_desired_warmup(self._desired_warmup, self._warmup_target))
 
     def _record_reported_warmup(self) -> None:
-        self._safe_record(lambda: self._diagnostics.record_reported_warmup(self._warmup))
+        diagnostics = self._diagnostics
+        if diagnostics is None:
+            return
+        self._safe_record(lambda: diagnostics.record_reported_warmup(self._warmup))
 
     def _record_reported_target(self) -> None:
-        self._safe_record(lambda: self._diagnostics.record_reported_target(self._reported_warmup_target))
+        diagnostics = self._diagnostics
+        if diagnostics is None:
+            return
+        self._safe_record(lambda: diagnostics.record_reported_target(self._reported_warmup_target))
 
-    def _record_frame(self, packet: bytes) -> None:
+    def _record_frame(self) -> None:
         if self._frame_handler is not None:
             try:
-                self._frame_handler(packet)
+                self._frame_handler()
             except Exception as e: # pylint: disable=broad-except
                 _log.exception(e)
 
@@ -342,6 +360,8 @@ class Santoker(AsyncComm):
             return False
         if not self.MIN_WARMUP_TEMP_C <= temp_c <= self.MAX_WARMUP_TEMP_C:
             return False
+        self._warmup_target = temp_c
+        self._record_desired_warmup()
         self.send_msg(self.WARMUP_TEMP, int(round(temp_c * 10)))
         self.send_msg(self.WARMUP, 1)
         return True
@@ -529,101 +549,72 @@ class Santoker(AsyncComm):
     # https://www.oreilly.com/library/view/using-asyncio-in/9781492075325/ch04.html
     @override
     async def read_msg(self, stream: asyncio.StreamReader|IteratorReader) -> None:
-        candidate:bytearray
-        read_bytes:bytearray
+        candidate:bytearray = bytearray()
 
         async def read_candidate(size: int) -> bytes:
-            nonlocal candidate
             try:
-                data = await stream.readexactly(size)
-                candidate.extend(data)
-                return data
+                part = await stream.readexactly(size)
             except asyncio.IncompleteReadError as exc:
                 partial = bytes(exc.partial)
                 if partial:
                     candidate.extend(partial)
                 if candidate:
                     self._record_rx(bytes(candidate), 'truncated frame', accepted=False)
-                    self._record_frame(bytes(candidate))
-                return b''
+                raise
+            candidate.extend(part)
+            return part
 
         # look for the first header byte
-        try:
-            read_bytes = bytearray(await stream.readuntil(self.HEADER[0:1]))
-        except asyncio.IncompleteReadError as exc:
-            if exc.partial:
-                self._record_rx(bytes(exc.partial), 'truncated frame', accepted=False)
-            return
-
-        candidate = bytearray(read_bytes[-1:]) # keep only bytes from first header byte
+        read_bytes = bytearray(await stream.readuntil(self.HEADER[0:1]))
+        candidate = bytearray(read_bytes[-1:])
 
         # check for the second header byte
         snd_header_byte = await read_candidate(1)
-        if len(snd_header_byte) != 1:
-            return
         if snd_header_byte == self.HEADER_BT[1:2]:
             candidate_header = self.HEADER_BT
         elif snd_header_byte == self.HEADER_WIFI[1:2]:
             candidate_header = self.HEADER_WIFI
         else:
             self._record_rx(bytes(candidate), 'invalid second header', accepted=False)
-            self._record_frame(bytes(candidate))
             return
 
         # read the data target (BT, ET,..)
         target = await read_candidate(1)
-        if len(target) != 1:
-            return
-
         # read code header
         code2 = await read_candidate(2)
-        if len(code2) != 2:
-            return
         if code2 != self.CODE_HEADER:
             self._record_rx(bytes(candidate), 'invalid code header', accepted=False)
-            self._record_frame(bytes(candidate))
             return
 
         # read the data length
         data_len = await read_candidate(1)
-        if len(data_len) != 1:
-            return
-        data = await read_candidate(int.from_bytes(data_len, 'big'))
-        if len(data) != int.from_bytes(data_len, 'big'):
-            return
-
         if data_len != b'\x03':
             self._record_rx(bytes(candidate), 'invalid data length', accepted=False)
-            self._record_frame(bytes(candidate))
             return
+
+        data = await read_candidate(int.from_bytes(data_len, 'big'))
 
         # read and check CRC over code header+length+data
         crc = await read_candidate(2)
-        if len(crc) != 2:
-            return
         calculated_crc = FramerRTU.compute_CRC(self.CODE_HEADER + data_len + data).to_bytes(2, 'big')
         if self._verify_crc and crc[1] != calculated_crc[1]: # we only check the second CRC bit!
             self._record_rx(bytes(candidate), 'CRC mismatch', accepted=False)
-            self._record_frame(bytes(candidate))
             if self._logging:
                 _log.debug('CRC error')
             return
 
         # check tail
         tail = await read_candidate(4)
-        if len(tail) != 4:
-            return
         if tail != self.TAIL:
             self._record_rx(bytes(candidate), 'invalid tail', accepted=False)
-            self._record_frame(bytes(candidate))
             return
 
         # full message decoded
         self.HEADER = candidate_header
         self._setHeaderReady(True)
         self._record_rx(bytes(candidate), 'accepted frame', accepted=True)
-        self._record_frame(bytes(candidate))
         self.register_reading(target, data)
+        self._record_frame()
 
     # send message interface
 
