@@ -13272,6 +13272,11 @@ class tgraphcanvas(QObject):
                 self.aw.pidcontrol.setSV(self.aw.sliderSV.value())
 
             # ADD DEVICE: # start communication/connect
+            santoker_diagnostics_session = (
+                self.aw.startSantokerDiagnosticsSession()
+                if self.device == 134
+                else None
+            )
             if not bool(self.aw.simulator):
                 if self.device == 53 and self.aw.hottop is None: # only start Hottop connection if there is not already one
                     # connect HOTTOP
@@ -13292,6 +13297,7 @@ class tgraphcanvas(QObject):
                     self.aw.hottop.start()
                 elif self.device == 134:
                     # connect Santoker
+                    assert santoker_diagnostics_session is not None
                     from artisanlib.santoker import Santoker
                     santoker_serial:SerialSettings|None = None
                     if self.aw.santokerSerial and not self.aw.santokerBLE:
@@ -13303,8 +13309,11 @@ class tgraphcanvas(QObject):
                                 parity = self.aw.ser.parity,
                                 timeout = self.aw.ser.timeout,
                                 clear_HUPCL = False)
+                    santoker_diagnostics_session.record_connection_attempt()
                     self.aw.santoker = Santoker(self.aw.santokerHost, self.aw.santokerPort,
                         santoker_serial, self.aw.santokerBLE,
+                        diagnostics=santoker_diagnostics_session,
+                        frame_handler=self.aw.santokerFrameSignal.emit,
                         connected_handler=lambda : self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} connected').format('Santoker'),True,None),
                         disconnected_handler=lambda : self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} disconnected').format('Santoker'),True,None),
                         # CHARGE handler disactivated to not trigger CHARGE after CHARGE is signalled to the machine by START
@@ -13318,7 +13327,6 @@ class tgraphcanvas(QObject):
                         warmup_temp_handler=self.aw.santokerWarmupTargetSignal.emit,
                         warmup_target=self.aw.santokerWarmupController.desired_temp_c,
                         ready_handler=self.aw.santokerWarmupReadySignal.emit)
-                    self.aw.santokerWarmupTargetSignal.emit(self.aw.santoker.getWarmupTarget())
                     self.aw.santoker.setLogging(self.device_logging)
                     self.aw.santoker.start()
                 elif self.device == 171:
@@ -13529,9 +13537,8 @@ class tgraphcanvas(QObject):
                     self.aw.hottop = None
 
                 # disconnect Santoker
-                if not bool(self.aw.simulator) and self.device == 134 and self.aw.santoker is not None:
-                    self.aw.santoker.stop()
-                    self.aw.santoker = None
+                if self.device == 134:
+                    self.aw.stopSantokerMonitoring()
 
                 # disconnect Santoker R
                 if not bool(self.aw.simulator) and self.device == 171 and self.aw.santokerR is not None:

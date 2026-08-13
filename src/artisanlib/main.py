@@ -231,7 +231,9 @@ from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, en
         eventtime2string, toDim, signature_message, rec_int_to_float, smooth_list)
 
 from artisanlib.qtsingleapplication import QtSingleApplication
+from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession, TransportKind
 from artisanlib.santoker_warmup import (
+    ReconcileOutcome,
     SantokerWarmupController,
     WarmupResult,
 )
@@ -1460,6 +1462,7 @@ class ApplicationWindow(QMainWindow):
     santokerWarmupReadySignal = pyqtSignal(bool)
     santokerWarmupButtonStateSignal = pyqtSignal(bool)
     santokerWarmupControlsRefreshSignal = pyqtSignal()
+    santokerFrameSignal = pyqtSignal()
     kaleidoSendMessageSignal = pyqtSignal(str,str)
     kaleidoSendMessageAwaitSignal = pyqtSignal(str,str,int,int)
     orbiterSendMessageSignal = pyqtSignal(bytes,bytes,bytes,int)
@@ -1497,7 +1500,7 @@ class ApplicationWindow(QMainWindow):
         'userprofilepath', 'printer', 'main_widget', 'defaultdpi', 'dpi', 'qmc', 'HottopControlActive', 'AsyncSamplingTimer', 'wheeldialog',
         'simulator', 'simulatorpath', 'comparator', 'eventsbuttonflag', 'minieventsflags', 'seriallogflag',
         'seriallog', 'ser', 'modbus', 'extraMODBUStemps', 'extraMODBUStx', 's7', 'extraS7tx', 'ws', 'extraser', 'extracomport', 'extrabaudrate',
-        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerWarmup', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
+        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerWarmup', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerDiagnosticsSession', 'santokerDiagnosticsDialog', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
         'mugmaHost','mugmaPort', 'mugma', 'mugma_default_host', 'shelly_3EMPro_host', 'shelly_PlusPlug_host',
         'kaleido_default_host', 'kaleidoHost', 'kaleidoPort', 'kaleidoSerial', 'kaleidoPID', 'kaleido', 'kaleidoEventFlags', 'colorTrack_mean_window_size', 'colorTrack_median_window_size', 'ikawa',
         'lcdpaletteB', 'lcdpaletteF', 'extraeventsbuttonsflags', 'extraeventslabels', 'extraeventbuttoncolor', 'extraeventsactionstrings',
@@ -1874,6 +1877,8 @@ class ApplicationWindow(QMainWindow):
         self.santokerEventFlags:list[bool] = [False, False, False, False, False, False, False ] # CHARGE, DRY, FCs, FCe, SCs, SCe, DROP
         self.santoker:Santoker|None = None # holds the Santoker instance created on connect; reset to None on disconnect
         self.santokerWarmupController:SantokerWarmupController = SantokerWarmupController()
+        self.santokerDiagnosticsSession:SantokerDiagnosticsSession|None = None
+        self.santokerDiagnosticsDialog:Any|None = None
 
         # Santoker R
         self.santokerR:SantokerR|None = None # holds the Santoker R instance created on connect; reset to None on disconnect
@@ -4354,9 +4359,22 @@ class ApplicationWindow(QMainWindow):
         self.pidToggleSignal.connect(self.pidToggle)
         self.notificationsSetEnabledSignal.connect(self.notificationsSetEnabled)
         self.santokerSendMessageSignal.connect(self.santokerSendMessage)
-        self.santokerWarmupStateSignal.connect(self.santokerWarmupStateChanged)
-        self.santokerWarmupTargetSignal.connect(self.santokerWarmupTargetChanged)
-        self.santokerWarmupReadySignal.connect(self.santokerWarmupReadyChanged)
+        self.santokerWarmupStateSignal.connect(
+            self.santokerWarmupStateChanged,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
+        self.santokerWarmupTargetSignal.connect(
+            self.santokerWarmupTargetChanged,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
+        self.santokerWarmupReadySignal.connect(
+            self.santokerWarmupReadyChanged,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
+        self.santokerFrameSignal.connect(
+            self.santokerFrameAccepted,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
         self.santokerWarmupButtonStateSignal.connect(self.setSantokerWarmupButtonState, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
         self.santokerWarmupControlsRefreshSignal.connect(self.refreshSantokerWarmupControls)
         self.kaleidoSendMessageSignal.connect(self.kaleidoSendMessage)
@@ -12446,15 +12464,12 @@ class ApplicationWindow(QMainWindow):
         target = self.santokerWarmupController.target_for_display(unit)
         self.santokerWarmupControls.configureTarget(unit, target)
 
-        ready = False
+        ready = bool(self.santoker is not None and self.santoker.isHeaderReady())
         pre_charge = (
             self.qmc.timeindex[0] == -1
             and not self.santokerWarmupController.is_charge_latched()
         )
-        warmup_enabled = False
-        if self.santoker is not None:
-            ready = self.santoker.isHeaderReady()
-            warmup_enabled = pre_charge and self.santoker.getWarmup() is True
+        warmup_enabled = pre_charge and self.santokerWarmupController.desired_enabled() is True
         safe_to_start = visible and ready and pre_charge
 
         self.santokerWarmupControls.setVisible(visible)
@@ -19651,9 +19666,13 @@ class ApplicationWindow(QMainWindow):
             ApplicationWindow.updateSantokerWarmupControls(self)
 
     @pyqtSlot(bool)
-    def santokerWarmupReadyChanged(self, _ready:bool) -> None:
+    def santokerWarmupReadyChanged(self, ready:bool) -> None:
         if bool(getattr(self, 'santokerWarmup', False)):
-            ApplicationWindow.refreshSantokerWarmupControls(self)
+            if ready:
+                ApplicationWindow.refreshSantokerWarmupControls(self)
+            else:
+                self.santokerWarmupController.note_transport_loss()
+                ApplicationWindow.refreshSantokerWarmupControls(self)
 
     @pyqtSlot(bool)
     def setSantokerWarmupButtonState(self, enabled:bool) -> None:
@@ -19674,35 +19693,49 @@ class ApplicationWindow(QMainWindow):
         finally:
             ApplicationWindow.refreshSantokerWarmupControls(self)
 
+    def startSantokerDiagnosticsSession(self) -> SantokerDiagnosticsSession:
+        transport:TransportKind = (
+            'BLE' if self.santokerBLE
+            else 'serial' if self.santokerSerial
+            else 'Wi-Fi'
+        )
+        session = SantokerDiagnosticsSession(transport)
+        self.santokerDiagnosticsSession = session
+        self.santokerWarmupController.attach_diagnostics(session)
+        return session
+
+    def stopSantokerMonitoring(self) -> None:
+        self.santokerWarmupController.stop_monitoring(self.santoker)
+        if self.santoker is not None:
+            self.santoker.stop()
+            self.santoker = None
+        if self.santokerDiagnosticsSession is not None:
+            self.santokerDiagnosticsSession.stop()
+
     @pyqtSlot(float)
     def santokerWarmupTargetChanged(self, temp_c:float) -> None:
         if not bool(getattr(self, 'santokerWarmup', False)):
             return
         self.santokerWarmupController.accept_reported_target(temp_c)
-        controls = getattr(self, 'santokerWarmupControls', None)
-        if controls is not None:
-            unit:Literal['C', 'F'] = 'F' if self.qmc.mode_tempsliders == 'F' else 'C'
-            controls.configureTarget(
-                unit,
-                self.santokerWarmupController.target_for_display(unit),
-            )
+        ApplicationWindow.refreshSantokerWarmupControls(self)
 
     @pyqtSlot(object)
     def santokerWarmupStateChanged(self, state:object) -> None:
         if not bool(getattr(self, 'santokerWarmup', False)):
             return
-        if state is None:
-            ApplicationWindow.setSantokerWarmupButtonState(self, False)
+        if not isinstance(state, bool | None):
             return
-        if not isinstance(state, bool):
-            return
-        unsafe = self.santokerWarmupController.reconcile_reported_state(
-            state,
+        self.santokerWarmupController.accept_reported_state(state)
+        ApplicationWindow.refreshSantokerWarmupControls(self)
+
+    @pyqtSlot()
+    def santokerFrameAccepted(self) -> None:
+        outcome = self.santokerWarmupController.reconcile_after_frame(
             self.qmc.timeindex[0],
             self.santoker,
         )
-        ApplicationWindow.setSantokerWarmupButtonState(self, False if unsafe else state)
-        if unsafe:
+        self.refreshSantokerWarmupControls()
+        if outcome is ReconcileOutcome.FORCED_OFF:
             self.sendmessage(QApplication.translate(
                 'Message',
                 'Santoker warm-up reported ON after CHARGE; sending OFF',
@@ -23262,15 +23295,14 @@ class ApplicationWindow(QMainWindow):
             if self.fullscreenAction is not None and not (platform.system() == 'Darwin' and self.qmc.locale_str == 'en'):
                 self.fullscreenAction.setChecked(False)
             self.showNormal()
+        if self.qmc.device == 134:
+            # disconnect Santoker
+            self.stopSantokerMonitoring()
         if self.simulator is None:
             if self.qmc.device == 53 and self.hottop is not None:
                 # disconnect HOTTOP
                 self.hottop.stop()
                 self.hottop = None
-            elif self.qmc.device == 134 and self.santoker is not None:
-                # disconnect Santoker
-                self.santoker.stop()
-                self.santoker = None
             elif self.qmc.device == 171 and self.santokerR is not None:
                 # disconnect Santoker R
                 self.santokerR.stop()

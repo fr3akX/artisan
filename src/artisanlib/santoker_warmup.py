@@ -366,6 +366,11 @@ class SantokerWarmupController:
                 is ReconcileOutcome.FORCED_OFF
             )
 
+    def accept_reported_state(self, enabled: bool | None) -> None:
+        with self.serialized():
+            self._reported_enabled = enabled
+            self._record_reported_state()
+
     def accept_reported_target(self, temp_c: float) -> None:
         with self.serialized():
             self._set_reported_target(temp_c)

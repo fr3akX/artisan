@@ -1,11 +1,30 @@
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
+import inspect
+import os
 import threading
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 
 from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
+from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
+
+
+os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+
+
+@pytest.fixture(scope='module')
+def qapplication() -> Any:
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        return QApplication([])
+    return app
 
 
 def clock() -> Callable[[], datetime]:
@@ -164,3 +183,171 @@ def test_non_utc_clock_rejected_after_initialization() -> None:
 
     with pytest.raises(ValueError, match=r'now_utc\(\) must return timezone-aware UTC datetime values'):
         session.record_connected()
+
+
+@pytest.mark.parametrize(
+    ('serial', 'ble', 'expected_transport'),
+    [
+        (False, True, 'BLE'),
+        (True, False, 'serial'),
+        (False, False, 'Wi-Fi'),
+        (True, True, 'BLE'),
+    ],
+)
+def test_monitoring_session_lifecycle_selects_transport_without_endpoint(
+    qapplication: Any,
+    serial: bool,
+    ble: bool,
+    expected_transport: str,
+) -> None:
+    from artisanlib.main import ApplicationWindow
+
+    del qapplication
+    controller = Mock(spec=SantokerWarmupController)
+    window = SimpleNamespace(
+        santokerSerial=serial,
+        santokerBLE=ble,
+        santokerDiagnosticsSession=None,
+        santokerWarmupController=controller,
+    )
+
+    session = ApplicationWindow.startSantokerDiagnosticsSession(
+        cast(ApplicationWindow, window)
+    )
+
+    assert session.transport == expected_transport
+    assert window.santokerDiagnosticsSession is session
+    controller.attach_diagnostics.assert_called_once_with(session)
+    session.record_connection_attempt()
+    assert session.view().events[-1].description == 'transport start requested'
+
+
+def test_monitoring_session_replacement_preserves_completed_snapshot(
+    qapplication: Any,
+) -> None:
+    from artisanlib.main import ApplicationWindow
+
+    del qapplication
+    previous = SantokerDiagnosticsSession('serial')
+    previous.stop()
+    previous_snapshot = previous.view()
+    controller = Mock(spec=SantokerWarmupController)
+    window = SimpleNamespace(
+        santokerSerial=False,
+        santokerBLE=False,
+        santokerDiagnosticsSession=previous,
+        santokerWarmupController=controller,
+    )
+
+    replacement = ApplicationWindow.startSantokerDiagnosticsSession(
+        cast(ApplicationWindow, window)
+    )
+
+    assert replacement is not previous
+    assert replacement.transport == 'Wi-Fi'
+    assert previous.view() == previous_snapshot
+    controller.attach_diagnostics.assert_called_once_with(replacement)
+
+
+def test_automatic_disconnect_keeps_monitoring_session_and_desired_on(
+    qapplication: Any,
+) -> None:
+    from artisanlib.main import ApplicationWindow
+
+    del qapplication
+    device = Mock()
+    device.isHeaderReady.return_value = True
+    device.requestWarmupOn.return_value = True
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    session = SantokerDiagnosticsSession('BLE')
+    controller.attach_diagnostics(session)
+    stop_monitoring = Mock()
+    window = SimpleNamespace(
+        santokerWarmup=True,
+        santokerWarmupController=controller,
+        santokerDiagnosticsSession=session,
+        stopSantokerMonitoring=stop_monitoring,
+    )
+
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), False
+    )
+
+    stop_monitoring.assert_not_called()
+    assert window.santokerDiagnosticsSession is session
+    assert session.view().state.monitoring_active
+    assert controller.desired_enabled() is True
+    device.requestWarmupOn.assert_called_once_with(205.0)
+
+
+def test_stop_monitoring_lifecycle_orders_and_is_idempotent(qapplication: Any) -> None:
+    from artisanlib.main import ApplicationWindow
+
+    del qapplication
+    trace: list[str] = []
+    controller = Mock(spec=SantokerWarmupController)
+    controller.stop_monitoring.side_effect = lambda _device: trace.append('controller')
+    santoker = Mock()
+    santoker.stop.side_effect = lambda: trace.append('santoker')
+    session = Mock(spec=SantokerDiagnosticsSession)
+    session.stop.side_effect = lambda: trace.append('session')
+    window = SimpleNamespace(
+        santokerWarmupController=controller,
+        santoker=santoker,
+        santokerDiagnosticsSession=session,
+    )
+
+    ApplicationWindow.stopSantokerMonitoring(cast(ApplicationWindow, window))
+
+    assert trace == ['controller', 'santoker', 'session']
+    assert window.santoker is None
+    controller.stop_monitoring.assert_called_once_with(santoker)
+
+    ApplicationWindow.stopSantokerMonitoring(cast(ApplicationWindow, window))
+
+    assert trace == ['controller', 'santoker', 'session', 'controller', 'session']
+    santoker.stop.assert_called_once_with()
+
+
+def test_canvas_monitoring_lifecycle_branch_selection(qapplication: Any) -> None:
+    from artisanlib.canvas import tgraphcanvas
+    from artisanlib.main import ApplicationWindow
+
+    del qapplication
+    source = inspect.getsource(tgraphcanvas.OnMonitor)
+    helper = 'self.aw.startSantokerDiagnosticsSession()'
+    add_device = source.index('# ADD DEVICE:')
+    helper_index = source.index(helper, add_device)
+    simulator_branch = source.index('if not bool(self.aw.simulator):', add_device)
+    device_branch = source.index('elif self.device == 134:', simulator_branch)
+    attempt = source.index(
+        'santoker_diagnostics_session.record_connection_attempt()', device_branch
+    )
+    construction = source.index('self.aw.santoker = Santoker(', attempt)
+    start = source.index('self.aw.santoker.start()', construction)
+
+    assert source.count(helper) == 1
+    selection = source[source.rindex('santoker_diagnostics_session =', add_device, helper_index):simulator_branch]
+    assert 'if self.device == 134' in selection
+    assert 'else None' in selection
+    assert helper_index < simulator_branch < device_branch
+    assert device_branch < attempt < construction < start
+    assert source[attempt:construction].strip() == (
+        'santoker_diagnostics_session.record_connection_attempt()'
+    )
+    assert 'diagnostics=santoker_diagnostics_session' in source[construction:start]
+    assert 'frame_handler=self.aw.santokerFrameSignal.emit' in source[construction:start]
+    assert 'getWarmupTarget()' not in source
+
+    stop_source = inspect.getsource(tgraphcanvas.OffMonitorCloseDown)
+    assert stop_source.count('self.aw.stopSantokerMonitoring()') == 1
+    assert stop_source.index('if self.device == 134:') < stop_source.index(
+        'self.aw.stopSantokerMonitoring()'
+    )
+
+    shutdown_source = inspect.getsource(ApplicationWindow.stopActivities)
+    assert shutdown_source.count('self.stopSantokerMonitoring()') == 1
+    assert shutdown_source.index('if self.qmc.device == 134:') < shutdown_source.index(
+        'self.stopSantokerMonitoring()'
+    ) < shutdown_source.index('self.qmc.ToggleMonitor()')

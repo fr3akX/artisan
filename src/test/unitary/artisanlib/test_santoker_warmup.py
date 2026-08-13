@@ -18,7 +18,7 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QSlider
 
 from artisanlib.main import ApplicationWindow
-from artisanlib.santoker_warmup import SantokerWarmupController
+from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
 INVENTORY_SELECTION = (
@@ -857,6 +857,149 @@ def test_target_field_edit_caches_while_inactive_and_sends_while_active(
     assert device.calls == [('target', 210.0)]
 
 
+def test_pending_reconnect_keeps_desired_button_checked_and_disabled(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    device = FakeWarmupDevice(ready=True, warmup=False)
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.ready = False
+    controller.note_transport_loss()
+
+    window = compact_window(controls, controller, device)
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+
+    assert controls.button.isChecked()
+    assert not controls.button.isEnabled()
+
+
+def test_ready_false_marks_transport_loss_without_emit_or_restore(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    device = FakeWarmupDevice(ready=True, warmup=False)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+
+    window = compact_window(controls, controller, device)
+    frame_signal = Mock()
+    window.santokerFrameSignal = frame_signal
+    calls = len(device.calls)
+
+    device.ready = False
+    ApplicationWindow.santokerWarmupReadyChanged(cast(ApplicationWindow, window), False)
+    ApplicationWindow.santokerWarmupReadyChanged(cast(ApplicationWindow, window), True)
+
+    assert frame_signal.emit.call_count == 0
+    assert len(device.calls) == calls
+    assert controller.desired_enabled() is True
+
+
+def test_worker_frame_signal_triggers_frame_reconciliation_on_qt_main_thread(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    from threading import Thread, get_ident
+
+    class MainThreadWarmupDevice(FakeWarmupDevice):
+        thread_ids: list[int]
+
+        def __init__(self) -> None:
+            super().__init__(ready=True, warmup=False)
+            self.thread_ids = []
+
+        @override
+        def requestWarmupOn(self, temp_c: float) -> bool:
+            self.thread_ids.append(get_ident())
+            return super().requestWarmupOn(temp_c)
+
+        @override
+        def getReportedWarmupTarget(self) -> float | None:
+            return None
+
+    controls = SantokerWarmupControls()
+    device = MainThreadWarmupDevice()
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    controller.note_transport_loss()
+
+    window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
+    QMainWindow.__init__(window)
+    window.app = SimpleNamespace(artisanviewerMode=False)
+    window.qmc = SimpleNamespace(
+        mode_tempsliders='C', timeindex=[-1], flagon=True, flagstart=False
+    )
+    window.santokerWarmup = True
+    window.santoker = device
+    window.santokerWarmupController = controller
+    window.santokerWarmupControls = controls
+    window.pushbuttonstyles = {'OFF': 'off-style', 'ON': 'on-style'}
+    window.reportSantokerWarmupResult = Mock()
+    window.sendmessage = Mock()
+    window.santokerWarmupControlsRefreshSignal = Mock()
+    window.santokerFrameSignal.connect(
+        window.santokerFrameAccepted,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+
+    main_thread = get_ident()
+    baseline = len(device.thread_ids)
+
+    def emit_frame() -> None:
+        window.santokerFrameSignal.emit()
+
+    thread = Thread(target=emit_frame)
+    thread.start()
+    thread.join(timeout=3)
+
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+
+    assert not thread.is_alive()
+    assert len(device.thread_ids) == baseline + 1
+    assert device.thread_ids[-1] == main_thread
+
+
+def test_transport_connected_records_without_frame_signal_or_restoration() -> None:
+    from artisanlib.santoker import Santoker
+    from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
+
+    session = SantokerDiagnosticsSession('Wi-Fi')
+    frame_handler = Mock()
+    santoker = Santoker(diagnostics=session, frame_handler=frame_handler)
+
+    assert santoker._connected_handler is not None
+    santoker._connected_handler()
+
+    view = session.view()
+    assert view.state.connected
+    assert [event.description for event in view.events] == [
+        'monitoring started',
+        'connected',
+    ]
+    assert not any(event.direction == 'TX' for event in view.events)
+    frame_handler.assert_not_called()
+
+
+def test_santoker_protocol_signals_are_queued_to_gui_slots() -> None:
+    import inspect
+
+    source = inspect.getsource(ApplicationWindow.__init__)
+    signal_names = (
+        'santokerWarmupReadySignal',
+        'santokerWarmupStateSignal',
+        'santokerWarmupTargetSignal',
+        'santokerFrameSignal',
+    )
+    for signal_name in signal_names:
+        connection = source[source.index(f'self.{signal_name}.connect('):]
+        connection = connection[:connection.index(')\n')]
+        assert 'Qt.ConnectionType.QueuedConnection' in connection
+
+
 def test_worker_target_edit_queues_compact_refresh_to_gui_signal(
     qapplication: QApplication,
 ) -> None:
@@ -934,7 +1077,7 @@ def test_warmup_report_updates_compact_state_without_command(
 
     ApplicationWindow.santokerWarmupStateChanged(cast(ApplicationWindow, window), True)
 
-    assert controls.button.isChecked()
+    assert not controls.button.isChecked()
     changed.assert_not_called()
     assert device.calls == []
 
@@ -1211,9 +1354,10 @@ def test_warmup_on_and_charge_are_serialized(
     assert call_order == before_rejected_on
 
     device.warmup = True
-    ApplicationWindow.santokerWarmupStateChanged(
-        cast(ApplicationWindow, window), True
+    window.refreshSantokerWarmupControls = lambda: (
+        ApplicationWindow.refreshSantokerWarmupControls(cast(ApplicationWindow, window))
     )
+    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
 
     assert call_order == before_rejected_on + ['off']
     assert not controls.button.isChecked()
@@ -1881,11 +2025,10 @@ def test_transport_disconnect_keeps_warmup_visible_while_monitoring(
 ) -> None:
     del qapplication
     controls = SantokerWarmupControls()
-    window = compact_window(
-        controls,
-        SantokerWarmupController(desired_temp_c=205.0),
-        FakeWarmupDevice(ready=True, warmup=True),
-    )
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    device = FakeWarmupDevice(ready=True, warmup=False)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    window = compact_window(controls, controller, device)
     ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
     assert controls.button.isEnabled()
     assert controls.button.isChecked()
@@ -1896,7 +2039,7 @@ def test_transport_disconnect_keeps_warmup_visible_while_monitoring(
     assert controls.isVisible()
     assert controls.target.isEnabled()
     assert not controls.button.isEnabled()
-    assert not controls.button.isChecked()
+    assert controls.button.isChecked()
     assert controls.target.value() == 205
 
 
