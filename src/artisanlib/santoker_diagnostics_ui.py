@@ -34,10 +34,11 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
     QGridLayout,
-    QGroupBox,
+    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QTabWidget,
     QVBoxLayout,
     QMessageBox,
     QWidget,
@@ -84,6 +85,7 @@ class SantokerDiagnosticsDialog(QDialog):
         self._last_sequence = 0
         self._first_retained_sequence: int | None = None
         self._last_refresh_failed = False
+        self._initial_size_applied = False
 
         self._monitoring_value = cast(QLabel, None)
         self._transport_value = cast(QLabel, None)
@@ -125,8 +127,8 @@ class SantokerDiagnosticsDialog(QDialog):
         return self._history
 
     def _build_ui(self) -> None:
-        session_group = QGroupBox(QApplication.translate('GroupBox', 'Session and Connection'))
-        session_layout = QGridLayout(session_group)
+        session_page = QWidget()
+        session_layout = QGridLayout(session_page)
         session_layout.setColumnStretch(1, 1)
 
         self._monitoring_value = self._add_value_row(
@@ -172,8 +174,8 @@ class SantokerDiagnosticsDialog(QDialog):
             'valueLastPacket',
         )
 
-        machine_group = QGroupBox(QApplication.translate('GroupBox', 'Machine State'))
-        machine_layout = QGridLayout(machine_group)
+        machine_page = QWidget()
+        machine_layout = QGridLayout(machine_page)
         machine_layout.setColumnStretch(1, 1)
 
         self._board_value = self._add_value_row(
@@ -231,8 +233,8 @@ class SantokerDiagnosticsDialog(QDialog):
             'valueDrum',
         )
 
-        warmup_group = QGroupBox(QApplication.translate('GroupBox', 'Warm-up State'))
-        warmup_layout = QGridLayout(warmup_group)
+        warmup_page = QWidget()
+        warmup_layout = QGridLayout(warmup_page)
         warmup_layout.setColumnStretch(1, 1)
 
         self._desired_warmup_value = self._add_value_row(
@@ -280,7 +282,22 @@ class SantokerDiagnosticsDialog(QDialog):
         self._history = QPlainTextEdit()
         self._history.setReadOnly(True)
 
-        button_container = QVBoxLayout()
+        summary_tabs = QTabWidget()
+        summary_tabs.setObjectName('summaryTabs')
+        summary_tabs.addTab(
+            session_page,
+            QApplication.translate('GroupBox', 'Session and Connection'),
+        )
+        summary_tabs.addTab(
+            machine_page,
+            QApplication.translate('GroupBox', 'Machine State'),
+        )
+        summary_tabs.addTab(
+            warmup_page,
+            QApplication.translate('GroupBox', 'Warm-up State'),
+        )
+
+        button_container = QHBoxLayout()
 
         copy_button = QPushButton(QApplication.translate('Button', 'Copy All'))
         copy_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -294,14 +311,13 @@ class SantokerDiagnosticsDialog(QDialog):
         close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         close_button.clicked.connect(self.close)
 
+        button_container.addStretch(1)
         button_container.addWidget(copy_button)
         button_container.addWidget(save_button)
         button_container.addWidget(close_button)
 
         root_layout = QVBoxLayout(self)
-        root_layout.addWidget(session_group)
-        root_layout.addWidget(machine_group)
-        root_layout.addWidget(warmup_group)
+        root_layout.addWidget(summary_tabs)
         root_layout.addWidget(history_label)
         root_layout.addWidget(self._history_discarded)
         root_layout.addWidget(self._history)
@@ -359,6 +375,20 @@ class SantokerDiagnosticsDialog(QDialog):
     @override
     def showEvent(self, a0: QShowEvent | None = None) -> None:
         super().showEvent(a0)
+        if not self._initial_size_applied:
+            screen = self.screen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                width = min(
+                    max(self.sizeHint().width(), 720),
+                    max(1, available.width() - 40),
+                )
+                height = min(
+                    max(self.sizeHint().height(), 560),
+                    max(1, available.height() - 40),
+                )
+                self.resize(width, height)
+            self._initial_size_applied = True
         self.refresh()
         self._refresh_timer.start()
 

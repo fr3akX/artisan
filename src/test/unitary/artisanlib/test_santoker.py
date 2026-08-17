@@ -69,6 +69,20 @@ async def read_packet(santoker: object, packet: bytes) -> None:
     await santoker.read_msg(stream)  # type: ignore[attr-defined]
 
 
+def create_incoming_packet(
+    header: bytes,
+    target: bytes,
+    payload: bytes,
+) -> bytes:
+    from pymodbus.framer.rtu import FramerRTU
+
+    from artisanlib.santoker import Santoker
+
+    body = Santoker.CODE_HEADER + len(payload).to_bytes(1, 'big') + payload
+    crc = FramerRTU.compute_CRC(body).to_bytes(2, 'big')
+    return header + target + body + crc + Santoker.TAIL
+
+
 @pytest.fixture(scope='session', autouse=True)
 def ensure_santoker_isolation() -> Generator[None, None, None]:
     """
@@ -1090,6 +1104,66 @@ class TestSantokerWarmupProtocol:
         target_handler.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('payload', [b'\x01', b'\x00\x00\x01'])
+    async def test_accepts_one_and_three_byte_telemetry_payloads(
+        self,
+        payload: bytes,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        diagnostics = create_diagnostic_spy()
+        receiver = Santoker(diagnostics=diagnostics)
+        packet = create_incoming_packet(
+            Santoker.HEADER_WIFI,
+            Santoker.WARMUP,
+            payload,
+        )
+
+        await read_packet(receiver, packet)
+
+        assert receiver.isHeaderReady()
+        assert receiver.getWarmup() is True
+        assert diagnostics.record_rx.call_args.kwargs == {'accepted': True}
+
+    @pytest.mark.asyncio
+    async def test_initial_ble_session_accepts_two_byte_telemetry_and_adapts_control_header(
+        self,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        ready_handler = Mock()
+        diagnostics = create_diagnostic_spy()
+        receiver = Santoker(
+            connect_using_ble=True,
+            diagnostics=diagnostics,
+            ready_handler=ready_handler,
+        )
+        packet = create_incoming_packet(
+            Santoker.HEADER_WIFI,
+            Santoker.BT,
+            (2300).to_bytes(2, 'big'),
+        )
+
+        await read_packet(receiver, packet)
+
+        assert receiver.isHeaderReady()
+        assert receiver.HEADER == Santoker.HEADER_WIFI
+        assert receiver.getBT() == 230.0
+        ready_handler.assert_called_once_with(True)
+        assert diagnostics.record_rx.call_args.args[0] == packet
+        assert 'accepted frame' in diagnostics.record_rx.call_args.args[1]
+        assert diagnostics.record_rx.call_args.kwargs == {'accepted': True}
+
+        ble_client = Mock()
+        receiver._ble_client = ble_client
+        receiver.send_msg(Santoker.AIR, 50)
+
+        sent_packet = ble_client.send.call_args.args[0]
+        assert sent_packet.startswith(Santoker.HEADER_WIFI + Santoker.AIR)
+
+    @pytest.mark.asyncio
     async def test_complete_wifi_packet_sets_header_ready(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker
@@ -1145,7 +1219,7 @@ class TestSantokerWarmupProtocol:
         if corruption == 'code_header':
             packet[3] ^= 0x01
         elif corruption == 'data_length':
-            packet[5] = 0x05
+            packet[5] = 0
         elif corruption == 'crc':
             packet[-5] ^= 0x01
         elif corruption == 'tail':
@@ -1162,6 +1236,28 @@ class TestSantokerWarmupProtocol:
         assert diagnostics.record_rx.call_args.args[1] == reason
         assert diagnostics.record_rx.call_args.kwargs == {'accepted': False}
         assert frame_handler.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_oversized_telemetry_payload_is_rejected(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        diagnostics = create_diagnostic_spy()
+        receiver = Santoker(diagnostics=diagnostics)
+        packet = create_incoming_packet(
+            Santoker.HEADER_WIFI,
+            Santoker.BT,
+            b'\x00\x00\x08\xfc',
+        )
+
+        await read_packet(receiver, packet)
+
+        assert not receiver.isHeaderReady()
+        assert diagnostics.record_rx.call_args.args == (
+            packet[:6],
+            'invalid data length',
+        )
+        assert diagnostics.record_rx.call_args.kwargs == {'accepted': False}
 
     @pytest.mark.asyncio
     async def test_truncated_frame_is_recorded_as_rejected(self) -> None:

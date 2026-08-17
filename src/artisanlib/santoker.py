@@ -591,13 +591,15 @@ class Santoker(AsyncComm):
             self._record_rx(bytes(candidate), 'invalid code header', accepted=False)
             return
 
-        # read the data length
+        # Santoker telemetry payloads use one to three bytes, while commands sent
+        # by Artisan always use three bytes.
         data_len = await read_candidate(1)
-        if data_len != b'\x03':
+        data_size = int.from_bytes(data_len, 'big')
+        if not 1 <= data_size <= 3:
             self._record_rx(bytes(candidate), 'invalid data length', accepted=False)
             return
 
-        data = await read_candidate(int.from_bytes(data_len, 'big'))
+        data = await read_candidate(data_size)
 
         # read and check CRC over code header+length+data
         crc = await read_candidate(2)

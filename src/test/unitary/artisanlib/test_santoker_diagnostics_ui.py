@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QTabWidget,
     QWidget,
 )
 
@@ -256,6 +257,41 @@ def test_no_session_dialog_is_read_only(qapplication: QApplication) -> None:
         'Save as Text…',
         'Close',
     }
+
+
+def test_dialog_summary_is_compact_and_fits_available_screen(
+    qapplication: QApplication,
+) -> None:
+    parent = QWidget()
+    dialog = SantokerDiagnosticsDialog(parent, lambda: None)
+    dialog.show()
+    qapplication.processEvents()
+
+    summary_tabs = dialog.findChild(QTabWidget, 'summaryTabs')
+    assert summary_tabs is not None
+    assert [
+        summary_tabs.tabText(index) for index in range(summary_tabs.count())
+    ] == [
+        'Session and Connection',
+        'Machine State',
+        'Warm-up State',
+    ]
+
+    screen = dialog.screen()
+    assert screen is not None
+    available = screen.availableGeometry()
+    assert dialog.sizeHint().height() <= available.height()
+    assert dialog.frameGeometry().width() <= available.width()
+    assert dialog.frameGeometry().height() <= available.height()
+
+    action_buttons = {
+        button.text(): button for button in dialog.findChildren(QPushButton)
+    }
+    action_y_positions = {
+        action_buttons[text].mapTo(dialog, action_buttons[text].rect().center()).y()
+        for text in ('Copy All', 'Save as Text…', 'Close')
+    }
+    assert len(action_y_positions) == 1
 
 
 def test_button_factory_invokes_callback_once(qapplication: QApplication) -> None:
