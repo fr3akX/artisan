@@ -423,7 +423,7 @@ class SantokerDiagnosticsDialog(QDialog):
                 document.setMaximumBlockCount(session.max_events)
                 view = session.view()
                 self._load_view(view, replace=True)
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             self._last_refresh_failed = True
             _LOG.exception('failed to refresh Santoker diagnostics')
             self._history.setPlainText(QApplication.translate('Message', 'Diagnostics unavailable'))
@@ -516,7 +516,7 @@ class SantokerDiagnosticsDialog(QDialog):
             session = self._session_provider()
             self._last_refresh_failed = False
             return session
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             self._last_refresh_failed = True
             _LOG.exception('failed to retrieve Santoker diagnostics session')
             self._history.setPlainText(QApplication.translate('Message', 'Diagnostics unavailable'))
@@ -535,7 +535,7 @@ class SantokerDiagnosticsDialog(QDialog):
             if clipboard is None:
                 raise RuntimeError('No clipboard available')
             clipboard.setText(_normalize_report(report))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # pylint: disable=broad-exception-caught  # noqa: BLE001
             _LOG.exception('failed to copy Santoker diagnostics')
             self._show_warning(
                 QApplication.translate('Error Message', 'Failed to copy Santoker diagnostics'),
@@ -554,7 +554,7 @@ class SantokerDiagnosticsDialog(QDialog):
                 encoding='utf-8',
                 newline='\n',
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # pylint: disable=broad-exception-caught  # noqa: BLE001
             if isinstance(exc, OSError):
                 _LOG.exception('failed to save Santoker diagnostics as text')
             else:

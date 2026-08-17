@@ -122,7 +122,7 @@ class SantokerWarmupController:
     def _safe_record(self, callback: Callable[[], None]) -> None:
         try:
             callback()
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             _LOG.exception('SantokerWarmup diagnostics recorder failed')
 
     def _record_desired_state(self) -> None:
