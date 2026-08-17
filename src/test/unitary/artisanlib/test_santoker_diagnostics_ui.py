@@ -11,13 +11,14 @@ from unittest.mock import MagicMock, Mock
 import pytest
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QClipboard
+from PyQt6.QtGui import QAction, QClipboard
 from PyQt6.QtWidgets import (
     QApplication,
     QGroupBox,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -26,7 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from artisanlib.devices import DeviceAssignmentDlg
-from artisanlib.main import ApplicationWindow
+from artisanlib.main import ApplicationWindow, UI_MODE
 from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
 from artisanlib.santoker_diagnostics_ui import (
     SantokerDiagnosticsDialog,
@@ -310,6 +311,52 @@ def test_button_factory_invokes_callback_once(qapplication: QApplication) -> Non
     button.click()
 
     callback.assert_called_once_with()
+
+
+def test_help_debug_menu_opens_diagnostics_in_all_ui_modes(
+    qapplication: QApplication,
+) -> None:
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    QMainWindow.__init__(window)
+    window.santokerDiagnosticsSession = None
+    window.santokerDiagnosticsDialog = None
+    for name in (
+        'helpAboutAction',
+        'aboutQtAction',
+        'helpDocumentationAction',
+        'KshortCAction',
+        'checkUpdateAction',
+        'errorAction',
+        'messageAction',
+        'serialAction',
+        'platformAction',
+        'loadSettingsAction',
+        'saveAsSettingsAction',
+        'resetAction',
+    ):
+        setattr(window, name, QAction(name, window))
+    window.openRecentSettingMenu = QMenu('openRecentSettingMenu', window)
+    window.santokerDiagnosticsAction = window.createSantokerDiagnosticsAction()
+
+    for ui_mode in UI_MODE:
+        help_menu = window.create_help_menu(ui_mode)
+        debug_menu = next(
+            (action.menu() for action in help_menu.actions() if action.text() == 'Debug'),
+            None,
+        )
+
+        assert debug_menu is not None
+        assert debug_menu.actions() == [window.santokerDiagnosticsAction]
+        assert window.santokerDiagnosticsAction.isEnabled()
+
+    window.santokerDiagnosticsAction.trigger()
+    qapplication.processEvents()
+
+    assert window.santokerDiagnosticsDialog is not None
+    assert window.santokerDiagnosticsDialog.isVisible()
+
+    window.santokerDiagnosticsDialog.close()
+    qapplication.processEvents()
 
 
 def test_diagnostics_ownership_reuses_and_reopens_completed_session(

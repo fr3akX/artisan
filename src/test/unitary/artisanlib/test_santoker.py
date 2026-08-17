@@ -881,6 +881,59 @@ class TestSantokerImplementationDetails:
 #        assert safe_call_handler(None) is True
 
 
+class TestSantokerPowerProtocol:
+    def test_set_power_sends_valid_value_when_protocol_ready(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setPower(100)
+
+        send_msg.assert_called_once_with(Santoker.POWER, 100)
+
+    @pytest.mark.parametrize('value', [-1, 101])
+    def test_set_power_rejects_out_of_range_value(self, value: int) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setPower(value)
+
+        send_msg.assert_not_called()
+
+    def test_set_power_waits_for_protocol_readiness(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setPower(100)
+
+        send_msg.assert_not_called()
+
+    def test_power_report_freshness_resets_on_transport_loss(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        assert not santoker.isPowerFresh()
+
+        santoker.register_reading(Santoker.POWER, b'\x46')
+        assert santoker.isPowerFresh()
+        assert santoker.getPower() == 70
+
+        santoker.resetProtocolState()
+        assert not santoker.isPowerFresh()
+        assert santoker.getPower() == 70
+
+
 class TestSantokerWarmupProtocol:
     def test_warmup_packets_use_expected_targets_and_crc(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)

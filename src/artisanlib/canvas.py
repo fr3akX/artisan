@@ -8434,6 +8434,9 @@ class tgraphcanvas(QObject):
         # reset the warm-up lifecycle only after all unrelated reset work completed
         if reset_succeeded:
             self.aw.santokerWarmupController.reset_charge()
+            santoker_power_controller = getattr(self.aw, 'santokerPowerController', None)
+            if santoker_power_controller is not None:
+                santoker_power_controller.reset_roast()
             self.aw.updateSantokerWarmupControls()
 
         #QApplication.processEvents() # this one seems to be needed for a proper redraw in fullscreen mode on OS X if a profile was loaded and NEW is pressed
@@ -15380,6 +15383,7 @@ class tgraphcanvas(QObject):
                                 self.timeindex[6] = max(0,len(self.timex)-1)
                             else:
                                 return
+                        self.aw.markSantokerDrop()
                         if self.BTcurve or self.ETcurve:
                             temp = (self.temp2[self.timeindex[6]] if self.BTcurve else self.temp1[self.timeindex[6]])
                             if is_proper_temp(temp):

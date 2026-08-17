@@ -4401,6 +4401,7 @@ def roastserver_action_window(profile_path: Path) -> ApplicationWindow:
         'saveStatisticsMenu', 'calibrateDelayAction', 'alarmAction',
         'autosaveAction', 'batchAction', 'roastServerConfigAction',
         'roastServerRoastsAction', 'roastServerUploadAction',
+        'santokerDiagnosticsAction',
     )
     for name in action_names:
         setattr(window, name, QAction(name))
@@ -4981,7 +4982,7 @@ class TestRoastServerMainIntegration:
             ('viewer', False, True, False),
         ],
     )
-    def test_roastserver_action_states_follow_all_operating_modes(
+    def test_roastserver_and_diagnostics_actions_follow_all_operating_modes(
         self,
         tmp_path: Path,
         mode: str,
@@ -5009,6 +5010,7 @@ class TestRoastServerMainIntegration:
         assert window.roastServerConfigAction.isEnabled() is config_enabled
         assert window.roastServerRoastsAction.isEnabled() is roasts_enabled
         assert window.roastServerUploadAction.isEnabled() is upload_enabled
+        assert window.santokerDiagnosticsAction.isEnabled()
 
     def test_roastserver_actions_refresh_on_dirty_file_mode_and_load_changes(
         self, tmp_path: Path

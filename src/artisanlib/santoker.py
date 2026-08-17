@@ -149,7 +149,7 @@ class Santoker(AsyncComm):
     __slots__ = [
         'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler',
         '_warmup_handler', '_warmup_temp_handler', '_ready_handler', '_board', '_bt', '_et',
-        '_bt_ror', '_et_ror', '_ir', '_power', '_air', '_drum', '_CHARGE', '_DRY', '_FCs',
+        '_bt_ror', '_et_ror', '_ir', '_power', '_power_fresh', '_air', '_drum', '_CHARGE', '_DRY', '_FCs',
         '_SCs', '_DROP', '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
         '_desired_warmup', '_connect_using_ble', '_ble_client', '_diagnostics', '_frame_handler'
     ]
@@ -221,6 +221,7 @@ class Santoker(AsyncComm):
         self._et_ror:float = -1 # environmental temperature rate-of-rise in C°/min
         self._ir:float = -1     # IR temperature in °C
         self._power:int = -1    # heater power in % [0-100]
+        self._power_fresh:bool = False
         self._air:int = -1      # fan speed in % [0-100]
         self._drum:int = -1     # drum speed in % [0-100]
 
@@ -251,6 +252,8 @@ class Santoker(AsyncComm):
         return self._ir
     def getPower(self) -> int:
         return self._power
+    def isPowerFresh(self) -> bool:
+        return self._power_fresh
     def getAir(self) -> int:
         return self._air
     def getDrum(self) -> int:
@@ -392,6 +395,12 @@ class Santoker(AsyncComm):
         self.send_msg(self.WARMUP, 0)
         return True
 
+    def setPower(self, value: int) -> bool:
+        if not self._header_ready or not 0 <= value <= 100:
+            return False
+        self.send_msg(self.POWER, value)
+        return True
+
     def resetReadings(self) -> None:
         self._board = -1
         self._bt = -1
@@ -405,6 +414,7 @@ class Santoker(AsyncComm):
 
     def resetProtocolState(self) -> None:
         self._setHeaderReady(False)
+        self._power_fresh = False
         self._reported_warmup_target = None
         self._setWarmupState(None)
 
@@ -463,6 +473,7 @@ class Santoker(AsyncComm):
                 self._ir = ir_c
                 self._record_decoded('ir_c', ir_c)
         elif target == self.POWER:
+            self._power_fresh = True
             if value != self._power:
                 self._power = value
                 self._record_decoded('power', value)

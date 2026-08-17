@@ -5,7 +5,7 @@
 
 ## Purpose
 
-Preserve a user's Santoker warm-up intent across an automatic transport reconnect, restore that intent safely after valid machine data resumes, and add a read-only diagnostics window that captures enough decoded and wire-level evidence to investigate reconnect behavior.
+Preserve a user's Santoker warm-up intent and active-roast heater-power intent across an automatic transport reconnect, restore each intent only in its safe roast phase after valid machine data resumes, and add a read-only diagnostics window that captures enough decoded and wire-level evidence to investigate reconnect behavior.
 
 The feature addresses [fr3akX/artisan issue #6](https://github.com/fr3akX/artisan/issues/6). Static analysis of the official Santoker Roast Assistant Android app v26.7.7 indicates that it keeps desired command state across BLE loss, reconnects and re-subscribes, and then reconciles desired state with reported `0x7E`/`0x7F` state. Physical-device verification remains a follow-up; tests must not access roasting hardware.
 
@@ -17,7 +17,9 @@ The feature addresses [fr3akX/artisan issue #6](https://github.com/fr3akX/artisa
 - Keep desired warm-up state and target separate from reported machine state and target.
 - Re-send target `0x7F` and warm-up ON `0x7E = 1` after a valid post-reconnect Santoker frame establishes protocol readiness.
 - Retry reconciliation at a bounded rate while valid reports contradict desired ON.
-- Retain all existing pre-CHARGE safety behavior and prohibit restoration after CHARGE.
+- Retain all existing pre-CHARGE warm-up safety behavior and prohibit warm-up restoration after CHARGE.
+- Retain the latest valid Artisan-requested fire/heater power (`0xFA`, `0–100`) issued while recording after CHARGE and before DROP, and restore it only within that same active-roast phase following an automatic transport loss.
+- Capture active-roast power requests made during the silent-link interval before the transport reports its disconnect, because TX diagnostics record requests rather than confirmed delivery.
 - Capture connection events, protocol transitions, decoded state, and raw RX/TX frame hex automatically from monitoring start.
 - Retain a bounded history for the current monitoring session, including while the diagnostics window is closed.
 - Add a read-only Santoker Diagnostics window under **Config → Device → Santoker**.
@@ -115,6 +117,18 @@ CHARGE remains serialized with warm-up operations. On CHARGE:
 - any later reported ON causes the existing safety OFF behavior.
 
 Undoing CHARGE or RESET does not resurrect the previous ON intent. A new explicit ON request is required.
+
+## Active-roast heater-power lifecycle
+
+Use a separate Qt-independent `SantokerPowerController`; heater recovery must not weaken or overload the pre-CHARGE warm-up safety model.
+
+Every valid Artisan-requested `0xFA` value from `0` through `100` issued while Artisan is recording after CHARGE and before DROP becomes the desired heater-power intent for the current roast. The request is retained before the transport write, including requests made after RX traffic has silently stopped but before Bleak reports the disconnect. Requests made outside recording, pre-CHARGE, post-DROP, and raw out-of-range requests retain their existing generic-command behavior but are not eligible for automatic restoration.
+
+An automatic transport loss marks restoration pending only when a desired power value exists. A transport-connected callback does not send power. The first complete accepted post-reconnect Santoker frame triggers an unconditional replay of the desired `0xFA` value only when CHARGE is set and DROP is not set. The first replay does not trust `Santoker.getPower()`, because that value can still be the stale pre-loss report.
+
+After the first replay, subsequent accepted frames compare reported power with desired power. A matching report converges restoration; a contradictory or unknown report permits another request no more than once per second. There is no blind timer retry without accepted machine data.
+
+A valid post-reconnect frame before CHARGE cancels the pending power replay without sending. DROP immediately clears desired and pending power state, including across DROP undo. Successful roast RESET, monitoring stop, and the next monitoring start also clear both. A power request made while protocol readiness is already false marks delivery pending directly, covering disconnects that cannot produce another ready-true to ready-false transition. Worker-thread Santoker commands capture the monitoring generation when their event-action thread is created; a queued command from an earlier generation is discarded rather than being sent to a replacement session. Fan (`0xCA`), drum (`0xC0`), and heating-mode (`0x7B`) restoration remain out of scope; live evidence showed normal X3 power output while `0x7B` reported zero, so Artisan must not invent a `0x7B` transition.
 
 ## Diagnostics session model
 
@@ -343,7 +357,12 @@ Extend `test_santoker_warmup.py` for:
 - RESET not resurrecting ON;
 - explicit monitoring stop clearing pending ON;
 - UI showing desired ON while reconnect is pending; and
-- all worker-originated UI changes crossing queued signals.
+- all worker-originated UI changes crossing queued signals;
+- silent-link `0xFA` requests retaining only the latest valid value;
+- unconditional first active-roast power replay after a valid post-reconnect frame;
+- no power replay before CHARGE, after DROP, without transport loss, or after monitoring stop;
+- stale matching pre-loss power not suppressing the first replay; and
+- reported-power convergence and one-second retry throttling.
 
 ### Dialog tests
 
@@ -406,3 +425,10 @@ From the repository root also run `git diff --check` and the relevant pre-commit
 12. Existing raw commands, presets, profile data, and non-Santoker device behavior remain compatible.
 13. Focused and broad automated checks pass without live hardware, subject to clearly reported environment limitations.
 14. Release notes retain the caveat that official-app behavior was established by static analysis and needs physical X3 verification.
+15. The latest valid requested `0xFA` value is retained even when requested during the silent-link interval before disconnect detection.
+16. The first valid post-reconnect frame replays desired heater power only during an active roast (after CHARGE and before DROP), without trusting stale pre-loss power state.
+17. Contradictory post-reconnect power reports retry no more than once per second and matching reports converge restoration.
+18. DROP, successful roast RESET, monitoring stop, and a new monitoring session clear heater-power restoration intent; fan, drum, and `0x7B` are not restored.
+19. Power commands outside recording, pre-CHARGE, or post-DROP remain raw commands but do not become later active-roast restoration intent.
+20. An active-roast power request made while protocol readiness is already false becomes pending without requiring another readiness transition.
+21. A queued Santoker command from an earlier monitoring generation cannot execute against a replacement session.

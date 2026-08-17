@@ -233,6 +233,7 @@ from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, en
 from artisanlib.qtsingleapplication import QtSingleApplication
 from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession, TransportKind
 from artisanlib.santoker_diagnostics_ui import SantokerDiagnosticsDialog
+from artisanlib.santoker_power import POWER_TARGET, SantokerPowerController
 from artisanlib.santoker_warmup import (
     ReconcileOutcome,
     SantokerWarmupController,
@@ -1354,18 +1355,29 @@ class VMToolbar(NavigationToolbar): # pylint: disable=abstract-method
 
 class EventActionThread(QThread):
 
-    def __init__(self, aw:'ApplicationWindow', action:int, command:str, eventtype:int|None) -> None:
+    def __init__(self, aw:'ApplicationWindow', action:int, command:str, eventtype:int|None,
+            santoker_generation:int|None = None) -> None:
         super().__init__()
         self.aw:ApplicationWindow = aw
         self.action:int = action
         self.command:str = command
         self.eventtype:int|None = eventtype
+        self.santoker_generation:int = (
+            aw.santokerMonitoringGeneration
+            if santoker_generation is None
+            else santoker_generation
+        )
 
     @override
     def run(self) -> None:
         # as eventaction_internal is not running in the GUI thread we avoid doing graphic updates and run them instead after thread termination within
         # the GUI thread
-        self.aw.eventaction_internal(self.action, self.command, self.eventtype)
+        self.aw.eventaction_internal(
+            self.action,
+            self.command,
+            self.eventtype,
+            self.santoker_generation,
+        )
 
 
 #########################################################################################################
@@ -1458,6 +1470,7 @@ class ApplicationWindow(QMainWindow):
     pidToggleSignal = pyqtSignal()
     notificationsSetEnabledSignal = pyqtSignal(bool)
     santokerSendMessageSignal = pyqtSignal(bytes,int)
+    santokerSendMessageGenerationSignal = pyqtSignal(int,bytes,int)
     santokerWarmupStateSignal = pyqtSignal(object)
     santokerWarmupTargetSignal = pyqtSignal(float)
     santokerWarmupReadySignal = pyqtSignal(bool)
@@ -1883,6 +1896,7 @@ class ApplicationWindow(QMainWindow):
         self.santokerEventFlags:list[bool] = [False, False, False, False, False, False, False ] # CHARGE, DRY, FCs, FCe, SCs, SCe, DROP
         self.santoker:Santoker|None = None # holds the Santoker instance created on connect; reset to None on disconnect
         self.santokerWarmupController:SantokerWarmupController = SantokerWarmupController()
+        self.santokerPowerController:SantokerPowerController = SantokerPowerController()
         self.santokerDiagnosticsSession:SantokerDiagnosticsSession|None = None
         self.santokerDiagnosticsDialog:SantokerDiagnosticsDialog|None = None
         self.santokerMonitoringGeneration:int = 0
@@ -2827,6 +2841,8 @@ class ApplicationWindow(QMainWindow):
 
         self.KshortCAction = QAction(QApplication.translate('Menu', 'Keyboard Shortcuts'), self)
         self.KshortCAction.triggered.connect(self.viewKshortcuts)
+
+        self.santokerDiagnosticsAction = self.createSantokerDiagnosticsAction()
 
         self.checkUpdateAction = QAction(QApplication.translate('Menu', 'Check for Updates'), self)
         self.checkUpdateAction.setMenuRole(QAction.MenuRole.NoRole)
@@ -4366,6 +4382,10 @@ class ApplicationWindow(QMainWindow):
         self.pidToggleSignal.connect(self.pidToggle)
         self.notificationsSetEnabledSignal.connect(self.notificationsSetEnabled)
         self.santokerSendMessageSignal.connect(self.santokerSendMessage)
+        self.santokerSendMessageGenerationSignal.connect(
+            self.santokerSendMessageForGeneration,
+            type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
+        )
         self.santokerWarmupStateSignal.connect(
             self.santokerWarmupStateChanged,
             type=Qt.ConnectionType.QueuedConnection,  # type: ignore[call-arg]
@@ -4606,6 +4626,12 @@ class ApplicationWindow(QMainWindow):
         return view_menu
 
 
+    def createSantokerDiagnosticsAction(self) -> QAction:
+        action = QAction(
+            QApplication.translate('Menu', 'Santoker Diagnostics…'), self)
+        action.triggered.connect(self.showSantokerDiagnostics)
+        return action
+
     def create_help_menu(self, ui_mode:UI_MODE) -> QMenu:
         help_menu = QMenu(f"&{QApplication.translate('Menu', 'Help')}")
         help_menu.addAction(self.helpAboutAction)
@@ -4615,6 +4641,10 @@ class ApplicationWindow(QMainWindow):
         if ui_mode in {UI_MODE.EXPERT, UI_MODE.DEFAULT}:
             help_menu.addSeparator()
             help_menu.addAction(self.checkUpdateAction)
+        help_menu.addSeparator()
+        debug_menu = QMenu(QApplication.translate('Menu', 'Debug'), help_menu)
+        debug_menu.addAction(self.santokerDiagnosticsAction)
+        help_menu.addMenu(debug_menu)
         if ui_mode is UI_MODE.EXPERT:
             help_menu.addSeparator()
             help_menu.addAction(self.errorAction)
@@ -9431,14 +9461,16 @@ class ApplicationWindow(QMainWindow):
     # in this case the event button is not generating an event entry during recording, but a button action could receive an event value from calling its action
     # and generate a corresponding event entry via a self.qmc.eventRecordActionSignal as done by the kaleido button IO Command action
     # eventtrype is -1 if the even action should await a result to be bound to _
-    def eventaction(self, action:int, cmd:str, parallel:bool = True, eventtype:int|None = None) -> None:
+    def eventaction(self, action:int, cmd:str, parallel:bool = True, eventtype:int|None = None,
+            santoker_generation:int|None = None) -> None:
         # split on an octothorpe '#' that is not inside parentheses '()'
         cmd = re.split(r'\#(?![^\(]*\))',cmd)[0].strip()
         if action:
             if not parallel:# or action==3: # subactions of multiple event actions, may crash if run in parallel, especially if they update the UI like button shape!
-                self.eventaction_internal(action,cmd,eventtype)
+                self.eventaction_internal(action,cmd,eventtype,santoker_generation)
             else:
-                eventActionThread = EventActionThread(self, action, cmd, eventtype)
+                eventActionThread = EventActionThread(
+                    self, action, cmd, eventtype, santoker_generation)
                 eventActionThread.finished.connect(self.eventactionThreadDone_slot)
                 eventActionThread.finished.connect(eventActionThread.deleteLater)
                 try:
@@ -9467,7 +9499,9 @@ class ApplicationWindow(QMainWindow):
 
     # NOTE: this may runs in a separate EventActionThread and not in the GUI thread thus actions modifying the GUI might need to use signals to
     # ensure that they run in the GUI thread to avoid hard crashes (see pidON/pidOFF)
-    def eventaction_internal(self, action:int, cmd:str, eventtype:int|None) -> None: # pyright: ignore [reportGeneralTypeIssues] # Code is too complex to analyze; reduce complexity by refactoring into subroutines or reducing conditional code paths
+    def eventaction_internal(
+            self, action:int, cmd:str, eventtype:int|None,
+            santoker_generation:int|None = None) -> None: # pyright: ignore [reportGeneralTypeIssues] # Code is too complex to analyze; reduce complexity by refactoring into subroutines or reducing conditional code paths
         if action:
             try:
                 if self.simulator and action not in [2,3,20]:  # 2 (Call Program) 3 (Multiple Event), 20 (Artisan Command)
@@ -9566,7 +9600,12 @@ class ApplicationWindow(QMainWindow):
                         else:
                             buttonnumber = int(cs)-1
                             #if self.extraeventsactions[buttonnumber] != 3:   #avoid calling other buttons with multiple actions to avoid possible infinite loops
-                            self.recordextraevent(buttonnumber,parallel=False,updateButtons=False)
+                            self.recordextraevent(
+                                buttonnumber,
+                                parallel=False,
+                                updateButtons=False,
+                                santoker_generation=santoker_generation,
+                            )
                 elif action == 4: # MODBUS Command
                     if cmd_str:
                         cmds = filter(None, cmd_str.split(';')) # allows for sequences of commands like in "<cmd>;<cmd>;...;<cmd>"
@@ -10112,7 +10151,25 @@ class ApplicationWindow(QMainWindow):
                                             # interpret target as hex string
                                             bts = bytes.fromhex(target)
                                             if len(bts)>0:
-                                                self.santokerSendMessageSignal.emit(bts[0:1], int(round(fv)))
+                                                generation = (
+                                                    getattr(self, 'santokerMonitoringGeneration', 0)
+                                                    if santoker_generation is None
+                                                    else santoker_generation
+                                                )
+                                                generation_signal = getattr(
+                                                    self,
+                                                    'santokerSendMessageGenerationSignal',
+                                                    None,
+                                                )
+                                                if generation_signal is not None:
+                                                    generation_signal.emit(
+                                                        generation,
+                                                        bts[0:1],
+                                                        int(round(fv)),
+                                                    )
+                                                else:
+                                                    self.santokerSendMessageSignal.emit(
+                                                        bts[0:1], int(round(fv)))
 
                                 ##  kaleido(<target>,<value>) : the <target> string indicates where <value> of type string should be written to
                                 elif c.startswith('kaleido'):
@@ -12063,7 +12120,8 @@ class ApplicationWindow(QMainWindow):
     #called from user configured event buttons
     #by default actions are processed in a parallel thread, but components of multiple button actions not to avoid crashes
     # value, if given, overwrites the button value as defined in the button table
-    def recordextraevent(self, ee:int, parallel:bool = True, updateButtons:bool = True, value:int|None = None) -> None:
+    def recordextraevent(self, ee:int, parallel:bool = True, updateButtons:bool = True,
+            value:int|None = None, santoker_generation:int|None = None) -> None:
         eventtype = self.extraeventstypes[ee]
         if updateButtons and self.mark_last_button_pressed: # not if triggered from mutiplebutton actions:
             try:
@@ -12097,7 +12155,9 @@ class ApplicationWindow(QMainWindow):
 #                except Exception:  # pylint: disable=broad-except
 #                    pass
                 cmd = cmd.format(*(tuple([cmdvalue]*cmd.count('{}'))))
-                self.eventaction(self.extraeventsactions[ee],cmd,parallel=parallel)
+                self.eventaction(
+                    self.extraeventsactions[ee], cmd, parallel=parallel,
+                    santoker_generation=santoker_generation)
                 # and record the event
                 if self.qmc.flagstart:
                     # we use event handling to enable the doupdategraphics/doupdatebackground also if running in background thread
@@ -12126,7 +12186,9 @@ class ApplicationWindow(QMainWindow):
                     actionvalue = int(round(actionvalue))
                 event_record:bool = True
                 if self.extraeventsactions[ee] in {8, 9, 16, 17, 18}: # for Hottop Heater/Fan/CoolingFan action we take the event value instead of the event string as cmd action
-                    self.eventaction(self.extraeventsactions[ee],str(int(new_value)),parallel=parallel)
+                    self.eventaction(
+                        self.extraeventsactions[ee], str(int(new_value)), parallel=parallel,
+                        santoker_generation=santoker_generation)
                 else:
                     # split on an octothorpe '#' that is not inside parentheses '()'
                     cmd = re.split(r'\#(?![^\(]*\))',self.extraeventsactionstrings[ee])[0].strip()
@@ -12140,10 +12202,14 @@ class ApplicationWindow(QMainWindow):
                     except Exception: # pylint: disable=broad-except
                         pass
                     if eventtype > 4 and cmdvalue==0: # relative values for +/- actions and event value is 0
-                        self.eventaction(self.extraeventsactions[ee],cmd,parallel=parallel,eventtype=etype)
+                        self.eventaction(
+                            self.extraeventsactions[ee], cmd, parallel=parallel, eventtype=etype,
+                            santoker_generation=santoker_generation)
                         event_record = False # we prevent recording an event here, as we assume that it will be added by the eventaction once the response is received
                     else:
-                        self.eventaction(self.extraeventsactions[ee],cmd,parallel=parallel)
+                        self.eventaction(
+                            self.extraeventsactions[ee], cmd, parallel=parallel,
+                            santoker_generation=santoker_generation)
                 # remember the new value as the last value set for this event
                 self.block_quantification_sampling_ticks[etype] = self.sampling_ticks_to_block_quantifiction
                 self.extraeventsactionslastvalue[etype] = new_value
@@ -12167,9 +12233,13 @@ class ApplicationWindow(QMainWindow):
             cmd = cmd.format(*(tuple([cmdvalue]*cmd.count('{}'))))
             if cmdvalue == 0 and eventtype == 4:
                 # no event type and cmdvalue is 0 => cmd actions should await response and bind result to _
-                self.eventaction(self.extraeventsactions[ee],cmd,parallel=parallel,eventtype=-1)
+                self.eventaction(
+                    self.extraeventsactions[ee], cmd, parallel=parallel, eventtype=-1,
+                    santoker_generation=santoker_generation)
             else:
-                self.eventaction(self.extraeventsactions[ee],cmd,parallel=parallel)
+                self.eventaction(
+                    self.extraeventsactions[ee], cmd, parallel=parallel,
+                    santoker_generation=santoker_generation)
 
     @pyqtSlot()
     @pyqtSlot(bool)
@@ -19694,9 +19764,13 @@ class ApplicationWindow(QMainWindow):
 
     @pyqtSlot(bool)
     def santokerWarmupReadyChanged(self, ready:bool) -> None:
-        if bool(getattr(self, 'santokerWarmup', False)):
-            if not ready and getattr(self, 'santoker', None) is not None:
+        if not ready and getattr(self, 'santoker', None) is not None:
+            power_controller = getattr(self, 'santokerPowerController', None)
+            if power_controller is not None:
+                power_controller.note_transport_loss()
+            if bool(getattr(self, 'santokerWarmup', False)):
                 self.santokerWarmupController.note_transport_loss()
+        if bool(getattr(self, 'santokerWarmup', False)):
             ApplicationWindow.refreshSantokerWarmupControls(self)
 
     @pyqtSlot(bool)
@@ -19718,6 +19792,11 @@ class ApplicationWindow(QMainWindow):
         finally:
             ApplicationWindow.refreshSantokerWarmupControls(self)
 
+    def markSantokerDrop(self) -> None:
+        power_controller = getattr(self, 'santokerPowerController', None)
+        if power_controller is not None:
+            power_controller.mark_drop()
+
     def startSantokerDiagnosticsSession(self) -> SantokerDiagnosticsSession:
         self.santokerMonitoringGeneration = getattr(self, 'santokerMonitoringGeneration', 0) + 1
         transport:TransportKind = (
@@ -19727,6 +19806,11 @@ class ApplicationWindow(QMainWindow):
         )
         session = SantokerDiagnosticsSession(transport)
         self.santokerDiagnosticsSession = session
+        power_controller = getattr(self, 'santokerPowerController', None)
+        if power_controller is None:
+            power_controller = SantokerPowerController()
+            self.santokerPowerController = power_controller
+        power_controller.start_monitoring()
         self.santokerWarmupController.attach_diagnostics(session)
         return session
 
@@ -19745,11 +19829,24 @@ class ApplicationWindow(QMainWindow):
     def stopSantokerMonitoring(self) -> None:
         self.santokerMonitoringGeneration = getattr(self, 'santokerMonitoringGeneration', 0) + 1
         self.santokerWarmupController.stop_monitoring(self.santoker)
+        power_controller = getattr(self, 'santokerPowerController', None)
+        if power_controller is not None:
+            power_controller.stop_monitoring()
         if self.santoker is not None:
             self.santoker.stop()
             self.santoker = None
         if self.santokerDiagnosticsSession is not None:
             self.santokerDiagnosticsSession.stop()
+
+    @pyqtSlot(int, bytes, int)
+    def santokerSendMessageForGeneration(
+        self,
+        generation:int,
+        target:bytes,
+        value:int,
+    ) -> None:
+        if generation == self.santokerMonitoringGeneration:
+            ApplicationWindow.santokerSendMessage(self, target, value)
 
     @pyqtSlot(int, object)
     def santokerCallbackForGeneration(
@@ -19805,6 +19902,19 @@ class ApplicationWindow(QMainWindow):
             self.qmc.timeindex[0],
             self.santoker,
         )
+        power_controller = getattr(self, 'santokerPowerController', None)
+        if power_controller is not None:
+            drop_index = self.qmc.timeindex[6] if len(self.qmc.timeindex) > 6 else 0
+            charge_index = (
+                self.qmc.timeindex[0]
+                if bool(getattr(self.qmc, 'flagstart', False))
+                else -1
+            )
+            power_controller.reconcile_after_frame(
+                charge_index,
+                drop_index,
+                self.santoker,
+            )
         self.refreshSantokerWarmupControls()
         if outcome is ReconcileOutcome.FORCED_OFF:
             self.sendmessage(QApplication.translate(
@@ -19867,6 +19977,17 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot(bytes,int)
     def santokerSendMessage(self, target:bytes, value:int) -> None:
         if self.santoker is not None:
+            power_controller = getattr(self, 'santokerPowerController', None)
+            if power_controller is not None and target == POWER_TARGET:
+                drop_index = self.qmc.timeindex[6] if len(self.qmc.timeindex) > 6 else 0
+                active_roast = (
+                    bool(getattr(self.qmc, 'flagstart', False))
+                    and self.qmc.timeindex[0] > -1
+                    and drop_index == 0
+                )
+                power_controller.note_power_request(value, active_roast=active_roast)
+                if active_roast and not self.santoker.isHeaderReady():
+                    power_controller.note_transport_loss()
             self.santoker.send_msg(target,value)
 
 
