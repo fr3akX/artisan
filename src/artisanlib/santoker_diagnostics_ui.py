@@ -114,6 +114,7 @@ class SantokerDiagnosticsDialog(QDialog):
 
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setModal(False)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
         self.setWindowTitle(QApplication.translate('Form Caption', 'Santoker Diagnostics'))
 
         self._refresh_timer = QTimer(self)

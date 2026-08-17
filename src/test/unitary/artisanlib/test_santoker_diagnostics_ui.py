@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QClipboard
 from PyQt6.QtWidgets import (
     QApplication,
@@ -257,6 +258,14 @@ def test_no_session_dialog_is_read_only(qapplication: QApplication) -> None:
         'Save as Text…',
         'Close',
     }
+
+
+def test_dialog_is_minimizable(qapplication: QApplication) -> None:
+    _ = qapplication
+    parent = QWidget()
+    dialog = SantokerDiagnosticsDialog(parent, lambda: None)
+
+    assert dialog.windowFlags() & Qt.WindowType.WindowMinimizeButtonHint
 
 
 def test_dialog_summary_is_compact_and_fits_available_screen(
