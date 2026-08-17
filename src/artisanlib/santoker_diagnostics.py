@@ -160,7 +160,7 @@ class SantokerDiagnosticsSession:
         now_utc: Callable[[], datetime] = utc_now,
         max_events: int = 5000,
     ) -> None:
-        if not isinstance(max_events, int) or isinstance(max_events, bool):
+        if type(max_events) is not int:
             raise ValueError('max_events must be an actual integer')
         if not 1 <= max_events <= 5000:
             raise ValueError('max_events must be between 1 and 5000')
