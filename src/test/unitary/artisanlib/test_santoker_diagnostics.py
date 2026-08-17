@@ -101,6 +101,57 @@ def test_record_decoded_power_updates_state_and_emits_one_transition_per_change(
     assert [event.description for event in power_events] == ['power: 40', 'power: 50']
 
 
+@pytest.mark.parametrize(
+    'state_name',
+    ['CONVERGED', 'BLOCKED_BY_CHARGE'],
+)
+def test_restoration_records_only_transitions_without_duplicate_label(
+    state_name: str,
+) -> None:
+    from artisanlib.santoker_diagnostics import RestorationState
+
+    state = RestorationState[state_name]
+    session = SantokerDiagnosticsSession('BLE')
+
+    session.record_restoration(state, state.value)
+    session.record_restoration(state, state.value)
+
+    restoration_events = [
+        event for event in session.view().events if event.category == 'restoration'
+    ]
+    assert [event.description for event in restoration_events] == [state.value]
+
+
+def test_repeated_restoration_attempts_remain_visible() -> None:
+    from artisanlib.santoker_diagnostics import RestorationState
+
+    session = SantokerDiagnosticsSession('BLE', now_utc=clock())
+
+    session.record_restoration(
+        RestorationState.PENDING,
+        RestorationState.PENDING.value,
+        attempted=True,
+    )
+    first_attempt = session.view().state.last_restoration_attempt_utc
+    session.record_restoration(
+        RestorationState.PENDING,
+        RestorationState.PENDING.value,
+        attempted=True,
+    )
+
+    restoration_events = [
+        event for event in session.view().events if event.category == 'restoration'
+    ]
+    assert [event.description for event in restoration_events] == [
+        RestorationState.PENDING.value,
+        RestorationState.PENDING.value,
+    ]
+    last_attempt = session.view().state.last_restoration_attempt_utc
+    assert first_attempt is not None
+    assert last_attempt is not None
+    assert last_attempt > first_attempt
+
+
 def test_record_event_is_thread_safe() -> None:
     session = SantokerDiagnosticsSession('serial')
     exceptions: list[BaseException] = []

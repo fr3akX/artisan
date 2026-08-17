@@ -538,14 +538,22 @@ class SantokerDiagnosticsSession:
         with self._lock:
             if not self._monitoring_active:
                 return
+            previous_state = self._restoration_state
             self._restoration_state = state
             if attempted:
                 self._last_restoration_attempt_utc = self._utc_now()
+            elif previous_state is state:
+                return
 
+            event_description = (
+                state.value
+                if description == state.value
+                else f'{state.value}: {description}'
+            )
             self._append_event(
                 category='restoration',
                 direction=None,
-                description=f'{state.value}: {description}',
+                description=event_description,
                 packet=None,
             )
 
