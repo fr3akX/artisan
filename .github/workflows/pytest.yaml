@@ -17,12 +17,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: prefix-13
-            prefix-size: 13
-          - label: prefix-14
-            prefix-size: 14
-          - label: prefix-15
-            prefix-size: 15
+          - label: partner-01
+            partner-index: 1
+          - label: partner-02
+            partner-index: 2
+          - label: partner-03
+            partner-index: 3
+          - label: partner-04
+            partner-index: 4
+          - label: partner-05
+            partner-index: 5
+          - label: partner-06
+            partner-index: 6
+          - label: partner-07
+            partner-index: 7
+          - label: partner-08
+            partner-index: 8
+          - label: partner-09
+            partner-index: 9
+          - label: partner-10
+            partner-index: 10
+          - label: partner-11
+            partner-index: 11
+          - label: partner-12
+            partner-index: 12
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
@@ -72,8 +90,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade -r src/requirements-dev.txt
           pip install -r src/requirements.txt
-      - name: Collect test module prefix
+      - name: Collect test module pair
         working-directory: src
         run: |
-          files=$(find test/unitary/artisanlib/roastserver -maxdepth 1 -name 'test_*.py' | sort | head -n ${{ matrix.prefix-size }})
-          pytest --collect-only -q $files
+          partner=$(find test/unitary/artisanlib/roastserver -maxdepth 1 -name 'test_*.py' | sort | sed -n '${{ matrix.partner-index }}p')
+          pytest --collect-only -q "$partner" test/unitary/artisanlib/roastserver/test_outbox.py
