@@ -12,23 +12,7 @@ jobs:
   pytest:
     runs-on: macos-latest # on ubunut the Qt libs are missing: ImportError: libEGL.so.1: cannot open shared object file: No such file or directory
     timeout-minutes: 5
-    name: runner / pytest / ${{ matrix.label }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: pytest-outbox
-            probe: pytest
-          - label: runpy-normal
-            probe: runpy-normal
-          - label: runpy-forced-exit
-            probe: runpy-forced-exit
-          - label: production-normal
-            probe: production-normal
-          - label: production-forced-exit
-            probe: production-forced-exit
-          - label: stdlib-normal
-            probe: stdlib-normal
+    name: runner / pytest
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
@@ -78,26 +62,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade -r src/requirements-dev.txt
           pip install -r src/requirements.txt
-      - name: Probe outbox collection lifecycle
+      - name: Probe outbox collection stack
         working-directory: src
         run: |
-          case '${{ matrix.probe }}' in
-            pytest)
-              pytest --collect-only -q test/unitary/artisanlib/roastserver/test_outbox.py
-              ;;
-            runpy-normal)
-              python -c "import runpy; runpy.run_path('test/unitary/artisanlib/roastserver/test_outbox.py'); print('runpy complete', flush=True)"
-              ;;
-            runpy-forced-exit)
-              python -c "import os, runpy; runpy.run_path('test/unitary/artisanlib/roastserver/test_outbox.py'); print('runpy complete', flush=True); os._exit(0)"
-              ;;
-            production-normal)
-              python -c "import artisanlib.roastserver.outbox; print('production import complete', flush=True)"
-              ;;
-            production-forced-exit)
-              python -c "import os, artisanlib.roastserver.outbox; print('production import complete', flush=True); os._exit(0)"
-              ;;
-            stdlib-normal)
-              python -c "import concurrent.futures, ctypes, sqlite3; print('stdlib imports complete', flush=True)"
-              ;;
-          esac
+          cat > pytest_collection_guard.py <<'PY'
+          import faulthandler
+          import signal
+
+
+          def _raise_timeout(_signum, _frame):
+              raise TimeoutError('pytest collection exceeded 60 seconds')
+
+
+          def pytest_sessionstart(session):
+              del session
+              faulthandler.dump_traceback_later(30, repeat=True)
+              signal.signal(signal.SIGALRM, _raise_timeout)
+              signal.alarm(60)
+
+
+          def pytest_collection_finish(session):
+              del session
+              signal.alarm(0)
+              faulthandler.cancel_dump_traceback_later()
+          PY
+          python -m pytest -p pytest_collection_guard --collect-only -q test/unitary/artisanlib/roastserver/test_outbox.py
