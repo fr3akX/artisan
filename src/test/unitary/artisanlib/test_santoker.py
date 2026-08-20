@@ -918,6 +918,34 @@ class TestSantokerPowerProtocol:
 
         send_msg.assert_not_called()
 
+    def test_valid_control_setters_require_later_reports_for_freshness(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+        santoker.register_reading(Santoker.POWER, b'\x46')
+        santoker.register_reading(Santoker.AIR, b'\x50')
+        santoker.register_reading(Santoker.DRUM, b'\x1e')
+
+        with patch.object(Santoker, 'send_msg'):
+            assert santoker.setPower(70)
+            assert not santoker.isPowerFresh()
+            assert santoker.isAirFresh()
+            assert santoker.isDrumFresh()
+
+            santoker.register_reading(Santoker.POWER, b'\x46')
+            assert santoker.setAir(80)
+            assert santoker.isPowerFresh()
+            assert not santoker.isAirFresh()
+            assert santoker.isDrumFresh()
+
+            santoker.register_reading(Santoker.AIR, b'\x50')
+            assert santoker.setDrum(30)
+            assert santoker.isPowerFresh()
+            assert santoker.isAirFresh()
+            assert not santoker.isDrumFresh()
+
     def test_power_report_freshness_resets_on_transport_loss(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker

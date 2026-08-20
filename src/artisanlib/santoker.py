@@ -405,18 +405,21 @@ class Santoker(AsyncComm):
     def setPower(self, value: int) -> bool:
         if not self._header_ready or not 0 <= value <= 100:
             return False
+        self._power_fresh = False
         self.send_msg(self.POWER, value)
         return True
 
     def setAir(self, value: int) -> bool:
         if not self._header_ready or not 0 <= value <= 100:
             return False
+        self._air_fresh = False
         self.send_msg(self.AIR, value)
         return True
 
     def setDrum(self, value: int) -> bool:
         if not self._header_ready or not 0 <= value <= 100:
             return False
+        self._drum_fresh = False
         self.send_msg(self.DRUM, value)
         return True
 

@@ -21,6 +21,7 @@ class FakeControlDevice:
     air_fresh: bool = True
     drum_fresh: bool = True
     writes_succeed: bool = True
+    attempts: list[tuple[bytes, int]] = field(default_factory=list)
     calls: list[tuple[bytes, int]] = field(default_factory=list)
 
     def isHeaderReady(self) -> bool:
@@ -54,9 +55,16 @@ class FakeControlDevice:
         return self._write(DRUM, value)
 
     def _write(self, target: bytes, value: int) -> bool:
+        self.attempts.append((target, value))
         if not self.ready or not 0 <= value <= 100 or not self.writes_succeed:
             return False
         self.calls.append((target, value))
+        if target == POWER:
+            self.power_fresh = False
+        elif target == AIR:
+            self.air_fresh = False
+        else:
+            self.drum_fresh = False
         return True
 
     def lose_control_freshness(self) -> None:
@@ -139,6 +147,36 @@ def test_command_during_rx_silence_replaces_pending_target() -> None:
         is ControlReconcileOutcome.ATTEMPTED
     )
     assert device.calls == [(DRUM, 45), (AIR, 80)]
+
+
+def test_mechanical_confirmation_must_follow_its_restoration_write() -> None:
+    device = FakeControlDevice()
+    controller = SantokerControlController()
+    controller.mark_charge(device)
+    controller.note_transport_loss(active_roast=True, device=device)
+
+    assert device.isDrumFresh()
+    assert device.isAirFresh()
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.ATTEMPTED
+    )
+    assert not device.isDrumFresh()
+    assert not device.isAirFresh()
+
+    device.air_fresh = True
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.THROTTLED
+    )
+    assert device.calls == [(DRUM, 30), (AIR, 80)]
+
+    device.drum_fresh = True
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.ATTEMPTED
+    )
+    assert device.calls[-1] == (POWER, 70)
 
 
 def test_known_heater_target_waits_for_every_known_mechanical_target() -> None:
@@ -238,6 +276,39 @@ def test_recovery_converges_only_after_fresh_matching_reports() -> None:
         is ControlReconcileOutcome.CONVERGED
     )
     assert not controller.restoration_pending()
+
+
+def test_failed_writes_are_throttled_for_one_second() -> None:
+    now = [10.0]
+    device = FakeControlDevice(writes_succeed=False)
+    controller = SantokerControlController(monotonic_clock=lambda: now[0])
+    controller.mark_charge(device)
+    controller.note_transport_loss(active_roast=True, device=device)
+
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.WAITING
+    )
+    assert device.attempts == [(DRUM, 30), (AIR, 80)]
+
+    now[0] = 10.5
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.THROTTLED
+    )
+    assert device.attempts == [(DRUM, 30), (AIR, 80)]
+
+    now[0] = 11.0
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.WAITING
+    )
+    assert device.attempts == [
+        (DRUM, 30),
+        (AIR, 80),
+        (DRUM, 30),
+        (AIR, 80),
+    ]
 
 
 def test_recovery_waits_for_protocol_readiness_and_failed_writes() -> None:

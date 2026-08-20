@@ -82,6 +82,9 @@ class SantokerControlController:
     _intended: dict[bytes, int] = field(default_factory=dict, init=False, repr=False)
     _pending: set[bytes] = field(default_factory=set, init=False, repr=False)
     _attempted: set[bytes] = field(default_factory=set, init=False, repr=False)
+    _last_attempt_targets: set[bytes] = field(
+        default_factory=set, init=False, repr=False
+    )
     _transport_lost: bool = field(default=False, init=False, repr=False)
     _last_attempt_monotonic: float | None = field(
         default=None, init=False, repr=False, compare=False
@@ -126,6 +129,7 @@ class SantokerControlController:
                 self._fill_missing_controls(device)
             self._pending = set(self._intended)
             self._attempted.clear()
+            self._last_attempt_targets.clear()
             self._transport_lost = True
             self._last_attempt_monotonic = None
 
@@ -172,7 +176,12 @@ class SantokerControlController:
                 return ControlReconcileOutcome.CONVERGED
 
             eligible = self._eligible_targets()
-            unattempted = [target for target in eligible if target not in self._attempted]
+            unattempted = [
+                target
+                for target in eligible
+                if target not in self._attempted
+                and target not in self._last_attempt_targets
+            ]
             if unattempted:
                 return self._attempt_targets(device, unattempted)
 
@@ -224,10 +233,11 @@ class SantokerControlController:
             if self._set_value(device, target, self._intended[target]):
                 self._attempted.add(target)
                 attempted = True
+        self._last_attempt_targets = set(targets)
+        self._last_attempt_monotonic = (
+            self.monotonic_clock() if now is None else now
+        )
         if attempted:
-            self._last_attempt_monotonic = (
-                self.monotonic_clock() if now is None else now
-            )
             return ControlReconcileOutcome.ATTEMPTED
         return ControlReconcileOutcome.WAITING
 
@@ -267,6 +277,7 @@ class SantokerControlController:
     def _cancel_recovery(self) -> None:
         self._pending.clear()
         self._attempted.clear()
+        self._last_attempt_targets.clear()
         self._transport_lost = False
         self._last_attempt_monotonic = None
 
