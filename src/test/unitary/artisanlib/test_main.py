@@ -5513,8 +5513,8 @@ class TestRoastServerMainIntegration:
     ) -> None:
         window = self.inventory_title_window(current_title)
         with patch.object(main_module.datetime, 'datetime') as datetime_class, patch.object(
-            main_module.QMessageBox, 'question'
-        ) as question:
+            main_module, 'QMessageBox'
+        ) as message_box:
             datetime_class.now.return_value.astimezone.return_value.strftime.return_value = (
                 '2026-08-20 14:37'
             )
@@ -5522,13 +5522,16 @@ class TestRoastServerMainIntegration:
             window.updateRoastNameFromInventoryAtCharge()
 
         assert window.qmc.title == 'Historical lot – 2026-08-20 14:37'
-        question.assert_not_called()
+        message_box.assert_not_called()
 
     @pytest.mark.parametrize(
         ('reply', 'expected'),
         [
-            (main_module.QMessageBox.StandardButton.Yes, 'Historical lot – 2026-08-20 14:37'),
-            (main_module.QMessageBox.StandardButton.No, 'Existing roast'),
+            (
+                main_module.QMessageBox.StandardButton.Yes,
+                '<b>Historical lot</b> – 2026-08-20 14:37',
+            ),
+            (main_module.QMessageBox.StandardButton.No, '<i>Existing roast</i>'),
         ],
         ids=['replace', 'preserve'],
     )
@@ -5537,10 +5540,15 @@ class TestRoastServerMainIntegration:
         reply: main_module.QMessageBox.StandardButton,
         expected: str,
     ) -> None:
-        window = self.inventory_title_window('Existing roast')
+        window = self.inventory_title_window(
+            '<i>Existing roast</i>', '<b>Historical lot</b>')
+        message = MagicMock()
+        message.exec.return_value = reply
+        standard_button = main_module.QMessageBox.StandardButton
         with patch.object(main_module.datetime, 'datetime') as datetime_class, patch.object(
-            main_module.QMessageBox, 'question', return_value=reply
-        ) as question:
+            main_module, 'QMessageBox', return_value=message
+        ) as message_box:
+            message_box.StandardButton = standard_button
             datetime_class.now.return_value.astimezone.return_value.strftime.return_value = (
                 '2026-08-20 14:37'
             )
@@ -5548,22 +5556,27 @@ class TestRoastServerMainIntegration:
             window.updateRoastNameFromInventoryAtCharge()
 
         assert window.qmc.title == expected
-        question.assert_called_once()
-        assert question.call_args.args[1] == 'Change'
-        assert 'Existing roast' in question.call_args.args[2]
-        assert 'Historical lot – 2026-08-20 14:37' in question.call_args.args[2]
-        assert question.call_args.args[4] == main_module.QMessageBox.StandardButton.No
+        message_box.assert_called_once_with(window)
+        message.setWindowTitle.assert_called_once_with('Change')
+        message.setTextFormat.assert_called_once_with(Qt.TextFormat.PlainText)
+        text = message.setText.call_args.args[0]
+        assert '<i>Existing roast</i>' in text
+        assert '<b>Historical lot</b> – 2026-08-20 14:37' in text
+        message.setStandardButtons.assert_called_once_with(
+            standard_button.Yes | standard_button.No)
+        message.setDefaultButton.assert_called_once_with(standard_button.No)
+        message.exec.assert_called_once_with()
 
     def test_inventory_charge_title_ignores_missing_inventory_name(self) -> None:
         window = self.inventory_title_window('Existing roast', None)
         with patch.object(main_module.datetime, 'datetime') as datetime_class, patch.object(
-            main_module.QMessageBox, 'question'
-        ) as question:
+            main_module, 'QMessageBox'
+        ) as message_box:
             window.updateRoastNameFromInventoryAtCharge()
 
         assert window.qmc.title == 'Existing roast'
         datetime_class.now.assert_not_called()
-        question.assert_not_called()
+        message_box.assert_not_called()
 
     def test_inventory_charge_prepare_builds_link_and_passes_profile_values(
         self,

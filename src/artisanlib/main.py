@@ -4928,14 +4928,14 @@ class ApplicationWindow(QMainWindow):
         default_title = QApplication.translate('Scope Title', 'Roaster Scope')
         if self.qmc.title not in {'', default_title}:
             name_label = QApplication.translate('Label', 'Name')
-            reply = QMessageBox.question(
-                self,
-                QApplication.translate('Label', 'Change'),
-                f'{name_label}:\n\n{self.qmc.title} → {candidate}',
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+            message = QMessageBox(self)
+            message.setWindowTitle(QApplication.translate('Label', 'Change'))
+            message.setTextFormat(Qt.TextFormat.PlainText)
+            message.setText(f'{name_label}:\n\n{self.qmc.title} → {candidate}')
+            message.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            message.setDefaultButton(QMessageBox.StandardButton.No)
+            if message.exec() != QMessageBox.StandardButton.Yes:
                 return
         self.qmc.title = candidate
 
