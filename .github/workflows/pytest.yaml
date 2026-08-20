@@ -17,30 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: partner-01
-            partner-index: 1
-          - label: partner-02
-            partner-index: 2
-          - label: partner-03
-            partner-index: 3
-          - label: partner-04
-            partner-index: 4
-          - label: partner-05
-            partner-index: 5
-          - label: partner-06
-            partner-index: 6
-          - label: partner-07
-            partner-index: 7
-          - label: partner-08
-            partner-index: 8
-          - label: partner-09
-            partner-index: 9
-          - label: partner-10
-            partner-index: 10
-          - label: partner-11
-            partner-index: 11
-          - label: partner-12
-            partner-index: 12
+          - label: pytest-outbox
+            probe: pytest
+          - label: runpy-normal
+            probe: runpy-normal
+          - label: runpy-forced-exit
+            probe: runpy-forced-exit
+          - label: production-normal
+            probe: production-normal
+          - label: production-forced-exit
+            probe: production-forced-exit
+          - label: stdlib-normal
+            probe: stdlib-normal
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
@@ -90,8 +78,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade -r src/requirements-dev.txt
           pip install -r src/requirements.txt
-      - name: Collect test module pair
+      - name: Probe outbox collection lifecycle
         working-directory: src
         run: |
-          partner=$(find test/unitary/artisanlib/roastserver -maxdepth 1 -name 'test_*.py' | sort | sed -n '${{ matrix.partner-index }}p')
-          pytest --collect-only -q "$partner" test/unitary/artisanlib/roastserver/test_outbox.py
+          case '${{ matrix.probe }}' in
+            pytest)
+              pytest --collect-only -q test/unitary/artisanlib/roastserver/test_outbox.py
+              ;;
+            runpy-normal)
+              python -c "import runpy; runpy.run_path('test/unitary/artisanlib/roastserver/test_outbox.py'); print('runpy complete', flush=True)"
+              ;;
+            runpy-forced-exit)
+              python -c "import os, runpy; runpy.run_path('test/unitary/artisanlib/roastserver/test_outbox.py'); print('runpy complete', flush=True); os._exit(0)"
+              ;;
+            production-normal)
+              python -c "import artisanlib.roastserver.outbox; print('production import complete', flush=True)"
+              ;;
+            production-forced-exit)
+              python -c "import os, artisanlib.roastserver.outbox; print('production import complete', flush=True); os._exit(0)"
+              ;;
+            stdlib-normal)
+              python -c "import concurrent.futures, ctypes, sqlite3; print('stdlib imports complete', flush=True)"
+              ;;
+          esac
