@@ -149,7 +149,8 @@ class Santoker(AsyncComm):
     __slots__ = [
         'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler',
         '_warmup_handler', '_warmup_temp_handler', '_ready_handler', '_board', '_bt', '_et',
-        '_bt_ror', '_et_ror', '_ir', '_power', '_power_fresh', '_air', '_drum', '_CHARGE', '_DRY', '_FCs',
+        '_bt_ror', '_et_ror', '_ir', '_power', '_power_fresh', '_air', '_air_fresh', '_drum',
+        '_drum_fresh', '_CHARGE', '_DRY', '_FCs',
         '_SCs', '_DROP', '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
         '_desired_warmup', '_connect_using_ble', '_ble_client', '_diagnostics', '_frame_handler'
     ]
@@ -223,7 +224,9 @@ class Santoker(AsyncComm):
         self._power:int = -1    # heater power in % [0-100]
         self._power_fresh:bool = False
         self._air:int = -1      # fan speed in % [0-100]
+        self._air_fresh:bool = False
         self._drum:int = -1     # drum speed in % [0-100]
+        self._drum_fresh:bool = False
 
         # current roast state
         self._CHARGE:bool = False
@@ -256,8 +259,12 @@ class Santoker(AsyncComm):
         return self._power_fresh
     def getAir(self) -> int:
         return self._air
+    def isAirFresh(self) -> bool:
+        return self._air_fresh
     def getDrum(self) -> int:
         return self._drum
+    def isDrumFresh(self) -> bool:
+        return self._drum_fresh
     def isHeaderReady(self) -> bool:
         return self._header_ready
     def getWarmup(self) -> bool | None:
@@ -401,6 +408,18 @@ class Santoker(AsyncComm):
         self.send_msg(self.POWER, value)
         return True
 
+    def setAir(self, value: int) -> bool:
+        if not self._header_ready or not 0 <= value <= 100:
+            return False
+        self.send_msg(self.AIR, value)
+        return True
+
+    def setDrum(self, value: int) -> bool:
+        if not self._header_ready or not 0 <= value <= 100:
+            return False
+        self.send_msg(self.DRUM, value)
+        return True
+
     def resetReadings(self) -> None:
         self._board = -1
         self._bt = -1
@@ -415,6 +434,8 @@ class Santoker(AsyncComm):
     def resetProtocolState(self) -> None:
         self._setHeaderReady(False)
         self._power_fresh = False
+        self._air_fresh = False
+        self._drum_fresh = False
         self._reported_warmup_target = None
         self._setWarmupState(None)
 
@@ -478,10 +499,12 @@ class Santoker(AsyncComm):
                 self._power = value
                 self._record_decoded('power', value)
         elif target == self.AIR:
+            self._air_fresh = True
             if value != self._air:
                 self._air = value
                 self._record_decoded('fan', value)
         elif target == self.DRUM:
+            self._drum_fresh = True
             if value != self._drum:
                 self._drum = value
                 self._record_decoded('drum', value)

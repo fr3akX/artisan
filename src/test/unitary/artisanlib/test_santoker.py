@@ -933,6 +933,75 @@ class TestSantokerPowerProtocol:
         assert not santoker.isPowerFresh()
         assert santoker.getPower() == 70
 
+    def test_control_freshness_is_tracked_independently(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker.resetProtocolState()
+        assert not santoker.isPowerFresh()
+        assert not santoker.isAirFresh()
+        assert not santoker.isDrumFresh()
+
+        santoker.register_reading(Santoker.POWER, b'\x46')
+        assert santoker.isPowerFresh()
+        assert not santoker.isAirFresh()
+        assert not santoker.isDrumFresh()
+
+        santoker.resetProtocolState()
+        santoker.register_reading(Santoker.AIR, b'\x50')
+        assert not santoker.isPowerFresh()
+        assert santoker.isAirFresh()
+        assert not santoker.isDrumFresh()
+
+        santoker.resetProtocolState()
+        santoker.register_reading(Santoker.DRUM, b'\x1e')
+        assert not santoker.isPowerFresh()
+        assert not santoker.isAirFresh()
+        assert santoker.isDrumFresh()
+
+    def test_control_setters_send_fan_and_drum_when_protocol_ready(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setAir(80)
+            assert santoker.setDrum(30)
+
+        assert send_msg.call_args_list == [
+            call(Santoker.AIR, 80),
+            call(Santoker.DRUM, 30),
+        ]
+
+    @pytest.mark.parametrize('value', [-1, 101])
+    def test_control_setters_reject_out_of_range_values(self, value: int) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setAir(value)
+            assert not santoker.setDrum(value)
+
+        send_msg.assert_not_called()
+
+    def test_control_setters_wait_for_protocol_readiness(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setAir(80)
+            assert not santoker.setDrum(30)
+
+        send_msg.assert_not_called()
+
 
 class TestSantokerWarmupProtocol:
     def test_warmup_packets_use_expected_targets_and_crc(self) -> None:
