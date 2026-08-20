@@ -2827,7 +2827,10 @@ def test_online_download_failures_and_ui_discard_consume_every_stage(
     _online_id, request = worker_harness.open_online()
     before = len(worker_harness.cache.discard_calls)
     worker_harness.bus.discard_worker.emit(str(request.staged_path))
-    worker_harness.wait_until(lambda: len(worker_harness.cache.discard_calls) > before)
+    worker_harness.wait_until(
+        lambda: len(worker_harness.cache.discard_calls) > before
+        and not request.staged_path.exists()
+    )
     assert not request.staged_path.exists()
     assert worker_harness.cache.discard_calls[-1][1] == worker_harness.worker_thread_id
 
