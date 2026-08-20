@@ -17,18 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: prefix-03
-            prefix-size: 3
-          - label: prefix-06
-            prefix-size: 6
-          - label: prefix-09
-            prefix-size: 9
-          - label: prefix-12
-            prefix-size: 12
+          - label: prefix-13
+            prefix-size: 13
+          - label: prefix-14
+            prefix-size: 14
           - label: prefix-15
             prefix-size: 15
-          - label: prefix-18
-            prefix-size: 18
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
