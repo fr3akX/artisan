@@ -86,6 +86,7 @@ def test_report_uses_unknown_and_excludes_connection_identity() -> None:
 
 def test_operating_mode_decoded_values_update_state_and_events() -> None:
     session = SantokerDiagnosticsSession('Wi-Fi')
+    session.record_connected()
 
     session.record_decoded('machine_on', 1)
     session.record_decoded('heating_on', 0)
@@ -96,6 +97,13 @@ def test_operating_mode_decoded_values_update_state_and_events() -> None:
     assert view.state.heating_on == 0
     assert 'machine_on: 1' in descriptions
     assert 'heating_on: 0' in descriptions
+
+    session.record_disconnected()
+
+    disconnected = session.view()
+    assert not disconnected.state.connected
+    assert disconnected.state.machine_on is None
+    assert disconnected.state.heating_on is None
 
 
 def test_record_decoded_power_updates_state_and_emits_one_transition_per_change() -> None:

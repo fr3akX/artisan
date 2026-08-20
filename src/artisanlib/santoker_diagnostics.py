@@ -402,6 +402,8 @@ class SantokerDiagnosticsSession:
             self._power = None
             self._fan = None
             self._drum = None
+            self._machine_on = None
+            self._heating_on = None
 
             self._decoded_values = {}
             self._was_disconnected = self._ever_connected
