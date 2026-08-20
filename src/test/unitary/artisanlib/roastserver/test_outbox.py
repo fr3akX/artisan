@@ -624,7 +624,11 @@ def test_snapshot_bytes_owns_exact_content_and_caller_timestamp(outbox: Outbox) 
     assert snapshot.source_modified_at == modified_at
 
 
-@pytest.mark.parametrize('content', [b'x', b'x' * MAX_PROFILE_BYTES])
+@pytest.mark.parametrize(
+    'content',
+    [b'x', b'x' * MAX_PROFILE_BYTES],
+    ids=['minimum', 'maximum'],
+)
 def test_snapshot_bytes_accepts_both_exact_content_bounds(
     outbox: Outbox, content: bytes
 ) -> None:
@@ -634,7 +638,11 @@ def test_snapshot_bytes_accepts_both_exact_content_bounds(
     assert snapshot.absolute_path.read_bytes() == content
 
 
-@pytest.mark.parametrize('content', [b'', b'x' * (MAX_PROFILE_BYTES + 1)])
+@pytest.mark.parametrize(
+    'content',
+    [b'', b'x' * (MAX_PROFILE_BYTES + 1)],
+    ids=['empty', 'overflow'],
+)
 def test_snapshot_bytes_rejects_content_outside_exact_bounds(
     outbox: Outbox, content: bytes
 ) -> None:
