@@ -106,6 +106,7 @@ class SantokerControlController:
         default_factory=dict, init=False, repr=False, compare=False
     )
     _transport_lost: bool = field(default=False, init=False, repr=False)
+    _charge_recovery_eligible: bool = field(default=False, init=False, repr=False)
     _last_reconciliation_attempts: tuple[tuple[bytes, int], ...] = field(
         default=(), init=False, repr=False
     )
@@ -125,6 +126,7 @@ class SantokerControlController:
     def mark_charge(self, device: SantokerControlDevice | None) -> None:
         with self._lock:
             self._clear()
+            self._charge_recovery_eligible = True
             self._intended[MACHINE_ON] = 1
             self._intended[HEATING_ON] = 1
             if device is not None:
@@ -135,7 +137,8 @@ class SantokerControlController:
     ) -> None:
         with self._lock:
             if (
-                active_roast
+                self._charge_recovery_eligible
+                and active_roast
                 and target in CONTROL_TARGETS
                 and self._valid_value(target, value)
             ):
@@ -149,7 +152,7 @@ class SantokerControlController:
         self, *, active_roast: bool, device: SantokerControlDevice | None
     ) -> None:
         with self._lock:
-            if not active_roast:
+            if not self._charge_recovery_eligible or not active_roast:
                 self._cancel_recovery()
                 return
             if device is not None:
@@ -298,5 +301,6 @@ class SantokerControlController:
 
     def _clear(self) -> None:
         self._intended.clear()
+        self._charge_recovery_eligible = False
         self._last_reconciliation_attempts = ()
         self._cancel_recovery()

@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import cast
 
 import pytest
 
@@ -209,11 +210,14 @@ def test_explicit_mode_off_replaces_charge_defaults_and_is_restored_off() -> Non
 def test_operating_mode_target_validation_rejects_non_binary_integers(
     target: bytes, value: object
 ) -> None:
+    device = FakeControlDevice()
     controller = SantokerControlController()
+    controller.mark_charge(device)
+    expected = controller.intended_controls()
 
     controller.note_control_request(target, value, active_roast=True)  # type: ignore[arg-type]
 
-    assert controller.intended_controls() == {}
+    assert controller.intended_controls() == expected
 
 
 @pytest.mark.parametrize('target', PERCENTAGE_TARGETS)
@@ -224,11 +228,16 @@ def test_operating_mode_target_validation_rejects_non_binary_integers(
 def test_percentage_target_validation_retains_exact_integer_range(
     target: bytes, value: object, accepted: bool
 ) -> None:
+    device = FakeControlDevice()
     controller = SantokerControlController()
+    controller.mark_charge(device)
+    expected = controller.intended_controls()
+    if accepted:
+        expected[target] = cast(int, value)
 
     controller.note_control_request(target, value, active_roast=True)  # type: ignore[arg-type]
 
-    assert controller.intended_controls() == ({target: value} if accepted else {})
+    assert controller.intended_controls() == expected
 
 
 def test_single_target_blocks_later_targets_until_fresh_matching_report() -> None:
@@ -293,6 +302,45 @@ def test_disconnected_request_replaces_only_its_target_and_retry_history() -> No
     device.report(DRUM, 32)
     assert controller.reconcile_after_frame(1, 0, device) is ControlReconcileOutcome.ATTEMPTED
     assert device.calls[-1] == (AIR, 82)
+
+
+def test_power_request_during_disconnection_replaces_only_power_retry_history() -> None:
+    now = [10.0]
+    device = FakeControlDevice()
+    controller = SantokerControlController(monotonic_clock=lambda: now[0])
+    controller.mark_charge(device)
+    controller.note_transport_loss(active_roast=True, device=device)
+
+    for target, value in (
+        (MACHINE_ON, 1),
+        (HEATING_ON, 1),
+        (DRUM, 30),
+        (AIR, 80),
+    ):
+        assert (
+            controller.reconcile_after_frame(1, 0, device)
+            is ControlReconcileOutcome.ATTEMPTED
+        )
+        assert device.calls[-1] == (target, value)
+        device.report(target, value)
+
+    assert controller.reconcile_after_frame(1, 0, device) is ControlReconcileOutcome.ATTEMPTED
+    assert device.calls[-1] == (POWER, 70)
+
+    now[0] = 10.2
+    controller.note_control_request(POWER, 75, active_roast=True)
+
+    assert controller.intended_controls() == {
+        MACHINE_ON: 1,
+        HEATING_ON: 1,
+        DRUM: 30,
+        AIR: 80,
+        POWER: 75,
+    }
+    assert controller.reconcile_after_frame(1, 0, device) is ControlReconcileOutcome.ATTEMPTED
+    assert device.calls[-1] == (POWER, 75)
+    assert device.calls.count((POWER, 70)) == 1
+    assert device.calls.count((POWER, 75)) == 1
 
 
 def test_charge_snapshots_literal_control_state_and_restores_in_safe_order() -> None:
@@ -658,6 +706,37 @@ def test_lifecycle_boundary_clears_intent_and_pending_recovery(
         controller.reconcile_after_frame(1, 0, device)
         is ControlReconcileOutcome.NONE
     )
+    assert device.calls == []
+
+
+@pytest.mark.parametrize(
+    'boundary',
+    [
+        SantokerControlController.start_monitoring,
+        SantokerControlController.stop_monitoring,
+    ],
+)
+def test_monitoring_boundary_requires_a_new_charge_before_recovery(
+    boundary: object,
+) -> None:
+    device = FakeControlDevice()
+    controller = SantokerControlController()
+    controller.mark_charge(device)
+
+    boundary(controller)  # type: ignore[operator]
+    device.power = 75
+    device.air = 85
+    device.drum = 35
+    controller.note_control_request(POWER, 90, active_roast=True)
+    controller.note_transport_loss(active_roast=True, device=device)
+
+    assert controller.intended_controls() == {}
+    assert not controller.restoration_pending()
+    for _ in CONTROL_TARGETS:
+        assert (
+            controller.reconcile_after_frame(1, 0, device)
+            is ControlReconcileOutcome.NONE
+        )
     assert device.calls == []
 
 

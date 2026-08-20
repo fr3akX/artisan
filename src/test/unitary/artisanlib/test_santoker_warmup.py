@@ -324,7 +324,7 @@ def test_accept_reported_target_only_updates_reported() -> None:
     controller.accept_reported_target(190.0)
     controller.accept_reported_target(225.5)
     controller.accept_reported_target(99.0)
-    controller.accept_reported_target(None)
+    controller.accept_reported_target(None)  # type: ignore[arg-type]
 
     assert controller.desired_temp_c == 205.0
     assert controller.reported_target() is None
@@ -553,7 +553,7 @@ def test_mark_charge_retries_failed_off_until_success() -> None:
         reject_off_once: bool = True
 
         @override
-        def setWarmup(self, enabled: bool) -> bool:  # type: ignore[override]
+        def setWarmup(self, enabled: bool) -> bool:
             self.calls.append(('enabled', enabled))
             if enabled is False and self.reject_off_once:
                 self.reject_off_once = False
@@ -614,7 +614,7 @@ def test_stop_monitoring_clears_state_after_safe_off() -> None:
 
     class FailingWarmupDevice(FakeWarmupDevice):
         @override
-        def setWarmup(self, enabled: bool) -> bool:  # type: ignore[override]
+        def setWarmup(self, enabled: bool) -> bool:
             self.calls.append(('enabled', enabled))
             self.warmup = enabled
             return bool(enabled)
@@ -648,7 +648,7 @@ def test_diagnostics_failures_do_not_change_command_results_or_state() -> None:
 
     device = FakeWarmupDevice(ready=True, reported_target=99.0)
     controller = SantokerWarmupController()
-    controller.attach_diagnostics(FailingDiagnostics())
+    controller.attach_diagnostics(cast(Any, FailingDiagnostics()))
 
     assert controller.set_enabled(True, -1, device) is WarmupResult.OK
     assert controller.desired_enabled() is True
@@ -1092,6 +1092,60 @@ def test_full_operating_state_recovery_charge_records_mode_defaults_without_writ
     assert window.santokerControlRecoveryReported is False
 
 
+@pytest.mark.parametrize('boundary', ['start', 'stop'])
+def test_monitoring_boundary_requires_new_charge_before_automatic_recovery(
+    qapplication: QApplication,
+    boundary: str,
+) -> None:
+    del qapplication
+    device = ParserWarmupDevice()
+    cast(Any, device).stop = Mock()
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        qmc=SimpleNamespace(
+            flagstart=True,
+            timeindex=[1, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        santoker=device,
+        santokerWarmup=False,
+        santokerWarmupController=SantokerWarmupController(),
+        santokerControlController=controller,
+        santokerControlRecoveryReported=False,
+        santokerMonitoringGeneration=1,
+        santokerDiagnosticsSession=None,
+        santokerSerial=False,
+        santokerBLE=False,
+        refreshSantokerWarmupControls=lambda: None,
+        sendmessage=Mock(),
+    )
+    ApplicationWindow.markSantokerCharge(cast(ApplicationWindow, window))
+
+    if boundary == 'start':
+        ApplicationWindow.startSantokerDiagnosticsSession(
+            cast(ApplicationWindow, window)
+        )
+    else:
+        ApplicationWindow.stopSantokerMonitoring(cast(ApplicationWindow, window))
+        window.santoker = device
+
+    device.power = 75
+    device.air = 85
+    device.drum = 35
+    device.calls.clear()
+    device.ready = False
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), False
+    )
+    device.ready = True
+    for _ in range(6):
+        ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
+
+    assert controller.intended_controls() == {}
+    assert not controller.restoration_pending()
+    assert [call for call in device.calls if call[0] == 'raw'] == []
+    window.sendmessage.assert_not_called()
+
+
 def test_full_operating_state_recovery_is_generation_guarded_ordered_and_logged(
     qapplication: QApplication,
     caplog: pytest.LogCaptureFixture,
@@ -1179,11 +1233,13 @@ def test_operating_mode_commands_update_active_intent_before_raw_forwarding() ->
     controller = SantokerControlController()
 
     class IntentObservingDevice(ParserWarmupDevice):
+        @override
         def send_msg(self, target: bytes, value: int) -> None:
             assert controller.intended_controls()[target] == value
             super().send_msg(target, value)
 
     device = IntentObservingDevice()
+    controller.mark_charge(device)
     window = SimpleNamespace(
         santoker=device,
         santokerControlController=controller,
@@ -1200,7 +1256,13 @@ def test_operating_mode_commands_update_active_intent_before_raw_forwarding() ->
         cast(ApplicationWindow, window), HEATING_ON, 0
     )
 
-    assert controller.intended_controls() == {MACHINE_ON: 0, HEATING_ON: 0}
+    assert controller.intended_controls() == {
+        MACHINE_ON: 0,
+        HEATING_ON: 0,
+        DRUM: 30,
+        AIR: 80,
+        POWER: 70,
+    }
     assert device.calls == [
         ('raw', (MACHINE_ON, 0)),
         ('raw', (HEATING_ON, 0)),
@@ -1299,7 +1361,7 @@ def test_initially_unready_active_roast_control_request_does_not_replay(
         if kind == 'raw'
     ]
     assert raw_calls == [(POWER, 90)]
-    assert controller.intended_controls() == {POWER: 90}
+    assert controller.intended_controls() == {}
     assert not controller.restoration_pending()
 
 
@@ -1385,14 +1447,19 @@ def test_confirmed_transport_loss_arms_only_during_active_roast(
         ),
     )
 
+    controller.mark_charge(device)
     ApplicationWindow.santokerWarmupReadyChanged(
         cast(ApplicationWindow, window), False
     )
 
     assert controller.restoration_pending() is armed
-    assert controller.intended_controls() == (
-        {POWER: 70, AIR: 80, DRUM: 30} if armed else {}
-    )
+    assert controller.intended_controls() == {
+        MACHINE_ON: 1,
+        HEATING_ON: 1,
+        DRUM: 30,
+        AIR: 80,
+        POWER: 70,
+    }
 
 
 @pytest.mark.parametrize('target', [POWER, AIR, DRUM])
@@ -1411,17 +1478,20 @@ def test_stale_generation_control_command_does_not_cross_monitoring_sessions(
         ),
     )
 
+    controller.mark_charge(device)
+    charge_intent = controller.intended_controls()
     ApplicationWindow.santokerSendMessageForGeneration(
         cast(ApplicationWindow, window), 1, target, 90
     )
     assert device.calls == []
-    assert controller.intended_controls() == {}
+    assert controller.intended_controls() == charge_intent
 
     ApplicationWindow.santokerSendMessageForGeneration(
         cast(ApplicationWindow, window), 2, target, 90
     )
     assert device.calls == [('raw', (target, 90))]
-    assert controller.intended_controls() == {target: 90}
+    charge_intent[target] = 90
+    assert controller.intended_controls() == charge_intent
 
 
 def test_event_action_thread_captures_monitoring_generation_at_creation() -> None:
