@@ -67,23 +67,31 @@ jobs:
         run: |
           cat > pytest_collection_guard.py <<'PY'
           import faulthandler
-          import signal
-
-
-          def _raise_timeout(_signum, _frame):
-              raise TimeoutError('pytest collection exceeded 60 seconds')
 
 
           def pytest_sessionstart(session):
               del session
-              faulthandler.dump_traceback_later(30, repeat=True)
-              signal.signal(signal.SIGALRM, _raise_timeout)
-              signal.alarm(60)
+              faulthandler.dump_traceback_later(15, repeat=True)
 
 
           def pytest_collection_finish(session):
               del session
-              signal.alarm(0)
               faulthandler.cancel_dump_traceback_later()
           PY
-          python -m pytest -p pytest_collection_guard --collect-only -q test/unitary/artisanlib/roastserver/test_outbox.py
+          python -m pytest -p pytest_collection_guard --collect-only -q test/unitary/artisanlib/roastserver/test_outbox.py > pytest-collection.log 2>&1 &
+          pytest_pid=$!
+          for _ in {1..45}; do
+            if ! kill -0 "$pytest_pid" 2>/dev/null; then
+              set +e
+              wait "$pytest_pid"
+              status=$?
+              set -e
+              cat pytest-collection.log
+              exit "$status"
+            fi
+            sleep 1
+          done
+          cat pytest-collection.log
+          kill -KILL "$pytest_pid" 2>/dev/null || true
+          echo 'pytest collection exceeded the 45-second watchdog'
+          exit 1
