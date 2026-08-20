@@ -11,30 +11,24 @@ on:
 jobs:
   pytest:
     runs-on: macos-latest # on ubunut the Qt libs are missing: ImportError: libEGL.so.1: cannot open shared object file: No such file or directory
-    timeout-minutes: 10
+    timeout-minutes: 5
     name: runner / pytest / ${{ matrix.label }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - label: roastserver-only
-            pytest-args: test/unitary/artisanlib/roastserver
-          - label: artisanlib-no-roastserver
-            pytest-args: test/unitary/artisanlib --ignore=test/unitary/artisanlib/roastserver
-          - label: unitary-rest
-            pytest-args: test/unitary --ignore=test/unitary/artisanlib --ignore=test/unitary/plus
-          - label: plus
-            pytest-args: test/unitary/plus
-          - label: sanity
-            pytest-args: test/sanity
-          - label: smoke
-            pytest-args: test/smoke
-          - label: uat
-            pytest-args: test/uat
-          - label: full-no-roastserver
-            pytest-args: test --ignore=test/unitary/artisanlib/roastserver
-          - label: full-control
-            pytest-args: test
+          - label: prefix-03
+            prefix-size: 3
+          - label: prefix-06
+            prefix-size: 6
+          - label: prefix-09
+            prefix-size: 9
+          - label: prefix-12
+            prefix-size: 12
+          - label: prefix-15
+            prefix-size: 15
+          - label: prefix-18
+            prefix-size: 18
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
@@ -84,7 +78,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade -r src/requirements-dev.txt
           pip install -r src/requirements.txt
-      - name: Collect test group
+      - name: Collect test module prefix
         working-directory: src
         run: |
-          pytest --collect-only -q ${{ matrix.pytest-args }}
+          files=$(find test/unitary/artisanlib/roastserver -maxdepth 1 -name 'test_*.py' | sort | head -n ${{ matrix.prefix-size }})
+          pytest --collect-only -q $files
