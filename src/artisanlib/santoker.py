@@ -128,6 +128,8 @@ class Santoker(AsyncComm):
     POWER:Final[bytes] = b'\xFA'
     AIR:Final[bytes] = b'\xCA'
     DRUM:Final[bytes] = b'\xC0'
+    MACHINE_ON:Final[bytes] = b'\x7A'
+    HEATING_ON:Final[bytes] = b'\x7B'
     WARMUP:Final[bytes] = b'\x7E'
     WARMUP_TEMP:Final[bytes] = b'\x7F'
     MIN_WARMUP_TEMP_C:Final[float] = 100.0
@@ -150,7 +152,8 @@ class Santoker(AsyncComm):
         'HEADER', '_charge_handler', '_dry_handler', '_fcs_handler', '_scs_handler', '_drop_handler',
         '_warmup_handler', '_warmup_temp_handler', '_ready_handler', '_board', '_bt', '_et',
         '_bt_ror', '_et_ror', '_ir', '_power', '_power_fresh', '_air', '_air_fresh', '_drum',
-        '_drum_fresh', '_CHARGE', '_DRY', '_FCs',
+        '_drum_fresh', '_machine_on', '_machine_on_fresh', '_heating_on', '_heating_on_fresh',
+        '_CHARGE', '_DRY', '_FCs',
         '_SCs', '_DROP', '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
         '_desired_warmup', '_connect_using_ble', '_ble_client', '_diagnostics', '_frame_handler'
     ]
@@ -227,6 +230,10 @@ class Santoker(AsyncComm):
         self._air_fresh:bool = False
         self._drum:int = -1     # drum speed in % [0-100]
         self._drum_fresh:bool = False
+        self._machine_on:int = -1
+        self._machine_on_fresh:bool = False
+        self._heating_on:int = -1
+        self._heating_on_fresh:bool = False
 
         # current roast state
         self._CHARGE:bool = False
@@ -265,6 +272,14 @@ class Santoker(AsyncComm):
         return self._drum
     def isDrumFresh(self) -> bool:
         return self._drum_fresh
+    def getMachineOn(self) -> int:
+        return self._machine_on
+    def isMachineOnFresh(self) -> bool:
+        return self._machine_on_fresh
+    def getHeatingOn(self) -> int:
+        return self._heating_on
+    def isHeatingOnFresh(self) -> bool:
+        return self._heating_on_fresh
     def isHeaderReady(self) -> bool:
         return self._header_ready
     def getWarmup(self) -> bool | None:
@@ -402,6 +417,20 @@ class Santoker(AsyncComm):
         self.send_msg(self.WARMUP, 0)
         return True
 
+    def setMachineOn(self, value: int) -> bool:
+        if not self._header_ready or type(value) is not int or value not in {0, 1}:
+            return False
+        self._machine_on_fresh = False
+        self.send_msg(self.MACHINE_ON, value)
+        return True
+
+    def setHeatingOn(self, value: int) -> bool:
+        if not self._header_ready or type(value) is not int or value not in {0, 1}:
+            return False
+        self._heating_on_fresh = False
+        self.send_msg(self.HEATING_ON, value)
+        return True
+
     def setPower(self, value: int) -> bool:
         if not self._header_ready or not 0 <= value <= 100:
             return False
@@ -439,6 +468,10 @@ class Santoker(AsyncComm):
         self._power_fresh = False
         self._air_fresh = False
         self._drum_fresh = False
+        self._machine_on = -1
+        self._machine_on_fresh = False
+        self._heating_on = -1
+        self._heating_on_fresh = False
         self._reported_warmup_target = None
         self._setWarmupState(None)
 
@@ -511,6 +544,18 @@ class Santoker(AsyncComm):
             if value != self._drum:
                 self._drum = value
                 self._record_decoded('drum', value)
+        elif target == self.MACHINE_ON:
+            if value in {0, 1}:
+                self._machine_on_fresh = True
+                if value != self._machine_on:
+                    self._machine_on = value
+                    self._record_decoded('machine_on', value)
+        elif target == self.HEATING_ON:
+            if value in {0, 1}:
+                self._heating_on_fresh = True
+                if value != self._heating_on:
+                    self._heating_on = value
+                    self._record_decoded('heating_on', value)
 
         elif target == self.CHARGE:
             b = bool(value)

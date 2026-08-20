@@ -882,6 +882,112 @@ class TestSantokerImplementationDetails:
 
 
 class TestSantokerPowerProtocol:
+    def test_operating_mode_reports_are_independently_fresh(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        assert Santoker.MACHINE_ON == b'\x7A'
+        assert Santoker.HEATING_ON == b'\x7B'
+        santoker.resetProtocolState()
+        assert santoker.getMachineOn() == -1
+        assert santoker.getHeatingOn() == -1
+        assert not santoker.isMachineOnFresh()
+        assert not santoker.isHeatingOnFresh()
+
+        santoker.register_reading(Santoker.MACHINE_ON, b'\x01')
+        assert santoker.getMachineOn() == 1
+        assert santoker.isMachineOnFresh()
+        assert not santoker.isHeatingOnFresh()
+
+        santoker.register_reading(Santoker.HEATING_ON, b'\x00')
+        assert santoker.getHeatingOn() == 0
+        assert santoker.isHeatingOnFresh()
+
+    @pytest.mark.parametrize(
+        ('target_name', 'getter_name', 'freshness_name'),
+        [
+            ('MACHINE_ON', 'getMachineOn', 'isMachineOnFresh'),
+            ('HEATING_ON', 'getHeatingOn', 'isHeatingOnFresh'),
+        ],
+    )
+    @pytest.mark.parametrize('reported_value', [2, 255])
+    def test_operating_mode_reports_ignore_invalid_values(
+        self,
+        target_name: str,
+        getter_name: str,
+        freshness_name: str,
+        reported_value: int,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        target = getattr(Santoker, target_name)
+
+        santoker.register_reading(target, reported_value.to_bytes(1, 'big'))
+
+        assert getattr(santoker, getter_name)() == -1
+        assert not getattr(santoker, freshness_name)()
+
+    @pytest.mark.parametrize('setter_name', ['setMachineOn', 'setHeatingOn'])
+    @pytest.mark.parametrize('value', [-1, 2, True])
+    def test_operating_mode_setters_reject_invalid_values(
+        self,
+        setter_name: str,
+        value: int,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not getattr(santoker, setter_name)(value)
+
+        send_msg.assert_not_called()
+
+    @pytest.mark.parametrize('setter_name', ['setMachineOn', 'setHeatingOn'])
+    def test_operating_mode_setters_wait_for_protocol_readiness(
+        self,
+        setter_name: str,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not getattr(santoker, setter_name)(1)
+
+        send_msg.assert_not_called()
+
+    def test_operating_mode_setters_send_and_invalidate_only_their_report(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+        santoker.register_reading(Santoker.MACHINE_ON, b'\x01')
+        santoker.register_reading(Santoker.HEATING_ON, b'\x00')
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setMachineOn(1)
+            assert not santoker.isMachineOnFresh()
+            assert santoker.isHeatingOnFresh()
+
+            santoker.register_reading(Santoker.MACHINE_ON, b'\x01')
+            assert santoker.setHeatingOn(0)
+            assert santoker.isMachineOnFresh()
+            assert not santoker.isHeatingOnFresh()
+
+        assert send_msg.call_args_list == [
+            call(Santoker.MACHINE_ON, 1),
+            call(Santoker.HEATING_ON, 0),
+        ]
+
     def test_set_power_sends_valid_value_when_protocol_ready(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker

@@ -40,7 +40,8 @@ DiagnosticCategory = Literal[
 DiagnosticDirection = Literal['RX', 'TX']
 DiagnosticField = Literal[
     'board_c', 'bt_c', 'et_c', 'ir_c', 'bt_ror_c', 'et_ror_c',
-    'power', 'fan', 'drum', 'charge', 'dry', 'fcs', 'scs', 'drop'
+    'power', 'fan', 'drum', 'machine_on', 'heating_on',
+    'charge', 'dry', 'fcs', 'scs', 'drop'
 ]
 
 
@@ -82,6 +83,8 @@ class SantokerDiagnosticsState:
     power: int | None
     fan: int | None
     drum: int | None
+    machine_on: int | None
+    heating_on: int | None
     desired_warmup: bool | None
     desired_target_c: float | None
     reported_warmup: bool | None
@@ -140,6 +143,8 @@ _STATE_LABELS: list[tuple[str, str]] = [
     ('power', 'power'),
     ('fan', 'fan'),
     ('drum', 'drum'),
+    ('machine_on', 'machine on'),
+    ('heating_on', 'heating on'),
     ('desired_warmup', 'desired warm-up'),
     ('desired_target_c', 'desired target'),
     ('reported_warmup', 'reported warm-up'),
@@ -194,6 +199,8 @@ class SantokerDiagnosticsSession:
         self._power: int | None = None
         self._fan: int | None = None
         self._drum: int | None = None
+        self._machine_on: int | None = None
+        self._heating_on: int | None = None
         self._desired_warmup: bool | None = None
         self._desired_target_c: float | None = None
         self._reported_warmup: bool | None = None
@@ -271,6 +278,8 @@ class SantokerDiagnosticsSession:
             power=self._power,
             fan=self._fan,
             drum=self._drum,
+            machine_on=self._machine_on,
+            heating_on=self._heating_on,
             desired_warmup=self._desired_warmup,
             desired_target_c=self._desired_target_c,
             reported_warmup=self._reported_warmup,
@@ -471,6 +480,10 @@ class SantokerDiagnosticsSession:
                 self._fan = int(value)
             elif field == 'drum':
                 self._drum = int(value)
+            elif field == 'machine_on':
+                self._machine_on = int(value)
+            elif field == 'heating_on':
+                self._heating_on = int(value)
             elif field == 'charge':
                 self._charge_latched = bool(value)
 

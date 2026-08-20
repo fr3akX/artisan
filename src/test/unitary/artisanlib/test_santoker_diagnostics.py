@@ -84,6 +84,20 @@ def test_report_uses_unknown_and_excludes_connection_identity() -> None:
     assert 'password' not in report.lower()
 
 
+def test_operating_mode_decoded_values_update_state_and_events() -> None:
+    session = SantokerDiagnosticsSession('Wi-Fi')
+
+    session.record_decoded('machine_on', 1)
+    session.record_decoded('heating_on', 0)
+
+    view = session.view()
+    descriptions = [event.description for event in view.events]
+    assert view.state.machine_on == 1
+    assert view.state.heating_on == 0
+    assert 'machine_on: 1' in descriptions
+    assert 'heating_on: 0' in descriptions
+
+
 def test_record_decoded_power_updates_state_and_emits_one_transition_per_change() -> None:
     session = SantokerDiagnosticsSession('Wi-Fi')
 
