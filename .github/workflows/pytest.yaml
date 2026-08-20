@@ -62,18 +62,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade -r src/requirements-dev.txt
           pip install -r src/requirements.txt
+          pip install pytest-timeout
       - name: Test with pytest
         working-directory: src
         run: |
-          python - <<'PY'
-          import subprocess
-
-          try:
-              subprocess.run(
-                  ['pytest', '-o', 'faulthandler_timeout=60'],
-                  check=True,
-                  timeout=600,
-              )
-          except subprocess.TimeoutExpired:
-              raise SystemExit('pytest exceeded 10-minute diagnostic timeout')
-          PY
+          pytest --timeout=60 --timeout-method=signal
