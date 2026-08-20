@@ -20044,12 +20044,6 @@ class ApplicationWindow(QMainWindow):
                     value,
                     active_roast=active_roast,
                 )
-                if active_roast and not self.santoker.isHeaderReady():
-                    control_controller.note_transport_loss(
-                        active_roast=True,
-                        device=self.santoker,
-                    )
-                    self.santokerControlRecoveryReported = False
             self.santoker.send_msg(target,value)
 
 

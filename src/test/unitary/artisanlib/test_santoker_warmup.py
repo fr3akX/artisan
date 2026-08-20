@@ -1121,7 +1121,7 @@ def test_cancelled_recovery_does_not_report_connected(
     assert not controller.restoration_pending()
 
 
-def test_unready_active_roast_control_request_replays_on_first_valid_frame(
+def test_initially_unready_active_roast_control_request_does_not_replay(
     qapplication: QApplication,
 ) -> None:
     del qapplication
@@ -1149,8 +1149,9 @@ def test_unready_active_roast_control_request_replays_on_first_valid_frame(
         for kind, payload in device.calls
         if kind == 'raw'
     ]
-    assert raw_calls == [(POWER, 90), (POWER, 90)]
+    assert raw_calls == [(POWER, 90)]
     assert controller.intended_controls() == {POWER: 90}
+    assert not controller.restoration_pending()
 
 
 @pytest.mark.parametrize('target', [POWER, AIR, DRUM])
