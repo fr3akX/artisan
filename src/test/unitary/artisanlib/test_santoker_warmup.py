@@ -1442,6 +1442,7 @@ def test_queued_stop_callbacks_do_not_leak_into_replacement_session(
 
     window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
     QMainWindow.__init__(window)
+    window.qmc = SimpleNamespace(timeindex=[-1], flagstart=False)
     window.santokerWarmup = True
     window.santokerWarmupControls = None
     window.santokerWarmupController = SantokerWarmupController(desired_temp_c=205.0)

@@ -3992,6 +3992,7 @@ def coordinator_inventory_charge_canvas(window: ApplicationWindow) -> SimpleName
     window.pidcontrol.pidOnCHARGE = False
     window.santokerWarmupController = MagicMock()
     window.updateSantokerWarmupControls = Mock()
+    window.markSantokerCharge = Mock()  # type: ignore[method-assign]
     window.updateRoastNameFromInventoryAtCharge = Mock()  # type: ignore[method-assign]
     window.onMarkMoveToNext = Mock()
     window.openPropertiesSignal = MagicMock()
