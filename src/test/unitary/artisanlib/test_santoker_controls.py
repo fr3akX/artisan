@@ -311,6 +311,42 @@ def test_failed_writes_are_throttled_for_one_second() -> None:
     ]
 
 
+def test_failed_write_throttle_survives_an_intervening_target_attempt() -> None:
+    now = [10.0]
+    device = FakeControlDevice(power=-1, air=-1, writes_succeed=False)
+    controller = SantokerControlController(monotonic_clock=lambda: now[0])
+    controller.mark_charge(device)
+    controller.note_transport_loss(active_roast=True, device=device)
+
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.WAITING
+    )
+    assert device.attempts == [(DRUM, 30)]
+
+    now[0] = 10.2
+    controller.note_control_request(AIR, 80, active_roast=True)
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.WAITING
+    )
+    assert device.attempts == [(DRUM, 30), (AIR, 80)]
+
+    now[0] = 10.5
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.THROTTLED
+    )
+    assert device.attempts == [(DRUM, 30), (AIR, 80)]
+
+    now[0] = 11.0
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.WAITING
+    )
+    assert device.attempts == [(DRUM, 30), (AIR, 80), (DRUM, 30)]
+
+
 def test_recovery_waits_for_protocol_readiness_and_failed_writes() -> None:
     device = FakeControlDevice(ready=False)
     controller = SantokerControlController()

@@ -82,13 +82,10 @@ class SantokerControlController:
     _intended: dict[bytes, int] = field(default_factory=dict, init=False, repr=False)
     _pending: set[bytes] = field(default_factory=set, init=False, repr=False)
     _attempted: set[bytes] = field(default_factory=set, init=False, repr=False)
-    _last_attempt_targets: set[bytes] = field(
-        default_factory=set, init=False, repr=False
+    _last_attempt_monotonic: dict[bytes, float] = field(
+        default_factory=dict, init=False, repr=False, compare=False
     )
     _transport_lost: bool = field(default=False, init=False, repr=False)
-    _last_attempt_monotonic: float | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
 
     def intended_controls(self) -> dict[bytes, int]:
         with self._lock:
@@ -117,6 +114,7 @@ class SantokerControlController:
                 if self._transport_lost:
                     self._pending.add(target)
                     self._attempted.discard(target)
+                    self._last_attempt_monotonic.pop(target, None)
 
     def note_transport_loss(
         self, *, active_roast: bool, device: SantokerControlDevice | None
@@ -129,9 +127,8 @@ class SantokerControlController:
                 self._fill_missing_controls(device)
             self._pending = set(self._intended)
             self._attempted.clear()
-            self._last_attempt_targets.clear()
+            self._last_attempt_monotonic.clear()
             self._transport_lost = True
-            self._last_attempt_monotonic = None
 
     def mark_drop(self) -> None:
         with self._lock:
@@ -175,23 +172,17 @@ class SantokerControlController:
                 self._cancel_recovery()
                 return ControlReconcileOutcome.CONVERGED
 
+            now = self.monotonic_clock()
             eligible = self._eligible_targets()
-            unattempted = [
+            attemptable = [
                 target
                 for target in eligible
-                if target not in self._attempted
-                and target not in self._last_attempt_targets
+                if target not in self._last_attempt_monotonic
+                or now - self._last_attempt_monotonic[target] >= RETRY_INTERVAL
             ]
-            if unattempted:
-                return self._attempt_targets(device, unattempted)
-
-            now = self.monotonic_clock()
-            if (
-                self._last_attempt_monotonic is not None
-                and now - self._last_attempt_monotonic < RETRY_INTERVAL
-            ):
+            if not attemptable:
                 return ControlReconcileOutcome.THROTTLED
-            return self._attempt_targets(device, eligible, now=now)
+            return self._attempt_targets(device, attemptable)
 
     def _fill_missing_controls(self, device: SantokerControlDevice) -> None:
         for target in CONTROL_TARGETS:
@@ -222,21 +213,14 @@ class SantokerControlController:
         ]
 
     def _attempt_targets(
-        self,
-        device: SantokerControlDevice,
-        targets: list[bytes],
-        *,
-        now: float | None = None,
+        self, device: SantokerControlDevice, targets: list[bytes]
     ) -> ControlReconcileOutcome:
         attempted = False
         for target in targets:
+            self._last_attempt_monotonic[target] = self.monotonic_clock()
             if self._set_value(device, target, self._intended[target]):
                 self._attempted.add(target)
                 attempted = True
-        self._last_attempt_targets = set(targets)
-        self._last_attempt_monotonic = (
-            self.monotonic_clock() if now is None else now
-        )
         if attempted:
             return ControlReconcileOutcome.ATTEMPTED
         return ControlReconcileOutcome.WAITING
@@ -277,9 +261,8 @@ class SantokerControlController:
     def _cancel_recovery(self) -> None:
         self._pending.clear()
         self._attempted.clear()
-        self._last_attempt_targets.clear()
+        self._last_attempt_monotonic.clear()
         self._transport_lost = False
-        self._last_attempt_monotonic = None
 
     def _clear(self) -> None:
         self._intended.clear()
