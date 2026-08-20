@@ -12,7 +12,20 @@ jobs:
   pytest:
     runs-on: macos-latest # on ubunut the Qt libs are missing: ImportError: libEGL.so.1: cannot open shared object file: No such file or directory
     timeout-minutes: 5
-    name: runner / pytest
+    name: runner / pytest / ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: outbox-tests-01-30
+            start: 0
+            end: 30
+          - label: outbox-tests-31-60
+            start: 30
+            end: 60
+          - label: outbox-tests-61-end
+            start: 60
+            end: 999
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
@@ -62,36 +75,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade -r src/requirements-dev.txt
           pip install -r src/requirements.txt
-      - name: Probe outbox collection stack
+      - name: Collect outbox test subset
         working-directory: src
         run: |
-          cat > pytest_collection_guard.py <<'PY'
-          import faulthandler
+          python - '${{ matrix.start }}' '${{ matrix.end }}' <<'PY'
+          import ast
+          from pathlib import Path
+          import sys
 
-
-          def pytest_sessionstart(session):
-              del session
-              faulthandler.dump_traceback_later(15, repeat=True)
-
-
-          def pytest_collection_finish(session):
-              del session
-              faulthandler.cancel_dump_traceback_later()
+          source = Path('test/unitary/artisanlib/roastserver/test_outbox.py')
+          tree = ast.parse(source.read_text(), filename=str(source))
+          tests = [
+              node
+              for node in tree.body
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and node.name.startswith('test_')
+          ]
+          start, end = map(int, sys.argv[1:])
+          tree.body = [
+              node
+              for node in tree.body
+              if not (
+                  isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node.name.startswith('test_')
+              )
+          ] + tests[start:end]
+          subset = source.with_name('test_outbox_subset.py')
+          subset.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+          print(f'generated {len(tests[start:end])} of {len(tests)} outbox tests')
           PY
-          python -m pytest -p pytest_collection_guard --collect-only -q test/unitary/artisanlib/roastserver/test_outbox.py > pytest-collection.log 2>&1 &
-          pytest_pid=$!
-          for _ in {1..45}; do
-            if ! kill -0 "$pytest_pid" 2>/dev/null; then
-              set +e
-              wait "$pytest_pid"
-              status=$?
-              set -e
-              cat pytest-collection.log
-              exit "$status"
-            fi
-            sleep 1
-          done
-          cat pytest-collection.log
-          kill -KILL "$pytest_pid" 2>/dev/null || true
-          echo 'pytest collection exceeded the 45-second watchdog'
-          exit 1
+          pytest --collect-only -q test/unitary/artisanlib/roastserver/test_outbox_subset.py
