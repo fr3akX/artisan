@@ -35,11 +35,19 @@ from typing import Final, Protocol
 
 MIN_CONTROL_VALUE: Final[int] = 0
 MAX_CONTROL_VALUE: Final[int] = 100
+MACHINE_ON: Final[bytes] = b'\x7A'
+HEATING_ON: Final[bytes] = b'\x7B'
 POWER: Final[bytes] = b'\xFA'
 AIR: Final[bytes] = b'\xCA'
 DRUM: Final[bytes] = b'\xC0'
-CONTROL_TARGETS: Final[tuple[bytes, ...]] = (DRUM, AIR, POWER)
-MECHANICAL_TARGETS: Final[tuple[bytes, ...]] = (DRUM, AIR)
+PERCENTAGE_TARGETS: Final[tuple[bytes, ...]] = (DRUM, AIR, POWER)
+CONTROL_TARGETS: Final[tuple[bytes, ...]] = (
+    MACHINE_ON,
+    HEATING_ON,
+    DRUM,
+    AIR,
+    POWER,
+)
 RETRY_INTERVAL: Final[float] = 1.0
 
 
@@ -54,6 +62,14 @@ class ControlReconcileOutcome(Enum):
 class SantokerControlDevice(Protocol):
     def isHeaderReady(self) -> bool: ...
 
+    def getMachineOn(self) -> int: ...
+
+    def isMachineOnFresh(self) -> bool: ...
+
+    def getHeatingOn(self) -> int: ...
+
+    def isHeatingOnFresh(self) -> bool: ...
+
     def getPower(self) -> int: ...
 
     def isPowerFresh(self) -> bool: ...
@@ -65,6 +81,10 @@ class SantokerControlDevice(Protocol):
     def getDrum(self) -> int: ...
 
     def isDrumFresh(self) -> bool: ...
+
+    def setMachineOn(self, value: int) -> bool: ...
+
+    def setHeatingOn(self, value: int) -> bool: ...
 
     def setPower(self, value: int) -> bool: ...
 
@@ -105,8 +125,10 @@ class SantokerControlController:
     def mark_charge(self, device: SantokerControlDevice | None) -> None:
         with self._lock:
             self._clear()
+            self._intended[MACHINE_ON] = 1
+            self._intended[HEATING_ON] = 1
             if device is not None:
-                self._fill_missing_controls(device)
+                self._fill_missing_percentage_controls(device)
 
     def note_control_request(
         self, target: bytes, value: int, *, active_roast: bool
@@ -115,7 +137,7 @@ class SantokerControlController:
             if (
                 active_roast
                 and target in CONTROL_TARGETS
-                and self._valid_value(value)
+                and self._valid_value(target, value)
             ):
                 self._intended[target] = value
                 if self._transport_lost:
@@ -131,7 +153,7 @@ class SantokerControlController:
                 self._cancel_recovery()
                 return
             if device is not None:
-                self._fill_missing_controls(device)
+                self._fill_missing_percentage_controls(device)
             self._pending = set(self._intended)
             self._attempted.clear()
             self._last_attempt_monotonic.clear()
@@ -180,23 +202,24 @@ class SantokerControlController:
                 self._cancel_recovery()
                 return ControlReconcileOutcome.CONVERGED
 
+            target = next(
+                target for target in CONTROL_TARGETS if target in self._pending
+            )
             now = self.monotonic_clock()
-            eligible = self._eligible_targets()
-            attemptable = [
-                target
-                for target in eligible
-                if target not in self._last_attempt_monotonic
-                or now - self._last_attempt_monotonic[target] >= RETRY_INTERVAL
-            ]
-            if not attemptable:
+            if (
+                target in self._last_attempt_monotonic
+                and now - self._last_attempt_monotonic[target] < RETRY_INTERVAL
+            ):
                 return ControlReconcileOutcome.THROTTLED
-            return self._attempt_targets(device, attemptable)
+            return self._attempt_target(device, target, now)
 
-    def _fill_missing_controls(self, device: SantokerControlDevice) -> None:
-        for target in CONTROL_TARGETS:
+    def _fill_missing_percentage_controls(
+        self, device: SantokerControlDevice
+    ) -> None:
+        for target in PERCENTAGE_TARGETS:
             if target not in self._intended:
                 value = self._get_value(device, target)
-                if self._valid_value(value):
+                if self._valid_value(target, value):
                     self._intended[target] = value
 
     def _remove_converged_targets(self, device: SantokerControlDevice) -> None:
@@ -210,42 +233,31 @@ class SantokerControlController:
                 self._pending.remove(target)
                 self._attempted.remove(target)
 
-    def _eligible_targets(self) -> list[bytes]:
-        mechanical_pending = any(
-            target in self._pending for target in MECHANICAL_TARGETS
-        )
-        return [
-            target
-            for target in CONTROL_TARGETS
-            if target in self._pending and (target != POWER or not mechanical_pending)
-        ]
-
-    def _attempt_targets(
-        self, device: SantokerControlDevice, targets: list[bytes]
+    def _attempt_target(
+        self, device: SantokerControlDevice, target: bytes, now: float
     ) -> ControlReconcileOutcome:
-        attempted = False
-        reconciliation_attempts: list[tuple[bytes, int]] = []
-        for target in targets:
-            value = self._intended[target]
-            self._last_attempt_monotonic[target] = self.monotonic_clock()
-            reconciliation_attempts.append((target, value))
-            if self._set_value(device, target, value):
-                self._attempted.add(target)
-                attempted = True
-        self._last_reconciliation_attempts = tuple(reconciliation_attempts)
-        if attempted:
+        value = self._intended[target]
+        self._last_attempt_monotonic[target] = now
+        self._last_reconciliation_attempts = ((target, value),)
+        if self._set_value(device, target, value):
+            self._attempted.add(target)
             return ControlReconcileOutcome.ATTEMPTED
         return ControlReconcileOutcome.WAITING
 
     @staticmethod
-    def _valid_value(value: object) -> bool:
-        return (
-            type(value) is int
-            and MIN_CONTROL_VALUE <= value <= MAX_CONTROL_VALUE
-        )
+    def _valid_value(target: bytes, value: object) -> bool:
+        if type(value) is not int:
+            return False
+        if target in (MACHINE_ON, HEATING_ON):
+            return value in (0, 1)
+        return MIN_CONTROL_VALUE <= value <= MAX_CONTROL_VALUE
 
     @staticmethod
     def _get_value(device: SantokerControlDevice, target: bytes) -> int:
+        if target == MACHINE_ON:
+            return device.getMachineOn()
+        if target == HEATING_ON:
+            return device.getHeatingOn()
         if target == DRUM:
             return device.getDrum()
         if target == AIR:
@@ -254,6 +266,10 @@ class SantokerControlController:
 
     @staticmethod
     def _is_fresh(device: SantokerControlDevice, target: bytes) -> bool:
+        if target == MACHINE_ON:
+            return device.isMachineOnFresh()
+        if target == HEATING_ON:
+            return device.isHeatingOnFresh()
         if target == DRUM:
             return device.isDrumFresh()
         if target == AIR:
@@ -264,6 +280,10 @@ class SantokerControlController:
     def _set_value(
         device: SantokerControlDevice, target: bytes, value: int
     ) -> bool:
+        if target == MACHINE_ON:
+            return device.setMachineOn(value)
+        if target == HEATING_ON:
+            return device.setHeatingOn(value)
         if target == DRUM:
             return device.setDrum(value)
         if target == AIR:
