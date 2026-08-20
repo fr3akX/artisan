@@ -12,7 +12,27 @@ jobs:
   pytest:
     runs-on: macos-latest # on ubunut the Qt libs are missing: ImportError: libEGL.so.1: cannot open shared object file: No such file or directory
     timeout-minutes: 20
-    name: runner / pytest
+    name: runner / pytest / ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: configured-collection
+            working-directory: src
+            pytest-args: --collect-only -q
+            empty-config: false
+          - label: configured-suite
+            working-directory: src
+            pytest-args: --timeout=60 --timeout-method=signal
+            empty-config: false
+          - label: empty-config-suite
+            working-directory: src
+            pytest-args: -c pytest-diagnostic.ini -ra -v test
+            empty-config: true
+          - label: root-default-suite
+            working-directory: .
+            pytest-args: src/test
+            empty-config: false
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
@@ -63,7 +83,12 @@ jobs:
           pip install --upgrade -r src/requirements-dev.txt
           pip install -r src/requirements.txt
           pip install pytest-timeout
-      - name: Test with pytest
-        working-directory: src
+      - name: Prepare empty pytest config
+        if: matrix.empty-config
+        working-directory: ${{ matrix.working-directory }}
         run: |
-          pytest --timeout=60 --timeout-method=signal
+          printf '[pytest]\n' > pytest-diagnostic.ini
+      - name: Test with pytest
+        working-directory: ${{ matrix.working-directory }}
+        run: |
+          pytest ${{ matrix.pytest-args }}
