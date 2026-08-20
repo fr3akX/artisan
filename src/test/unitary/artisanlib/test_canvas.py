@@ -1360,6 +1360,19 @@ class TestInventoryCharge:
         assert canvas.roastUUID == '33333333333343338333333333333333'
         canvas.aw.prepareRoastServerInventoryCharge.assert_called_once_with()
 
+    def test_inventory_charge_snapshots_santoker_after_semaphore_release(self) -> None:
+        canvas = inventory_charge_canvas()
+
+        def mark_santoker_charge() -> None:
+            assert not canvas.profileDataSemaphore.acquired
+            assert canvas.timeindex[0] == 0
+
+        canvas.aw.markSantokerCharge.side_effect = mark_santoker_charge
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        canvas.aw.markSantokerCharge.assert_called_once_with()
+
     def test_inventory_charge_updates_title_after_semaphore_release(self) -> None:
         canvas = inventory_charge_canvas()
 
@@ -1413,6 +1426,7 @@ class TestInventoryCharge:
         assert canvas.profileDataSemaphore.acquire_calls == 1
         assert canvas.profileDataSemaphore.release_calls == 1
         canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
+        canvas.aw.markSantokerCharge.assert_not_called()
         canvas.aw.sendmessage.assert_called_once_with(
             'Not enough data collected yet. Try again in a few seconds')
 
@@ -1425,6 +1439,7 @@ class TestInventoryCharge:
 
         assert canvas.timeindex[0] == -1
         canvas.aw.commitRoastServerInventoryCharge.assert_not_called()
+        canvas.aw.markSantokerCharge.assert_not_called()
 
     def test_inventory_charge_manual_array_precondition_blocks_before_commit(
         self,
@@ -1457,6 +1472,7 @@ class TestInventoryCharge:
         assert canvas.timeindex[0] == -1
         assert canvas.roastUUID is None
         canvas.aw.santokerWarmupController.mark_charge.assert_not_called()
+        canvas.aw.markSantokerCharge.assert_not_called()
         canvas.aw.pidcontrol.pidOn.assert_not_called()
         canvas.aw.updateRoastNameFromInventoryAtCharge.assert_not_called()
 

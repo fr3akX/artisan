@@ -8434,9 +8434,9 @@ class tgraphcanvas(QObject):
         # reset the warm-up lifecycle only after all unrelated reset work completed
         if reset_succeeded:
             self.aw.santokerWarmupController.reset_charge()
-            santoker_power_controller = getattr(self.aw, 'santokerPowerController', None)
-            if santoker_power_controller is not None:
-                santoker_power_controller.reset_roast()
+            santoker_control_controller = getattr(self.aw, 'santokerControlController', None)
+            if santoker_control_controller is not None:
+                santoker_control_controller.reset_roast()
             self.aw.updateSantokerWarmupControls()
 
         #QApplication.processEvents() # this one seems to be needed for a proper redraw in fullscreen mode on OS X if a profile was loaded and NEW is pressed
@@ -14649,6 +14649,7 @@ class tgraphcanvas(QObject):
             if semaphore_acquired:
                 self.profileDataSemaphore.release(1)
         if charge_marked:
+            self.aw.markSantokerCharge()
             self.aw.updateRoastNameFromInventoryAtCharge()
         if self.flagstart:
             # redraw (within timealign) should not be called if semaphore is hold!

@@ -18,7 +18,7 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QSlider
 
 from artisanlib.main import ApplicationWindow, EventActionThread
-from artisanlib.santoker_power import SantokerPowerController
+from artisanlib.santoker_controls import AIR, DRUM, POWER, SantokerControlController
 from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
@@ -77,6 +77,46 @@ class FakeWarmupDevice:
 
 @dataclass
 class ParserWarmupDevice(FakeWarmupDevice):
+    power: int = 70
+    air: int = 80
+    drum: int = 30
+    power_fresh: bool = True
+    air_fresh: bool = True
+    drum_fresh: bool = True
+
+    def getPower(self) -> int:
+        return self.power
+
+    def isPowerFresh(self) -> bool:
+        return self.power_fresh
+
+    def getAir(self) -> int:
+        return self.air
+
+    def isAirFresh(self) -> bool:
+        return self.air_fresh
+
+    def getDrum(self) -> int:
+        return self.drum
+
+    def isDrumFresh(self) -> bool:
+        return self.drum_fresh
+
+    def setPower(self, value: int) -> bool:
+        self.power_fresh = False
+        self.calls.append(('raw', (POWER, value)))
+        return self.ready
+
+    def setAir(self, value: int) -> bool:
+        self.air_fresh = False
+        self.calls.append(('raw', (AIR, value)))
+        return self.ready
+
+    def setDrum(self, value: int) -> bool:
+        self.drum_fresh = False
+        self.calls.append(('raw', (DRUM, value)))
+        return self.ready
+
     def send_msg(self, target: bytes, value: int) -> None:
         self.calls.append(('raw', (target, value)))
 
@@ -715,7 +755,7 @@ def successful_reset_canvas(
     trace: list[str],
 ) -> SimpleNamespace:
     window = compact_window(controls, controller, device)
-    window.santokerPowerController = Mock()
+    window.santokerControlController = Mock()
     window.pushbuttonstyles['STOP'] = 'stop-style'
     window.centralWidget = Mock(return_value=None)
     window.restoreExtraDeviceSettingsBackup = Mock()
@@ -980,95 +1020,12 @@ def test_ready_false_marks_transport_loss_without_emit_or_restore(
     assert controller.desired_enabled() is True
 
 
-def test_active_roast_reconnect_restores_latest_power_requested_during_rx_silence(
+def test_active_roast_reconnect_restores_controls_logs_targets_and_reports_once(
     qapplication: QApplication,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     del qapplication
-
-    @dataclass
-    class FakePowerDevice(FakeWarmupDevice):
-        power: int = 70
-
-        def getPower(self) -> int:
-            return self.power
-
-        def isPowerFresh(self) -> bool:
-            return True
-
-        def setPower(self, value: int) -> bool:
-            if not self.ready or not 0 <= value <= 100:
-                return False
-            self.calls.append(('raw', (b'\xfa', value)))
-            self.power = value
-            return True
-
-        def send_msg(self, target: bytes, value: int) -> None:
-            self.calls.append(('raw', (target, value)))
-
-    controls = SantokerWarmupControls()
-    device = FakePowerDevice(ready=True, warmup=False)
-    window = compact_window(
-        controls,
-        SantokerWarmupController(),
-        device,
-        charge_index=1,
-        recording=True,
-    )
-    window.qmc.timeindex = [1, 0, 0, 0, 0, 0, 0, 0]
-    window.santokerPowerController = SantokerPowerController()
-    window.refreshSantokerWarmupControls = lambda: (
-        ApplicationWindow.refreshSantokerWarmupControls(
-            cast(ApplicationWindow, window)
-        )
-    )
-
-    for value in (80, 90, 100):
-        ApplicationWindow.santokerSendMessage(
-            cast(ApplicationWindow, window), b'\xfa', value
-        )
-
-    device.ready = False
-    ApplicationWindow.santokerWarmupReadyChanged(
-        cast(ApplicationWindow, window), False
-    )
-    device.ready = True
-    device.power = 0
-    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
-
-    power_values: list[int] = []
-    for kind, payload in device.calls:
-        if kind == 'raw':
-            target, value = cast(tuple[bytes, int], payload)
-            if target == b'\xfa':
-                power_values.append(value)
-    assert power_values == [80, 90, 100, 100]
-
-
-def test_unready_active_roast_power_request_replays_on_first_valid_frame(
-    qapplication: QApplication,
-) -> None:
-    del qapplication
-
-    @dataclass
-    class FakePowerDevice(FakeWarmupDevice):
-        power: int = 0
-
-        def getPower(self) -> int:
-            return self.power
-
-        def isPowerFresh(self) -> bool:
-            return False
-
-        def setPower(self, value: int) -> bool:
-            if not self.ready:
-                return False
-            self.calls.append(('raw', (b'\xfa', value)))
-            return True
-
-        def send_msg(self, target: bytes, value: int) -> None:
-            self.calls.append(('raw', (target, value)))
-
-    device = FakePowerDevice(ready=False, warmup=False)
+    device = ParserWarmupDevice(ready=True, warmup=False)
     window = compact_window(
         SantokerWarmupControls(),
         SantokerWarmupController(),
@@ -1077,24 +1034,126 @@ def test_unready_active_roast_power_request_replays_on_first_valid_frame(
         recording=True,
     )
     window.qmc.timeindex = [1, 0, 0, 0, 0, 0, 0, 0]
-    window.santokerPowerController = SantokerPowerController()
+    window.santokerControlController = SantokerControlController()
+    window.santokerControlController.mark_charge(device)
+    window.refreshSantokerWarmupControls = lambda: None
+
+    for target, value in ((POWER, 71), (AIR, 81), (DRUM, 31)):
+        ApplicationWindow.santokerSendMessage(
+            cast(ApplicationWindow, window), target, value
+        )
+
+    device.ready = False
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), False
+    )
+    device.ready = True
+    device.power = device.air = device.drum = 0
+    device.power_fresh = device.air_fresh = device.drum_fresh = False
+
+    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
+
+    raw_calls = [
+        cast(tuple[bytes, int], payload)
+        for kind, payload in device.calls
+        if kind == 'raw'
+    ]
+    assert raw_calls == [
+        (POWER, 71),
+        (AIR, 81),
+        (DRUM, 31),
+        (DRUM, 31),
+        (AIR, 81),
+    ]
+    window.sendmessage.assert_called_once_with('Connected')
+    assert [record.getMessage() for record in caplog.records] == [
+        'Santoker control restore target=C0 value=31',
+        'Santoker control restore target=CA value=81',
+    ]
+
+    device.drum = 31
+    device.air = 81
+    device.drum_fresh = device.air_fresh = True
+    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
+    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
+
+    raw_calls = [
+        cast(tuple[bytes, int], payload)
+        for kind, payload in device.calls
+        if kind == 'raw'
+    ]
+    assert raw_calls[-1] == (POWER, 71)
+    window.sendmessage.assert_called_once_with('Connected')
+    assert [record.getMessage() for record in caplog.records][-1] == (
+        'Santoker control restore target=FA value=71'
+    )
+
+
+def test_cancelled_recovery_does_not_report_connected(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    device = ParserWarmupDevice(ready=True, warmup=False)
+    controller = SantokerControlController()
+    window = compact_window(
+        SantokerWarmupControls(),
+        SantokerWarmupController(),
+        device,
+        charge_index=1,
+        recording=True,
+    )
+    window.qmc.timeindex = [1, 0, 0, 0, 0, 0, 0, 0]
+    window.santokerControlController = controller
+    window.refreshSantokerWarmupControls = lambda: None
+    controller.mark_charge(device)
+
+    device.ready = False
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), False
+    )
+    window.qmc.flagstart = False
+    window.qmc.timeindex[0] = -1
+    device.ready = True
+
+    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
+
+    window.sendmessage.assert_not_called()
+    assert not controller.restoration_pending()
+
+
+def test_unready_active_roast_control_request_replays_on_first_valid_frame(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    device = ParserWarmupDevice(ready=False, warmup=False, air=-1, drum=-1)
+    controller = SantokerControlController()
+    window = compact_window(
+        SantokerWarmupControls(),
+        SantokerWarmupController(),
+        device,
+        charge_index=1,
+        recording=True,
+    )
+    window.qmc.timeindex = [1, 0, 0, 0, 0, 0, 0, 0]
+    window.santokerControlController = controller
     window.refreshSantokerWarmupControls = lambda: None
 
     ApplicationWindow.santokerSendMessage(
-        cast(ApplicationWindow, window), b'\xfa', 90
+        cast(ApplicationWindow, window), POWER, 90
     )
     device.ready = True
     ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
 
-    power_values: list[int] = []
-    for kind, payload in device.calls:
-        if kind == 'raw':
-            target, value = cast(tuple[bytes, int], payload)
-            if target == b'\xfa':
-                power_values.append(value)
-    assert power_values == [90, 90]
+    raw_calls = [
+        cast(tuple[bytes, int], payload)
+        for kind, payload in device.calls
+        if kind == 'raw'
+    ]
+    assert raw_calls == [(POWER, 90), (POWER, 90)]
+    assert controller.intended_controls() == {POWER: 90}
 
 
+@pytest.mark.parametrize('target', [POWER, AIR, DRUM])
 @pytest.mark.parametrize(
     ('recording', 'charge_index', 'drop_index'),
     [
@@ -1104,40 +1163,20 @@ def test_unready_active_roast_power_request_replays_on_first_valid_frame(
     ],
     ids=['not-recording', 'precharge', 'postdrop'],
 )
-def test_power_command_outside_active_roast_is_not_restoration_intent(
+def test_control_command_outside_active_roast_is_not_restoration_intent(
+    target: bytes,
     recording: bool,
     charge_index: int,
     drop_index: int,
 ) -> None:
     device = ParserWarmupDevice(ready=True)
-    controller = SantokerPowerController()
+    controller = SantokerControlController()
     window = SimpleNamespace(
         santoker=device,
-        santokerPowerController=controller,
+        santokerControlController=controller,
         qmc=SimpleNamespace(
             flagstart=recording,
             timeindex=[charge_index, 0, 0, 0, 0, 0, drop_index, 0],
-        ),
-    )
-
-    ApplicationWindow.santokerSendMessage(
-        cast(ApplicationWindow, window), b'\xfa', 90
-    )
-
-    assert device.calls == [('raw', (b'\xfa', 90))]
-    assert controller.desired_power() is None
-
-
-@pytest.mark.parametrize('target', [b'\x7b', b'\xca', b'\xc0'])
-def test_non_power_target_is_never_restoration_intent(target: bytes) -> None:
-    device = ParserWarmupDevice(ready=True)
-    controller = SantokerPowerController()
-    window = SimpleNamespace(
-        santoker=device,
-        santokerPowerController=controller,
-        qmc=SimpleNamespace(
-            flagstart=True,
-            timeindex=[1, 0, 0, 0, 0, 0, 0, 0],
         ),
     )
 
@@ -1146,26 +1185,76 @@ def test_non_power_target_is_never_restoration_intent(target: bytes) -> None:
     )
 
     assert device.calls == [('raw', (target, 90))]
-    assert controller.desired_power() is None
+    assert controller.intended_controls() == {}
 
 
-def test_stale_generation_power_command_does_not_cross_monitoring_sessions() -> None:
-    @dataclass
-    class FakePowerDevice:
-        calls: list[tuple[bytes, int]] = field(default_factory=list)
+def test_non_control_target_is_never_restoration_intent() -> None:
+    device = ParserWarmupDevice(ready=True)
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        santoker=device,
+        santokerControlController=controller,
+        qmc=SimpleNamespace(
+            flagstart=True,
+            timeindex=[1, 0, 0, 0, 0, 0, 0, 0],
+        ),
+    )
 
-        def isHeaderReady(self) -> bool:
-            return True
+    ApplicationWindow.santokerSendMessage(
+        cast(ApplicationWindow, window), b'\x7b', 1
+    )
 
-        def send_msg(self, target: bytes, value: int) -> None:
-            self.calls.append((target, value))
+    assert device.calls == [('raw', (b'\x7b', 1))]
+    assert controller.intended_controls() == {}
 
-    device = FakePowerDevice()
-    controller = SantokerPowerController()
+
+@pytest.mark.parametrize(
+    ('recording', 'charge_index', 'drop_index', 'armed'),
+    [
+        (True, 1, 0, True),
+        (False, 1, 0, False),
+        (True, -1, 0, False),
+        (True, 1, 5, False),
+    ],
+)
+def test_confirmed_transport_loss_arms_only_during_active_roast(
+    recording: bool,
+    charge_index: int,
+    drop_index: int,
+    armed: bool,
+) -> None:
+    device = ParserWarmupDevice(ready=False)
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        santoker=device,
+        santokerWarmup=False,
+        santokerControlController=controller,
+        qmc=SimpleNamespace(
+            flagstart=recording,
+            timeindex=[charge_index, 0, 0, 0, 0, 0, drop_index, 0],
+        ),
+    )
+
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), False
+    )
+
+    assert controller.restoration_pending() is armed
+    assert controller.intended_controls() == (
+        {POWER: 70, AIR: 80, DRUM: 30} if armed else {}
+    )
+
+
+@pytest.mark.parametrize('target', [POWER, AIR, DRUM])
+def test_stale_generation_control_command_does_not_cross_monitoring_sessions(
+    target: bytes,
+) -> None:
+    device = ParserWarmupDevice()
+    controller = SantokerControlController()
     window = SimpleNamespace(
         santokerMonitoringGeneration=2,
         santoker=device,
-        santokerPowerController=controller,
+        santokerControlController=controller,
         qmc=SimpleNamespace(
             flagstart=True,
             timeindex=[1, 0, 0, 0, 0, 0, 0, 0],
@@ -1173,16 +1262,16 @@ def test_stale_generation_power_command_does_not_cross_monitoring_sessions() -> 
     )
 
     ApplicationWindow.santokerSendMessageForGeneration(
-        cast(ApplicationWindow, window), 1, b'\xfa', 90
+        cast(ApplicationWindow, window), 1, target, 90
     )
     assert device.calls == []
-    assert controller.desired_power() is None
+    assert controller.intended_controls() == {}
 
     ApplicationWindow.santokerSendMessageForGeneration(
-        cast(ApplicationWindow, window), 2, b'\xfa', 90
+        cast(ApplicationWindow, window), 2, target, 90
     )
-    assert device.calls == [(b'\xfa', 90)]
-    assert controller.desired_power() == 90
+    assert device.calls == [('raw', (target, 90))]
+    assert controller.intended_controls() == {target: 90}
 
 
 def test_event_action_thread_captures_monitoring_generation_at_creation() -> None:
@@ -1255,13 +1344,26 @@ def test_nested_extra_event_forwards_monitoring_generation_to_command() -> None:
     )
 
 
-def test_drop_immediately_clears_power_restoration_intent() -> None:
-    power_controller = Mock()
-    window = SimpleNamespace(santokerPowerController=power_controller)
+def test_successful_charge_snapshots_live_santoker_controls() -> None:
+    device = ParserWarmupDevice()
+    control_controller = Mock()
+    window = SimpleNamespace(
+        santoker=device,
+        santokerControlController=control_controller,
+    )
+
+    ApplicationWindow.markSantokerCharge(cast(ApplicationWindow, window))
+
+    control_controller.mark_charge.assert_called_once_with(device)
+
+
+def test_drop_immediately_clears_control_restoration_intent() -> None:
+    control_controller = Mock()
+    window = SimpleNamespace(santokerControlController=control_controller)
 
     ApplicationWindow.markSantokerDrop(cast(ApplicationWindow, window))
 
-    power_controller.mark_drop.assert_called_once_with()
+    control_controller.mark_drop.assert_called_once_with()
     canvas_source = Path('artisanlib/canvas.py').read_text(encoding='utf-8')
     assert 'self.aw.markSantokerDrop()' in canvas_source
 
@@ -1741,6 +1843,7 @@ def test_warmup_on_and_charge_are_serialized(
     window.arabicReshape = lambda text: text
     window.onMarkMoveToNext = Mock()
     window.openPropertiesSignal = Mock()
+    window.markSantokerCharge = Mock()
     window.updateRoastNameFromInventoryAtCharge = Mock()
 
     canvas = SimpleNamespace(
@@ -1920,7 +2023,7 @@ def test_successful_reset_clears_charge_latch_after_profile_unlock(
         'controls-refreshed',
     ]
     assert not controller.is_charge_latched()
-    canvas.aw.santokerPowerController.reset_roast.assert_called_once_with()
+    canvas.aw.santokerControlController.reset_roast.assert_called_once_with()
     assert controls.button.isEnabled() is enabled_after_reset
     assert not controls.button.isChecked()
     assert (

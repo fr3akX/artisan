@@ -221,6 +221,25 @@ def test_unavailable_mechanical_targets_do_not_block_power() -> None:
     assert device.calls == [(POWER, 70)]
 
 
+def test_reconciliation_attempts_are_reported_as_an_ordered_immutable_snapshot() -> None:
+    device = FakeControlDevice()
+    controller = SantokerControlController()
+    controller.mark_charge(device)
+    controller.note_transport_loss(active_roast=True, device=device)
+
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.ATTEMPTED
+    )
+    assert controller.last_reconciliation_attempts() == ((DRUM, 30), (AIR, 80))
+
+    assert (
+        controller.reconcile_after_frame(1, 0, device)
+        is ControlReconcileOutcome.THROTTLED
+    )
+    assert controller.last_reconciliation_attempts() == ()
+
+
 def test_retries_use_one_second_throttle_and_fixed_order() -> None:
     now = [10.0]
     device = FakeControlDevice()

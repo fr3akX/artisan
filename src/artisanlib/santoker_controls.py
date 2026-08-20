@@ -86,6 +86,9 @@ class SantokerControlController:
         default_factory=dict, init=False, repr=False, compare=False
     )
     _transport_lost: bool = field(default=False, init=False, repr=False)
+    _last_reconciliation_attempts: tuple[tuple[bytes, int], ...] = field(
+        default=(), init=False, repr=False
+    )
 
     def intended_controls(self) -> dict[bytes, int]:
         with self._lock:
@@ -94,6 +97,10 @@ class SantokerControlController:
     def restoration_pending(self) -> bool:
         with self._lock:
             return bool(self._pending)
+
+    def last_reconciliation_attempts(self) -> tuple[tuple[bytes, int], ...]:
+        with self._lock:
+            return self._last_reconciliation_attempts
 
     def mark_charge(self, device: SantokerControlDevice | None) -> None:
         with self._lock:
@@ -153,6 +160,7 @@ class SantokerControlController:
         device: SantokerControlDevice | None,
     ) -> ControlReconcileOutcome:
         with self._lock:
+            self._last_reconciliation_attempts = ()
             if drop_index > 0:
                 self._clear()
                 return ControlReconcileOutcome.NONE
@@ -216,11 +224,15 @@ class SantokerControlController:
         self, device: SantokerControlDevice, targets: list[bytes]
     ) -> ControlReconcileOutcome:
         attempted = False
+        reconciliation_attempts: list[tuple[bytes, int]] = []
         for target in targets:
+            value = self._intended[target]
             self._last_attempt_monotonic[target] = self.monotonic_clock()
-            if self._set_value(device, target, self._intended[target]):
+            reconciliation_attempts.append((target, value))
+            if self._set_value(device, target, value):
                 self._attempted.add(target)
                 attempted = True
+        self._last_reconciliation_attempts = tuple(reconciliation_attempts)
         if attempted:
             return ControlReconcileOutcome.ATTEMPTED
         return ControlReconcileOutcome.WAITING
@@ -266,4 +278,5 @@ class SantokerControlController:
 
     def _clear(self) -> None:
         self._intended.clear()
+        self._last_reconciliation_attempts = ()
         self._cancel_recovery()

@@ -231,9 +231,9 @@ from artisanlib.util import (appFrozen, uchr, decodeLocal, decodeLocalStrict, en
         eventtime2string, toDim, signature_message, rec_int_to_float, smooth_list)
 
 from artisanlib.qtsingleapplication import QtSingleApplication
+from artisanlib.santoker_controls import CONTROL_TARGETS, SantokerControlController
 from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession, TransportKind
 from artisanlib.santoker_diagnostics_ui import SantokerDiagnosticsDialog
-from artisanlib.santoker_power import POWER_TARGET, SantokerPowerController
 from artisanlib.santoker_warmup import (
     ReconcileOutcome,
     SantokerWarmupController,
@@ -1896,7 +1896,8 @@ class ApplicationWindow(QMainWindow):
         self.santokerEventFlags:list[bool] = [False, False, False, False, False, False, False ] # CHARGE, DRY, FCs, FCe, SCs, SCe, DROP
         self.santoker:Santoker|None = None # holds the Santoker instance created on connect; reset to None on disconnect
         self.santokerWarmupController:SantokerWarmupController = SantokerWarmupController()
-        self.santokerPowerController:SantokerPowerController = SantokerPowerController()
+        self.santokerControlController:SantokerControlController = SantokerControlController()
+        self.santokerControlRecoveryReported:bool = False
         self.santokerDiagnosticsSession:SantokerDiagnosticsSession|None = None
         self.santokerDiagnosticsDialog:SantokerDiagnosticsDialog|None = None
         self.santokerMonitoringGeneration:int = 0
@@ -19785,9 +19786,20 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot(bool)
     def santokerWarmupReadyChanged(self, ready:bool) -> None:
         if not ready and getattr(self, 'santoker', None) is not None:
-            power_controller = getattr(self, 'santokerPowerController', None)
-            if power_controller is not None:
-                power_controller.note_transport_loss()
+            control_controller = getattr(self, 'santokerControlController', None)
+            if control_controller is not None:
+                drop_index = self.qmc.timeindex[6] if len(self.qmc.timeindex) > 6 else 0
+                active_roast = (
+                    bool(getattr(self.qmc, 'flagstart', False))
+                    and self.qmc.timeindex[0] > -1
+                    and drop_index == 0
+                )
+                control_controller.note_transport_loss(
+                    active_roast=active_roast,
+                    device=self.santoker,
+                )
+                if active_roast and control_controller.restoration_pending():
+                    self.santokerControlRecoveryReported = False
             if bool(getattr(self, 'santokerWarmup', False)):
                 self.santokerWarmupController.note_transport_loss()
         if bool(getattr(self, 'santokerWarmup', False)):
@@ -19812,10 +19824,17 @@ class ApplicationWindow(QMainWindow):
         finally:
             ApplicationWindow.refreshSantokerWarmupControls(self)
 
+    def markSantokerCharge(self) -> None:
+        control_controller = getattr(self, 'santokerControlController', None)
+        if control_controller is not None:
+            control_controller.mark_charge(getattr(self, 'santoker', None))
+        self.santokerControlRecoveryReported = False
+
     def markSantokerDrop(self) -> None:
-        power_controller = getattr(self, 'santokerPowerController', None)
-        if power_controller is not None:
-            power_controller.mark_drop()
+        control_controller = getattr(self, 'santokerControlController', None)
+        if control_controller is not None:
+            control_controller.mark_drop()
+        self.santokerControlRecoveryReported = False
 
     def startSantokerDiagnosticsSession(self) -> SantokerDiagnosticsSession:
         self.santokerMonitoringGeneration = getattr(self, 'santokerMonitoringGeneration', 0) + 1
@@ -19826,11 +19845,12 @@ class ApplicationWindow(QMainWindow):
         )
         session = SantokerDiagnosticsSession(transport)
         self.santokerDiagnosticsSession = session
-        power_controller = getattr(self, 'santokerPowerController', None)
-        if power_controller is None:
-            power_controller = SantokerPowerController()
-            self.santokerPowerController = power_controller
-        power_controller.start_monitoring()
+        control_controller = getattr(self, 'santokerControlController', None)
+        if control_controller is None:
+            control_controller = SantokerControlController()
+            self.santokerControlController = control_controller
+        control_controller.start_monitoring()
+        self.santokerControlRecoveryReported = False
         self.santokerWarmupController.attach_diagnostics(session)
         return session
 
@@ -19849,9 +19869,10 @@ class ApplicationWindow(QMainWindow):
     def stopSantokerMonitoring(self) -> None:
         self.santokerMonitoringGeneration = getattr(self, 'santokerMonitoringGeneration', 0) + 1
         self.santokerWarmupController.stop_monitoring(self.santoker)
-        power_controller = getattr(self, 'santokerPowerController', None)
-        if power_controller is not None:
-            power_controller.stop_monitoring()
+        control_controller = getattr(self, 'santokerControlController', None)
+        if control_controller is not None:
+            control_controller.stop_monitoring()
+        self.santokerControlRecoveryReported = False
         if self.santoker is not None:
             self.santoker.stop()
             self.santoker = None
@@ -19922,19 +19943,32 @@ class ApplicationWindow(QMainWindow):
             self.qmc.timeindex[0],
             self.santoker,
         )
-        power_controller = getattr(self, 'santokerPowerController', None)
-        if power_controller is not None:
+        control_controller = getattr(self, 'santokerControlController', None)
+        if control_controller is not None:
             drop_index = self.qmc.timeindex[6] if len(self.qmc.timeindex) > 6 else 0
             charge_index = (
                 self.qmc.timeindex[0]
                 if bool(getattr(self.qmc, 'flagstart', False))
                 else -1
             )
-            power_controller.reconcile_after_frame(
+            control_controller.reconcile_after_frame(
                 charge_index,
                 drop_index,
                 self.santoker,
             )
+            reconciliation_attempts = control_controller.last_reconciliation_attempts()
+            if (
+                reconciliation_attempts
+                and not bool(getattr(self, 'santokerControlRecoveryReported', False))
+            ):
+                self.sendmessage(QApplication.translate('Label', 'Connected'))
+                self.santokerControlRecoveryReported = True
+            for target, value in reconciliation_attempts:
+                _log.warning(
+                    'Santoker control restore target=%s value=%d',
+                    target.hex().upper(),
+                    value,
+                )
         self.refreshSantokerWarmupControls()
         if outcome is ReconcileOutcome.FORCED_OFF:
             self.sendmessage(QApplication.translate(
@@ -19997,17 +20031,25 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot(bytes,int)
     def santokerSendMessage(self, target:bytes, value:int) -> None:
         if self.santoker is not None:
-            power_controller = getattr(self, 'santokerPowerController', None)
-            if power_controller is not None and target == POWER_TARGET:
+            control_controller = getattr(self, 'santokerControlController', None)
+            if control_controller is not None and target in CONTROL_TARGETS:
                 drop_index = self.qmc.timeindex[6] if len(self.qmc.timeindex) > 6 else 0
                 active_roast = (
                     bool(getattr(self.qmc, 'flagstart', False))
                     and self.qmc.timeindex[0] > -1
                     and drop_index == 0
                 )
-                power_controller.note_power_request(value, active_roast=active_roast)
+                control_controller.note_control_request(
+                    target,
+                    value,
+                    active_roast=active_roast,
+                )
                 if active_roast and not self.santoker.isHeaderReady():
-                    power_controller.note_transport_loss()
+                    control_controller.note_transport_loss(
+                        active_roast=True,
+                        device=self.santoker,
+                    )
+                    self.santokerControlRecoveryReported = False
             self.santoker.send_msg(target,value)
 
 
