@@ -17,15 +17,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: outbox-tests-01-30
+          - label: outbox-tests-01-10
             start: 0
+            end: 10
+          - label: outbox-tests-11-20
+            start: 10
+            end: 20
+          - label: outbox-tests-21-30
+            start: 20
             end: 30
-          - label: outbox-tests-31-60
-            start: 30
-            end: 60
-          - label: outbox-tests-61-end
-            start: 60
-            end: 999
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
