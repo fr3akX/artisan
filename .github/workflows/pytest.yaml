@@ -17,40 +17,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: roastserver-cache
-            pytest-path: test/unitary/artisanlib/roastserver/test_cache.py
-          - label: roastserver-coexistence
-            pytest-path: test/unitary/artisanlib/roastserver/test_coexistence.py
-          - label: inventory
-            pytest-path: test/unitary/artisanlib/roastserver/test_inventory.py
-          - label: inventory-api
-            pytest-path: test/unitary/artisanlib/roastserver/test_inventory_api.py
-          - label: inventory-contract
-            pytest-path: test/unitary/artisanlib/roastserver/test_inventory_contract.py
-          - label: inventory-controller
-            pytest-path: test/unitary/artisanlib/roastserver/test_inventory_controller.py
-          - label: inventory-dialogs
-            pytest-path: test/unitary/artisanlib/roastserver/test_inventory_dialogs.py
-          - label: inventory-store
-            pytest-path: test/unitary/artisanlib/roastserver/test_inventory_store.py
-          - label: inventory-worker
-            pytest-path: test/unitary/artisanlib/roastserver/test_inventory_worker.py
-          - label: roastserver-controller
-            pytest-path: test/unitary/artisanlib/roastserver/test_roastserver_controller.py
-          - label: roastserver-dialogs
-            pytest-path: test/unitary/artisanlib/roastserver/test_roastserver_dialogs.py
-          - label: roastserver-worker
-            pytest-path: test/unitary/artisanlib/roastserver/test_worker.py
-          - label: canvas
-            pytest-path: test/unitary/artisanlib/test_canvas.py
-          - label: main
-            pytest-path: test/unitary/artisanlib/test_main.py
-          - label: santoker-warmup
-            pytest-path: test/unitary/artisanlib/test_santoker_warmup.py
-          - label: util
-            pytest-path: test/unitary/artisanlib/test_util.py
-          - label: ci-workflows
-            pytest-path: test/unitary/test_ci_workflows.py
+          - label: roastserver-only
+            pytest-args: test/unitary/artisanlib/roastserver
+          - label: artisanlib-no-roastserver
+            pytest-args: test/unitary/artisanlib --ignore=test/unitary/artisanlib/roastserver
+          - label: unitary-rest
+            pytest-args: test/unitary --ignore=test/unitary/artisanlib --ignore=test/unitary/plus
+          - label: plus
+            pytest-args: test/unitary/plus
+          - label: sanity
+            pytest-args: test/sanity
+          - label: smoke
+            pytest-args: test/smoke
+          - label: uat
+            pytest-args: test/uat
+          - label: full-no-roastserver
+            pytest-args: test --ignore=test/unitary/artisanlib/roastserver
+          - label: full-control
+            pytest-args: test
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.14
@@ -100,7 +84,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade -r src/requirements-dev.txt
           pip install -r src/requirements.txt
-      - name: Collect test module
+      - name: Collect test group
         working-directory: src
         run: |
-          pytest --collect-only -q ${{ matrix.pytest-path }}
+          pytest --collect-only -q ${{ matrix.pytest-args }}
