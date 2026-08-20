@@ -1741,6 +1741,7 @@ def test_warmup_on_and_charge_are_serialized(
     window.arabicReshape = lambda text: text
     window.onMarkMoveToNext = Mock()
     window.openPropertiesSignal = Mock()
+    window.updateRoastNameFromInventoryAtCharge = Mock()
 
     canvas = SimpleNamespace(
         aw=window,

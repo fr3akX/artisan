@@ -1360,6 +1360,19 @@ class TestInventoryCharge:
         assert canvas.roastUUID == '33333333333343338333333333333333'
         canvas.aw.prepareRoastServerInventoryCharge.assert_called_once_with()
 
+    def test_inventory_charge_updates_title_after_semaphore_release(self) -> None:
+        canvas = inventory_charge_canvas()
+
+        def update_title() -> None:
+            assert not canvas.profileDataSemaphore.acquired
+            assert canvas.timeindex[0] == 0
+
+        canvas.aw.updateRoastNameFromInventoryAtCharge.side_effect = update_title
+
+        tgraphcanvas._markCharge(canvas, noaction=True)
+
+        canvas.aw.updateRoastNameFromInventoryAtCharge.assert_called_once_with()
+
     def test_inventory_charge_prepare_precedes_profile_semaphore(self) -> None:
         canvas = inventory_charge_canvas()
 
@@ -1445,6 +1458,7 @@ class TestInventoryCharge:
         assert canvas.roastUUID is None
         canvas.aw.santokerWarmupController.mark_charge.assert_not_called()
         canvas.aw.pidcontrol.pidOn.assert_not_called()
+        canvas.aw.updateRoastNameFromInventoryAtCharge.assert_not_called()
 
     def test_inventory_charge_manual_commit_failure_rolls_back_sample_and_curves(
         self,

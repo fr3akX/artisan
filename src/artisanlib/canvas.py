@@ -14648,6 +14648,8 @@ class tgraphcanvas(QObject):
         finally:
             if semaphore_acquired:
                 self.profileDataSemaphore.release(1)
+        if charge_marked:
+            self.aw.updateRoastNameFromInventoryAtCharge()
         if self.flagstart:
             # redraw (within timealign) should not be called if semaphore is hold!
             # NOTE: the following self.aw.eventaction might do serial communication that acquires a lock, so release it here

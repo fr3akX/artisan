@@ -3992,6 +3992,7 @@ def coordinator_inventory_charge_canvas(window: ApplicationWindow) -> SimpleName
     window.pidcontrol.pidOnCHARGE = False
     window.santokerWarmupController = MagicMock()
     window.updateSantokerWarmupControls = Mock()
+    window.updateRoastNameFromInventoryAtCharge = Mock()  # type: ignore[method-assign]
     window.onMarkMoveToNext = Mock()
     window.openPropertiesSignal = MagicMock()
     window.sendmessage = Mock()  # type: ignore[method-assign]
@@ -5492,6 +5493,77 @@ class TestRoastServerMainIntegration:
         window.roastserver_controller = Mock()
         window.sendmessage = Mock()  # type: ignore[method-assign]
         return window
+
+    @staticmethod
+    def inventory_title_window(
+        title: str = 'Roaster Scope',
+        inventory_name: str|None = 'Historical lot',
+    ) -> ApplicationWindow:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.qmc = SimpleNamespace(
+            title=title,
+            roastServerBeanLotName=inventory_name,
+        )
+        return window
+
+    @pytest.mark.parametrize('current_title', ['', 'Roaster Scope'])
+    def test_inventory_charge_title_replaces_default_without_prompt(
+        self,
+        current_title: str,
+    ) -> None:
+        window = self.inventory_title_window(current_title)
+        with patch.object(main_module.datetime, 'datetime') as datetime_class, patch.object(
+            main_module.QMessageBox, 'question'
+        ) as question:
+            datetime_class.now.return_value.astimezone.return_value.strftime.return_value = (
+                '2026-08-20 14:37'
+            )
+
+            window.updateRoastNameFromInventoryAtCharge()
+
+        assert window.qmc.title == 'Historical lot – 2026-08-20 14:37'
+        question.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ('reply', 'expected'),
+        [
+            (main_module.QMessageBox.StandardButton.Yes, 'Historical lot – 2026-08-20 14:37'),
+            (main_module.QMessageBox.StandardButton.No, 'Existing roast'),
+        ],
+        ids=['replace', 'preserve'],
+    )
+    def test_inventory_charge_title_asks_before_replacing_custom_title(
+        self,
+        reply: main_module.QMessageBox.StandardButton,
+        expected: str,
+    ) -> None:
+        window = self.inventory_title_window('Existing roast')
+        with patch.object(main_module.datetime, 'datetime') as datetime_class, patch.object(
+            main_module.QMessageBox, 'question', return_value=reply
+        ) as question:
+            datetime_class.now.return_value.astimezone.return_value.strftime.return_value = (
+                '2026-08-20 14:37'
+            )
+
+            window.updateRoastNameFromInventoryAtCharge()
+
+        assert window.qmc.title == expected
+        question.assert_called_once()
+        assert question.call_args.args[1] == 'Change'
+        assert 'Existing roast' in question.call_args.args[2]
+        assert 'Historical lot – 2026-08-20 14:37' in question.call_args.args[2]
+        assert question.call_args.args[4] == main_module.QMessageBox.StandardButton.No
+
+    def test_inventory_charge_title_ignores_missing_inventory_name(self) -> None:
+        window = self.inventory_title_window('Existing roast', None)
+        with patch.object(main_module.datetime, 'datetime') as datetime_class, patch.object(
+            main_module.QMessageBox, 'question'
+        ) as question:
+            window.updateRoastNameFromInventoryAtCharge()
+
+        assert window.qmc.title == 'Existing roast'
+        datetime_class.now.assert_not_called()
+        question.assert_not_called()
 
     def test_inventory_charge_prepare_builds_link_and_passes_profile_values(
         self,

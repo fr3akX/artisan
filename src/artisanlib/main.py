@@ -4919,6 +4919,26 @@ class ApplicationWindow(QMainWindow):
         return messages.get(code, QApplication.translate(
             'Message', 'Inventory reservation could not be prepared. CHARGE was canceled.'))
 
+    def updateRoastNameFromInventoryAtCharge(self) -> None:
+        inventory_name = self.qmc.roastServerBeanLotName
+        if not inventory_name:
+            return
+        timestamp = datetime.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M')
+        candidate = f'{inventory_name} – {timestamp}'
+        default_title = QApplication.translate('Scope Title', 'Roaster Scope')
+        if self.qmc.title not in {'', default_title}:
+            name_label = QApplication.translate('Label', 'Name')
+            reply = QMessageBox.question(
+                self,
+                QApplication.translate('Label', 'Change'),
+                f'{name_label}:\n\n{self.qmc.title} → {candidate}',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self.qmc.title = candidate
+
     def prepareRoastServerInventoryCharge(
         self,
     ) -> 'PreparedInventoryCharge|None':
