@@ -14,6 +14,7 @@ v4.2.2
 * FIXES
   - fixes faulty hash generation on files created using `Save As` causing `modified file` warnings on load ([Issue #2205](../../../issues/2205))
   - fixes regression causing canvas color not being applied correctly ([Issue #2212](../../../issues/2212))
+  - [fr3akX/artisan issue #6](https://github.com/fr3akX/artisan/issues/6): Santoker warm-up `ON`/target before CHARGE and active-roast heater power after CHARGE are restored safely after automatic reconnect, and a read-only protocol diagnostics window captures current-session events. Official-app reconnect behavior was established by static analysis; physical X3 verification is pending.
 
 ----
 v4.2.0 (Jun 30, 2026)

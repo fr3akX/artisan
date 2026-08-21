@@ -199,6 +199,7 @@
         <location filename="../artisanlib/designer.py" line="239"/>
         <location filename="../artisanlib/wheels.py" line="135"/>
         <location filename="../artisanlib/wheels.py" line="50"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="293"/>
         <source>Close</source>
         <translation>Zavrieť</translation>
     </message>
@@ -1135,6 +1136,22 @@ KONIEC</translation>
     <message>
         <source>scan</source>
         <translation type="vanished">skenovať</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="67"/>
+        <source>Diagnostics…</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="285"/>
+        <source>Copy All</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="516"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="289"/>
+        <source>Save as Text…</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>CheckBox</name>
@@ -4514,6 +4531,16 @@ KONIEC</translation>
         <source>Exception: redrawdesigner() Roast events may be out of order. Resetting Designer.</source>
         <translation>Výnimka: udalosti redrawdesigner() Roast môžu byť mimo prevádzky. Resetovanie návrhára.</translation>
     </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="511"/>
+        <source>Failed to copy Santoker diagnostics</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="533"/>
+        <source>Failed to save Santoker diagnostics</source>
+        <translation type="unfinished"/>
+    </message>
 </context><context>
     <name>Form Caption</name>
     <message>
@@ -4812,6 +4839,11 @@ KONIEC</translation>
         <location filename="../artisanlib/cup_profile.py" line="50"/>
         <source>Cup Profile</source>
         <translation>Profil pohára</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="115"/>
+        <source>Santoker Diagnostics</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>GroupBox</name>
@@ -5253,6 +5285,21 @@ KONIEC</translation>
         <location filename="../artisanlib/colors.py" line="518"/>
         <source>Slow Cooling Timer LCD</source>
         <translation>Časovač pomalého chladenia LCD</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="128"/>
+        <source>Session and Connection</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="175"/>
+        <source>Machine State</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="234"/>
+        <source>Warm-up State</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>HTML Report Template</name>
@@ -12919,6 +12966,7 @@ Klávesové skratky musia byť zakázané (ENTER)</translation>
     </message>
     <message>
         <location filename="../artisanlib/ports.py" line="1542"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="141"/>
         <source>Transport</source>
         <translation>Doprava</translation>
     </message>
@@ -14320,6 +14368,7 @@ Menej uzlov: jednoduchšia krivka, ale môže dôjsť k strate detailov</transla
     </message>
     <message>
         <location filename="../artisanlib/devices.py" line="783"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="218"/>
         <source>Power</source>
         <translation>Moc</translation>
     </message>
@@ -14714,6 +14763,116 @@ Menej uzlov: jednoduchšia krivka, ale môže dôjsť k strate detailov</transla
     <message>
         <source>Meter</source>
         <translation type="vanished">Merač</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="56"/>
+        <source>unknown</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="135"/>
+        <source>Monitoring</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="147"/>
+        <source>Connected</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="153"/>
+        <source>Ready</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="159"/>
+        <source>Header</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="165"/>
+        <source>Reconnect Count</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="171"/>
+        <source>Last Packet</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="182"/>
+        <source>Board</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="188"/>
+        <source>Bean</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="194"/>
+        <source>Environment</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="200"/>
+        <source>Infrared</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="206"/>
+        <source>Bean ROR</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="212"/>
+        <source>Environment ROR</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="224"/>
+        <source>Fan</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="230"/>
+        <source>Drum</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="241"/>
+        <source>Desired warm-up</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="247"/>
+        <source>Desired target</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="253"/>
+        <source>Reported warm-up</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="259"/>
+        <source>Reported target</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="265"/>
+        <source>Restoration</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="271"/>
+        <source>CHARGE latch</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="278"/>
+        <source>History</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>MAC_APPLICATION_MENU</name>
@@ -18306,6 +18465,27 @@ Continue?</source>
     <message>
         <source>Bluetooth access denied</source>
         <translation type="vanished">Prístup cez Bluetooth bol odmietnutý</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="357"/>
+        <source>No Santoker monitoring session captured</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="492"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="399"/>
+        <source>Diagnostics unavailable</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="469"/>
+        <source>[older entries discarded: %1]</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="540"/>
+        <source>Error</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>Plus</name>

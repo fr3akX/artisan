@@ -8434,6 +8434,9 @@ class tgraphcanvas(QObject):
         # reset the warm-up lifecycle only after all unrelated reset work completed
         if reset_succeeded:
             self.aw.santokerWarmupController.reset_charge()
+            santoker_control_controller = getattr(self.aw, 'santokerControlController', None)
+            if santoker_control_controller is not None:
+                santoker_control_controller.reset_roast()
             self.aw.updateSantokerWarmupControls()
 
         #QApplication.processEvents() # this one seems to be needed for a proper redraw in fullscreen mode on OS X if a profile was loaded and NEW is pressed
@@ -13272,6 +13275,11 @@ class tgraphcanvas(QObject):
                 self.aw.pidcontrol.setSV(self.aw.sliderSV.value())
 
             # ADD DEVICE: # start communication/connect
+            santoker_diagnostics_session = (
+                self.aw.startSantokerDiagnosticsSession()
+                if self.device == 134
+                else None
+            )
             if not bool(self.aw.simulator):
                 if self.device == 53 and self.aw.hottop is None: # only start Hottop connection if there is not already one
                     # connect HOTTOP
@@ -13292,6 +13300,7 @@ class tgraphcanvas(QObject):
                     self.aw.hottop.start()
                 elif self.device == 134:
                     # connect Santoker
+                    assert santoker_diagnostics_session is not None
                     from artisanlib.santoker import Santoker
                     santoker_serial:SerialSettings|None = None
                     if self.aw.santokerSerial and not self.aw.santokerBLE:
@@ -13303,22 +13312,32 @@ class tgraphcanvas(QObject):
                                 parity = self.aw.ser.parity,
                                 timeout = self.aw.ser.timeout,
                                 clear_HUPCL = False)
+                    santoker_diagnostics_session.record_connection_attempt()
+                    santoker_generation = self.aw.santokerMonitoringGeneration
+
+                    def queue_santoker_callback(callback:Callable[[], None]) -> None:
+                        self.aw.santokerCallbackGenerationSignal.emit(
+                            santoker_generation,
+                            callback,
+                        )
+
                     self.aw.santoker = Santoker(self.aw.santokerHost, self.aw.santokerPort,
                         santoker_serial, self.aw.santokerBLE,
-                        connected_handler=lambda : self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} connected').format('Santoker'),True,None),
-                        disconnected_handler=lambda : self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} disconnected').format('Santoker'),True,None),
+                        diagnostics=santoker_diagnostics_session,
+                        frame_handler=lambda: self.aw.santokerFrameGenerationSignal.emit(santoker_generation),
+                        connected_handler=lambda: queue_santoker_callback(lambda: self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} connected').format('Santoker'),True,None)),
+                        disconnected_handler=lambda: queue_santoker_callback(lambda: self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} disconnected').format('Santoker'),True,None)),
                         # CHARGE handler disactivated to not trigger CHARGE after CHARGE is signalled to the machine by START
                         # NOTE: only after CHARGE the heater
-                        charge_handler=lambda : (self.markChargeDelaySignal.emit(0) if (len(self.aw.santokerEventFlags)>0 and self.aw.santokerEventFlags[0] and self.timeindex[0] == -1) else None),
-                        dry_handler=lambda : (self.markDRYSignal.emit(False) if (len(self.aw.santokerEventFlags)>1 and self.aw.santokerEventFlags[1] and self.timeindex[1] == 0) else None),
-                        fcs_handler=lambda : (self.markFCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>2 and self.aw.santokerEventFlags[2] and self.timeindex[2] == 0) else None),
-                        scs_handler=lambda : (self.markSCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>4 and self.aw.santokerEventFlags[4] and self.timeindex[4] == 0) else None),
-                        drop_handler=lambda : (self.markDropSignal.emit(False) if (len(self.aw.santokerEventFlags)>6 and self.aw.santokerEventFlags[6] and self.timeindex[6] == 0) else None),
-                        warmup_handler=self.aw.santokerWarmupStateSignal.emit,
-                        warmup_temp_handler=self.aw.santokerWarmupTargetSignal.emit,
+                        charge_handler=lambda: queue_santoker_callback(lambda: (self.markChargeDelaySignal.emit(0) if (len(self.aw.santokerEventFlags)>0 and self.aw.santokerEventFlags[0] and self.timeindex[0] == -1) else None)),
+                        dry_handler=lambda: queue_santoker_callback(lambda: (self.markDRYSignal.emit(False) if (len(self.aw.santokerEventFlags)>1 and self.aw.santokerEventFlags[1] and self.timeindex[1] == 0) else None)),
+                        fcs_handler=lambda: queue_santoker_callback(lambda: (self.markFCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>2 and self.aw.santokerEventFlags[2] and self.timeindex[2] == 0) else None)),
+                        scs_handler=lambda: queue_santoker_callback(lambda: (self.markSCsSignal.emit(False) if (len(self.aw.santokerEventFlags)>4 and self.aw.santokerEventFlags[4] and self.timeindex[4] == 0) else None)),
+                        drop_handler=lambda: queue_santoker_callback(lambda: (self.markDropSignal.emit(False) if (len(self.aw.santokerEventFlags)>6 and self.aw.santokerEventFlags[6] and self.timeindex[6] == 0) else None)),
+                        warmup_handler=lambda state: self.aw.santokerWarmupStateGenerationSignal.emit(santoker_generation, state),
+                        warmup_temp_handler=lambda temp_c: self.aw.santokerWarmupTargetGenerationSignal.emit(santoker_generation, temp_c),
                         warmup_target=self.aw.santokerWarmupController.desired_temp_c,
-                        ready_handler=self.aw.santokerWarmupReadySignal.emit)
-                    self.aw.santokerWarmupTargetSignal.emit(self.aw.santoker.getWarmupTarget())
+                        ready_handler=lambda ready: self.aw.santokerWarmupReadyGenerationSignal.emit(santoker_generation, ready))
                     self.aw.santoker.setLogging(self.device_logging)
                     self.aw.santoker.start()
                 elif self.device == 171:
@@ -13529,9 +13548,8 @@ class tgraphcanvas(QObject):
                     self.aw.hottop = None
 
                 # disconnect Santoker
-                if not bool(self.aw.simulator) and self.device == 134 and self.aw.santoker is not None:
-                    self.aw.santoker.stop()
-                    self.aw.santoker = None
+                if self.device == 134:
+                    self.aw.stopSantokerMonitoring()
 
                 # disconnect Santoker R
                 if not bool(self.aw.simulator) and self.device == 171 and self.aw.santokerR is not None:
@@ -14630,6 +14648,9 @@ class tgraphcanvas(QObject):
         finally:
             if semaphore_acquired:
                 self.profileDataSemaphore.release(1)
+        if charge_marked:
+            self.aw.markSantokerCharge()
+            self.aw.updateRoastNameFromInventoryAtCharge()
         if self.flagstart:
             # redraw (within timealign) should not be called if semaphore is hold!
             # NOTE: the following self.aw.eventaction might do serial communication that acquires a lock, so release it here
@@ -15365,6 +15386,7 @@ class tgraphcanvas(QObject):
                                 self.timeindex[6] = max(0,len(self.timex)-1)
                             else:
                                 return
+                        self.aw.markSantokerDrop()
                         if self.BTcurve or self.ETcurve:
                             temp = (self.temp2[self.timeindex[6]] if self.BTcurve else self.temp1[self.timeindex[6]])
                             if is_proper_temp(temp):

@@ -23,7 +23,6 @@ import subprocess
 import warnings
 import math
 import pytest
-import tempfile
 import hypothesis.strategies as st
 import numpy as np
 from hypothesis import example, given, settings
@@ -3477,46 +3476,34 @@ class TestSerialize:
             'flush-directory',
         ]
 
-    def test_serialize_basic(self) -> None:
+    def test_serialize_basic(self, tmp_path: Path) -> None:
         """Test serialize writes object to file."""
         # Arrange
         test_obj = {'key': 'value', 'number': 42}
+        destination = tmp_path / 'basic.alog'
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_filename = temp_file.name
+        # Act
+        serialize(str(destination), test_obj)
 
-        try:
-            # Act
-            serialize(temp_filename, test_obj)
+        # Assert
+        content = destination.read_text(encoding='utf-8')
+        assert 'key' in content
+        assert 'value' in content
+        assert '42' in content
 
-            # Assert
-            with open(temp_filename, encoding='utf-8') as f:
-                content = f.read()
-                assert 'key' in content
-                assert 'value' in content
-                assert '42' in content
-        finally:
-            os.unlink(temp_filename)
-
-    def test_serialize_complex_object(self) -> None:
+    def test_serialize_complex_object(self, tmp_path: Path) -> None:
         """Test serialize with complex nested object."""
         # Arrange
         test_obj = {'nested': {'inner': 'value'}, 'list': [1, 2, 3], 'boolean': True}
+        destination = tmp_path / 'complex.alog'
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_filename = temp_file.name
+        # Act
+        serialize(str(destination), test_obj)
 
-        try:
-            # Act
-            serialize(temp_filename, test_obj)
-
-            # Assert
-            with open(temp_filename, encoding='utf-8') as f:
-                content = f.read()
-                assert 'nested' in content
-                assert 'inner' in content
-        finally:
-            os.unlink(temp_filename)
+        # Assert
+        content = destination.read_text(encoding='utf-8')
+        assert 'nested' in content
+        assert 'inner' in content
 
 
 

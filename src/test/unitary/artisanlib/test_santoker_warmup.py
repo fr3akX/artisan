@@ -17,8 +17,16 @@ from PyQt6.QtCore import QCoreApplication, QEvent, QSettings, Qt
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QSlider
 
-from artisanlib.main import ApplicationWindow
-from artisanlib.santoker_warmup import SantokerWarmupController
+from artisanlib.main import ApplicationWindow, EventActionThread
+from artisanlib.santoker_controls import (
+    AIR,
+    DRUM,
+    HEATING_ON,
+    MACHINE_ON,
+    POWER,
+    SantokerControlController,
+)
+from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 from artisanlib.santoker_warmup_ui import SantokerWarmupControls
 
 INVENTORY_SELECTION = (
@@ -46,6 +54,7 @@ def qapplication() -> QApplication:
 class FakeWarmupDevice:
     ready: bool = True
     warmup: bool | None = False
+    reported_target: float | None = None
     calls: list[tuple[str, object]] = field(default_factory=list)
 
     def isHeaderReady(self) -> bool:
@@ -53,6 +62,9 @@ class FakeWarmupDevice:
 
     def getWarmup(self) -> bool | None:
         return self.warmup
+
+    def getReportedWarmupTarget(self) -> float | None:
+        return self.reported_target
 
     def setWarmupTarget(self, temp_c: float) -> bool:
         self.calls.append(('target', temp_c))
@@ -63,11 +75,100 @@ class FakeWarmupDevice:
         self.warmup = enabled
         return self.ready
 
+    def requestWarmupOn(self, temp_c: float) -> bool:
+        if not self.ready:
+            return False
+        if not self.setWarmupTarget(temp_c):
+            return False
+        return self.setWarmup(True)
 
 @dataclass
 class ParserWarmupDevice(FakeWarmupDevice):
+    machine_on: int = 1
+    heating_on: int = 1
+    power: int = 70
+    air: int = 80
+    drum: int = 30
+    machine_on_fresh: bool = True
+    heating_on_fresh: bool = True
+    power_fresh: bool = True
+    air_fresh: bool = True
+    drum_fresh: bool = True
+
+    def getMachineOn(self) -> int:
+        return self.machine_on
+
+    def isMachineOnFresh(self) -> bool:
+        return self.machine_on_fresh
+
+    def getHeatingOn(self) -> int:
+        return self.heating_on
+
+    def isHeatingOnFresh(self) -> bool:
+        return self.heating_on_fresh
+
+    def getPower(self) -> int:
+        return self.power
+
+    def isPowerFresh(self) -> bool:
+        return self.power_fresh
+
+    def getAir(self) -> int:
+        return self.air
+
+    def isAirFresh(self) -> bool:
+        return self.air_fresh
+
+    def getDrum(self) -> int:
+        return self.drum
+
+    def isDrumFresh(self) -> bool:
+        return self.drum_fresh
+
+    def setMachineOn(self, value: int) -> bool:
+        self.machine_on_fresh = False
+        self.calls.append(('raw', (MACHINE_ON, value)))
+        return self.ready
+
+    def setHeatingOn(self, value: int) -> bool:
+        self.heating_on_fresh = False
+        self.calls.append(('raw', (HEATING_ON, value)))
+        return self.ready
+
+    def setPower(self, value: int) -> bool:
+        self.power_fresh = False
+        self.calls.append(('raw', (POWER, value)))
+        return self.ready
+
+    def setAir(self, value: int) -> bool:
+        self.air_fresh = False
+        self.calls.append(('raw', (AIR, value)))
+        return self.ready
+
+    def setDrum(self, value: int) -> bool:
+        self.drum_fresh = False
+        self.calls.append(('raw', (DRUM, value)))
+        return self.ready
+
     def send_msg(self, target: bytes, value: int) -> None:
         self.calls.append(('raw', (target, value)))
+
+    def report(self, target: bytes, value: int) -> None:
+        if target == MACHINE_ON:
+            self.machine_on = value
+            self.machine_on_fresh = True
+        elif target == HEATING_ON:
+            self.heating_on = value
+            self.heating_on_fresh = True
+        elif target == POWER:
+            self.power = value
+            self.power_fresh = True
+        elif target == AIR:
+            self.air = value
+            self.air_fresh = True
+        elif target == DRUM:
+            self.drum = value
+            self.drum_fresh = True
 
 
 def test_controller_converts_fahrenheit_and_updates_device() -> None:
@@ -82,6 +183,22 @@ def test_controller_converts_fahrenheit_and_updates_device() -> None:
     assert controller.desired_temp_c == pytest.approx(190.0)
     assert device.calls == [('target', pytest.approx(190.0))]
     assert controller.target_for_display('F') == pytest.approx(374.0)
+
+
+def test_fahrenheit_target_is_canonical_and_converges_without_resend() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True, warmup=True, reported_target=190.6)
+    controller = SantokerWarmupController()
+
+    assert controller.set_target(375.0, 'F', None) is WarmupResult.OK
+    assert controller.desired_temp_c == 190.6
+    assert controller.target_for_display('F') == pytest.approx(375.08)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.CONVERGED
+    assert device.calls == []
 
 
 @pytest.mark.parametrize(('value', 'unit'), [(99.0, 'C'), (573.0, 'F')])
@@ -155,6 +272,28 @@ def test_charge_latch_blocks_on_until_reset() -> None:
     assert controller.set_enabled(True, -1, device) is WarmupResult.OK
 
 
+def test_real_santoker_active_target_edit_sends_only_target_and_keeps_diagnostics_on() -> None:
+    from artisanlib.santoker import Santoker
+    from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
+
+    diagnostics = SantokerDiagnosticsSession('Wi-Fi')
+    device = Santoker(diagnostics=diagnostics)
+    device._header_ready = True
+    controller = SantokerWarmupController()
+    controller.attach_diagnostics(diagnostics)
+
+    with patch.object(Santoker, 'send_msg') as send_msg:
+        assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+        device.register_reading(Santoker.WARMUP, b'\x00\x00\x01')
+        send_msg.reset_mock()
+        assert controller.set_target(205.0, 'C', device) is WarmupResult.OK
+
+    send_msg.assert_called_once_with(Santoker.WARMUP_TEMP, 2050)
+    state = diagnostics.view().state
+    assert state.desired_warmup is True
+    assert state.desired_target_c == 205.0
+
+
 def test_controller_starts_with_desired_target() -> None:
     from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 
@@ -177,21 +316,370 @@ def test_controller_does_not_send_redundant_off_while_inactive() -> None:
     assert device.calls == []
 
 
-@pytest.mark.parametrize(
-    ('reported_temp_c', 'expected_temp_c'),
-    [(99.9, 190.0), (300.1, 190.0), (100.0, 100.0), (225.5, 225.5), (300.0, 300.0)],
-)
-def test_accept_reported_target_validates_inclusive_range(
-    reported_temp_c: float, expected_temp_c: float
-) -> None:
+def test_accept_reported_target_only_updates_reported() -> None:
     from artisanlib.santoker_warmup import SantokerWarmupController
+
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+
+    controller.accept_reported_target(190.0)
+    controller.accept_reported_target(225.5)
+    controller.accept_reported_target(99.0)
+    controller.accept_reported_target(None)  # type: ignore[arg-type]
+
+    assert controller.desired_temp_c == 205.0
+    assert controller.reported_target() is None
+
+
+def test_reconnect_restores_target_then_on_after_valid_frame() -> None:
+    from artisanlib.santoker_warmup import (
+        ReconcileOutcome,
+        RestorationState,
+        SantokerWarmupController,
+        WarmupResult,
+    )
+
+    now = [10.0]
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=190.0)
+    controller = SantokerWarmupController(
+        desired_temp_c=205.0,
+        monotonic_clock=lambda: now[0],
+    )
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    device.ready = False
+    controller.note_transport_loss()
+    assert controller.desired_enabled() is True
+    assert controller.restoration_state() is RestorationState.WAITING_FOR_DATA
+    assert device.calls == []
+
+    device.ready = True
+    device.warmup = False
+    device.reported_target = 190.0
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+
+
+def test_reconnect_readiness_notification_without_reconcile_sends_nothing() -> None:
+    from artisanlib.santoker_warmup import RestorationState, SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True, warmup=True)
+    controller = SantokerWarmupController()
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    device.ready = False
+    controller.note_transport_loss()
+    device.ready = True
+
+    assert controller.desired_enabled() is True
+    assert controller.restoration_state() is RestorationState.WAITING_FOR_DATA
+    assert device.calls == []
+
+
+def test_reconcile_after_frame_attempts_on_unknown_reports() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=None)
+    controller = SantokerWarmupController(
+        desired_temp_c=205.0,
+    )
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+
+
+def test_reconcile_after_frame_throttles_duplicate_frames() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    calls = [10.0]
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=190.0)
+    controller = SantokerWarmupController(
+        desired_temp_c=205.0,
+        monotonic_clock=lambda: calls[0],
+    )
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    calls[0] = 10.0
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+    device.calls.clear()
+
+    calls[0] = 10.2
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.THROTTLED
+    assert device.calls == []
+
+    calls[0] = 11.0
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert device.calls == [('target', 205.0), ('enabled', True)]
+
+
+def test_reconcile_after_frame_matching_target_and_report_converges() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True, warmup=True, reported_target=190.0)
+    controller = SantokerWarmupController(desired_temp_c=190.0)
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.CONVERGED
+    assert device.calls == []
+
+
+@pytest.mark.parametrize('reported_target', [None, 99.0, 300.1])
+def test_reconcile_after_frame_known_target_regresses_to_attempt_on_unknown_value(
+    reported_target: float | None,
+) -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True, warmup=True, reported_target=190.0)
+    controller = SantokerWarmupController(desired_temp_c=190.0)
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+
+    device.reported_target = reported_target
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert controller.reported_target() is None
+    assert device.calls == [('target', 190.0), ('enabled', True)]
+
+
+def test_reconcile_after_frame_no_blind_timer_activity() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
+
+    monotonic_calls: list[float] = []
+
+    def monotonic_clock() -> float:
+        monotonic_calls.append(1.0)
+        return 10.0
+
+    device = FakeWarmupDevice(ready=True)
+    controller = SantokerWarmupController(monotonic_clock=monotonic_clock)
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    controller.note_transport_loss()
+    assert monotonic_calls == []
+
+
+def test_off_without_device_keeps_state() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
 
     controller = SantokerWarmupController()
 
-    controller.accept_reported_target(reported_temp_c)
+    assert controller.set_enabled(False, -1, None) is WarmupResult.OK
+    assert controller.desired_enabled() is False
 
-    assert controller.desired_temp_c == expected_temp_c
 
+def test_off_unready_cancels_waiting_restoration() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController, WarmupResult
+
+    device = FakeWarmupDevice(ready=True)
+    controller = SantokerWarmupController()
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    controller.note_transport_loss()
+    device.ready = False
+
+    assert controller.set_enabled(False, -1, device) is WarmupResult.OK
+    assert controller.desired_enabled() is False
+    assert device.calls == [('target', 190.0), ('enabled', True)]
+
+
+def test_mark_charge_records_safety_off_requirement() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=190.0)
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+
+    assert controller.set_enabled(True, -1, device) is not None
+    device.calls.clear()
+    controller.mark_charge()
+
+    assert controller.desired_enabled() is False
+    assert controller.restoration_state().value == 'blocked by CHARGE'
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+    assert device.calls == [('enabled', False)]
+
+
+def test_mark_charge_failed_race_retains_safety_off() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=190.0)
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+
+    assert controller.set_enabled(True, -1, device) is not None
+    controller.mark_charge()
+    device.ready = False
+    assert controller.set_enabled(False, -1, device) is not None
+
+    device.ready = True
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+
+
+def test_charge_safety_off_is_immediate_then_throttled_until_reported_off() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    now = [10.0]
+    device = FakeWarmupDevice(ready=True, warmup=True, reported_target=190.0)
+    controller = SantokerWarmupController(monotonic_clock=lambda: now[0])
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    controller.mark_charge()
+
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+    assert device.calls == [('enabled', False)]
+
+    device.warmup = True
+    now[0] = 10.2
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.THROTTLED
+    assert device.calls == [('enabled', False)]
+
+    now[0] = 11.0
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+    assert device.calls == [('enabled', False), ('enabled', False)]
+
+
+def test_mark_charge_retries_failed_off_until_success() -> None:
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController
+
+    class OneShotOffRejectingDevice(FakeWarmupDevice):
+        reject_off_once: bool = True
+
+        @override
+        def setWarmup(self, enabled: bool) -> bool:
+            self.calls.append(('enabled', enabled))
+            if enabled is False and self.reject_off_once:
+                self.reject_off_once = False
+                self.ready = False
+                return False
+            self.warmup = enabled
+            return self.ready
+
+    device = OneShotOffRejectingDevice(ready=True, warmup=True, reported_target=190.0)
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+
+    assert controller.set_enabled(True, -1, device) is not None
+    device.calls.clear()
+    controller.mark_charge()
+
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.WAITING
+    assert device.calls == [('enabled', False)]
+
+    device.ready = True
+    assert controller.reconcile_after_frame(0, device) is ReconcileOutcome.FORCED_OFF
+    assert device.calls == [('enabled', False), ('enabled', False)]
+
+
+def test_reset_charge_only_clears_charge_latch_not_intent() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True)
+    controller = SantokerWarmupController()
+
+    controller.set_enabled(True, -1, device)
+    controller.mark_charge()
+    controller.reset_charge()
+
+    assert not controller.is_charge_latched()
+    assert controller.desired_enabled() is False
+
+
+def test_stop_monitoring_retries_pending_safety_off_after_readiness_recovers() -> None:
+    from artisanlib.santoker_warmup import SantokerWarmupController
+
+    device = FakeWarmupDevice(ready=True, warmup=True)
+    controller = SantokerWarmupController()
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    controller.mark_charge()
+    device.ready = False
+    assert controller.set_enabled(False, 0, device) is WarmupResult.OK
+    device.calls.clear()
+
+    device.ready = True
+    device.warmup = False
+    controller.stop_monitoring(device)
+
+    assert device.calls == [('enabled', False)]
+
+
+def test_stop_monitoring_clears_state_after_safe_off() -> None:
+    from artisanlib.santoker_warmup import RestorationState, SantokerWarmupController
+
+    class FailingWarmupDevice(FakeWarmupDevice):
+        @override
+        def setWarmup(self, enabled: bool) -> bool:
+            self.calls.append(('enabled', enabled))
+            self.warmup = enabled
+            return bool(enabled)
+
+    device = FailingWarmupDevice(ready=True, warmup=True)
+    controller = SantokerWarmupController()
+
+    assert controller.set_enabled(True, -1, device) is not None
+    controller.stop_monitoring(device)
+
+    assert controller.desired_enabled() is None
+    assert controller.restoration_state() is RestorationState.IDLE
+    assert ('enabled', False) in device.calls
+
+
+def test_diagnostics_failures_do_not_change_command_results_or_state() -> None:
+    from unittest.mock import Mock
+
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    class FailingDiagnostics:
+        def __init__(self) -> None:
+            for method in (
+                'record_desired_warmup',
+                'record_reported_warmup',
+                'record_reported_target',
+                'record_restoration',
+                'record_charge_latch',
+            ):
+                setattr(self, method, Mock(side_effect=RuntimeError('recorder failed')))
+
+    device = FakeWarmupDevice(ready=True, reported_target=99.0)
+    controller = SantokerWarmupController()
+    controller.attach_diagnostics(cast(Any, FailingDiagnostics()))
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    assert controller.desired_enabled() is True
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    assert controller.reported_target() is None
+
+
+def test_diagnostics_records_cleared_reported_target() -> None:
+    from unittest.mock import Mock
+
+    from artisanlib.santoker_warmup import ReconcileOutcome, SantokerWarmupController, WarmupResult
+
+    diagnostics = Mock()
+    diagnostics.record_desired_warmup = Mock()
+    diagnostics.record_reported_warmup = Mock()
+    diagnostics.record_reported_target = Mock()
+    diagnostics.record_restoration = Mock()
+    diagnostics.record_charge_latch = Mock()
+
+    device = FakeWarmupDevice(ready=True, warmup=False, reported_target=99.0)
+    controller = SantokerWarmupController()
+    controller.attach_diagnostics(diagnostics)
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.calls.clear()
+    assert controller.reconcile_after_frame(-1, device) is ReconcileOutcome.ATTEMPTED
+    diagnostics.record_reported_target.assert_called_with(None)
+    assert controller.reported_target() is None
+
+    # no command side effect from diagnostics failure checks
+    assert diagnostics.record_desired_warmup.call_count >= 1
 
 def test_post_charge_on_report_is_forced_off() -> None:
     from artisanlib.santoker_warmup import SantokerWarmupController
@@ -317,6 +805,7 @@ def successful_reset_canvas(
     trace: list[str],
 ) -> SimpleNamespace:
     window = compact_window(controls, controller, device)
+    window.santokerControlController = Mock()
     window.pushbuttonstyles['STOP'] = 'stop-style'
     window.centralWidget = Mock(return_value=None)
     window.restoreExtraDeviceSettingsBackup = Mock()
@@ -441,8 +930,9 @@ def test_reported_target_updates_spinbox_without_command(
         cast(ApplicationWindow, window), 205.0
     )
 
-    assert controls.target.value() == 205
-    assert controller.desired_temp_c == 205.0
+    assert controls.target.value() == 190.0
+    assert controller.desired_temp_c == 190.0
+    assert controller.reported_target() == 205.0
     changed.assert_not_called()
     assert device.calls == []
 
@@ -538,6 +1028,807 @@ def test_target_field_edit_caches_while_inactive_and_sends_while_active(
     assert device.calls == [('target', 210.0)]
 
 
+def test_pending_reconnect_keeps_desired_button_checked_and_disabled(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    device = FakeWarmupDevice(ready=True, warmup=False)
+
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    device.ready = False
+    controller.note_transport_loss()
+
+    window = compact_window(controls, controller, device)
+    ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
+
+    assert controls.button.isChecked()
+    assert not controls.button.isEnabled()
+
+
+def test_ready_false_marks_transport_loss_without_emit_or_restore(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    controls = SantokerWarmupControls()
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    device = FakeWarmupDevice(ready=True, warmup=False)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+
+    window = compact_window(controls, controller, device)
+    frame_signal = Mock()
+    window.santokerFrameSignal = frame_signal
+    calls = len(device.calls)
+
+    device.ready = False
+    ApplicationWindow.santokerWarmupReadyChanged(cast(ApplicationWindow, window), False)
+    ApplicationWindow.santokerWarmupReadyChanged(cast(ApplicationWindow, window), True)
+
+    assert frame_signal.emit.call_count == 0
+    assert len(device.calls) == calls
+    assert controller.desired_enabled() is True
+
+
+def test_full_operating_state_recovery_charge_records_mode_defaults_without_writes() -> None:
+    device = ParserWarmupDevice(machine_on=0, heating_on=-1)
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        santoker=device,
+        santokerControlController=controller,
+        santokerControlRecoveryReported=True,
+    )
+
+    ApplicationWindow.markSantokerCharge(cast(ApplicationWindow, window))
+
+    assert controller.intended_controls() == {
+        MACHINE_ON: 1,
+        HEATING_ON: 1,
+        DRUM: 30,
+        AIR: 80,
+        POWER: 70,
+    }
+    assert device.calls == []
+    assert window.santokerControlRecoveryReported is False
+
+
+@pytest.mark.parametrize('boundary', ['start', 'stop'])
+def test_monitoring_boundary_requires_new_charge_before_automatic_recovery(
+    qapplication: QApplication,
+    boundary: str,
+) -> None:
+    del qapplication
+    device = ParserWarmupDevice()
+    cast(Any, device).stop = Mock()
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        qmc=SimpleNamespace(
+            flagstart=True,
+            timeindex=[1, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        santoker=device,
+        santokerWarmup=False,
+        santokerWarmupController=SantokerWarmupController(),
+        santokerControlController=controller,
+        santokerControlRecoveryReported=False,
+        santokerMonitoringGeneration=1,
+        santokerDiagnosticsSession=None,
+        santokerSerial=False,
+        santokerBLE=False,
+        refreshSantokerWarmupControls=lambda: None,
+        sendmessage=Mock(),
+    )
+    ApplicationWindow.markSantokerCharge(cast(ApplicationWindow, window))
+
+    if boundary == 'start':
+        ApplicationWindow.startSantokerDiagnosticsSession(
+            cast(ApplicationWindow, window)
+        )
+    else:
+        ApplicationWindow.stopSantokerMonitoring(cast(ApplicationWindow, window))
+        window.santoker = device
+
+    device.power = 75
+    device.air = 85
+    device.drum = 35
+    device.calls.clear()
+    device.ready = False
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), False
+    )
+    device.ready = True
+    for _ in range(6):
+        ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
+
+    assert controller.intended_controls() == {}
+    assert not controller.restoration_pending()
+    assert [call for call in device.calls if call[0] == 'raw'] == []
+    window.sendmessage.assert_not_called()
+
+
+def test_full_operating_state_recovery_is_generation_guarded_ordered_and_logged(
+    qapplication: QApplication,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    del qapplication
+    device = ParserWarmupDevice(
+        ready=True,
+        warmup=False,
+        machine_on=0,
+        heating_on=0,
+        power=0,
+        air=0,
+        drum=0,
+    )
+    window = compact_window(
+        SantokerWarmupControls(),
+        SantokerWarmupController(),
+        device,
+        charge_index=1,
+        recording=True,
+    )
+    window.qmc.timeindex = [1, 0, 0, 0, 0, 0, 0, 0]
+    window.santokerMonitoringGeneration = 2
+    window.santokerControlController = SantokerControlController()
+    window.santokerWarmupReadyChanged = lambda ready: (
+        ApplicationWindow.santokerWarmupReadyChanged(
+            cast(ApplicationWindow, window), ready
+        )
+    )
+    window.santokerFrameAccepted = lambda: ApplicationWindow.santokerFrameAccepted(
+        cast(ApplicationWindow, window)
+    )
+    window.refreshSantokerWarmupControls = lambda: None
+    ApplicationWindow.markSantokerCharge(cast(ApplicationWindow, window))
+
+    for target, value in ((DRUM, 31), (AIR, 81), (POWER, 71)):
+        ApplicationWindow.santokerSendMessage(
+            cast(ApplicationWindow, window), target, value
+        )
+    device.calls.clear()
+
+    device.ready = False
+    ApplicationWindow.santokerWarmupReadyChangedForGeneration(
+        cast(ApplicationWindow, window), 1, False
+    )
+    assert not window.santokerControlController.restoration_pending()
+    ApplicationWindow.santokerWarmupReadyChangedForGeneration(
+        cast(ApplicationWindow, window), 2, False
+    )
+    assert window.santokerControlController.restoration_pending()
+
+    device.ready = True
+    device.machine_on_fresh = device.heating_on_fresh = False
+    device.power_fresh = device.air_fresh = device.drum_fresh = False
+    expected = [
+        (MACHINE_ON, 1),
+        (HEATING_ON, 1),
+        (DRUM, 31),
+        (AIR, 81),
+        (POWER, 71),
+    ]
+    for target, value in expected:
+        ApplicationWindow.santokerFrameAcceptedForGeneration(
+            cast(ApplicationWindow, window), 2
+        )
+        assert device.calls[-1] == ('raw', (target, value))
+        device.report(target, value)
+
+    ApplicationWindow.santokerFrameAcceptedForGeneration(
+        cast(ApplicationWindow, window), 2
+    )
+
+    assert device.calls == [('raw', item) for item in expected]
+    window.sendmessage.assert_called_once_with('Connected')
+    assert [record.getMessage() for record in caplog.records] == [
+        'Santoker control restore target=7A value=1',
+        'Santoker control restore target=7B value=1',
+        'Santoker control restore target=C0 value=31',
+        'Santoker control restore target=CA value=81',
+        'Santoker control restore target=FA value=71',
+    ]
+
+
+def test_operating_mode_commands_update_active_intent_before_raw_forwarding() -> None:
+    controller = SantokerControlController()
+
+    class IntentObservingDevice(ParserWarmupDevice):
+        @override
+        def send_msg(self, target: bytes, value: int) -> None:
+            assert controller.intended_controls()[target] == value
+            super().send_msg(target, value)
+
+    device = IntentObservingDevice()
+    controller.mark_charge(device)
+    window = SimpleNamespace(
+        santoker=device,
+        santokerControlController=controller,
+        qmc=SimpleNamespace(
+            flagstart=True,
+            timeindex=[1, 0, 0, 0, 0, 0, 0, 0],
+        ),
+    )
+
+    ApplicationWindow.santokerSendMessage(
+        cast(ApplicationWindow, window), MACHINE_ON, 0
+    )
+    ApplicationWindow.santokerSendMessage(
+        cast(ApplicationWindow, window), HEATING_ON, 0
+    )
+
+    assert controller.intended_controls() == {
+        MACHINE_ON: 0,
+        HEATING_ON: 0,
+        DRUM: 30,
+        AIR: 80,
+        POWER: 70,
+    }
+    assert device.calls == [
+        ('raw', (MACHINE_ON, 0)),
+        ('raw', (HEATING_ON, 0)),
+    ]
+
+
+@pytest.mark.parametrize('target', [MACHINE_ON, HEATING_ON])
+def test_operating_mode_command_outside_roast_and_stale_generation_is_not_intent(
+    target: bytes,
+) -> None:
+    device = ParserWarmupDevice()
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        santokerMonitoringGeneration=2,
+        santoker=device,
+        santokerControlController=controller,
+        qmc=SimpleNamespace(
+            flagstart=False,
+            timeindex=[-1, 0, 0, 0, 0, 0, 0, 0],
+        ),
+    )
+
+    ApplicationWindow.santokerSendMessageForGeneration(
+        cast(ApplicationWindow, window), 2, target, 0
+    )
+    assert device.calls == [('raw', (target, 0))]
+    assert controller.intended_controls() == {}
+
+    window.qmc.flagstart = True
+    window.qmc.timeindex[0] = 1
+    ApplicationWindow.santokerSendMessageForGeneration(
+        cast(ApplicationWindow, window), 1, target, 1
+    )
+    assert device.calls == [('raw', (target, 0))]
+    assert controller.intended_controls() == {}
+
+
+def test_cancelled_recovery_does_not_report_connected(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    device = ParserWarmupDevice(ready=True, warmup=False)
+    controller = SantokerControlController()
+    window = compact_window(
+        SantokerWarmupControls(),
+        SantokerWarmupController(),
+        device,
+        charge_index=1,
+        recording=True,
+    )
+    window.qmc.timeindex = [1, 0, 0, 0, 0, 0, 0, 0]
+    window.santokerControlController = controller
+    window.refreshSantokerWarmupControls = lambda: None
+    controller.mark_charge(device)
+
+    device.ready = False
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), False
+    )
+    window.qmc.flagstart = False
+    window.qmc.timeindex[0] = -1
+    device.ready = True
+
+    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
+
+    window.sendmessage.assert_not_called()
+    assert not controller.restoration_pending()
+
+
+def test_initially_unready_active_roast_control_request_does_not_replay(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    device = ParserWarmupDevice(ready=False, warmup=False, air=-1, drum=-1)
+    controller = SantokerControlController()
+    window = compact_window(
+        SantokerWarmupControls(),
+        SantokerWarmupController(),
+        device,
+        charge_index=1,
+        recording=True,
+    )
+    window.qmc.timeindex = [1, 0, 0, 0, 0, 0, 0, 0]
+    window.santokerControlController = controller
+    window.refreshSantokerWarmupControls = lambda: None
+
+    ApplicationWindow.santokerSendMessage(
+        cast(ApplicationWindow, window), POWER, 90
+    )
+    device.ready = True
+    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
+
+    raw_calls = [
+        cast(tuple[bytes, int], payload)
+        for kind, payload in device.calls
+        if kind == 'raw'
+    ]
+    assert raw_calls == [(POWER, 90)]
+    assert controller.intended_controls() == {}
+    assert not controller.restoration_pending()
+
+
+@pytest.mark.parametrize('target', [POWER, AIR, DRUM])
+@pytest.mark.parametrize(
+    ('recording', 'charge_index', 'drop_index'),
+    [
+        (False, 1, 0),
+        (True, -1, 0),
+        (True, 1, 5),
+    ],
+    ids=['not-recording', 'precharge', 'postdrop'],
+)
+def test_control_command_outside_active_roast_is_not_restoration_intent(
+    target: bytes,
+    recording: bool,
+    charge_index: int,
+    drop_index: int,
+) -> None:
+    device = ParserWarmupDevice(ready=True)
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        santoker=device,
+        santokerControlController=controller,
+        qmc=SimpleNamespace(
+            flagstart=recording,
+            timeindex=[charge_index, 0, 0, 0, 0, 0, drop_index, 0],
+        ),
+    )
+
+    ApplicationWindow.santokerSendMessage(
+        cast(ApplicationWindow, window), target, 90
+    )
+
+    assert device.calls == [('raw', (target, 90))]
+    assert controller.intended_controls() == {}
+
+
+def test_non_control_target_is_never_restoration_intent() -> None:
+    device = ParserWarmupDevice(ready=True)
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        santoker=device,
+        santokerControlController=controller,
+        qmc=SimpleNamespace(
+            flagstart=True,
+            timeindex=[1, 0, 0, 0, 0, 0, 0, 0],
+        ),
+    )
+
+    ApplicationWindow.santokerSendMessage(
+        cast(ApplicationWindow, window), b'\x7c', 1
+    )
+
+    assert device.calls == [('raw', (b'\x7c', 1))]
+    assert controller.intended_controls() == {}
+
+
+@pytest.mark.parametrize(
+    ('recording', 'charge_index', 'drop_index', 'armed'),
+    [
+        (True, 1, 0, True),
+        (False, 1, 0, False),
+        (True, -1, 0, False),
+        (True, 1, 5, False),
+    ],
+)
+def test_confirmed_transport_loss_arms_only_during_active_roast(
+    recording: bool,
+    charge_index: int,
+    drop_index: int,
+    armed: bool,
+) -> None:
+    device = ParserWarmupDevice(ready=False)
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        santoker=device,
+        santokerWarmup=False,
+        santokerControlController=controller,
+        qmc=SimpleNamespace(
+            flagstart=recording,
+            timeindex=[charge_index, 0, 0, 0, 0, 0, drop_index, 0],
+        ),
+    )
+
+    controller.mark_charge(device)
+    ApplicationWindow.santokerWarmupReadyChanged(
+        cast(ApplicationWindow, window), False
+    )
+
+    assert controller.restoration_pending() is armed
+    assert controller.intended_controls() == {
+        MACHINE_ON: 1,
+        HEATING_ON: 1,
+        DRUM: 30,
+        AIR: 80,
+        POWER: 70,
+    }
+
+
+@pytest.mark.parametrize('target', [POWER, AIR, DRUM])
+def test_stale_generation_control_command_does_not_cross_monitoring_sessions(
+    target: bytes,
+) -> None:
+    device = ParserWarmupDevice()
+    controller = SantokerControlController()
+    window = SimpleNamespace(
+        santokerMonitoringGeneration=2,
+        santoker=device,
+        santokerControlController=controller,
+        qmc=SimpleNamespace(
+            flagstart=True,
+            timeindex=[1, 0, 0, 0, 0, 0, 0, 0],
+        ),
+    )
+
+    controller.mark_charge(device)
+    charge_intent = controller.intended_controls()
+    ApplicationWindow.santokerSendMessageForGeneration(
+        cast(ApplicationWindow, window), 1, target, 90
+    )
+    assert device.calls == []
+    assert controller.intended_controls() == charge_intent
+
+    ApplicationWindow.santokerSendMessageForGeneration(
+        cast(ApplicationWindow, window), 2, target, 90
+    )
+    assert device.calls == [('raw', (target, 90))]
+    charge_intent[target] = 90
+    assert controller.intended_controls() == charge_intent
+
+
+def test_event_action_thread_captures_monitoring_generation_at_creation() -> None:
+    window = SimpleNamespace(
+        santokerMonitoringGeneration=4,
+        eventaction_internal=Mock(),
+    )
+    thread = EventActionThread(cast(Any, window), 6, 'santoker(fa,90)', None)
+    window.santokerMonitoringGeneration = 5
+
+    thread.run()
+
+    window.eventaction_internal.assert_called_once_with(
+        6, 'santoker(fa,90)', None, 4
+    )
+
+
+def test_multiple_event_forwards_monitoring_generation_to_nested_action() -> None:
+    window = SimpleNamespace(
+        simulator=False,
+        lastbuttonpressed=-1,
+        recordextraevent=Mock(),
+    )
+
+    ApplicationWindow.eventaction_internal(
+        cast(ApplicationWindow, window),
+        3,
+        '1',
+        None,
+        4,
+    )
+
+    window.recordextraevent.assert_called_once_with(
+        0,
+        parallel=False,
+        updateButtons=False,
+        santoker_generation=4,
+    )
+
+
+def test_nested_extra_event_forwards_monitoring_generation_to_command() -> None:
+    window = SimpleNamespace(
+        extraeventstypes=[9],
+        mark_last_button_pressed=False,
+        lastbuttonpressed=-1,
+        extraeventsvalues=[90],
+        extraeventsactionstrings=['santoker(fa,{})'],
+        extraeventsactions=[6],
+        buttonStates=[0],
+        eventaction=Mock(),
+        qmc=SimpleNamespace(
+            eventsInternal2ExternalValue=lambda value: value,
+            flagstart=False,
+        ),
+    )
+
+    ApplicationWindow.recordextraevent(
+        cast(ApplicationWindow, window),
+        0,
+        parallel=False,
+        updateButtons=False,
+        santoker_generation=4,
+    )
+
+    window.eventaction.assert_called_once_with(
+        6,
+        'santoker(fa,90)',
+        parallel=False,
+        santoker_generation=4,
+    )
+
+
+def test_successful_charge_snapshots_live_santoker_controls() -> None:
+    device = ParserWarmupDevice()
+    control_controller = Mock()
+    window = SimpleNamespace(
+        santoker=device,
+        santokerControlController=control_controller,
+    )
+
+    ApplicationWindow.markSantokerCharge(cast(ApplicationWindow, window))
+
+    control_controller.mark_charge.assert_called_once_with(device)
+
+
+def test_drop_immediately_clears_control_restoration_intent() -> None:
+    device = ParserWarmupDevice()
+    control_controller = SantokerControlController()
+    control_controller.mark_charge(device)
+    window = SimpleNamespace(
+        santokerControlController=control_controller,
+        santokerControlRecoveryReported=True,
+    )
+
+    ApplicationWindow.markSantokerDrop(cast(ApplicationWindow, window))
+
+    assert control_controller.intended_controls() == {}
+    assert not control_controller.restoration_pending()
+    assert window.santokerControlRecoveryReported is False
+    canvas_source = Path('artisanlib/canvas.py').read_text(encoding='utf-8')
+    assert 'self.aw.markSantokerDrop()' in canvas_source
+
+
+def test_worker_frame_signal_triggers_frame_reconciliation_on_qt_main_thread(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    from threading import Thread, get_ident
+
+    class MainThreadWarmupDevice(FakeWarmupDevice):
+        thread_ids: list[int]
+
+        def __init__(self) -> None:
+            super().__init__(ready=True, warmup=False)
+            self.thread_ids = []
+
+        @override
+        def requestWarmupOn(self, temp_c: float) -> bool:
+            self.thread_ids.append(get_ident())
+            return super().requestWarmupOn(temp_c)
+
+        @override
+        def getReportedWarmupTarget(self) -> float | None:
+            return None
+
+    controls = SantokerWarmupControls()
+    device = MainThreadWarmupDevice()
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    controller.note_transport_loss()
+
+    window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
+    QMainWindow.__init__(window)
+    window.app = SimpleNamespace(artisanviewerMode=False)
+    window.qmc = SimpleNamespace(
+        mode_tempsliders='C', timeindex=[-1], flagon=True, flagstart=False
+    )
+    window.santokerWarmup = True
+    window.santoker = device
+    window.santokerWarmupController = controller
+    window.santokerWarmupControls = controls
+    window.pushbuttonstyles = {'OFF': 'off-style', 'ON': 'on-style'}
+    window.reportSantokerWarmupResult = Mock()
+    window.sendmessage = Mock()
+    window.santokerWarmupControlsRefreshSignal = Mock()
+    window.santokerFrameSignal.connect(
+        window.santokerFrameAccepted,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+
+    main_thread = get_ident()
+    baseline = len(device.thread_ids)
+
+    def emit_frame() -> None:
+        window.santokerFrameSignal.emit()
+
+    thread = Thread(target=emit_frame)
+    thread.start()
+    thread.join(timeout=3)
+
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+
+    assert not thread.is_alive()
+    assert len(device.thread_ids) == baseline + 1
+    assert device.thread_ids[-1] == main_thread
+
+
+def test_queued_stop_callbacks_do_not_leak_into_replacement_session(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    from artisanlib.santoker import Santoker
+    from artisanlib.santoker_warmup import RestorationState
+
+    window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
+    QMainWindow.__init__(window)
+    window.qmc = SimpleNamespace(timeindex=[-1], flagstart=False)
+    window.santokerWarmup = True
+    window.santokerWarmupControls = None
+    window.santokerWarmupController = SantokerWarmupController(desired_temp_c=205.0)
+    window.santokerDiagnosticsSession = None
+    window.santokerSerial = False
+    window.santokerBLE = False
+    window.santokerWarmupReadySignal.connect(
+        window.santokerWarmupReadyChanged,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    window.santokerWarmupStateSignal.connect(
+        window.santokerWarmupStateChanged,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+
+    first_session = window.startSantokerDiagnosticsSession()
+    first_santoker = Santoker(
+        ready_handler=window.santokerWarmupReadySignal.emit,
+        warmup_handler=window.santokerWarmupStateSignal.emit,
+        diagnostics=first_session,
+    )
+    window.santoker = first_santoker
+    first_santoker._setHeaderReady(True)
+    first_santoker._setWarmupState(True)
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+    assert window.santokerWarmupController.set_enabled(
+        True, -1, first_santoker
+    ) is WarmupResult.OK
+
+    window.stopSantokerMonitoring()
+
+    assert window.santoker is None
+    assert window.santokerWarmupController.restoration_state() is RestorationState.IDLE
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+    assert window.santokerWarmupController.restoration_state() is RestorationState.IDLE
+
+    replacement_session = window.startSantokerDiagnosticsSession()
+    assert replacement_session is not first_session
+    assert replacement_session.view().state.restoration_state is RestorationState.IDLE
+
+    replacement_santoker = Santoker(
+        ready_handler=window.santokerWarmupReadySignal.emit,
+        warmup_handler=window.santokerWarmupStateSignal.emit,
+        diagnostics=replacement_session,
+    )
+    window.santoker = replacement_santoker
+    replacement_santoker._setHeaderReady(True)
+    replacement_santoker._setWarmupState(True)
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+    assert window.santokerWarmupController.set_enabled(
+        True, -1, replacement_santoker
+    ) is WarmupResult.OK
+
+    replacement_santoker.resetProtocolState()
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+
+    assert window.santoker is replacement_santoker
+    assert window.santokerWarmupController.desired_enabled() is True
+    assert (
+        window.santokerWarmupController.restoration_state()
+        is RestorationState.WAITING_FOR_DATA
+    )
+    assert (
+        replacement_session.view().state.restoration_state
+        is RestorationState.WAITING_FOR_DATA
+    )
+
+
+def test_queued_old_generation_callbacks_cannot_mutate_replacement_device(
+    qapplication: QApplication,
+) -> None:
+    del qapplication
+    from artisanlib.santoker_warmup import RestorationState
+
+    controls = SantokerWarmupControls()
+    replacement = FakeWarmupDevice(ready=True, warmup=True, reported_target=205.0)
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    assert controller.set_enabled(True, -1, replacement) is WarmupResult.OK
+    replacement.calls.clear()
+
+    window = cast(Any, ApplicationWindow.__new__(ApplicationWindow))
+    QMainWindow.__init__(window)
+    window.app = SimpleNamespace(artisanviewerMode=False)
+    window.qmc = SimpleNamespace(
+        mode_tempsliders='C', timeindex=[-1], flagon=True, flagstart=False
+    )
+    window.santokerWarmup = True
+    window.santoker = replacement
+    window.santokerWarmupController = controller
+    window.santokerWarmupControls = controls
+    window.pushbuttonstyles = {'OFF': 'off-style', 'ON': 'on-style'}
+    window.sendmessage = Mock()
+    window.santokerMonitoringGeneration = 2
+    window.santokerWarmupReadyGenerationSignal.connect(
+        window.santokerWarmupReadyChangedForGeneration,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    window.santokerWarmupStateGenerationSignal.connect(
+        window.santokerWarmupStateChangedForGeneration,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    window.santokerFrameGenerationSignal.connect(
+        window.santokerFrameAcceptedForGeneration,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    window.santokerCallbackGenerationSignal.connect(
+        window.santokerCallbackForGeneration,
+        type=Qt.ConnectionType.QueuedConnection,
+    )
+    stale_device_callback = Mock()
+
+    window.santokerWarmupReadyGenerationSignal.emit(1, False)
+    window.santokerWarmupStateGenerationSignal.emit(1, False)
+    window.santokerFrameGenerationSignal.emit(1)
+    window.santokerCallbackGenerationSignal.emit(1, stale_device_callback)
+    QCoreApplication.sendPostedEvents(window, QEvent.Type.MetaCall)
+
+    stale_device_callback.assert_not_called()
+    assert controller.desired_enabled() is True
+    assert controller.restoration_state() is RestorationState.IDLE
+    assert replacement.calls == []
+
+
+def test_transport_connected_records_without_frame_signal_or_restoration() -> None:
+    from artisanlib.santoker import Santoker
+    from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
+
+    session = SantokerDiagnosticsSession('Wi-Fi')
+    frame_handler = Mock()
+    santoker = Santoker(diagnostics=session, frame_handler=frame_handler)
+
+    assert santoker._connected_handler is not None
+    santoker._connected_handler()
+
+    view = session.view()
+    assert view.state.connected
+    assert [event.description for event in view.events] == [
+        'monitoring started',
+        'connected',
+    ]
+    assert not any(event.direction == 'TX' for event in view.events)
+    frame_handler.assert_not_called()
+
+
+def test_santoker_protocol_signals_are_queued_to_gui_slots() -> None:
+    import inspect
+
+    source = inspect.getsource(ApplicationWindow.__init__)
+    signal_names = (
+        'santokerWarmupReadySignal',
+        'santokerWarmupStateSignal',
+        'santokerWarmupTargetSignal',
+        'santokerFrameSignal',
+    )
+    for signal_name in signal_names:
+        connection = source[source.index(f'self.{signal_name}.connect('):]
+        connection = connection[:connection.index(')\n')]
+        assert 'Qt.ConnectionType.QueuedConnection' in connection
+
+
 def test_worker_target_edit_queues_compact_refresh_to_gui_signal(
     qapplication: QApplication,
 ) -> None:
@@ -615,7 +1906,7 @@ def test_warmup_report_updates_compact_state_without_command(
 
     ApplicationWindow.santokerWarmupStateChanged(cast(ApplicationWindow, window), True)
 
-    assert controls.button.isChecked()
+    assert not controls.button.isChecked()
     changed.assert_not_called()
     assert device.calls == []
 
@@ -765,7 +2056,8 @@ def test_warmup_on_and_charge_are_serialized(
     controls = SantokerWarmupControls()
     controls.setState(True)
     controls.button.setEnabled(True)
-    controller = BarrierWarmupController()
+    safety_now = [10.0]
+    controller = BarrierWarmupController(monotonic_clock=lambda: safety_now[0])
     device = BlockingWarmupDevice()
     window = compact_window(controls, controller, device)
     window.santokerWarmupButtonStateSignal = Mock()
@@ -779,6 +2071,8 @@ def test_warmup_on_and_charge_are_serialized(
     window.arabicReshape = lambda text: text
     window.onMarkMoveToNext = Mock()
     window.openPropertiesSignal = Mock()
+    window.markSantokerCharge = Mock()
+    window.updateRoastNameFromInventoryAtCharge = Mock()
 
     canvas = SimpleNamespace(
         aw=window,
@@ -892,9 +2186,11 @@ def test_warmup_on_and_charge_are_serialized(
     assert call_order == before_rejected_on
 
     device.warmup = True
-    ApplicationWindow.santokerWarmupStateChanged(
-        cast(ApplicationWindow, window), True
+    safety_now[0] = 11.0
+    window.refreshSantokerWarmupControls = lambda: (
+        ApplicationWindow.refreshSantokerWarmupControls(cast(ApplicationWindow, window))
     )
+    ApplicationWindow.santokerFrameAccepted(cast(ApplicationWindow, window))
 
     assert call_order == before_rejected_on + ['off']
     assert not controls.button.isChecked()
@@ -955,6 +2251,7 @@ def test_successful_reset_clears_charge_latch_after_profile_unlock(
         'controls-refreshed',
     ]
     assert not controller.is_charge_latched()
+    canvas.aw.santokerControlController.reset_roast.assert_called_once_with()
     assert controls.button.isEnabled() is enabled_after_reset
     assert not controls.button.isChecked()
     assert (
@@ -1562,11 +2859,10 @@ def test_transport_disconnect_keeps_warmup_visible_while_monitoring(
 ) -> None:
     del qapplication
     controls = SantokerWarmupControls()
-    window = compact_window(
-        controls,
-        SantokerWarmupController(desired_temp_c=205.0),
-        FakeWarmupDevice(ready=True, warmup=True),
-    )
+    controller = SantokerWarmupController(desired_temp_c=205.0)
+    device = FakeWarmupDevice(ready=True, warmup=False)
+    assert controller.set_enabled(True, -1, device) is WarmupResult.OK
+    window = compact_window(controls, controller, device)
     ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
     assert controls.button.isEnabled()
     assert controls.button.isChecked()
@@ -1577,7 +2873,7 @@ def test_transport_disconnect_keeps_warmup_visible_while_monitoring(
     assert controls.isVisible()
     assert controls.target.isEnabled()
     assert not controls.button.isEnabled()
-    assert not controls.button.isChecked()
+    assert controls.button.isChecked()
     assert controls.target.value() == 205
 
 

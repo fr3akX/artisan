@@ -97,14 +97,29 @@ The tracked Santoker presets include `src/includes/Machines/Santoker/Q_+_X_Serie
 - Existing fire, airflow, drum, and event target numbers agree with the app analysis.
 - Warm-up support now names `0x7E` and `0x7F`, validates the target range, gates semantic warm-up writes on observed header readiness, limits warm-up enablement to pre-`CHARGE`, and reconciles echoed warm-up state/target reports.
 
+### Reconnect restoration behavior in Artisan
+
+- During one monitoring session, automatic reconnect loss across BLE, Wi-Fi, or serial transport keeps the desired warm-up enable/target intent (`0x7E`/`0x7F`) and the latest valid active-roast Artisan-requested heater power (`0xFA`, `0–100`) in memory for their respective safe roast phases.
+- Heater-power requests issued while Artisan is recording after CHARGE and before DROP are retained before the transport write, so the final active-roast request made during RX silence but before disconnect detection is not lost from Artisan's desired state. Requests outside recording, pre-CHARGE, or post-DROP are never promoted to later restoration intent.
+- After a reconnect, restoration does not start on transport callback alone. It waits until a complete accepted Santoker frame is seen with valid CRC, valid header, valid code/header/length, and valid tail bytes.
+- Before CHARGE, warm-up restoration sends target first (`0x7F`) and then warm-up enable ON (`0x7E = 1`). During an active roast after CHARGE and before DROP, heater restoration sends the latest desired `0xFA` value; it never invents a `0x7B` heating-mode command.
+- The first active-roast power replay is unconditional because the protocol's current power value may be stale from before the loss. Later accepted frames reconcile against reported power.
+- Reconciliation/retry is bounded to one attempt per second and only evaluates on accepted frames; there is no timer-based retry loop without new valid data.
+- Explicit warm-up OFF, CHARGE handling, or monitoring stop clears pending warm-up restoration. DROP, successful roast RESET, monitoring stop, and a new monitoring session clear pending heater-power restoration.
+- An active-roast power request made while protocol readiness is already false marks restoration pending directly; it does not depend on a later ready-true to ready-false transition.
+- Event-action worker threads capture their monitoring generation; a queued Santoker command from an older generation is discarded instead of being sent to a replacement session.
+- The diagnostics path is read-only, holds at most 5,000 events for one monitoring session, and is available in **Config → Device → Santoker → Diagnostics…**.
+- `santoker` transmission is recorded as requests; outgoing frames are not acknowledged by protocol evidence captured here, and success is not inferred from request generation alone.
+- `v26.7.7` findings are from static analysis of the Android app only; physical X3 behavior and verification remain pending.
+
 ### Functional and safety gaps
 
 1. **Physical verification is limited.** Warm-up activation on an X3 from Artisan has been observed by the user, and static analysis plus tests cover the compact-control warm-up path. A live X3 capture is still needed to confirm outbound BLE header selection, target writes, OFF behavior, echoed reports, acknowledgements, and full hardware behavior.
 2. **No model/firmware detection.** Artisan adapts the header but does not identify X3, inspect its capability version, or gate features such as drum-speed control on confirmed firmware support.
 3. **Setup-target semantics remain unresolved.** The app's `0x8A`, `0x8E`, and `0x8F` synchronization/setup sequence is still not understood well enough to automate safely.
-4. **No acknowledgements or report-cadence guarantees.** Warm-up state/target reports are now reconciled when seen, but sending is still fire-and-forget and protocol-level success/failure semantics remain unknown.
-5. **Controls outside warm-up scope are still mostly generic.** Machine on/off, heating, cooling, blend, advanced settings, and model-specific limits remain largely reachable only through raw targets or older preset actions.
-6. **Raw `santoker()` intentionally bypasses semantic safety.** The new warm-up helpers enforce pre-`CHARGE`, header-readiness, and display-unit conversion rules, but direct `santoker(<target>,<value>)` calls can still skip those safeguards.
+4. **No acknowledgements or report-cadence guarantees.** Warm-up state/target and active-roast power reports are reconciled when seen, but sending is still fire-and-forget and protocol-level success/failure semantics remain unknown.
+5. **Controls outside warm-up scope are still mostly generic.** Fire/power remains a raw preset command with focused reconnect reconciliation; machine on/off, heating, cooling, blend, advanced settings, and model-specific limits remain largely reachable only through raw targets or older preset actions.
+6. **Raw `santoker()` intentionally bypasses most semantic safety.** The warm-up helpers enforce pre-`CHARGE`, header-readiness, and display-unit conversion rules. Valid `santoker(FA,<0–100>)` requests are retained for active-roast reconnect restoration, but other direct commands can still skip semantic safeguards.
 7. **Unsigned-only encoder API.** Negative calibration values must be converted by the caller to their 16-bit two's-complement number, such as `-1` to `65535`, to produce low bytes `FF FF`. Passing `-1` directly fails unsigned `to_bytes()` conversion.
 8. **Preset/app event difference.** Artisan sends `0x81`–`0x83` for DRY/FC/SC from its presets, while the analyzed app path records those events locally. This should be verified on hardware before assuming both behaviors are interchangeable.
 

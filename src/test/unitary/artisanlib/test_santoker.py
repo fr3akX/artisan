@@ -32,6 +32,31 @@ import sys
 from collections.abc import Generator
 from unittest.mock import Mock, call, patch
 
+
+def create_diagnostic_spy(failing_method:str|None = None) -> Mock:
+    methods = [
+        'record_connected',
+        'record_disconnected',
+        'record_protocol',
+        'record_rx',
+        'record_tx',
+        'record_decoded',
+        'record_desired_warmup',
+        'record_reported_warmup',
+        'record_reported_target',
+        'record_event',
+        'record_connection_attempt',
+        'record_restoration',
+        'record_charge_latch',
+    ]
+    diagnostics = Mock()
+    for method in methods:
+        method_callable = Mock()
+        if method == failing_method:
+            method_callable = Mock(side_effect=RuntimeError('recorder failed'))
+        setattr(diagnostics, method, method_callable)
+    return diagnostics
+
 import pytest
 
 
@@ -42,6 +67,20 @@ async def read_packet(santoker: object, packet: bytes) -> None:
     stream.feed_data(packet)
     stream.feed_eof()
     await santoker.read_msg(stream)  # type: ignore[attr-defined]
+
+
+def create_incoming_packet(
+    header: bytes,
+    target: bytes,
+    payload: bytes,
+) -> bytes:
+    from pymodbus.framer.rtu import FramerRTU
+
+    from artisanlib.santoker import Santoker
+
+    body = Santoker.CODE_HEADER + len(payload).to_bytes(1, 'big') + payload
+    crc = FramerRTU.compute_CRC(body).to_bytes(2, 'big')
+    return header + target + body + crc + Santoker.TAIL
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -259,10 +298,10 @@ class TestSantokerImplementationDetails:
             source_content = f.read()
 
         # Test that temperature processing with averaging exists
-        assert 'BT = value / 10.0' in source_content
-        assert 'self._bt = (BT if self._bt == -1 else (2*BT + self._bt)/3)' in source_content
-        assert 'ET = value / 10.0' in source_content
-        assert 'self._et = (ET if self._et == -1 else (2*ET + self._et)/3)' in source_content
+        assert 'bt_c = value / 10.0' in source_content
+        assert 'bt = (bt_c if self._bt == -1 else (2*bt_c + self._bt)/3)' in source_content
+        assert 'et_c = value / 10.0' in source_content
+        assert 'et = (et_c if self._et == -1 else (2*et_c + self._et)/3)' in source_content
 
         # Test that RoR processing with sign handling exists
         assert 'if target in {self.BT_ROR, self.ET_ROR}:' in source_content
@@ -842,6 +881,262 @@ class TestSantokerImplementationDetails:
 #        assert safe_call_handler(None) is True
 
 
+class TestSantokerPowerProtocol:
+    def test_operating_mode_reports_are_independently_fresh(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        assert Santoker.MACHINE_ON == b'\x7A'
+        assert Santoker.HEATING_ON == b'\x7B'
+        santoker.resetProtocolState()
+        assert santoker.getMachineOn() == -1
+        assert santoker.getHeatingOn() == -1
+        assert not santoker.isMachineOnFresh()
+        assert not santoker.isHeatingOnFresh()
+
+        santoker.register_reading(Santoker.MACHINE_ON, b'\x01')
+        assert santoker.getMachineOn() == 1
+        assert santoker.isMachineOnFresh()
+        assert not santoker.isHeatingOnFresh()
+
+        santoker.register_reading(Santoker.HEATING_ON, b'\x00')
+        assert santoker.getHeatingOn() == 0
+        assert santoker.isHeatingOnFresh()
+
+    @pytest.mark.parametrize(
+        ('target_name', 'getter_name', 'freshness_name'),
+        [
+            ('MACHINE_ON', 'getMachineOn', 'isMachineOnFresh'),
+            ('HEATING_ON', 'getHeatingOn', 'isHeatingOnFresh'),
+        ],
+    )
+    @pytest.mark.parametrize('reported_value', [2, 255])
+    def test_operating_mode_reports_ignore_invalid_values(
+        self,
+        target_name: str,
+        getter_name: str,
+        freshness_name: str,
+        reported_value: int,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        target = getattr(Santoker, target_name)
+
+        santoker.register_reading(target, reported_value.to_bytes(1, 'big'))
+
+        assert getattr(santoker, getter_name)() == -1
+        assert not getattr(santoker, freshness_name)()
+
+    @pytest.mark.parametrize('setter_name', ['setMachineOn', 'setHeatingOn'])
+    @pytest.mark.parametrize('value', [-1, 2, True])
+    def test_operating_mode_setters_reject_invalid_values(
+        self,
+        setter_name: str,
+        value: int,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not getattr(santoker, setter_name)(value)
+
+        send_msg.assert_not_called()
+
+    @pytest.mark.parametrize('setter_name', ['setMachineOn', 'setHeatingOn'])
+    def test_operating_mode_setters_wait_for_protocol_readiness(
+        self,
+        setter_name: str,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not getattr(santoker, setter_name)(1)
+
+        send_msg.assert_not_called()
+
+    def test_operating_mode_setters_send_and_invalidate_only_their_report(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+        santoker.register_reading(Santoker.MACHINE_ON, b'\x01')
+        santoker.register_reading(Santoker.HEATING_ON, b'\x00')
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setMachineOn(1)
+            assert not santoker.isMachineOnFresh()
+            assert santoker.isHeatingOnFresh()
+
+            santoker.register_reading(Santoker.MACHINE_ON, b'\x01')
+            assert santoker.setHeatingOn(0)
+            assert santoker.isMachineOnFresh()
+            assert not santoker.isHeatingOnFresh()
+
+        assert send_msg.call_args_list == [
+            call(Santoker.MACHINE_ON, 1),
+            call(Santoker.HEATING_ON, 0),
+        ]
+
+    def test_set_power_sends_valid_value_when_protocol_ready(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setPower(100)
+
+        send_msg.assert_called_once_with(Santoker.POWER, 100)
+
+    @pytest.mark.parametrize('value', [-1, 101])
+    def test_set_power_rejects_out_of_range_value(self, value: int) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setPower(value)
+
+        send_msg.assert_not_called()
+
+    def test_set_power_waits_for_protocol_readiness(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setPower(100)
+
+        send_msg.assert_not_called()
+
+    def test_valid_control_setters_require_later_reports_for_freshness(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+        santoker.register_reading(Santoker.POWER, b'\x46')
+        santoker.register_reading(Santoker.AIR, b'\x50')
+        santoker.register_reading(Santoker.DRUM, b'\x1e')
+
+        with patch.object(Santoker, 'send_msg'):
+            assert santoker.setPower(70)
+            assert not santoker.isPowerFresh()
+            assert santoker.isAirFresh()
+            assert santoker.isDrumFresh()
+
+            santoker.register_reading(Santoker.POWER, b'\x46')
+            assert santoker.setAir(80)
+            assert santoker.isPowerFresh()
+            assert not santoker.isAirFresh()
+            assert santoker.isDrumFresh()
+
+            santoker.register_reading(Santoker.AIR, b'\x50')
+            assert santoker.setDrum(30)
+            assert santoker.isPowerFresh()
+            assert santoker.isAirFresh()
+            assert not santoker.isDrumFresh()
+
+    def test_power_report_freshness_resets_on_transport_loss(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        assert not santoker.isPowerFresh()
+
+        santoker.register_reading(Santoker.POWER, b'\x46')
+        assert santoker.isPowerFresh()
+        assert santoker.getPower() == 70
+
+        santoker.resetProtocolState()
+        assert not santoker.isPowerFresh()
+        assert santoker.getPower() == 70
+
+    def test_control_freshness_is_tracked_independently(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker.resetProtocolState()
+        assert not santoker.isPowerFresh()
+        assert not santoker.isAirFresh()
+        assert not santoker.isDrumFresh()
+
+        santoker.register_reading(Santoker.POWER, b'\x46')
+        assert santoker.isPowerFresh()
+        assert not santoker.isAirFresh()
+        assert not santoker.isDrumFresh()
+
+        santoker.resetProtocolState()
+        santoker.register_reading(Santoker.AIR, b'\x50')
+        assert not santoker.isPowerFresh()
+        assert santoker.isAirFresh()
+        assert not santoker.isDrumFresh()
+
+        santoker.resetProtocolState()
+        santoker.register_reading(Santoker.DRUM, b'\x1e')
+        assert not santoker.isPowerFresh()
+        assert not santoker.isAirFresh()
+        assert santoker.isDrumFresh()
+
+    def test_control_setters_send_fan_and_drum_when_protocol_ready(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.setAir(80)
+            assert santoker.setDrum(30)
+
+        assert send_msg.call_args_list == [
+            call(Santoker.AIR, 80),
+            call(Santoker.DRUM, 30),
+        ]
+
+    @pytest.mark.parametrize('value', [-1, 101])
+    def test_control_setters_reject_out_of_range_values(self, value: int) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setAir(value)
+            assert not santoker.setDrum(value)
+
+        send_msg.assert_not_called()
+
+    def test_control_setters_wait_for_protocol_readiness(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert not santoker.setAir(80)
+            assert not santoker.setDrum(30)
+
+        send_msg.assert_not_called()
+
+
 class TestSantokerWarmupProtocol:
     def test_warmup_packets_use_expected_targets_and_crc(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
@@ -863,27 +1158,23 @@ class TestSantokerWarmupProtocol:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker
 
-        state_handler = Mock()
-        santoker = Santoker(warmup_handler=state_handler)
+        santoker = Santoker()
         santoker._header_ready = True
 
         with patch.object(Santoker, 'send_msg') as send_msg:
-            assert santoker.setWarmupTarget(190.0)
             assert santoker.setWarmup(True)
 
         assert send_msg.call_args_list == [
             call(Santoker.WARMUP_TEMP, 1900),
             call(Santoker.WARMUP, 1),
         ]
-        assert santoker.getWarmup() is True
-        state_handler.assert_called_once_with(True)
+        assert santoker.getWarmup() is None
 
     def test_target_change_is_cached_while_inactive(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker
 
         santoker = Santoker()
-        santoker._header_ready = True
 
         with patch.object(Santoker, 'send_msg') as send_msg:
             assert santoker.setWarmupTarget(205.5)
@@ -897,7 +1188,7 @@ class TestSantokerWarmupProtocol:
 
         santoker = Santoker()
         santoker._header_ready = True
-        santoker._warmup = True
+        santoker._desired_warmup = True
 
         with patch.object(Santoker, 'send_msg') as send_msg:
             assert santoker.setWarmupTarget(205.5)
@@ -949,13 +1240,31 @@ class TestSantokerWarmupProtocol:
 
         santoker = Santoker()
         santoker._header_ready = True
-        santoker._warmup = True
 
         with patch.object(Santoker, 'send_msg') as send_msg:
             assert santoker.setWarmup(False)
 
         send_msg.assert_called_once_with(Santoker.WARMUP, 0)
-        assert santoker.getWarmup() is False
+        assert santoker.getWarmup() is None
+
+    def test_active_target_edit_sends_only_target_and_preserves_desired_on(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+        from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession
+
+        diagnostics = SantokerDiagnosticsSession('Wi-Fi')
+        santoker = Santoker(diagnostics=diagnostics)
+        santoker._header_ready = True
+
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.requestWarmupOn(190.0)
+            send_msg.reset_mock()
+            assert santoker.setWarmupTarget(205.0)
+
+        send_msg.assert_called_once_with(Santoker.WARMUP_TEMP, 2050)
+        state = diagnostics.view().state
+        assert state.desired_warmup is True
+        assert state.desired_target_c == 205.0
 
     def test_warmup_reports_update_state_and_target(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
@@ -975,6 +1284,7 @@ class TestSantokerWarmupProtocol:
 
         assert santoker.getWarmup() is True
         assert santoker.getWarmupTarget() == 190.0
+        assert santoker.getReportedWarmupTarget() == 190.0
         state_handler.assert_called_once_with(True)
         target_handler.assert_called_once_with(190.0)
 
@@ -984,15 +1294,43 @@ class TestSantokerWarmupProtocol:
 
         target_handler = Mock()
         santoker = Santoker(warmup_temp_handler=target_handler)
-        santoker._header_ready = True
 
         santoker.register_reading(Santoker.WARMUP_TEMP, (1900).to_bytes(3, 'big'))
         assert santoker.setWarmupTarget(200.0)
         santoker.register_reading(Santoker.WARMUP_TEMP, (1900).to_bytes(3, 'big'))
         santoker.register_reading(Santoker.WARMUP_TEMP, (1900).to_bytes(3, 'big'))
 
-        assert target_handler.call_args_list == [call(190.0), call(190.0)]
-        assert santoker.getWarmupTarget() == 190.0
+        assert target_handler.call_args_list == [call(190.0)]
+        assert santoker.getReportedWarmupTarget() == 190.0
+        assert santoker.getWarmupTarget() == 200.0
+
+    @pytest.mark.asyncio
+    async def test_accepted_frame_is_only_recorded_once_for_unchanged_fields(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        frame_handler = Mock()
+        diagnostics = create_diagnostic_spy()
+        sender = Santoker()
+        receiver = Santoker(diagnostics=diagnostics, frame_handler=frame_handler)
+        packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
+
+        await read_packet(receiver, packet)
+        await read_packet(receiver, packet)
+
+        assert receiver.isHeaderReady()
+        assert receiver.HEADER == Santoker.HEADER_WIFI
+        assert receiver.getWarmupTarget() == 190.0
+        assert receiver.getReportedWarmupTarget() == 190.0
+        assert diagnostics.record_reported_target.call_count == 1
+        description = diagnostics.record_rx.call_args_list[-1].args[1]
+        assert 'accepted frame' in description
+        assert 'target=7F' in description
+        assert 'value=1900' in description
+        assert diagnostics.record_rx.call_args_list[-1].args[0] == packet
+        assert diagnostics.record_rx.call_args_list[-1].kwargs == {'accepted': True}
+        assert frame_handler.call_count == 2
+        assert frame_handler.call_args_list == [call(), call()]
 
     @pytest.mark.parametrize(
         ('target', 'data'),
@@ -1017,17 +1355,77 @@ class TestSantokerWarmupProtocol:
 
         assert santoker.getWarmup() is None
         assert santoker.getWarmupTarget() == Santoker.DEFAULT_WARMUP_TEMP_C
+        assert santoker.getReportedWarmupTarget() is None
         state_handler.assert_not_called()
         target_handler.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_complete_a5_packet_sets_ble_header_ready(self) -> None:
+    @pytest.mark.parametrize('payload', [b'\x01', b'\x00\x00\x01'])
+    async def test_accepts_one_and_three_byte_telemetry_payloads(
+        self,
+        payload: bytes,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        diagnostics = create_diagnostic_spy()
+        receiver = Santoker(diagnostics=diagnostics)
+        packet = create_incoming_packet(
+            Santoker.HEADER_WIFI,
+            Santoker.WARMUP,
+            payload,
+        )
+
+        await read_packet(receiver, packet)
+
+        assert receiver.isHeaderReady()
+        assert receiver.getWarmup() is True
+        assert diagnostics.record_rx.call_args.kwargs == {'accepted': True}
+
+    @pytest.mark.asyncio
+    async def test_initial_ble_session_accepts_two_byte_telemetry_and_adapts_control_header(
+        self,
+    ) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        ready_handler = Mock()
+        diagnostics = create_diagnostic_spy()
+        receiver = Santoker(
+            connect_using_ble=True,
+            diagnostics=diagnostics,
+            ready_handler=ready_handler,
+        )
+        packet = create_incoming_packet(
+            Santoker.HEADER_WIFI,
+            Santoker.BT,
+            (2300).to_bytes(2, 'big'),
+        )
+
+        await read_packet(receiver, packet)
+
+        assert receiver.isHeaderReady()
+        assert receiver.HEADER == Santoker.HEADER_WIFI
+        assert receiver.getBT() == 230.0
+        ready_handler.assert_called_once_with(True)
+        assert diagnostics.record_rx.call_args.args[0] == packet
+        assert 'accepted frame' in diagnostics.record_rx.call_args.args[1]
+        assert diagnostics.record_rx.call_args.kwargs == {'accepted': True}
+
+        ble_client = Mock()
+        receiver._ble_client = ble_client
+        receiver.send_msg(Santoker.AIR, 50)
+
+        sent_packet = ble_client.send.call_args.args[0]
+        assert sent_packet.startswith(Santoker.HEADER_WIFI + Santoker.AIR)
+
+    @pytest.mark.asyncio
+    async def test_complete_wifi_packet_sets_header_ready(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker
 
         sender = Santoker()
-        ready_handler = Mock()
-        receiver = Santoker(connect_using_ble=True, ready_handler=ready_handler)
+        receiver = Santoker(ready_handler=Mock())
         packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
 
         await read_packet(receiver, packet)
@@ -1035,7 +1433,7 @@ class TestSantokerWarmupProtocol:
         assert receiver.isHeaderReady()
         assert receiver.HEADER == Santoker.HEADER_WIFI
         assert receiver.getWarmupTarget() == 190.0
-        ready_handler.assert_called_once_with(True)
+        assert receiver.getReportedWarmupTarget() == 190.0
 
     @pytest.mark.asyncio
     async def test_readiness_handler_tracks_only_accepted_transitions(self) -> None:
@@ -1044,7 +1442,7 @@ class TestSantokerWarmupProtocol:
 
         sender = Santoker()
         ready_handler = Mock()
-        receiver = Santoker(connect_using_ble=True, ready_handler=ready_handler)
+        receiver = Santoker(ready_handler=ready_handler)
         packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
 
         await read_packet(receiver, packet)
@@ -1055,62 +1453,250 @@ class TestSantokerWarmupProtocol:
         assert ready_handler.call_args_list == [call(True), call(False)]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('corruption', ['crc', 'tail'])
-    async def test_invalid_complete_packet_does_not_set_header_ready(self, corruption: str) -> None:
+    @pytest.mark.parametrize(
+        ('corruption', 'reason', 'available_length'),
+        [
+            ('code_header', 'invalid code header', 5),
+            ('data_length', 'invalid data length', 6),
+            ('crc', 'CRC mismatch', 11),
+            ('tail', 'invalid tail', 15),
+            ('second_header', 'invalid second header', 2),
+        ],
+    )
+    async def test_invalid_complete_packet_does_not_set_header_ready(self, corruption: str, reason: str, available_length: int) -> None:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker
 
         sender = Santoker()
-        ready_handler = Mock()
-        receiver = Santoker(connect_using_ble=True, ready_handler=ready_handler)
         packet = bytearray(sender.create_msg(Santoker.WARMUP_TEMP, 1900))
-        if corruption == 'crc':
-            packet[-5] ^= 0x01  # Santoker currently verifies the second CRC byte
-        else:
-            packet[-1] ^= 0x01
+        diagnostics = create_diagnostic_spy()
+        frame_handler = Mock()
 
+        if corruption == 'code_header':
+            packet[3] ^= 0x01
+        elif corruption == 'data_length':
+            packet[5] = 0
+        elif corruption == 'crc':
+            packet[-5] ^= 0x01
+        elif corruption == 'tail':
+            packet[-1] ^= 0x01
+        else:
+            packet[1] ^= 0x01
+
+        receiver = Santoker(diagnostics=diagnostics, frame_handler=frame_handler)
         await read_packet(receiver, bytes(packet))
 
         assert not receiver.isHeaderReady()
-        assert receiver.HEADER == Santoker.HEADER_BT
-        ready_handler.assert_not_called()
+        assert receiver.getReportedWarmupTarget() is None
+        assert diagnostics.record_rx.call_args.args[0] == bytes(packet[:available_length])
+        assert diagnostics.record_rx.call_args.args[1] == reason
+        assert diagnostics.record_rx.call_args.kwargs == {'accepted': False}
+        assert frame_handler.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_truncated_packet_does_not_set_header_ready(self) -> None:
+    async def test_oversized_telemetry_payload_is_rejected(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        diagnostics = create_diagnostic_spy()
+        receiver = Santoker(diagnostics=diagnostics)
+        packet = create_incoming_packet(
+            Santoker.HEADER_WIFI,
+            Santoker.BT,
+            b'\x00\x00\x08\xfc',
+        )
+
+        await read_packet(receiver, packet)
+
+        assert not receiver.isHeaderReady()
+        assert diagnostics.record_rx.call_args.args == (
+            packet[:6],
+            'invalid data length',
+        )
+        assert diagnostics.record_rx.call_args.kwargs == {'accepted': False}
+
+    @pytest.mark.asyncio
+    async def test_truncated_frame_is_recorded_as_rejected(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
         import asyncio
 
+        sender = Santoker()
+        diagnostics = create_diagnostic_spy()
+        receiver = Santoker(connect_using_ble=True, diagnostics=diagnostics)
+        packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
+        truncated = packet[:-3]
+
+        with pytest.raises(asyncio.IncompleteReadError):
+            await read_packet(receiver, truncated)
+
+        assert not receiver.isHeaderReady()
+        assert receiver.getReportedWarmupTarget() is None
+        assert diagnostics.record_rx.call_args.args[0] == truncated
+        assert diagnostics.record_rx.call_args.args[1] == 'truncated frame'
+        assert diagnostics.record_rx.call_args.kwargs == {'accepted': False}
+
+    @pytest.mark.asyncio
+    async def test_incomplete_read_without_header_is_reraised_without_recording(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        import asyncio
+
+        diagnostics = create_diagnostic_spy()
+        receiver = Santoker(diagnostics=diagnostics)
+
+        with pytest.raises(asyncio.IncompleteReadError):
+            await read_packet(receiver, b'\x11\x22\x33')
+
+        assert diagnostics.record_rx.call_count == 0
+
+    def test_send_records_exact_frame_passed_to_transport(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        expected_packet = Santoker().create_msg(Santoker.WARMUP_TEMP, 1900)
+
+        with patch.object(Santoker, 'send') as transport_send:
+            santoker = Santoker()
+            santoker.send_msg(Santoker.WARMUP_TEMP, 1900)
+
+        transport_send.assert_called_once_with(expected_packet)
+
+    def test_send_records_exact_frame_passed_to_ble_transport(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        mock_client = Mock()
+        mock_client.send = Mock()
+        santoker = Santoker(connect_using_ble=True)
+        expected_packet = santoker.create_msg(Santoker.WARMUP_TEMP, 1900)
+        santoker._ble_client = mock_client
+        santoker.send_msg(Santoker.WARMUP_TEMP, 1900)
+
+        mock_client.send.assert_called_once_with(expected_packet)
+
+    def test_reported_target_does_not_replace_desired_target(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        diagnostics = create_diagnostic_spy()
+        target_handler = Mock()
+        santoker = Santoker(diagnostics=diagnostics, warmup_temp_handler=target_handler)
+        assert santoker.setWarmupTarget(190.0)
+        santoker.register_reading(Santoker.WARMUP_TEMP, (2000).to_bytes(3, 'big'))
+
+        assert santoker.getWarmupTarget() == 190.0
+        assert santoker.getReportedWarmupTarget() == 200.0
+        assert target_handler.call_args_list == [call(200.0)]
+
+    @pytest.mark.asyncio
+    async def test_reject_recording_errors_does_not_block_protocol_readiness(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker
 
         sender = Santoker()
-        ready_handler = Mock()
-        receiver = Santoker(connect_using_ble=True, ready_handler=ready_handler)
+        diagnostics = create_diagnostic_spy('record_protocol')
+        receiver = Santoker(diagnostics=diagnostics)
         packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
 
-        with pytest.raises(asyncio.IncompleteReadError):
-            await read_packet(receiver, packet[:-3])
+        await read_packet(receiver, packet)
 
-        assert not receiver.isHeaderReady()
-        assert receiver.HEADER == Santoker.HEADER_BT
-        ready_handler.assert_not_called()
+        assert receiver.isHeaderReady()
+        assert receiver.getReportedWarmupTarget() == 190.0
 
-    def test_protocol_reset_retains_desired_target(self) -> None:
+    @pytest.mark.asyncio
+    async def test_reject_recording_errors_does_not_block_decoded_recording(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        sender = Santoker()
+        diagnostics = create_diagnostic_spy('record_decoded')
+        receiver = Santoker(diagnostics=diagnostics)
+        packet = sender.create_msg(Santoker.BT, 2300)
+
+        await read_packet(receiver, packet)
+
+        assert receiver.isHeaderReady()
+        assert receiver.getBT() == 230.0
+
+    @pytest.mark.asyncio
+    async def test_reject_recording_errors_does_not_block_rx_recording(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        sender = Santoker()
+        diagnostics = create_diagnostic_spy('record_rx')
+        receiver = Santoker(diagnostics=diagnostics)
+        packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
+
+        await read_packet(receiver, packet)
+
+        assert receiver.isHeaderReady()
+        assert receiver.getReportedWarmupTarget() == 190.0
+
+    def test_reject_recording_errors_does_not_block_transport_send(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        diagnostics = create_diagnostic_spy('record_tx')
+        with patch.object(Santoker, 'send') as transport_send:
+            santoker = Santoker(diagnostics=diagnostics)
+            santoker.send_msg(Santoker.WARMUP, 1)
+
+        transport_send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_read_msg_is_tolerant_without_diagnostics(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        sender = Santoker()
+        receiver = Santoker(diagnostics=None)
+        packet = sender.create_msg(Santoker.WARMUP_TEMP, 1900)
+
+        await read_packet(receiver, packet)
+
+        assert receiver.isHeaderReady()
+        assert receiver.getReportedWarmupTarget() == 190.0
+
+    @pytest.mark.asyncio
+    async def test_request_warmup_on_sends_target_and_state(self) -> None:
+        sys.modules.pop('artisanlib.santoker', None)
+        from artisanlib.santoker import Santoker
+
+        santoker = Santoker()
+        assert not santoker.requestWarmupOn(210.0)
+
+        santoker._header_ready = True
+        with patch.object(Santoker, 'send_msg') as send_msg:
+            assert santoker.requestWarmupOn(210.0)
+
+        send_msg.assert_has_calls(
+            [
+                call(Santoker.WARMUP_TEMP, 2100),
+                call(Santoker.WARMUP, 1),
+            ]
+        )
+        assert santoker.getWarmupTarget() == 210.0
+        assert not santoker.requestWarmupOn(300.1)
+
         sys.modules.pop('artisanlib.santoker', None)
         from artisanlib.santoker import Santoker
 
         state_handler = Mock()
         santoker = Santoker(warmup_handler=state_handler)
         santoker._header_ready = True
-        with patch.object(Santoker, 'send_msg'):
-            assert santoker.setWarmupTarget(195.0)
-            assert santoker.setWarmup(True)
+        assert santoker.setWarmupTarget(195.0)
+        assert santoker.setWarmup(True)
 
         santoker.resetProtocolState()
 
         assert not santoker.isHeaderReady()
         assert santoker.getWarmup() is None
         assert santoker.getWarmupTarget() == 195.0
-        assert state_handler.call_args_list[-1] == call(None)
+        assert state_handler.call_args_list == []
 
     def test_disconnect_handler_resets_protocol_state_before_callback(self) -> None:
         sys.modules.pop('artisanlib.santoker', None)
@@ -1158,18 +1744,15 @@ class TestSantokerWarmupProtocol:
             disconnected_handler=disconnected_handler,
         )
         santoker_ref.append(santoker)
-        santoker._header_ready = True
-        with patch.object(Santoker, 'send_msg'):
-            assert santoker.setWarmupTarget(195.0)
-            assert santoker.setWarmup(True)
+        assert santoker.setWarmupTarget(195.0)
+        santoker.register_reading(Santoker.WARMUP, b'\x00\x00\x01')
 
         assert santoker._disconnected_handler is not None
         santoker._disconnected_handler()
 
         assert callback_state == [(False, None, 195.0)]
         assert callback_events == [
-            ('ready', False, True, 195.0),
             ('disconnect', False, None, 195.0),
         ]
         assert state_handler.call_args_list[-1] == call(None)
-        assert ready_calls == [False]
+        assert ready_calls == []

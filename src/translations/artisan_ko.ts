@@ -257,6 +257,7 @@
         <location filename="../artisanlib/designer.py" line="239"/>
         <location filename="../artisanlib/wheels.py" line="135"/>
         <location filename="../artisanlib/wheels.py" line="50"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="293"/>
         <source>Close</source>
         <translation type="unfinished">닫기</translation>
     </message>
@@ -1283,6 +1284,22 @@ END</source>
     <message>
         <source>Extra</source>
         <translation type="vanished">기타</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="67"/>
+        <source>Diagnostics…</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="285"/>
+        <source>Copy All</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="516"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="289"/>
+        <source>Save as Text…</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>CheckBox</name>
@@ -4988,6 +5005,16 @@ END</source>
         <source>Exception: redrawdesigner() Roast events may be out of order. Restting Designer.</source>
         <translation type="vanished">예외: redrawdesigner() 로스트 이벤트의 순서가 잘못되었을 수 있습니다. 쉬고 있는 디자이너.</translation>
     </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="511"/>
+        <source>Failed to copy Santoker diagnostics</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="533"/>
+        <source>Failed to save Santoker diagnostics</source>
+        <translation type="unfinished"/>
+    </message>
 </context><context>
     <name>Flavor Scope Label</name>
     <message>
@@ -5352,6 +5379,11 @@ END</source>
     <message>
         <source>Plotter Help</source>
         <translation type="vanished">플로터 도움말</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="115"/>
+        <source>Santoker Diagnostics</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>GroupBox</name>
@@ -5881,6 +5913,21 @@ END</source>
     <message>
         <source>Head Up Display</source>
         <translation type="vanished">헤드 업 디스플레이</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="128"/>
+        <source>Session and Connection</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="175"/>
+        <source>Machine State</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="234"/>
+        <source>Warm-up State</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>HTML Report Template</name>
@@ -13846,6 +13893,7 @@ When Keyboard Shortcuts are OFF adds a custom event</source>
     </message>
     <message>
         <location filename="../artisanlib/ports.py" line="1542"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="141"/>
         <source>Transport</source>
         <translation>수송</translation>
     </message>
@@ -15247,6 +15295,7 @@ Fewer nodes: simpler curve but may lose detail</source>
     </message>
     <message>
         <location filename="../artisanlib/devices.py" line="783"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="218"/>
         <source>Power</source>
         <translation type="unfinished">화력</translation>
     </message>
@@ -15938,6 +15987,116 @@ Fewer nodes: simpler curve but may lose detail</source>
     <message>
         <source>CO2 per kg green coffee</source>
         <translation type="vanished">녹색 커피 kg 당 CO2</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="56"/>
+        <source>unknown</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="135"/>
+        <source>Monitoring</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="147"/>
+        <source>Connected</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="153"/>
+        <source>Ready</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="159"/>
+        <source>Header</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="165"/>
+        <source>Reconnect Count</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="171"/>
+        <source>Last Packet</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="182"/>
+        <source>Board</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="188"/>
+        <source>Bean</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="194"/>
+        <source>Environment</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="200"/>
+        <source>Infrared</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="206"/>
+        <source>Bean ROR</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="212"/>
+        <source>Environment ROR</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="224"/>
+        <source>Fan</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="230"/>
+        <source>Drum</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="241"/>
+        <source>Desired warm-up</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="247"/>
+        <source>Desired target</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="253"/>
+        <source>Reported warm-up</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="259"/>
+        <source>Reported target</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="265"/>
+        <source>Restoration</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="271"/>
+        <source>CHARGE latch</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="278"/>
+        <source>History</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>Label  </name>
@@ -19700,6 +19859,27 @@ To keep it free and current please support us with your donation and subscribe t
     <message>
         <source>Keyboard Shortcuts</source>
         <translation type="vanished">단축키</translation>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="357"/>
+        <source>No Santoker monitoring session captured</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="492"/>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="399"/>
+        <source>Diagnostics unavailable</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="469"/>
+        <source>[older entries discarded: %1]</source>
+        <translation type="unfinished"/>
+    </message>
+    <message>
+        <location filename="../artisanlib/santoker_diagnostics_ui.py" line="540"/>
+        <source>Error</source>
+        <translation type="unfinished"/>
     </message>
 </context><context>
     <name>Plus</name>

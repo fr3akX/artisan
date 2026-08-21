@@ -2702,7 +2702,11 @@ def test_cancel_fence_after_validation_before_publish_discards_only_exact_stage(
         first.token.cancel()
         blocker.release.set()
         harness.wait_until(
-            lambda: any(path == first.staged_path for path, _thread in harness.cache.discard_calls)
+            lambda: any(
+                path == first.staged_path
+                for path, _thread in harness.cache.discard_calls
+            )
+            and not first.staged_path.exists()
         )
 
         assert first.token.is_cancelled()
@@ -2827,7 +2831,10 @@ def test_online_download_failures_and_ui_discard_consume_every_stage(
     _online_id, request = worker_harness.open_online()
     before = len(worker_harness.cache.discard_calls)
     worker_harness.bus.discard_worker.emit(str(request.staged_path))
-    worker_harness.wait_until(lambda: len(worker_harness.cache.discard_calls) > before)
+    worker_harness.wait_until(
+        lambda: len(worker_harness.cache.discard_calls) > before
+        and not request.staged_path.exists()
+    )
     assert not request.staged_path.exists()
     assert worker_harness.cache.discard_calls[-1][1] == worker_harness.worker_thread_id
 
@@ -2921,7 +2928,10 @@ def test_delayed_duplicate_publish_and_discard_affect_only_the_exact_stage(
 
     before = len(worker_harness.cache.discard_calls)
     worker_harness.bus.discard_worker.emit(str(second.staged_path))
-    worker_harness.wait_until(lambda: len(worker_harness.cache.discard_calls) > before)
+    worker_harness.wait_until(
+        lambda: len(worker_harness.cache.discard_calls) > before
+        and not second.staged_path.exists()
+    )
     worker_harness.bus.discard_worker.emit(str(second.staged_path))
     worker_harness.wait_for_spy(failed, 1)
 
