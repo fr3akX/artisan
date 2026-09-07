@@ -18464,6 +18464,16 @@ Turpināt?</translation>
         <source>Error</source>
         <translation type="unfinished"/>
     </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="4701" />
+        <source>Inventory conflict for {lot}. Balance recorded with the command: {balance} g. Reconcile this lot in Roast Server before relying on inventory totals.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/main.py" line="4707" />
+        <source>Open lot in browser</source>
+        <translation type="unfinished" />
+    </message>
 </context><context>
     <name>Plus</name>
     <message>
@@ -22078,4 +22088,167 @@ pieņemot, ka tiek kontrolēts gāzes spiediens, nevis gāzes plūsma.
 Lai samazinātu siltumu (vai gāzes plūsmu) par 50% no gāzes spiediena
 ir jāsamazina 4 reizes.</translation>
     </message>
-</context></TS>
+</context><context>
+    <name>RoastServer</name>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="1283" />
+        <source>Authentication paused. Paste a new token and choose Test and replace token.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="107" />
+        <source>Authentication paused: replace the token in Roast Server settings.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="904" />
+        <source>Changes are not applied. Test and replace the token to connect.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="958" />
+        <source>Checking replacement token. Uploads are paused.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="115" />
+        <location filename="../artisanlib/roastserver/dialogs.py" line="1788" />
+        <source>Could not open the browser.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="87" />
+        <source>Last successful upload: {time}</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="100" />
+        <location filename="../artisanlib/roastserver/presentation.py" line="57" />
+        <source>No uploads this session.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="62" />
+        <source>Open on server</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="1570" />
+        <source>Open roast in browser</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="706" />
+        <source>Paste a new token to replace the stored token</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="917" />
+        <source>Previous upload settings restored.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="708" />
+        <source>Resume previous upload settings</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="59" />
+        <source>Roast Server upload status</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="90" />
+        <source>Roast {roast}</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="707" />
+        <source>Test and replace token</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="1150" />
+        <source>Token saved and connection verified. Enable Roast Server to synchronize.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/dialogs.py" line="1149" />
+        <source>Token saved and connection verified. Resume uploads when ready.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="83" />
+        <source>Upload failed: review the upload queue</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="82" />
+        <source>Upload paused: replace the token in Roast Server settings</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="78" />
+        <source>Upload queued</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="81" />
+        <source>Upload will retry</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="80" />
+        <source>Uploaded</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/presentation.py" line="79" />
+        <source>Uploading</source>
+        <translation type="unfinished" />
+    </message>
+</context>
+<context>
+    <name>RoastServerInventory</name>
+    <message>
+        <location filename="../artisanlib/roastserver/inventory_dialogs.py" line="246" />
+        <source> g</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/inventory_dialogs.py" line="247" />
+        <source>Actual green weight</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/inventory_dialogs.py" line="270" />
+        <source>Actual green weight:</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/inventory_dialogs.py" line="834" />
+        <source>Could not open the browser.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/inventory_dialogs.py" line="252" />
+        <source>Finalize</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/inventory_dialogs.py" line="360" />
+        <source>Finalize deducts {grams} g of green coffee. Release cancels the reservation without consumption.</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/inventory_dialogs.py" line="253" />
+        <source>Finalize selected reservation using actual green weight</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <location filename="../artisanlib/roastserver/inventory_dialogs.py" line="652" />
+        <source>Open lot in browser</source>
+        <translation type="unfinished" />
+    </message>
+</context>
+</TS>

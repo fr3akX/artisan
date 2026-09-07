@@ -160,11 +160,11 @@ InventoryLifecycle = Literal[
 ]
 
 _UUID_CHECK = (
-    "length({column}) = 32 AND lower({column}) = {column} "
+    'length({column}) = 32 AND lower({column}) = {column} '
     "AND {column} NOT GLOB '*[^0-9a-f]*'"
 )
 _NAMESPACE_KEY_CHECK = (
-    "length(namespace_key) = 64 AND lower(namespace_key) = namespace_key "
+    'length(namespace_key) = 64 AND lower(namespace_key) = namespace_key '
     "AND namespace_key NOT GLOB '*[^0-9a-f]*'"
 )
 
@@ -1027,20 +1027,8 @@ class InventoryStore:
                     row['roast_uuid'],
                 ),
             )
-            connection.execute(
-                '''UPDATE bean_lots
-                   SET on_hand_grams = ?, reserved_grams = ?, available_grams = ?,
-                       unresolved_conflict_count = ?
-                   WHERE namespace_id = ? AND lot_uuid = ?''',
-                (
-                    balance.on_hand_grams,
-                    balance.reserved_grams,
-                    balance.available_grams,
-                    balance.unresolved_conflict_count,
-                    row['namespace_id'],
-                    row['lot_uuid'],
-                ),
-            )
+            # A receipt may predate the latest lot refresh. Keep its balance on
+            # the roast only; current stock comes exclusively from inventory reads.
             self._prune_completed(connection, now)
             updated = connection.execute(
                 '''SELECT * FROM roast_inventory

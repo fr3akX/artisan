@@ -136,6 +136,17 @@ class Namespace:
     key: str
 
 
+type UploadProgressState = Literal['queued', 'uploading', 'uploaded', 'retrying', 'paused', 'failed']
+
+
+@dataclass(frozen=True, slots=True)
+class UploadProgress:
+    namespace: Namespace
+    roast_uuid: UUID
+    state: UploadProgressState
+    occurred_at: datetime
+
+
 @dataclass(frozen=True, slots=True)
 class ArchiveFilters:
     search: str | None = None

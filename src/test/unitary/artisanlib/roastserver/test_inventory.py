@@ -737,3 +737,13 @@ def test_store_failures_use_fixed_error_and_do_not_wake(
         'inventory_storage_failed', lambda: coordinator.commit_charge(prepared)
     )
     assert wake_calls == []
+
+
+def test_interrupted_recovery_persists_actual_green_weight(store: InventoryStore) -> None:
+    coordinator = InventoryCoordinator(store, clock=Clock(),
+        uuid_factory=SequenceFactory(RESERVATION_UUID), wake=lambda: None)
+    coordinator.commit_charge(coordinator.prepare_charge(CONTEXT, LINK, ROAST_UUID, 1.25, 'Kg'))
+    coordinator.resolve_interrupted(CONTEXT, ROAST_UUID, 'finalize', 875)
+    state = store.roast_state(NAMESPACE, ROAST_UUID)
+    assert state is not None and state.actual_grams == 875
+    assert state.terminal_intent == 'finalize'

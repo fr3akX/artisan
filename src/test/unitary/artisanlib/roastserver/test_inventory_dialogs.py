@@ -122,6 +122,7 @@ class FakeController(QObject):
         self.locked = False
         self.lock_calls: list[tuple[InventoryProfileLink | None, UUID | None, bool]] = []
         self.recovery_calls: list[tuple[UUID, str]] = []
+        self.recovery_weights: list[int | None] = []
         self.inventoryRefreshFinished.connect(self._refresh_finished)
         self.operationFailed.connect(self._refresh_failed)
         self.settingsChanged.connect(self._context_changed)
@@ -172,8 +173,9 @@ class FakeController(QObject):
         self.lock_calls.append((link, roast_uuid, profile_has_charge))
         return link is not None and self.locked
 
-    def resolve_interrupted_inventory(self, roast_uuid: UUID, action: str) -> None:
+    def resolve_interrupted_inventory(self, roast_uuid: UUID, action: str, actual_grams: int | None = None) -> None:
         self.recovery_calls.append((roast_uuid, action))
+        self.recovery_weights.append(actual_grams)
 
 
 def _recovery(
@@ -1114,3 +1116,15 @@ def test_roast_properties_cancel_lock_and_context_change_rules() -> None:
     finally:
         staged_dialog.cleanUpInventoryLotSelection()
         QDialog.reject(staged_dialog)
+
+
+def test_recovery_sends_edited_actual_green_weight() -> None:
+    controller = FakeController()
+    record = _recovery(NAMESPACE, UUID('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'))
+    dialog = InterruptedReservationsDialog(None, controller, (record,), NAMESPACE)
+    dialog.actualWeight.setValue(875)
+    assert '875' in dialog.deductionLabel.text()
+    dialog.finalizeButton.click()
+    assert controller.recovery_weights == [875]
+    dialog.clean_up()
+    dialog.close()

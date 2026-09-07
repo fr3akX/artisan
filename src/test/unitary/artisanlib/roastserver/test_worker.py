@@ -2824,6 +2824,8 @@ def test_online_download_failures_and_ui_discard_consume_every_stage(
     )
     worker_harness.bus.online_worker.emit(request_id)
     worker_harness.wait_for_spy(failed, 0)
+    worker_harness.wait_until(lambda: len(worker_harness.cache.discard_calls) == 1
+        and not worker_harness.cache.discard_calls[-1][0].exists())
     assert len(worker_harness.cache.discard_calls) == 1
     assert not worker_harness.cache.discard_calls[-1][0].exists()
 
@@ -3285,3 +3287,12 @@ def test_worker_module_has_no_plus_dependency() -> None:
         node.module or '' for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
     )
     assert not any(name == 'plus' or name.startswith('plus.') for name in imported)
+
+
+def test_upload_progress_follows_durable_completion(worker_harness: WorkerHarness) -> None:
+    progress = QSignalSpy(worker_harness.worker.uploadProgress)
+    worker_harness.enqueue_saved_profile()
+    worker_harness.run_one_queue_tick()
+    worker_harness.wait_until(lambda: any(row[0].state == 'uploaded' for row in progress))
+    assert [row[0].state for row in progress] == ['queued', 'uploading', 'uploaded']
+    assert worker_harness.outbox.counts(NAMESPACE).complete == 1

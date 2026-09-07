@@ -51,6 +51,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSpinBox,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -84,6 +85,7 @@ class InventoryRecoveryDialogController(Protocol):
         self,
         roast_uuid: UUID,
         action: Literal['finalize', 'release', 'keep'],
+        actual_grams: int | None = None,
     ) -> object: ...
 
 
@@ -239,8 +241,16 @@ class InterruptedReservationsDialog(QDialog):
         self.noticeLabel.setWordWrap(True)
         self.noticeLabel.setAccessibleName(_tr('Inventory recovery status'))
 
-        self.finalizeButton = QPushButton(_tr('Finalize planned'), self)
-        self.finalizeButton.setAccessibleName(_tr('Finalize selected reservation using planned weight'))
+        self.actualWeight = QSpinBox(self)
+        self.actualWeight.setRange(1, 2_147_483_647)
+        self.actualWeight.setSuffix(QApplication.translate('RoastServerInventory', ' g'))
+        self.actualWeight.setAccessibleName(QApplication.translate('RoastServerInventory', 'Actual green weight'))
+        self._weight_record: tuple[Namespace, UUID] | None = None
+        self.deductionLabel = QLabel('', self)
+        self.deductionLabel.setWordWrap(True)
+        self.actualWeight.valueChanged.connect(self._weight_changed)
+        self.finalizeButton = QPushButton(QApplication.translate('RoastServerInventory', 'Finalize'), self)
+        self.finalizeButton.setAccessibleName(QApplication.translate('RoastServerInventory', 'Finalize selected reservation using actual green weight'))
         self.releaseButton = QPushButton(_tr('Release'), self)
         self.releaseButton.setAccessibleName(_tr('Release selected inventory reservation'))
         self.keepButton = QPushButton(_tr('Keep pending'), self)
@@ -256,6 +266,13 @@ class InterruptedReservationsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(intro)
         layout.addWidget(self.tableView, 1)
+        weight_row = QHBoxLayout()
+        weight_label = QLabel(QApplication.translate('RoastServerInventory', 'Actual green weight:'), self)
+        weight_label.setBuddy(self.actualWeight)
+        weight_row.addWidget(weight_label)
+        weight_row.addWidget(self.actualWeight)
+        layout.addLayout(weight_row)
+        layout.addWidget(self.deductionLabel)
         layout.addWidget(self.noticeLabel)
         layout.addLayout(actions)
 
@@ -292,6 +309,13 @@ class InterruptedReservationsDialog(QDialog):
         record = self._selected_record()
         active = record is not None and record.namespace == self._active_namespace
         waiting = self._pending is not None
+        key = None if record is None else (record.namespace, record.roast_uuid)
+        if key != self._weight_record:
+            self._weight_record = key
+            if record is not None:
+                self.actualWeight.setValue(record.planned_grams)
+        self.actualWeight.setEnabled(active and not waiting)
+        self._weight_changed()
         self.finalizeButton.setEnabled(active and not waiting)
         self.releaseButton.setEnabled(active and not waiting)
         self.keepButton.setEnabled(record is not None and not waiting)
@@ -330,6 +354,12 @@ class InterruptedReservationsDialog(QDialog):
                 )
         self._selection_changed()
 
+    @pyqtSlot()
+    def _weight_changed(self) -> None:
+        self.deductionLabel.setText(
+            QApplication.translate('RoastServerInventory', 'Finalize deducts {grams} g of green coffee. Release cancels the reservation without consumption.').format(
+                grams=self.actualWeight.value()))
+
     def _selected_record(self) -> InterruptedReservation | None:
         selection = self.tableView.selectionModel()
         if selection is None:
@@ -352,7 +382,11 @@ class InterruptedReservationsDialog(QDialog):
         self.noticeLabel.setText(_tr('Waiting for inventory recovery state.'))
         self._selection_changed()
         try:
-            self._controller.resolve_interrupted_inventory(record.roast_uuid, action)
+            if action == 'finalize':
+                self._controller.resolve_interrupted_inventory(
+                    record.roast_uuid, action, self.actualWeight.value())
+            else:
+                self._controller.resolve_interrupted_inventory(record.roast_uuid, action)
         except (RuntimeError, ValueError):
             self._pending = None
             self.noticeLabel.setText(
@@ -362,6 +396,8 @@ class InterruptedReservationsDialog(QDialog):
 
 
 class InventoryLotDialogController(Protocol):
+    def open_web_lot(self, lot_uuid: UUID) -> bool: ...
+
     inventoryLotsChanged: _Signal
     inventoryRefreshFinished: _Signal
     operationFailed: _Signal
@@ -613,6 +649,9 @@ class InventoryLotDialog(QDialog):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.refreshButton)
         button_layout.addWidget(self.clearButton)
+        self.webButton = QPushButton(QApplication.translate('RoastServerInventory', 'Open lot in browser'), self)
+        self.webButton.clicked.connect(self._open_web_lot)
+        button_layout.addWidget(self.webButton)
         button_layout.addStretch()
         button_layout.addWidget(self.buttonBox)
         button_layout.addWidget(self.chooseButton)
@@ -783,11 +822,17 @@ class InventoryLotDialog(QDialog):
     def _selection_changed(self) -> None:
         lot = self._selected_lot()
         self.chooseButton.setEnabled(lot is not None)
+        self.webButton.setEnabled(lot is not None)
         self.warningLabel.setText(
             '' if lot is None else BeanLotTableModel._warning(lot)  # pylint: disable=protected-access
         )
 
     @pyqtSlot()
+    def _open_web_lot(self) -> None:
+        lot = self._selected_lot()
+        if lot is not None and not self._controller.open_web_lot(lot.lot_id):
+            self.statusLabel.setText(QApplication.translate('RoastServerInventory', 'Could not open the browser.'))
+
     def _choose(self) -> None:
         lot = self._selected_lot()
         if lot is None:

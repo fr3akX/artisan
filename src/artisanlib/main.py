@@ -4776,11 +4776,16 @@ class ApplicationWindow(QMainWindow):
         warning.setTextFormat(Qt.TextFormat.PlainText)
         warning.setText(QApplication.translate(
             'Message',
-            'Inventory conflict for {lot}. Available balance: {balance} g. '
+            'Inventory conflict for {lot}. Balance recorded with the command: {balance} g. '
             'Reconcile this lot in Roast Server before relying on inventory totals.'
         ).format(lot=value.lot_name, balance=balance.available_grams))
         warning.setStandardButtons(QMessageBox.StandardButton.Ok)
+        open_lot = warning.addButton(QApplication.translate(
+            'Message', 'Open lot in browser'), QMessageBox.ButtonRole.ActionRole)
         warning.exec()
+        if warning.clickedButton() is open_lot:
+            from artisanlib.roastserver.presentation import open_server_page
+            open_server_page(value.namespace.origin, 'inventory', value.lot_id)
 
     def cleanUpRoastServerInventoryPresentation(self) -> None:
         try:
@@ -5051,6 +5056,14 @@ class ApplicationWindow(QMainWindow):
         controller.profileReady.connect(self.openRoastServerProfile)
         controller.inventoryRecoveryRequired.connect(self.scheduleInventoryRecovery)
         controller.inventoryConflict.connect(self.showInventoryConflict)
+        from artisanlib.roastserver.presentation import UploadStatusWidget
+        upload_status = UploadStatusWidget(self)
+        controller.uploadProgress.connect(upload_status.show_progress)
+        controller.settingsChanged.connect(upload_status.settings_changed)
+        controller.operationFailed.connect(upload_status.operation_failed)
+        status_bar = self.statusBar()
+        if status_bar is not None:
+            status_bar.addPermanentWidget(upload_status)
         controller.start()
 
     #

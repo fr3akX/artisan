@@ -149,6 +149,8 @@ class _Signal(Protocol):
 
 
 class RoastServerBrowserController(Protocol):
+    def open_web_roast(self, roast_uuid: UUID) -> bool: ...
+
     archivePageReady: _Signal
     operationFailed: _Signal
     onlineChanged: _Signal
@@ -169,6 +171,12 @@ class RoastServerBrowserController(Protocol):
 
 
 class RoastServerDialogController(Protocol):
+    uploadProgress: _Signal
+
+    def last_upload_progress(self) -> object: ...
+
+    def last_successful_upload(self) -> object: ...
+
     settingsChanged: _Signal
     identityChanged: _Signal
     queueChanged: _Signal
@@ -654,6 +662,7 @@ class RoastServerConfigDialog(QDialog):
         self._testing_operation: str | None = None
         self._ignored_operations: set[str] = set()
         self._connection_dirty = False
+        self._resume_settings: ConnectorSettings | None = None
         self._rendering = False
         self._inventory_unsupported_context: object | None = None
 
@@ -694,6 +703,12 @@ class RoastServerConfigDialog(QDialog):
         credential_layout.addWidget(self.test_button)
         self.credential_label.setBuddy(self.credential_edit)
         connection_layout.addRow(self.credential_label, credential_row)
+        self.credential_edit.setPlaceholderText(QApplication.translate('RoastServer', 'Paste a new token to replace the stored token'))
+        self.test_button.setText(QApplication.translate('RoastServer', 'Test and replace token'))
+        self.resume_button = QPushButton(QApplication.translate('RoastServer', 'Resume previous upload settings'), connection_group)
+        self.resume_button.hide()
+        self.resume_button.clicked.connect(self._resume_uploads)
+        connection_layout.addRow(self.resume_button)
 
         identity_caption = QLabel(_tr('Identity:'), connection_group)
         self.identity_label = QLabel(_tr(_NOT_CONNECTED), connection_group)
@@ -753,6 +768,14 @@ class RoastServerConfigDialog(QDialog):
         self.refresh_button = QPushButton(_tr('&Refresh queue'), queue_group)
         queue_layout.addWidget(self.refresh_button, 0, Qt.AlignmentFlag.AlignRight)
         layout.addWidget(queue_group, 1)
+        from artisanlib.roastserver.presentation import UploadStatusWidget
+        self.upload_status = UploadStatusWidget(self)
+        self._controller.uploadProgress.connect(self.upload_status.show_progress)
+        self._controller.settingsChanged.connect(self.upload_status.settings_changed)
+        self._controller.operationFailed.connect(self.upload_status.operation_failed)
+        self.upload_status.show_progress(self._controller.last_successful_upload())
+        self.upload_status.show_progress(self._controller.last_upload_progress())
+        layout.addWidget(self.upload_status)
 
         inventory_group = QGroupBox(_tr('Inventory queue'), self)
         inventory_layout = QVBoxLayout(inventory_group)
@@ -869,12 +892,29 @@ class RoastServerConfigDialog(QDialog):
     def _connection_edited(self) -> None:
         if self._rendering:
             return
+        operation = self._testing_operation
+        if operation is not None:
+            self._ignored_operations.add(operation)
+            self._controller.cancel_connection_test(operation)
         self._connection_dirty = True
         self._testing_operation = None
-        self._invalidate_proof(
-            persist_automatic_off=True,
-            invalidate_controller=True,
-        )
+        self.resume_button.hide()
+        # Editing is a draft. Do not change the saved connection or upload options.
+        self._invalidate_proof(persist_automatic_off=False)
+        self._set_error(QApplication.translate('RoastServer', 'Changes are not applied. Test and replace the token to connect.'))
+
+    @pyqtSlot()
+    def _resume_uploads(self) -> None:
+        previous = self._resume_settings
+        if previous is None or not self._has_current_proof():
+            return
+        if previous.origin != self._settings.origin or previous.identity != self._identity:
+            return
+        if not self._persist_options(enabled=previous.enabled, automatic_upload=previous.automatic_upload):
+            return
+        self.resume_button.hide()
+        self._resume_settings = None
+        self._set_error(QApplication.translate('RoastServer', 'Previous upload settings restored.'))
 
     def _invalidate_proof(
         self,
@@ -910,12 +950,15 @@ class RoastServerConfigDialog(QDialog):
             self._clear_candidate()
             self._set_error(_tr('Enter a valid HTTPS origin.'))
             return
-        if self.credential_edit.text() == '':
+        if self.credential_edit.text().strip() == '':
             self._set_error(_tr(_ENTER_CREDENTIAL_MESSAGE))
             return
+        if self._resume_settings is None and self._settings.enabled:
+            self._resume_settings = self._settings
+        self._set_error(QApplication.translate('RoastServer', 'Checking replacement token. Uploads are paused.'))
         try:
             self._testing_operation = self._controller.test_connection(
-                origin, self.credential_edit.text()
+                origin, self.credential_edit.text().strip()
             )
         except RuntimeError:
             self._testing_operation = None
@@ -972,7 +1015,7 @@ class RoastServerConfigDialog(QDialog):
         enabled: bool | None = None,
         automatic_upload: bool | None = None,
         cache_limit_bytes: int | None = None,
-    ) -> None:
+    ) -> bool:
         target_enabled = self._settings.enabled if enabled is None else enabled
         target_automatic = (
             self._settings.automatic_upload
@@ -996,13 +1039,14 @@ class RoastServerConfigDialog(QDialog):
         except RuntimeError:
             self._set_error(_tr(_GENERIC_OPERATION_FAILURE))
             self._render_settings(self._settings, update_origin=False)
-            return
+            return False
         self._settings = replace(
             self._settings,
             enabled=target_enabled,
             automatic_upload=target_automatic,
             cache_limit_bytes=target_limit,
         )
+        return True
 
     @pyqtSlot()
     def _remove_credential(self) -> None:
@@ -1095,7 +1139,15 @@ class RoastServerConfigDialog(QDialog):
             self.clear_cache_button.setEnabled(self._settings.enabled)
         finally:
             self._rendering = False
-        self._set_error('')
+        previous = self._resume_settings
+        can_resume = (
+            previous is not None and previous.enabled
+            and previous.origin == editor_origin and previous.identity == identity
+        )
+        self.resume_button.setVisible(can_resume)
+        self._set_error(
+            QApplication.translate('RoastServer', 'Token saved and connection verified. Resume uploads when ready.') if can_resume
+            else QApplication.translate('RoastServer', 'Token saved and connection verified. Enable Roast Server to synchronize.'))
         self._render_inventory_failed_actions()
 
     @pyqtSlot(object)
@@ -1227,7 +1279,9 @@ class RoastServerConfigDialog(QDialog):
             self.inventory_status_label.setText(
                 _tr('Server does not support inventory.'))
             return
-        if failure.kind is FailureKind.KEYRING:
+        if failure.kind is FailureKind.CREDENTIAL_REJECTED:
+            self._set_error(QApplication.translate('RoastServer', 'Authentication paused. Paste a new token and choose Test and replace token.'))
+        elif failure.kind is FailureKind.KEYRING:
             self._set_error(_tr(KEYRING_FAILURE_MESSAGE))
         else:
             self._set_error(failure.message)
@@ -1513,6 +1567,11 @@ class RoastServerBrowserDialog(QDialog):
         if close_button is None:
             raise RuntimeError('Close button is unavailable.')
         action_row.addStretch(1)
+        self.web_button = QPushButton(QApplication.translate('RoastServer', 'Open roast in browser'), self)
+        self.web_button.setAutoDefault(False)
+        self.web_button.setEnabled(False)
+        self.web_button.clicked.connect(self._open_web_roast)
+        action_row.addWidget(self.web_button)
         action_row.addWidget(self.open_button)
         action_row.addWidget(self.button_box)
         layout.addLayout(action_row)
@@ -1714,6 +1773,7 @@ class RoastServerBrowserDialog(QDialog):
         _previous: QModelIndex = _ROOT_INDEX,
     ) -> None:
         row = self._selected_row()
+        self.web_button.setEnabled(row is not None)
         enabled = (
             not self.progress_bar.isVisible()
             and row is not None
@@ -1721,6 +1781,11 @@ class RoastServerBrowserDialog(QDialog):
             and (self._online or row.cached is not None)
         )
         self.open_button.setEnabled(enabled)
+
+    def _open_web_roast(self) -> None:
+        row = self._selected_row()
+        if row is not None and not self._controller.open_web_roast(row.roast.roast_uuid):
+            self._set_error(QApplication.translate('RoastServer', 'Could not open the browser.'))
 
     def _selected_row(self) -> ArchiveRow | None:
         current = self.roast_view.currentIndex()

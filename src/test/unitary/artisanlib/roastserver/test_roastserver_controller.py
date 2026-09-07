@@ -555,6 +555,7 @@ class FakeWorker(QObject):
     credentialRemoved = pyqtSignal(str)
     operationFailed = pyqtSignal(str, object)
     queueChanged = pyqtSignal(object)
+    uploadProgress = pyqtSignal(object)
     failedJobsChanged = pyqtSignal(object)
     cacheStatsChanged = pyqtSignal(object)
     archivePageReady = pyqtSignal(str, object)
@@ -3999,3 +4000,51 @@ def test_controller_source_has_no_plus_import_secret_signal_or_terminate() -> No
     assert 'from plus' not in source
     assert '.terminate(' not in source
     assert 'pyqtSignal(str, str)' not in source
+
+
+def test_rejected_authentication_queues_no_further_stored_token_authentication(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller_harness.confirm()
+    controller_harness.enable()
+    controller_harness.relay.failure.emit('configure', public_failure(FailureKind.CREDENTIAL_REJECTED))
+    controller_harness.wait_until(lambda: bool(controller_harness.fake_worker.configure_values)
+        and not controller_harness.fake_worker.configure_values[-1].authenticate)
+    assert not controller_harness.fake_worker.configure_values[-1].enabled
+    # A replacement must never cause the saved, rejected token to be authenticated.
+    controller_harness.controller.test_connection(ORIGIN, secrets.token_urlsafe(32))
+    controller_harness.wait_until(lambda: not controller_harness.fake_worker.configure_values[-1].authenticate)
+
+
+def test_real_expired_token_stops_and_replacement_works_without_removal(
+    tmp_path: Path, qcoreapplication: QCoreApplication,
+) -> None:
+    settings = SettingsStore(QSettings(str(tmp_path / 'rotation.ini'), QSettings.Format.IniFormat))
+    settings.set_origin(ORIGIN)
+    settings.save_connection(ORIGIN, IDENTITY)
+    settings.save_options(True, True, 64 * 1024 * 1024)
+    credentials = FakeCredentialStore()
+    old, new = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    credentials.values[ORIGIN] = old
+    recorder = ActivationShutdownRecorder(new)
+    recorder.release_final_auth.set()
+    controller = RoastServerController(
+        settings=settings, credentials=credentials, data_root=tmp_path / 'rotation-data',
+        client_factory=cast(ClientFactory, recorder), profile_validator=lambda _path: None,
+    )
+    failed = QSignalSpy(controller.operationFailed)
+    controller.start()
+    try:
+        _wait_for_qt(qcoreapplication, lambda: len(failed) > 0, 'initial rejection not reported')
+        for _ in range(30):
+            qcoreapplication.processEvents()
+            time.sleep(0.002)
+        assert recorder.api_calls == ['test_connection']
+        assert credentials.values[ORIGIN] == old
+        controller.test_connection(ORIGIN, new)
+        _wait_for_qt(qcoreapplication, lambda: controller._identity == IDENTITY,
+                     'replacement token was not activated')
+        assert credentials.values[ORIGIN] == new
+        assert credentials.delete_calls == []
+    finally:
+        assert controller.shutdown(2000)
