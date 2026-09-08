@@ -55,6 +55,7 @@ from artisanlib.roastserver.contract import (
     ArchiveFilters,
     FailureKind,
     Namespace,
+    UploadProgress,
     PublicFailure,
     RoastPage,
     RoastSummary,
@@ -211,6 +212,7 @@ class RoastServerController(QObject):
     settingsChanged = pyqtSignal(object)
     identityChanged = pyqtSignal(object)
     queueChanged = pyqtSignal(object)
+    uploadProgress = pyqtSignal(object)
     failedJobsChanged = pyqtSignal(object)
     cacheStatsChanged = pyqtSignal(object)
     archivePageReady = pyqtSignal(str, object)
@@ -289,6 +291,9 @@ class RoastServerController(QObject):
         self._activation_previous: dict[str, ConnectorSettings] = {}
         self._rollback_settlements: set[str] = set()
         self._active_connection_test: str | None = None
+        self._authentication_paused = False
+        self._last_upload_progress: UploadProgress | None = None
+        self._last_successful_upload: UploadProgress | None = None
         self._credential_removals: set[str] = set()
         self._browse_epoch = 0
         self._browse_filters: ArchiveFilters | None = None
@@ -414,6 +419,7 @@ class RoastServerController(QObject):
         _connect(worker.credentialRemoved, self._on_credential_removed, queued)
         _connect(worker.operationFailed, self._on_operation_failed, queued)
         _connect(worker.queueChanged, self._on_queue_changed, queued)
+        _connect(worker.uploadProgress, self._on_upload_progress, queued)
         _connect(worker.failedJobsChanged, self._on_failed_jobs_changed, queued)
         _connect(worker.cacheStatsChanged, self._on_cache_stats_changed, queued)
         _connect(worker.archivePageReady, self._on_archive_page, queued)
@@ -495,6 +501,38 @@ class RoastServerController(QObject):
         self._shutdown_complete = True
         return True
 
+    def last_upload_progress(self) -> UploadProgress | None:
+        self._require_ui_thread()
+        value = self._last_upload_progress
+        return value if value is not None and value.namespace == self._configured_namespace(require_enabled=False) else None
+
+    def last_successful_upload(self) -> UploadProgress | None:
+        self._require_ui_thread()
+        value = self._last_successful_upload
+        return value if value is not None and value.namespace == self._configured_namespace(require_enabled=False) else None
+
+    @pyqtSlot(object)
+    def _on_upload_progress(self, value: object) -> None:
+        if (self._stop_requested or not isinstance(value, UploadProgress)
+                or value.namespace != self._configured_namespace(require_enabled=False)):
+            return
+        self._last_upload_progress = value
+        if value.state == 'uploaded' and (self._last_successful_upload is None
+                or value.namespace != self._last_successful_upload.namespace
+                or value.occurred_at >= self._last_successful_upload.occurred_at):
+            self._last_successful_upload = value
+        self.uploadProgress.emit(value)
+
+    def open_web_roast(self, roast_uuid: UUID) -> bool:
+        self._require_command_state()
+        from artisanlib.roastserver.presentation import open_server_page
+        return open_server_page(self._settings.origin, 'roasts', roast_uuid)
+
+    def open_web_lot(self, lot_uuid: UUID) -> bool:
+        self._require_command_state()
+        from artisanlib.roastserver.presentation import open_server_page
+        return open_server_page(self._settings.origin, 'inventory', lot_uuid)
+
     def inventory_context(self) -> InventoryContext:
         self._require_ui_thread()
         namespace = self._configured_namespace(require_enabled=False)
@@ -523,7 +561,7 @@ class RoastServerController(QObject):
         snapshot = self.inventory_cache_snapshot()
         return () if snapshot is None else snapshot.lots
 
-    def refresh_inventory_lots(self) -> str:
+    def refresh_inventory_lots(self, *, force: bool = False) -> str:
         self._require_command_state()
         context = self.inventory_context()
         generation = self._inventory_generation
@@ -537,7 +575,7 @@ class RoastServerController(QObject):
             raise ControllerError('inventory_namespace_inactive')
         refresh_context = (generation, context.namespace)
         for request_id, tracked_context in self._inventory_refresh_requests.items():
-            if tracked_context == refresh_context:
+            if tracked_context == refresh_context and not force:
                 return request_id
         self._invalidate_inventory_refreshes()
         request_id = self._put_command(
@@ -627,6 +665,7 @@ class RoastServerController(QObject):
         self,
         roast_uuid: UUID,
         action: Literal['finalize', 'release', 'keep'],
+        actual_grams: int | None = None,
     ) -> InventoryNotice:
         self._require_command_state()
         context = self.inventory_context()
@@ -642,7 +681,7 @@ class RoastServerController(QObject):
             if len(active) != 1:
                 raise ControllerError('inventory_recovery_unavailable')
             notice = self._inventory_coordinator.resolve_interrupted(
-                context, roast_uuid, action
+                context, roast_uuid, action, actual_grams
             )
         except InventoryCoordinatorError as error:
             raise ControllerError(error.code) from None
@@ -675,6 +714,7 @@ class RoastServerController(QObject):
         candidate_value: object = candidate
         if not isinstance(candidate_value, str) or candidate_value == '':
             raise ControllerError(_INVALID_REQUEST_MESSAGE)
+        self._authentication_paused = True
 
         self._cancel_connection_transactions()
         if (
@@ -769,6 +809,7 @@ class RoastServerController(QObject):
 
     def invalidate_connection_proof(self) -> None:
         self._require_command_state()
+        self._authentication_paused = True
         generation = self._revoke_configuration()
         self._cancel_connection_transactions()
         try:
@@ -1347,6 +1388,7 @@ class RoastServerController(QObject):
         self._rollback_settlements.discard(request_id)
         self._identity = value
         self._proof = (self._settings.origin, value.organization.id)
+        self._authentication_paused = False
         self._invalidate_archive_state()
         self._acknowledgeConnectionWorker.emit(request_id)
         self._queue_configuration(self._configuration())
@@ -1545,6 +1587,7 @@ class RoastServerController(QObject):
             else:
                 self._cancelConnectionWorker.emit(operation)
         if failure.kind is FailureKind.CREDENTIAL_REJECTED:
+            self._authentication_paused = True
             paused = self._configuration(enabled=False)
             if not self._set_automatic_upload_off(public_operation):
                 return
@@ -1870,6 +1913,12 @@ class RoastServerController(QObject):
         ):
             return
         self.inventoryStateChanged.emit(state)
+        if state.balance is not None and self.inventory_context().enabled:
+            # Command receipts acknowledge history; only a read updates current stock.
+            try:
+                self.refresh_inventory_lots(force=True)
+            except ControllerError:
+                self._emit_failure('inventory_refresh', FailureKind.LOCAL_INVENTORY)
         if state.conflict_id is not None:
             self.inventoryConflict.emit(state)
 
@@ -2056,6 +2105,7 @@ class RoastServerController(QObject):
             identity=identity,
             pending_connection=pending is not None,
             activation_id=activation_id,
+            authenticate=not self._authentication_paused,
         )
 
     def _prior_active_configuration(self) -> WorkerConfiguration:

@@ -351,7 +351,7 @@ def test_fresh_schema_is_exact_versioned_and_task_3_ready(tmp_path: Path) -> Non
     try:
         assert connection.execute('SELECT version FROM schema_version').fetchall() == [(1,)]
         objects = connection.execute(
-            "SELECT type, name FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name"
+            'SELECT type, name FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name'
         ).fetchall()
         assert objects == [
             ('index', 'bean_lots_name_idx'),
@@ -1098,8 +1098,7 @@ def test_completion_atomically_updates_roast_balance_cache_and_conflict(
     assert state.lifecycle == 'reserved'
     assert state.server_reservation_uuid == SERVER_RESERVATION_UUID
     assert state.balance == result.balance and state.conflict_id == CONFLICT_UUID
-    assert store.cached_lots(NAMESPACE)[0].reserved_grams == 1_250
-    assert store.cached_lots(NAMESPACE)[0].unresolved_conflict_count == 1
+    assert store.cached_lots(NAMESPACE)[0] == lot()
     assert store.counts(NAMESPACE).complete == 1
 
 
@@ -1456,6 +1455,7 @@ def test_completed_history_prunes_only_old_terminal_roasts(
 
 _CROSS_PROCESS_SCRIPT = r'''
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -1718,3 +1718,20 @@ def test_two_store_reserve_and_terminal_intent_races_are_serialized(
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.parametrize('replay', [False, True])
+def test_delayed_receipt_preserves_newer_lot_snapshot(store: InventoryStore, replay: bool) -> None:
+    store.enqueue_reserve(NAMESPACE, RESERVE_REQUEST, 'Lot', NOW)
+    command = store.lease_next(NAMESPACE, NOW, 30)
+    assert command is not None and command.lease_token is not None
+    refreshed = NOW + timedelta(seconds=5)
+    current = lot(on_hand_grams=20000, reserved_grams=1250, available_grams=18750)
+    store.replace_lots(NAMESPACE, (current,), refreshed)
+    receipt = replace(mutation_result(), idempotent_replay=replay)
+    state = store.mark_complete(command.id, command.lease_token, receipt, NOW + timedelta(seconds=10))
+    snapshot = store.cache_snapshot(NAMESPACE)
+    assert snapshot.lots == (current,)
+    assert snapshot.refreshed_at == refreshed
+    assert state.balance == receipt.balance
+    assert store.counts(NAMESPACE).complete == 1

@@ -5097,7 +5097,9 @@ class TestRoastServerMainIntegration:
             return_value=controller,
         ) as controller_class, patch(
             'artisanlib.roastserver.api.RoastServerClient'
-        ) as client_class:
+        ) as client_class, patch(
+            'artisanlib.roastserver.presentation.UploadStatusWidget'
+        ), patch.object(ApplicationWindow, 'statusBar', return_value=Mock()):
             window.startRoastServer(tmp_path)
 
         controller_class.assert_called_once_with(

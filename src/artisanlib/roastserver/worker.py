@@ -57,6 +57,8 @@ from artisanlib.roastserver.contract import (
     ArchiveFilters,
     FailureKind,
     Namespace,
+    UploadProgress,
+    UploadProgressState,
     PublicFailure,
     RevisionUpload,
     RoastDetail,
@@ -314,6 +316,7 @@ class WorkerConfiguration:
     identity: ServerIdentity | None = None
     pending_connection: bool = False
     activation_id: str | None = None
+    authenticate: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +446,7 @@ class RoastServerWorker(QObject):
     credentialRemoved = pyqtSignal(str)
     operationFailed = pyqtSignal(str, object)
     queueChanged = pyqtSignal(object)
+    uploadProgress = pyqtSignal(object)
     failedJobsChanged = pyqtSignal(object)
     cacheStatsChanged = pyqtSignal(object)
     archivePageReady = pyqtSignal(str, object)
@@ -627,7 +631,7 @@ class RoastServerWorker(QObject):
 
         namespace = configuration.namespace
         identity = configuration.identity
-        if namespace is None or identity is None:
+        if namespace is None or identity is None or not configuration.authenticate:
             self.onlineChanged.emit(False)
             self._stop_timer()
             self._emit_aggregates(namespace)
@@ -1275,7 +1279,7 @@ class RoastServerWorker(QObject):
             profile = None
             if self._cancelled():
                 return
-            self._outbox.enqueue(
+            enqueued = self._outbox.enqueue(
                 namespace,
                 snapshot,
                 roast_uuid,
@@ -1289,6 +1293,16 @@ class RoastServerWorker(QObject):
                 self._outbox.pause_namespace(
                     namespace, self._now(), 'credential_removed'
                 )
+            states: dict[str, UploadProgressState] = {
+                'complete': 'uploaded', 'failed': 'failed', 'leased': 'uploading',
+                'paused': 'paused', 'retrying': 'retrying',
+            }
+            state = states.get(enqueued.job.state, 'queued')
+            if self._credential is None and state != 'uploaded':
+                state = 'paused'
+            self.uploadProgress.emit(UploadProgress(
+                namespace, roast_uuid, state,
+                enqueued.job.updated_at if state == 'uploaded' else self._now()))
         except KeyError:
             if not self._cancelled():
                 self._emit_failure(request_id, _failure(FailureKind.LOCAL_PROFILE))
@@ -1446,6 +1460,7 @@ class RoastServerWorker(QObject):
         retry_after: int | None = None
         status_code: int | None = None
         try:
+            self.uploadProgress.emit(UploadProgress(job.namespace, job.roast_uuid, 'uploading', self._now()))
             self._execute_delivery(configuration, job)
         except _StaleConfiguration:
             self._stop_timer()
@@ -1484,6 +1499,10 @@ class RoastServerWorker(QObject):
             self._schedule_next(job.namespace)
             return
 
+        self.uploadProgress.emit(UploadProgress(
+            job.namespace, job.roast_uuid,
+            'paused' if status_code == 401 or failure.kind is FailureKind.CREDENTIAL_REJECTED
+            else 'retrying' if failure.retryable else 'failed', now))
         if status_code == 401 or failure.kind is FailureKind.CREDENTIAL_REJECTED:
             if self._commit_retry(job, token, now, now, failure):
                 if self._cancelled():
@@ -1570,6 +1589,7 @@ class RoastServerWorker(QObject):
     ) -> bool:
         try:
             self._outbox.mark_complete(job.id, lease_token, now)
+            self.uploadProgress.emit(UploadProgress(job.namespace, job.roast_uuid, 'uploaded', now))
             return True
         except OutboxError as error:
             return self._transition_error(error)
@@ -3087,12 +3107,14 @@ def _valid_configuration(value: object) -> WorkerConfiguration | None:
     if not isinstance(value, WorkerConfiguration):
         return None
     enabled: object = value.enabled
+    authenticate: object = value.authenticate
     automatic_upload: object = value.automatic_upload
     client_instance_uuid: object = value.client_instance_uuid
     cache_limit_bytes: object = value.cache_limit_bytes
     generation: object = value.generation
     if (
         type(enabled) is not bool
+        or type(authenticate) is not bool
         or type(automatic_upload) is not bool
         or not isinstance(client_instance_uuid, UUID)
         or type(cache_limit_bytes) is not int

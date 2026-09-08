@@ -234,6 +234,7 @@ class FakeController(QObject):
     settingsChanged = pyqtSignal(object)
     identityChanged = pyqtSignal(object)
     queueChanged = pyqtSignal(object)
+    uploadProgress = pyqtSignal(object)
     failedJobsChanged = pyqtSignal(object)
     inventoryQueueChanged = pyqtSignal(object)
     inventoryFailedChanged = pyqtSignal(object)
@@ -272,6 +273,12 @@ class FakeController(QObject):
         cache_limit_bytes: int,
     ) -> None:
         self.apply_calls.append((origin, enabled, automatic_upload, cache_limit_bytes))
+
+    def last_upload_progress(self) -> object:
+        return None
+
+    def last_successful_upload(self) -> object:
+        return None
 
     def invalidate_connection_proof(self) -> None:
         self.invalidate_calls += 1
@@ -474,18 +481,18 @@ def test_credential_copy_never_places_runtime_secret_on_clipboard(
     dialog.credential_edit.clear()
 
 
-def test_config_edit_without_local_proof_always_invalidates_controller(
+def test_config_draft_edits_do_not_change_saved_connection(
     dialog: RoastServerConfigDialog,
     controller: FakeController,
 ) -> None:
     dialog.server_edit.setText(NEW_ORIGIN)
-    assert controller.invalidate_calls == 1
+    assert controller.invalidate_calls == 0
 
     dialog.credential_edit.setText(secrets.token_urlsafe(24))
-    assert controller.invalidate_calls == 2
+    assert controller.invalidate_calls == 0
 
 
-def test_config_any_origin_or_credential_edit_immediately_revokes_auto_proof(
+def test_config_draft_edits_disable_local_options_without_stopping_uploads(
     dialog: RoastServerConfigDialog,
     controller: FakeController,
     settings: ConnectorSettings,
@@ -499,7 +506,7 @@ def test_config_any_origin_or_credential_edit_immediately_revokes_auto_proof(
     assert not dialog.automatic_upload_check.isChecked()
     assert not dialog.automatic_upload_check.isEnabled()
     assert dialog.identity_label.text() == 'Not connected'
-    assert controller.invalidate_calls == 1
+    assert controller.invalidate_calls == 0
     assert controller.apply_calls == []
     controller.settingsChanged.emit(
         replace(settings, enabled=True, automatic_upload=False, identity=IDENTITY)
@@ -513,7 +520,7 @@ def test_config_any_origin_or_credential_edit_immediately_revokes_auto_proof(
     dialog.credential_edit.setText(secrets.token_urlsafe(24))
 
     assert not dialog.automatic_upload_check.isEnabled()
-    assert controller.invalidate_calls == 4
+    assert controller.invalidate_calls == 0
     assert controller.apply_calls == []
 
 
@@ -523,11 +530,11 @@ def test_config_edit_cancels_an_opaque_test_transaction_immediately(
 ) -> None:
     dialog.credential_edit.setText(secrets.token_urlsafe(24))
     dialog.test_button.click()
-    assert controller.invalidate_calls == 1
+    assert controller.invalidate_calls == 0
 
     dialog.server_edit.setText('https://newer.example.test')
 
-    assert controller.invalidate_calls == 2
+    assert controller.invalidate_calls == 0
     assert not dialog.automatic_upload_check.isEnabled()
 
 
@@ -907,7 +914,7 @@ def test_each_close_path_cancels_real_blocked_auth_without_keyring_or_identity(
         qapp.processEvents()
 
 
-def test_real_startup_edit_without_test_revokes_backend_proof_and_automatic_upload(
+def test_real_startup_draft_edit_preserves_backend_connection_and_options(
     qapp: QApplication,
     tmp_path: Path,
 ) -> None:
@@ -933,7 +940,7 @@ def test_real_startup_edit_without_test_revokes_backend_proof_and_automatic_uplo
     assert client.entered.wait(timeout=2)
     try:
         value.server_edit.setText(NEW_ORIGIN)
-        assert not settings_store.load().automatic_upload
+        assert settings_store.load().automatic_upload
 
         client.release.set()
         assert client.completed.wait(timeout=2)
@@ -941,7 +948,7 @@ def test_real_startup_edit_without_test_revokes_backend_proof_and_automatic_uplo
         while time.monotonic() < deadline:
             qapp.processEvents()
             configuration = controller._worker._configuration
-            if configuration is not None and not configuration.enabled:
+            if configuration is not None and controller._identity == IDENTITY:
                 break
             time.sleep(0.001)
         for _ in range(10):
@@ -949,12 +956,12 @@ def test_real_startup_edit_without_test_revokes_backend_proof_and_automatic_uplo
             time.sleep(0.001)
 
         loaded = settings_store.load()
-        assert controller._proof is None
-        assert controller._identity is None
-        assert controller._active_namespace(require_enabled=False) is None
-        assert not loaded.enabled and not loaded.automatic_upload
+        assert controller._proof is not None
+        assert controller._identity == IDENTITY
+        assert controller._active_namespace(require_enabled=False) is not None
+        assert loaded.enabled and loaded.automatic_upload
         assert controller._worker._configuration is not None
-        assert not controller._worker._configuration.enabled
+        assert controller._worker._configuration.enabled
         assert value.identity_label.text() == 'Not connected'
         assert not value.automatic_upload_check.isEnabled()
         assert credentials.values[ORIGIN] == persisted_credential
@@ -1678,3 +1685,17 @@ def test_browser_is_modeless_plain_accessible_keyboard_reachable_and_onscreen(
         and available.height() >= browser.minimumHeight()
     ):
         assert available.contains(browser.frameGeometry())
+
+
+def test_replacement_offers_explicit_resume_for_same_account(
+    dialog: RoastServerConfigDialog, controller: FakeController, settings: ConnectorSettings,
+) -> None:
+    activate(dialog, controller, settings, automatic_upload=True, enabled=True)
+    dialog.credential_edit.setText(secrets.token_urlsafe(32))
+    assert controller.apply_calls == []
+    assert controller.invalidate_calls == 0
+    dialog.test_button.click()
+    activate(dialog, controller, settings, automatic_upload=False, enabled=False)
+    assert not dialog.resume_button.isHidden()
+    dialog.resume_button.click()
+    assert controller.apply_calls[-1][1:3] == (True, True)

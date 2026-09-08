@@ -292,6 +292,7 @@ class InventoryCoordinator:
         context: InventoryContext,
         roast_uuid: UUID,
         action: Literal['finalize', 'release', 'keep'],
+        actual_grams: int | None = None,
     ) -> InventoryNotice:
         if action not in {'finalize', 'release', 'keep'}:
             raise InventoryCoordinatorError('inventory_recovery_action_invalid')
@@ -323,11 +324,11 @@ class InventoryCoordinator:
                     roast_uuid=state.roast_uuid,
                     lot_id=state.lot_id,
                     planned_grams=state.planned_grams,
-                    actual_grams=None,
+                    actual_grams=actual_grams,
                     occurred_at=now,
                 )
                 updated = self._store.enqueue_finalize(
-                    state.namespace, request, None, now
+                    state.namespace, request, actual_grams, now
                 )
             except (InventoryStoreError, ValueError):
                 raise InventoryCoordinatorError('inventory_storage_failed') from None

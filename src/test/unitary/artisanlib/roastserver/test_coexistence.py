@@ -77,6 +77,7 @@ class CoexistenceWorker(QObject):
     credentialRemoved = pyqtSignal(str)
     operationFailed = pyqtSignal(str, object)
     queueChanged = pyqtSignal(object)
+    uploadProgress = pyqtSignal(object)
     failedJobsChanged = pyqtSignal(object)
     cacheStatsChanged = pyqtSignal(object)
     archivePageReady = pyqtSignal(str, object)
