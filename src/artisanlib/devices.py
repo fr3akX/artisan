@@ -1,8 +1,8 @@
 #
 # ABOUT
-# Artisan Device Configuration Dialog
+# artisan scope device configuration dialog
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -32,7 +32,6 @@ import re
 import platform
 import logging
 from PIL import ImageColor
-from babel.units import get_unit_name
 from typing import override, Final, cast, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -47,7 +46,8 @@ from artisanlib.dialogs import ArtisanResizeablDialog, tareDlg
 from artisanlib.widgets import MyContentLimitedQComboBox, MyQComboBox, MyQDoubleSpinBox
 from artisanlib.scale import SUPPORTED_SCALES
 from artisanlib.santoker_diagnostics_ui import create_santoker_diagnostics_button
-
+from artisanlib.table_style import horizontal_header_style, vertical_header_style
+from artisanlib.device_registry import DEVICES, DEVICE_ID_NONE, DEVICE_ID_VIRTUAL, is_non_serial_device, get_device_name, get_device_id
 
 _log: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
         # devices with a first letter "+" are extra devices an depend on another device
         # each device provides 2 curves
         #don't show devices with a "-". Devices with a - at front are either a pid, arduino, or an external program
-        dev = self.aw.qmc.devices[:]             #deep copy
+        dev = DEVICES[:]             #deep copy
         limit = len(dev)
         for _ in range(limit):
             for i, _ in enumerate(dev):
@@ -224,7 +224,7 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
             self.nonpidButton.setChecked(True)          #else
             selected_device_index = 0
             try:
-                selected_device_index = self.sorted_devices.index(self.aw.qmc.devices[self.aw.qmc.device - 1])
+                selected_device_index = self.sorted_devices.index(get_device_name(self.aw.qmc.device))
             except Exception: # pylint: disable=broad-except
                 pass
             self.devicetypeComboBox.setCurrentIndex(selected_device_index)
@@ -274,6 +274,32 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
         ##########################    TAB 2  WIDGETS   "EXTRA DEVICES"
         #table for showing data
         self.devicetable = QTableWidget()
+
+# with this one loses the native macOS rectangular focus frames and native items on all cells
+#        self.devicetable.setStyleSheet("""
+#            QDialog QLineEdit {
+#                padding: 0 2px;
+#            }
+#            QTableWidget {
+#                background-color: palette(base);
+#                padding: 3px;
+#                border-radius: 10px;
+#                border-width: 2px;
+#                border-style: solid;
+#                border-color: palette(dark);
+#            }
+#            }
+#        """)
+#            self.devicetable.setStyleSheet("selection-background-color: transparent;") # avoid the selection color to shine through transparent device color items
+
+        horizontal_header = self.devicetable.horizontalHeader()
+        if horizontal_header is not None:
+            horizontal_header.setStyleSheet(horizontal_header_style(self.aw.app.darkmode))
+        vertical_header = self.devicetable.verticalHeader()
+        if vertical_header is not None:
+            vertical_header.setStyleSheet(vertical_header_style(self.aw.app.darkmode))
+            vertical_header.setDefaultAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
+
         self.devicetable.setTabKeyNavigation(True)
         self.copydeviceTableButton = QPushButton(QApplication.translate('Button', 'Copy Table'))
         self.copydeviceTableButton.setToolTip(QApplication.translate('Tooltip','Copy table to clipboard, OPTION or ALT click for tabular text'))
@@ -408,7 +434,6 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
         phidget1048VBox.addStretch()
         phidget1048GroupBox = QGroupBox('1048/1051/TMP1100/TMP1101 TC')
         phidget1048GroupBox.setLayout(phidget1048VBox)
-        phidget1048GroupBox.setContentsMargins(0,0,0,0)
         phidget1048HBox.setContentsMargins(0,0,0,0)
         phidget1048VBox.setContentsMargins(0,0,0,0)
 
@@ -580,7 +605,6 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
         phidget1046VBox.addStretch()
         phidget1046GroupBox = QGroupBox('1046 RTD / DAQ1500')
         phidget1046GroupBox.setLayout(phidget1046VBox)
-        phidget1046GroupBox.setContentsMargins(0,10,0,0)
         phidget1046HBox.setContentsMargins(0,0,0,0)
         phidget1046VBox.setContentsMargins(0,0,0,0)
 
@@ -787,7 +811,6 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
 
         phidget1200GroupBox = QGroupBox('TMP1200/1202 RTD')
         phidget1200GroupBox.setLayout(phidgetGroupBoxLayout)
-        phidget1200GroupBox.setContentsMargins(0,2,0,0) # left, top, right, bottom
 
 
         # DAQ1400 VI
@@ -826,7 +849,6 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
 
         phidget1400GroupBox = QGroupBox('DAQ1400 VI')
         phidget1400GroupBox.setLayout(phidget1400VBox)
-        phidget1400GroupBox.setContentsMargins(0,0,0,0)
         phidget1400VBox.setContentsMargins(0,0,0,0)
         phidget1400HBox.setContentsMargins(0,0,0,0)
 
@@ -1997,7 +2019,10 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
             self.automaticRegistrationPeriod.setToolTip(QApplication.translate('Tooltip','Register the weight of a roasted batch automatically\nafter the given time (if not set to zero) without removing the filled container,\nenabling the addition of more batches'))
             self.automaticRegistrationPeriod.setRange(0, 30)
             self.automaticRegistrationPeriod.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+            from babel.units import get_unit_name
             unit_name = get_unit_name('duration-minute', length='short', locale=self.aw.locale_str)
+
             self.automaticRegistrationPeriod.setSuffix(f" {unit_name if unit_name is not None else 'min'}")
             self.automaticRegistrationPeriod.setValue(int(round(self.aw.automatic_registration_period/60.)))
 
@@ -2836,7 +2861,6 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
             self.devicetable.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
             self.devicetable.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
 
-#            self.devicetable.setStyleSheet("selection-background-color: transparent;") # avoid the selection color to shine through transparent device color items
 
             self.devicetable.setShowGrid(True)
             vheader = self.devicetable.verticalHeader()
@@ -2845,7 +2869,7 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
 
             fixed_size_sections = [7,8,9,10,11,12,13,14]
             if nddevices:
-                dev = self.aw.qmc.devices[:]             #deep copy
+                dev = DEVICES[:]             #deep copy
                 limit = len(dev)
                 for _ in range(limit):
                     for i, _ in enumerate(dev):
@@ -2863,11 +2887,10 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
                         typeComboBox.addItems(devices[:])
                         dev_name:str
                         try:
-                            dev_name = self.aw.qmc.devices[max(0,self.aw.qmc.extradevices[i]-1)]
-                            if dev_name == 'NONE': # manual device not available among extra devices
-                                dev_name = self.aw.qmc.devices[24] # +Virtual
+                            # manual device (NONE) not available among extra devices
+                            dev_name = (get_device_name(DEVICE_ID_VIRTUAL) if self.aw.qmc.extradevices[i] == DEVICE_ID_NONE else get_device_name(self.aw.qmc.extradevices[i]))
                         except Exception: # pylint: disable=broad-except
-                            dev_name = self.aw.qmc.devices[24] # +Virtual
+                            dev_name = get_device_name(DEVICE_ID_VIRTUAL)
                         if dev_name[0] == '+':
                             dev_name = dev_name[1:]
                         typeComboBox.setCurrentIndex(devices.index(dev_name))
@@ -2885,10 +2908,14 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
                         color2Button.setStyleSheet(f"selection-background-color: transparent; border: none; outline: none; background-color: rgba{ImageColor.getcolor(self.aw.qmc.extradevicecolor2[i], 'RGBA')}; color: {textcolor}")
                         # 3+4: name 1 + 2
                         name1edit = QLineEdit(self.aw.qmc.extraname1[i])
+                        name1edit.setTextMargins(3,0,3,0) # (left, top, right, bottom)
                         name2edit = QLineEdit(self.aw.qmc.extraname2[i])
+                        name2edit.setTextMargins(3,0,3,0) # (left, top, right, bottom)
                         # 5+6: math 1 + 2
                         mexpr1edit = QLineEdit(self.aw.qmc.extramathexpression1[i])
+                        mexpr1edit.setTextMargins(3,0,3,0) # (left, top, right, bottom)
                         mexpr2edit = QLineEdit(self.aw.qmc.extramathexpression2[i])
+                        mexpr2edit.setTextMargins(3,0,3,0) # (left, top, right, bottom)
                         mexpr1edit.setToolTip(QApplication.translate('Tooltip','Example: 100 + 2*x'))
                         mexpr2edit.setToolTip(QApplication.translate('Tooltip','Example: 100 + x'))
                         # 7: lcd 1
@@ -3324,17 +3351,16 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
                 mexpr1edit = cast(QLineEdit, self.devicetable.cellWidget(i,5))
                 mexpr2edit = cast(QLineEdit, self.devicetable.cellWidget(i,6))
                 try:
-                    self.aw.qmc.extradevices[i] = self.aw.qmc.devices.index(str(typecombobox.currentText())) + 1
+                    self.aw.qmc.extradevices[i] = get_device_id(typecombobox.currentText())
                 except Exception: # pylint: disable=broad-except
                     try: # might be a +device
-                        self.aw.qmc.extradevices[i] = self.aw.qmc.devices.index('+' + str(typecombobox.currentText())) + 1
+                        self.aw.qmc.extradevices[i] = get_device_id(f'+{typecombobox.currentText()}')
                     except Exception: # pylint: disable=broad-except
-                        self.aw.qmc.extradevices[i] = 25
+                        self.aw.qmc.extradevices[i] = DEVICE_ID_VIRTUAL
                 self.aw.qmc.extraname1[i] = name1edit.text()
                 self.aw.qmc.extraname2[i] = name2edit.text()
-
-                self.aw.extraLCDlabel1[i].setText('<b>' + self.aw.qmc.device_name_subst(self.aw.qmc.extraname1[i]) + '</b>')
-                self.aw.extraLCDlabel2[i].setText('<b>' + self.aw.qmc.device_name_subst(self.aw.qmc.extraname2[i]) + '</b>')
+                self.aw.extraLCDlabel1[i].setText(self.aw.extra_lcd_label_fmt.format(self.aw.qmc.device_name_subst(self.aw.qmc.extraname1[i])))
+                self.aw.extraLCDlabel2[i].setText(self.aw.extra_lcd_label_fmt.format(self.aw.qmc.device_name_subst(self.aw.qmc.extraname2[i])))
                 self.aw.qmc.extramathexpression1[i] = mexpr1edit.text()
                 self.aw.qmc.extramathexpression2[i] = mexpr2edit.text()
             #update legend with new curves
@@ -4637,6 +4663,9 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
                 ##########################
                 ####  DEVICE 206 is +WebSocket 1112 but +DEVICE cannot be set as main device
                 ##########################
+                ##########################
+                ####  DEVICE 207 is +MODBUS 1112 but +DEVICE cannot be set as main device
+                ##########################
 
                 # ADD DEVICE:
 
@@ -4862,7 +4891,8 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
                 1, # 203
                 1, # 204
                 1, # 205
-                1  # 206
+                1, # 206
+                1  # 207
                 ]
             #init serial settings of extra devices
             for i, _ in enumerate(self.aw.qmc.extradevices):
@@ -4893,12 +4923,7 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
                 else:
                     self.aw.extratimeout.append(dsettings[4])
             if self.nonpidButton.isChecked():
-                self.aw.buttonSVp5.setVisible(False)
-                self.aw.buttonSVp10.setVisible(False)
-                self.aw.buttonSVp20.setVisible(False)
-                self.aw.buttonSVm20.setVisible(False)
-                self.aw.buttonSVm10.setVisible(False)
-                self.aw.buttonSVm5.setVisible(False)
+                self.aw.pidbuttonFrame.setVisible(False)
                 self.aw.LCD6frame.setVisible(False)
                 self.aw.LCD7frame.setVisible(False)
             self.aw.qmc.ETfunction = str(self.ETfunctionedit.text())
@@ -5047,7 +5072,7 @@ class DeviceAssignmentDlg(ArtisanResizeablDialog):
             self.aw.sendmessage(message)
             #open serial conf Dialog
             #if device is not None or not external-program (don't need serial settings config)
-            if (self.aw.qmc.device not in self.aw.qmc.nonSerialDevices or (self.aw.qmc.device == 134 and self.aw.santokerSerial) or
+            if (not is_non_serial_device(self.aw.qmc.device) or (self.aw.qmc.device == 134 and self.aw.santokerSerial) or
                 (self.aw.qmc.device == 138 and self.aw.kaleidoSerial)) and (self.aw.qmc.device != 50) and self.TabWidget.currentIndex() in {0,1,6}:
                 QTimer.singleShot(700, self.aw.setcommport)
             self.close()

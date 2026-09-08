@@ -222,12 +222,14 @@ from artisanlib.util import FileDestinationTransaction
 from artisanlib.util import deserialize as util_deserialize
 from artisanlib.util import serialize_with_timestamp as util_serialize_with_timestamp
 from artisanlib.widgets import MyQLCDNumber, SliderUnclickable
+from plus import schedule as plus_schedule
 from plus.stock import Blend, BlendList
 
 _PROFILE_DATA_ADAPTER = TypeAdapter(ProfileData)
 _PROFILE_DATA_ADAPTER.rebuild(
     _types_namespace={'Blend': Blend, 'BlendList': BlendList})
 _MAIN_TEST_MODULES = {
+    'plus.schedule': plus_schedule,
     'artisanlib.main': main_module,
     'artisanlib.util': util_module,
     'artisanlib.roastserver.dialogs': roastserver_dialogs,
@@ -237,7 +239,6 @@ _MAIN_TEST_MODULES = {
             'plus.config',
             'plus.controller',
             'plus.register',
-            'plus.schedule',
             'plus.stock',
             'plus.sync',
             'plus.util',
@@ -248,6 +249,7 @@ _MAIN_TEST_MODULES = {
 _MAIN_PLUS_ATTRIBUTES = {
     name: getattr(main_module.plus, name)
     for name in ('config', 'controller', 'register', 'schedule', 'stock', 'sync', 'util')
+    if hasattr(main_module.plus, name)
 }
 
 
@@ -4362,7 +4364,7 @@ def roastserver_menu_window() -> ApplicationWindow:
         'commportAction', 'calibrateDelayAction', 'curvesAction', 'eventsAction',
         'alarmAction', 'phasesGraphAction', 'StatisticsAction',
         'WindowconfigAction', 'colorsAction', 'autosaveAction', 'batchAction',
-        'roastServerConfigAction',
+        'roastServerConfigAction', 'machineNameAction',
     )
     for name in action_names:
         label = {

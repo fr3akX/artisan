@@ -2,9 +2,9 @@
 # sync.py
 #
 # ABOUT
-# This module connects to the artisan.plus inventory management service
+# This module connects to the artisan platform
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -740,7 +740,7 @@ def applyServerUpdates(data:dict[str, Any]) -> None:
             aw.qmc.fileDirty()
             aw.sendmessageSignal.emit(
                 QApplication.translate(
-                    'Plus', 'Updated data received from artisan.plus'
+                    'Plus', 'Updated data received from artisan platform'
                 ),
                 True,
                 None,
