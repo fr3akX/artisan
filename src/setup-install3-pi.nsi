@@ -1,7 +1,7 @@
 ; ABOUT
-; NSIS script file for Artisan Windows installer.
+; NSIS script file for artisan Windows installer.
 ;
-; COPYRIGHT (C) 2010-2026 The Artisan team represented by
+; COPYRIGHT (C) 2010-2026 The artisan team represented by
 ; Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 ;
 ; LICENSE
@@ -433,6 +433,8 @@ Section Uninstall
   Delete "$INSTDIR\Humor-Sans.ttf"
   Delete "$INSTDIR\dijkstra.ttf"
   Delete "$INSTDIR\xkcd-script.ttf"
+  Delete "$INSTDIR\Nunito-Regular.ttf"
+  Delete "$INSTDIR\NotoSansMono-Regular.ttf"
   Delete "$INSTDIR\ComicNeue-Regular.ttf"
   Delete "$INSTDIR\WenQuanYiZenHei-01.ttf"
   Delete "$INSTDIR\WenQuanYiZenHeiMonoMedium.ttf"
@@ -464,13 +466,16 @@ Section Uninstall
   Delete "$INSTDIR\bigtext.js"
   Delete "$INSTDIR\sorttable.js"
   Delete "$INSTDIR\report-template.htm"
+  Delete "$INSTDIR\report-template-pdf.htm"
   Delete "$INSTDIR\roast-template.htm"
+  Delete "$INSTDIR\roast-template-pdf.htm"
   Delete "$INSTDIR\ranking-template.htm"
+  Delete "$INSTDIR\ranking-template-pdf.htm"
   Delete "$INSTDIR\jquery-1.11.1.min.js"
   Delete "$INSTDIR\qt.conf"
   Delete "$INSTDIR\vc_redist.x64.exe"
-  Delete "$INSTDIR\logging.yaml"
-  Delete "$INSTDIR\artisan_public_key.pem dist"
+  Delete "$INSTDIR\logging.json"
+  Delete "$INSTDIR\artisan_public_key.pem"
 
   SetShellVarContext all
   Delete "$SMPROGRAMS\Artisan\Uninstall.lnk"

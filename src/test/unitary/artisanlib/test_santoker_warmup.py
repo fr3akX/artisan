@@ -743,7 +743,9 @@ def compact_window(
         santoker=device,
         santokerWarmupController=controller,
         santokerWarmupControls=controls,
-        pushbuttonstyles={'OFF': 'off-style', 'ON': 'on-style'},
+        main_button_min_width=100,
+        button_font_size=13,
+        button_border_radius=6,
         extraeventsactionstrings=[],
         buttonStates=[],
         setExtraEventButtonStyleSignal=Mock(),
@@ -806,7 +808,6 @@ def successful_reset_canvas(
 ) -> SimpleNamespace:
     window = compact_window(controls, controller, device)
     window.santokerControlController = Mock()
-    window.pushbuttonstyles['STOP'] = 'stop-style'
     window.centralWidget = Mock(return_value=None)
     window.restoreExtraDeviceSettingsBackup = Mock()
     window.soundpopSignal = Mock()
@@ -1633,7 +1634,9 @@ def test_worker_frame_signal_triggers_frame_reconciliation_on_qt_main_thread(
     window.santoker = device
     window.santokerWarmupController = controller
     window.santokerWarmupControls = controls
-    window.pushbuttonstyles = {'OFF': 'off-style', 'ON': 'on-style'}
+    window.main_button_min_width = 100
+    window.button_font_size = 13
+    window.button_border_radius = 6
     window.reportSantokerWarmupResult = Mock()
     window.sendmessage = Mock()
     window.santokerWarmupControlsRefreshSignal = Mock()
@@ -1759,7 +1762,9 @@ def test_queued_old_generation_callbacks_cannot_mutate_replacement_device(
     window.santoker = replacement
     window.santokerWarmupController = controller
     window.santokerWarmupControls = controls
-    window.pushbuttonstyles = {'OFF': 'off-style', 'ON': 'on-style'}
+    window.main_button_min_width = 100
+    window.button_font_size = 13
+    window.button_border_radius = 6
     window.sendmessage = Mock()
     window.santokerMonitoringGeneration = 2
     window.santokerWarmupReadyGenerationSignal.connect(
@@ -1861,7 +1866,9 @@ def test_worker_target_edit_queues_compact_refresh_to_gui_signal(
     window.santoker = device
     window.santokerWarmupController = controller
     window.santokerWarmupControls = controls
-    window.pushbuttonstyles = {'OFF': 'off-style', 'ON': 'on-style'}
+    window.main_button_min_width = 100
+    window.button_font_size = 13
+    window.button_border_radius = 6
     window.reportSantokerWarmupResult = Mock()
     refresh_signal = getattr(window, 'santokerWarmupControlsRefreshSignal', None)
     if refresh_signal is not None:
@@ -2812,7 +2819,9 @@ def test_window_updates_compact_control_visibility(
         santoker=None,
         santokerWarmupController=SantokerWarmupController(),
         santokerWarmupControls=controls,
-        pushbuttonstyles={'OFF': '', 'ON': ''},
+        main_button_min_width=100,
+        button_font_size=13,
+        button_border_radius=6,
     )
 
     ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
@@ -2820,6 +2829,9 @@ def test_window_updates_compact_control_visibility(
     assert controls.isHidden() is (not visible)
     assert not controls.button.isEnabled()
     assert controls.target.isEnabled() is visible
+    assert 'min-width: 100px;' in controls.button.styleSheet()
+    assert 'font-size: 13px;' in controls.button.styleSheet()
+    assert 'border-radius: 6px;' in controls.button.styleSheet()
 
 
 def test_warmup_target_survives_off_on_visibility_cycle(
@@ -2891,7 +2903,9 @@ def test_window_enables_compact_button_when_ready_before_charge(
         santoker=FakeWarmupDevice(ready=True, warmup=False),
         santokerWarmupController=SantokerWarmupController(),
         santokerWarmupControls=controls,
-        pushbuttonstyles={'OFF': '', 'ON': ''},
+        main_button_min_width=100,
+        button_font_size=13,
+        button_border_radius=6,
     )
 
     ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
@@ -2916,7 +2930,9 @@ def test_window_disables_and_unchecks_compact_button_after_charge(
         santoker=FakeWarmupDevice(ready=True, warmup=True),
         santokerWarmupController=SantokerWarmupController(),
         santokerWarmupControls=controls,
-        pushbuttonstyles={'OFF': '', 'ON': ''},
+        main_button_min_width=100,
+        button_font_size=13,
+        button_border_radius=6,
     )
 
     ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
@@ -2945,7 +2961,9 @@ def test_window_readiness_callback_refreshes_compact_button(
         santoker=device,
         santokerWarmupController=SantokerWarmupController(),
         santokerWarmupControls=controls,
-        pushbuttonstyles={'OFF': '', 'ON': ''},
+        main_button_min_width=100,
+        button_font_size=13,
+        button_border_radius=6,
     )
     ApplicationWindow.updateSantokerWarmupControls(cast(ApplicationWindow, window))
     assert not controls.button.isEnabled()

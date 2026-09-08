@@ -1,8 +1,8 @@
 @echo off
 :: ABOUT
-:: Windows CI build file for Artisan
+:: Windows CI build file for artisan scope
 ::
-:: COPYRIGHT (C) 2010-2026 The Artisan team represented by
+:: COPYRIGHT (C) 2010-2026 The artisan team represented by
 ::   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 ::
 :: LICENSE
@@ -84,7 +84,7 @@ if ERRORLEVEL 1 (echo ** Failed in NSIS & exit /b 1) else (echo ** Success)
 :: check that the install file is above an expected size
 ::
 set file=artisan-win*setup.exe
-set min_size=170000000
+set min_size=140000000
 for %%A in (%file%) do set size=%%~zA
 if %size% LSS %min_size% (
     echo *** Zip file is smaller than expected

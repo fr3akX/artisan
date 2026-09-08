@@ -1,7 +1,7 @@
 # ABOUT
-# Artisan pyinstaller specification file
+# artisan scope pyinstaller specification file
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -145,8 +145,8 @@ hiddenimports_list=['charset_normalizer.md__mypyc', # part of requests 2.28.2 # 
                             'win32cred',
                             'win32timezone',
                             'babel.numbers',  # should not be needed as it got fixed in pyinstaller 6.11
-                            'PyQt6.QtWebChannel',
-                            'PyQt6.QtWebEngineCore',
+#                            'PyQt6.QtWebChannel',
+#                            'PyQt6.QtWebEngineCore',
                             'importlib_resources',
                             'winrt.windows.foundation.collections'
                             ]
@@ -163,7 +163,13 @@ a = Analysis(['artisan.py'],
              hookspath=[],
              runtime_hooks=[r'pyinstaller_hooks\rthooks\pyi_rth_mplconfig.py'], # overwrites default MPL runtime hook which keeps loading font cache from (new) temp directory
              additional_hooks_dir=[],
-             excludes=['pkg_resources'],
+             excludes=['tkinter', 'mypy', 'hypothesis', 'tornado', 'pkg_resources', 'setuptools', 'curses', 'matplotlib.tests', 'numpy.tests',
+                'scipy.tests', 'numpy.lib.tests', 'numpy.ma.tests', 'numpy.matrixlib.tests', 'numpy.polynomial.tests', 'numpy.random.tests',
+                'numpy.testing.tests', 'numpy.typing.tests', 'scipy._lib.tests', 'scipy.constants.tests', 'scipy.datasets.tests', 'scipy.fft.tests',
+                'scipy.fftpack.tests', 'scipy.integrate._ivp.tests', 'scipy.interpolate.tests', 'scipy.io._harwell_boeing.tests', 'scipy.io.arff.tests',
+                'scipy.io.matlab.tests', 'scipy.io.tests', 'scipy.linalg.tests', 'scipy.ndimage.tests', 'scipy.odr.tests', 'scipy.optimize.tests',
+                'scipy.signal.tests', 'scipy.sparse.linalg._isolve.tests', 'scipy.sparse.linalg.tests', 'scipy.sparse.tests', 'scipy.spatial.tests',
+                'scipy.spatial.transform.tests', 'scipy.special.tests', 'scipy.stats.tests'],
              hiddenimports=hiddenimports_list,
              win_no_prefer_redirects=False,
              win_private_assemblies=False,
@@ -274,6 +280,8 @@ for fn in [
     r'includes\dijkstra.ttf',
     r'includes\ComicNeue-Regular.ttf',
     r'includes\xkcd-script.ttf',
+    r'includes\Nunito-Regular.ttf',
+    r'includes\NotoSansMono-Regular.ttf',
     r'includes\WenQuanYiZenHei-01.ttf',
     r'includes\WenQuanYiZenHeiMonoMedium.ttf',
     r'includes\SourceHanSansCN-Regular.otf',
@@ -294,8 +302,11 @@ for fn in [
     r'includes\bigtext.js',
     r'includes\sorttable.js',
     r'includes\report-template.htm',
+    r'includes\report-template-pdf.htm',
     r'includes\roast-template.htm',
+    r'includes\roast-template-pdf.htm',
     r'includes\ranking-template.htm',
+    r'includes\ranking-template-pdf.htm',
     r'includes\jquery-1.11.1.min.js',
     r'includes\android-chrome-192x192.png',
     r'includes\android-chrome-512x512.png',
@@ -307,7 +318,7 @@ for fn in [
     r'includes\mstile-150x150.png',
     r'includes\safari-pinned-tab.svg',
     r'includes\site.webmanifest',
-    r'includes\logging.yaml',
+    r'includes\logging.json',
     r'includes\artisan_public_key.pem',
     ]:
     copy_file(fn, TARGET)
@@ -366,58 +377,6 @@ for root, _, files in os.walk(rootdir + r'\babel\locale-data'):
 # remove unneeded files and folders from Windows
 logging.info(">>>>> Removing unneeded files")
 for fn in [
-    r'_internal\PyQt6\Qt6\bin\Qt6Multimedia.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6MultimediaQuick.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6PdfQuick.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6PositioningQuick.dll',
-    #r'_internal\PyQt6\Qt6\bin\Qt6QmlWorkerScript.dll',  # required for pyqt6 v6.8+
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3D.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DAssetImport.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DAssetUtils.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DEffects.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DHelpers.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DHelpersImpl.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DParticles.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DPhysics.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DPhysicsHelpers.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DRuntimeRender.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DSpatialAudio.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Quick3DUtils.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2Basic.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2BasicStyleImpl.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2Fusion.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2FusionStyleImpl.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2Imagine.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2ImagineStyleImpl.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2Impl.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2Material.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2MaterialStyleImpl.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2Universal.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickControls2UniversalStyleImpl.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickDialogs2.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickDialogs2QuickImpl.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickDialogs2Utils.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickLayouts.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickParticles.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickShapes.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickTemplates2.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickTest.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickTimeline.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6QuickTimelineBlendTrees.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6RemoteObjects.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6RemoteObjectsQml.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Sensors.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6SensorsQuick.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6SerialPort.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6ShaderTools.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6SpatialAudio.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6Test.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6TextToSpeech.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6WebChannelQuick.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6WebEngineQuick.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6WebEngineQuickDelegatesQml.dll',
-    r'_internal\PyQt6\Qt6\bin\Qt6WebSockets.dll',
     r'_internal\PyQt6\Qt6\plugins\platforms\qminimal.dll',
     r'_internal\PyQt6\Qt6\plugins\platforms\qoffscreen.dll',
     r'_internal\PyQt6\Qt6\plugins\imageformats\qicns.dll',
@@ -438,9 +397,7 @@ logging.info(">>>>> Removing unneeded folders")
 for dp in [
     r'_internal\PyQt6\Qt6\plugins\generic',
     r'_internal\PyQt6\Qt6\plugins\networkinformation',
-    r'_internal\PyQt6\Qt6\plugins\position',
     r'_internal\PyQt6\Qt6\plugins\tls',
-    r'_internal\PyQt6\Qt6\qml',
     r'_internal\matplotlib\mpl-data\sample_data',
     ]:
     remove_dir(f'{TARGET}{dp}', True)

@@ -1,8 +1,8 @@
 #
 # ABOUT
-# Artisan Main Canvas
+# artisan main canvas
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -49,7 +49,6 @@ import textwrap
 import functools
 import psutil
 from psutil._common import bytes2human # pyright:ignore[reportPrivateImportUsage]
-from babel.units import get_unit_name
 
 from collections.abc import Callable, Sequence
 from typing import override, Final, Literal, Any, cast, TYPE_CHECKING
@@ -81,6 +80,8 @@ from artisanlib.time import ArtisanTime
 #from artisanlib.filters import LiveMedian
 from artisanlib.dialogs import ArtisanMessageBox
 from artisanlib.atypes import SerialSettings, BTBreakParams, BbpCache, AlarmSet, EnergyMetrics
+from artisanlib.button_style import artisan_push_button_style_dict, artisan_simulator_push_button_style_dict
+from artisanlib.device_registry import is_special_device, is_non_temp_device, is_non_temp_device_chan, is_phidget_device, is_binary_device
 
 # import artisan.plus modules
 from plus.util import roastLink
@@ -211,6 +212,7 @@ class MplCanvas(FigureCanvas):
 
 # NOTE: to have pylint to verify proper __slot__ definitions using pylint one has to remove the super class FigureCanvas here temporarily
 #   as this does not has __slot__ definitions and thus __dict__ is contained which suppresses the warnings
+#class tgraphcanvas():
 class tgraphcanvas(QObject):
     updategraphicsSignal = pyqtSignal()
     updateLargeLCDsTimeSignal = pyqtSignal(str)
@@ -246,6 +248,8 @@ class tgraphcanvas(QObject):
     redrawSignal = pyqtSignal(bool,bool,bool,bool,bool)
     redrawKeepViewSignal = pyqtSignal(bool,bool,bool,bool,bool)
     monitorClosedDown = pyqtSignal()
+    canvasZoomSignal = pyqtSignal(float, float)
+    canvasPanSignal = pyqtSignal(float, float, int)
 
     umlaute_dict : Final[dict[str, str]] = {
        uchr(228): 'ae',  # U+00E4   \xc3\xa4
@@ -279,7 +283,7 @@ class tgraphcanvas(QObject):
         'YOCTO_dataRate', 'YOCTO_dataRatesStrings', 'YOCTO_dataRatesValues', 'phidget1018valueFactor', 'phidget1018_async', 'phidget1018_ratio', 'phidget1018_dataRates',
         'phidget1018_changeTriggers', 'phidget1018_changeTriggersValues', 'phidget1018_changeTriggersStrings', 'phidgetVCP100x_voltageRanges', 'phidgetVCP100x_voltageRangeValues',
         'phidgetVCP100x_voltageRangeStrings', 'phidgetDAQ1400_powerSupplyStrings', 'phidgetDAQ1400_powerSupply', 'phidgetDAQ1400_inputModeStrings', 'phidgetDAQ1400_inputMode',
-        'devices', 'phidgetDevices', 'nonSerialDevices', 'nonTempDevices', 'specialDevices', 'binaryDevices', 'extradevices', 'extratimex', 'extradevicecolor1', 'extradevicecolor2', 'extratemp1',
+        'extradevices', 'extratimex', 'extradevicecolor1', 'extradevicecolor2', 'extratemp1',
         'extratemp2', 'extrastemp1', 'extrastemp2', 'extractimex1', 'extractimex2', 'extractemp1', 'extractemp2', 'extratemp1lines', 'extratemp2lines', 'extrafill1lines', 'extrafill2lines',
         'extraname1', 'extraname2', 'extramathexpression1', 'extramathexpression2', 'extralinestyles1', 'extralinestyles2', 'extradrawstyles1', 'extradrawstyles2',
         'extralinewidths1', 'extralinewidths2', 'extramarkers1', 'extramarkers2', 'extramarkersizes1', 'extramarkersizes2', 'devicetablecolumnwidths', 'energytablecolumnwidths', 'extraNoneTempHint1',
@@ -390,7 +394,8 @@ class tgraphcanvas(QObject):
         'CO2kg_per_BTU_default', 'CO2kg_per_BTU', 'Biogas_CO2_Reduction', 'Biogas_CO2_Reduction_default',
         'meterunitnames', 'meterreads_default', 'meterreads', 'meterlabels_setup', 'meterlabels', 'meterunits_setup', 'meterunits',
         'meterfuels_setup', 'meterfuels', 'metersources_setup', 'metersources', 'playbackdrop_min_roasttime', 'TP_max_roasttime',
-        'single_click_mpl_upperleft_corner_timer', 'single_click_mpl_upperleft_corner_TIMEOUT', 'profile_upload_limit', 'last_profile_upload_times'
+        'single_click_mpl_upperleft_corner_timer', 'single_click_mpl_upperleft_corner_TIMEOUT', 'profile_upload_limit', 'last_profile_upload_times',
+        'zoom_follow_pan_x', 'zoom_follow_pan_y', 'main_event_buttons_undo_enabled', 'plus_beans_reminder_on_start',
         ]
 
 
@@ -615,7 +620,7 @@ class tgraphcanvas(QObject):
         self.errorlog:list[str] = []
 
         # default delay between readings in milliseconds
-        self.default_delay: Final[int] = 2000 # default 2s
+        self.default_delay: Final[int] = 1000 # default 1s
         self.delay:int = self.default_delay
         self.min_delay: Final[int] = 100 #250 # 1000 # Note that already a 0.25s min delay puts a lot of performance pressure on the app
 
@@ -801,416 +806,6 @@ class tgraphcanvas(QObject):
         self.phidgetDAQ1400_inputModeStrings: Final[list[str]] = ['NPN','PNP']
         self.phidgetDAQ1400_inputMode:int = 0
 
-        #menu of thermocouple devices
-        #device with first letter + only shows in extra device tab
-        #device with first letter - does not show in any tab (but its position in the list is important)
-        # device labels (used in Dialog config).
-
-        # ADD DEVICE: to add a device you have to modify several places. Search for the tag "ADD DEVICE:" in the code
-        # (check also the tags in comm.py and devices.py!!)
-        # - add to self.devices
-        self.devices: Final[list[str]] = [  # NOTE: the index of the elements in this list is one less than the device id indicated in the comments below
-                                            # The index of device "NONE" in self.devices is 17 not 18!
-                        #Fuji PID               #0
-                       'Omega HH806AU',         #1
-                       'Omega HH506RA',         #2
-                       'CENTER 309',            #3
-                       'CENTER 306',            #4
-                       'CENTER 305',            #5
-                       'CENTER 304',            #6
-                       'CENTER 303',            #7
-                       'CENTER 302',            #8
-                       'CENTER 301',            #9
-                       'CENTER 300',            #10
-                       'VOLTCRAFT K204',        #11
-                       'VOLTCRAFT K202',        #12
-                       'VOLTCRAFT 300K',        #13
-                       'VOLTCRAFT 302KJ',       #14
-                       'EXTECH 421509',         #15
-                       'Omega HH802U',          #16
-                       'Omega HH309',           #17
-                       'NONE',                  #18
-                       '-ARDUINOTC4',           #19
-                       'TE VA18B',              #20
-                       '+CENTER 309 34',        #21
-                       '+PID SV/DUTY %',        #22
-                       'Omega HHM28[6]',        #23
-                       '+VOLTCRAFT K204 34',    #24
-                       '+Virtual',              #25
-                       '-DTAtemperature',       #26
-                       'Program',               #27
-                       '+ArduinoTC4 34',        #28
-                       'MODBUS',                #29
-                       'VOLTCRAFT K201',        #30
-                       'Amprobe TMD-56',        #31
-                       '+ArduinoTC4 56',        #32
-                       '+MODBUS 34',            #33
-                       'Phidget 1048 4xTC 01',  #34
-                       '+Phidget 1048 4xTC 23', #35
-                       '+Phidget 1048 4xTC AT', #36
-                       'Phidget 1046 4xRTD 01', #37
-                       '+Phidget 1046 4xRTD 23',#38
-                       'Mastech MS6514',        #39
-                       'Phidget IO 01',         #40
-                       '+Phidget IO 23',        #41
-                       '+Phidget IO 45',        #42
-                       '+Phidget IO 67',        #43
-                       '+ArduinoTC4 78',        #44
-                       'Yocto Thermocouple',    #45
-                       'Yocto PT100',           #46
-                       'Phidget 1045 IR',       #47
-                       '+Program 34',           #48
-                       '+Program 56',           #49
-                       'DUMMY',                 #50
-                       '+CENTER 304 34',        #51
-                       'Phidget 1051 1xTC 01',  #52
-                       'Hottop BT/ET',          #53
-                       '+Hottop Heater/Fan',    #54
-                       '+MODBUS 56',            #55
-                       'Apollo DT301',          #56
-                       'EXTECH 755',            #57
-                       'Phidget TMP1101 4xTC 01',  #58
-                       '+Phidget TMP1101 4xTC 23', #59
-                       '+Phidget TMP1101 4xTC AT', #60
-                       'Phidget TMP1100 1xTC',     #61
-                       'Phidget 1011 IO 01',       #62
-                       'Phidget HUB IO 01',        #63
-                       '+Phidget HUB IO 23',       #64
-                       '+Phidget HUB IO 45',       #65
-                       '-Omega HH806W',            #66 NOT WORKING
-                       'VOLTCRAFT PL-125-T2',      #67
-                       'Phidget TMP1200 1xRTD A',  #68
-                       'Phidget IO Digital 01',    #69
-                       '+Phidget IO Digital 23',   #70
-                       '+Phidget IO Digital 45',   #71
-                       '+Phidget IO Digital 67',   #72
-                       'Phidget 1011 IO Digital 01', #73
-                       'Phidget HUB IO Digital 01', #74
-                       '+Phidget HUB IO Digital 23',#75
-                       '+Phidget HUB IO Digital 45',#76
-                       'VOLTCRAFT PL-125-T4',       #77
-                       '+VOLTCRAFT PL-125-T4 34',   #78
-                       'S7',                        #79
-                       '+S7 34',                    #80
-                       '+S7 56',                    #81
-                       '+S7 78',                    #82
-                       'Aillio Bullet R1 BT/DT',             #83
-                       '+Aillio Bullet R1 Heater/Fan',       #84
-                       '+Aillio Bullet R1 BT RoR/Drum',      #85
-                       '+Aillio Bullet R1 Voltage/Exhaust',  #86
-                       '+Aillio Bullet R1 State/Fan RPM',    #87
-                       '+Program 78',               #88
-                       '+Program 910',              #89
-                       '+Slider 01',                #90
-                       '+Slider 23',                #91
-                       '-Probat Middleware',                 #92
-                       '-Probat Middleware burner/drum',     #93
-                       '-Probat Middleware fan/pressure',    #94
-                       'Phidget DAQ1400 Current',   #95
-                       'Phidget DAQ1400 Frequency', #96
-                       'Phidget DAQ1400 Digital',   #97
-                       'Phidget DAQ1400 Voltage',   #98
-                       'Aillio Bullet R1 IBTS/BT',  #99
-                       'Yocto IR',                  #100
-                       'Behmor BT/CT',              #101
-                       '+Behmor 34',                #102
-                       'VICTOR 86B',                #103
-                       '+Behmor 56',                #104
-                       '+Behmor 78',                #105
-                       'Phidget HUB IO 0',          #106
-                       'Phidget HUB IO Digital 0',  #107
-                       'Yocto 4-20mA Rx',           #108
-                       '+MODBUS 78',                #109
-                       '+S7 910',                   #110
-                       'WebSocket',                 #111
-                       '+WebSocket 34',             #112
-                       '+WebSocket 56',             #113
-                       '+Phidget TMP1200 1xRTD B',  #114
-                       'HB BT/ET',                  #115
-                       '+HB DT/IT',                 #116
-                       '+HB AT',                    #117
-                       '+WebSocket 78',             #118
-                       '+WebSocket 910',            #119
-                       'Yocto 0-10V Rx',            #120
-                       'Yocto milliVolt Rx',        #121
-                       'Yocto Serial',              #122
-                       'Phidget VCP1000',           #123
-                       'Phidget VCP1001',           #124
-                       'Phidget VCP1002',           #125
-                       'ARC BT/ET',                 #126
-                       '+ARC MET/IT',               #127
-                       '+ARC AT',                   #128
-                       'Yocto Power',               #129
-                       'Yocto Energy',              #130
-                       'Yocto Voltage',             #131
-                       'Yocto Current',             #132
-                       'Yocto Sensor',              #133
-                       'Santoker BT/ET',            #134
-                       '+Santoker Power/Fan',       #135
-                       '+Santoker Drum',            #136
-                       'Phidget DAQ1500',           #137
-                       'Kaleido BT/ET',             #138
-                       '+Kaleido SV/AT',            #139
-                       '+Kaleido Drum/AH',          #140
-                       '+Kaleido Heater/Fan',       #141
-                       'IKAWA',                     #142
-                       '+IKAWA SET/RPM',            #143
-                       '+IKAWA Heater/Fan',         #144
-                       '+IKAWA State/Humidity',     #145
-                       'Phidget DAQ1000 01',        #146
-                       '+Phidget DAQ1000 23',       #147
-                       '+Phidget DAQ1000 45',       #148
-                       '+Phidget DAQ1000 67',       #149
-                       '+MODBUS 910',               #150
-                       '+S7 1112',                  #151
-                       'Phidget DAQ1200 01',        #152
-                       '+Phidget DAQ1200 23',       #153
-                       'Phidget DAQ1300 01',        #154
-                       '+Phidget DAQ1300 23',       #155
-                       'Phidget DAQ1301 01',        #156
-                       '+Phidget DAQ1301 23',       #157
-                       '+Phidget DAQ1301 45',       #158
-                       '+Phidget DAQ1301 67',       #159
-                       f'+IKAWA {deltaLabelUTF8}Humidity/{deltaLabelUTF8}Humidity Dir.',    #160
-                       '+Omega HH309 34',           #161
-                       'Digi-Sense 20250-07',       #162
-                       'Extech 42570',              #163
-                       'Mugma BT/ET',               #164
-                       '+Mugma Heater/Fan',         #165
-                       '+Mugma Heater/Catalyzer',   #166
-                       '+Mugma SV',                 #167
-                       'Phidget TMP1202 1xRTD A',   #168
-                       '+Phidget TMP1202 1xRTD B',  #169
-                       'ColorTrack Serial',         #170
-                       'Santoker R BT/ET',          #171
-                       '+Santoker IR/Board',        #172
-                       '+Santoker DeltaBT/DeltaET', #173
-                       'ColorTrack BT',             #174
-                       'Thermoworks BlueDOT',       #175
-                       'Aillio Bullet R2',          #176
-                       '+PID P/I',                  #177
-                       '+PID D/Error',              #178
-                       '+Shelly 3EM Pro Energy/Return', #179
-                       '+Shelly Plug Energy/Last',      #180
-                       '+Shelly 3EM Pro Power/S',       #181
-                       '+Shelly Plug Power/Temp',       #182
-                       '+Shelly Plug Voltage/Current',  #183
-                       'TASI TA612C',                   #184
-                       '+TASI TA612C 34',               #185
-                       '+CM ET/BT',                     #186
-                       '+RoastSeeNEXT Agtron/Crack',    #187
-                       '+RoastSeeNEXT RoR/FoR',         #188
-                       '+RoastSeeNEXT Distance/Time',   #189
-                       '+RoastSeeNEXT Yellow',          #190
-                       '+Phidget TMP1000',           #191
-                       '+Phidget HUM1000 Hum/Temp',  #192
-                       '+Phidget PRE1000',           #193
-                       '+Yocto Meteo Hum/Temp',      #194
-                       '+Yocto Meteo Pressure',      #195
-                       'Orbiter BT/ET',              #196
-                       '+Orbiter IT/DT',             #197
-                       '+Orbiter Sound/Drum',        #198
-                       '+Orbiter Damper/Heater',     #199
-                       '+Orbiter Air/RoR',           #200
-                       'MQTT',                       #201
-                       '+MQTT 34',                   #202
-                       '+MQTT 56',                   #203
-                       '+MQTT 78',                   #204
-                       '+MQTT 910',                  #205
-                       '+MQTT 1112',                 #206
-                       ]
-
-        # ADD DEVICE:
-        # ids of devices temperature conversions should not be applied
-        self.nonTempDevices : Final[dict[int,tuple[bool,bool]]] = {
-            # channel 1, channel 2
-            22: (False, True), # +PID SV/DUTY %
-            25: (True, True), # +Virtual
-            40: (True, True), # Phidget IO 01
-            41: (True, True), # +Phidget IO 23
-            42: (True, True), # +Phidget IO 45
-            43: (True, True), # +Phidget IO 67
-            50: (True, True), # DUMMY
-            54: (True, True), # +Hottop Heater/Fan
-            57: (True, True), # EXTECH 755
-            62: (True, True), # Phidget 1011 IO 01
-            63: (True, True), # Phidget HUB IO 01
-            64: (True, True), # +Phidget HUB IO 23
-            65: (True, True), # +Phidget HUB IO 45
-            69: (True, True), # Phidget IO Digital 01
-            70: (True, True), # +Phidget IO Digital 23
-            71: (True, True), # +Phidget IO Digital 45
-            72: (True, True), # +Phidget IO Digital 67
-            73: (True, True), # Phidget 1011 IO Digital 01
-            74: (True, True), # Phidget HUB IO Digital 0
-            75: (True, True), # +Phidget HUB IO Digital 23
-            76: (True, True), # +Phidget HUB IO Digital 45
-            84: (True, True), # +Aillio Bullet R1 Heater/Fan
-            85: (True, True), # +Aillio Bullet R1 BT RoR/Drum
-            87: (True, True), # +Aillio Bullet R1 State
-            90: (True, True), # +Slider 01
-            91: (True, True), # +Slider 23
-            95: (True, True), # Phidget DAQ1400 Current
-            96: (True, True), # Phidget DAQ1400 Frequency
-            97: (True, True), # Phidget DAQ1400 Digital
-            98: (True, True), # Phidget DAQ1400 Voltage
-            106: (True, True), # Phidget HUB IO 0
-            107: (True, True), # Phidget HUB IO Digital 0
-            108: (True, True), # Yocto 4-20mA Rx
-            120: (True, True), # Yocto-0-10V-Rx
-            121: (True, True), # Yocto-milliVolt-Rx
-            122: (True, True), # Yocto-Serial
-            123: (True, True), # Phidget VCP1000
-            124: (True, True), # Phidget VCP1001
-            125: (True, True), # Phidget VCP1002
-            129: (True, True), # Yocto Power
-            130: (True, True), # Yocto Energy
-            131: (True, True), # Yocto Voltage
-            132: (True, True), # Yocto Current
-            133: (True, True), # Yocto Sensor
-            135: (True, True), # Santoker Power/Fan
-            136: (True, True), # Santoker Drum
-            137: (True, True), # Phidget DAQ1500
-            140: (True, True), # Kaleido Drum/AH
-            141: (True, True), # Kaleido Heater/Fan
-            143: (False, True), # IKAWA Set/RPM
-            144: (True, True), # IKAWA Heater/Fan
-            145: (True, True), # IKAWA State/Humidity
-            146: (True, True), # Phidget DAQ1000 01
-            147: (True, True), # +Phidget DAQ1000 23
-            148: (True, True), # +Phidget DAQ1000 45
-            149: (True, True), # +Phidget DAQ1000 67
-            152: (True, True), # Phidget DAQ1200 01
-            153: (True, True), # +Phidget DAQ1200 23
-            154: (True, True), # Phidget DAQ1300 01
-            155: (True, True), # +Phidget DAQ1300 23
-            156: (True, True), # Phidget DAQ1301 01
-            157: (True, True), # +Phidget DAQ1301 23
-            158: (True, True), # +Phidget DAQ1301 45
-            159: (True, True), # +Phidget DAQ1301 67
-            160: (True, True), # IKAWA \Delta Humidity / \Delat Humidity direction
-            165: (True, True), # +Mugma Heater/Fan
-            166: (True, True), # +Mugma Heater/Catalyzer
-            170: (True, True), # ColorTrack Serial
-            173: (True, True), # +Santoker BT RoR / ET RoR
-            174: (True, True), # ColorTrack BT
-            177: (True, True), # +PID P/I
-            178: (True, True), # +PID D/Error
-            179: (True, True), # +Shelly 3EM Pro Energy/Return
-            180: (True, True), # +Shelly Plug Total/Last
-            181: (True, True), # +Shelly 3EM Pro Power/S
-            182: (True, False), # +Shelly Plug Power/Temp
-            183: (True, True), # +Shelly Plug Voltage/Current
-            187: (True, True), # +RoastSeeNEXT Agtron/Crack
-            188: (True, True), # +RoastSeeNEXT RoR/FOR
-            189: (True, True), # +RoastSeeNEXT Distance/Time
-            190: (True, True), # +RoastSeeNEXT Yellow
-            192: (True, False), # +Phidget HUM1000 Hum/Temp
-            193: (True, True), # +Phidget PRE1000
-            194: (True, False), # +Yocto Meteo Hum/Temp
-            195: (True, True), # +Yocto Meteo Pressure
-            198: (True, True), # +Orbiter Sound/Drum
-            199: (True, True), # +Orbiter Damper/Heater
-            200: (True, True)  # +Orbiter Air/RoR
-        }
-
-        # ADD DEVICE:
-        # ids of (main) Phidget devices (without a + in front of their name string) as well as Phidget TMP100, HUM100 or PRE1000
-        self.phidgetDevices : Final[list[int]] = [
-            34, # Phidget 1048
-            37, # Phidget 1046
-            40, # Phidget IO
-            47, # Phidget 1045
-            52, # Phidget 1051
-            58, # Phidget TMP1101
-            61, # Phidget TMP1100
-            62, # Phidget 1011
-            63, # Phidget HUB IO 01
-            64, # Phidget HUB IO 23 # + device but need to be mounted directly
-            65, # Phidget HUB IO 45 # + device but need to be mounted directly
-            68, # Phidget TMP1200
-            69, # Phidget IO Digital
-            73, # Phidget 1011 IO Digital
-            74, # Phidget HUB IO Digital 01
-            75, # Phidget HUB IO Digital 23 # + device but need to be mounted directly
-            76, # Phidget HUB IO Digital 45 # + device but need to be mounted directly
-            95, # Phidget DAQ1400 Current
-            96, # Phidget DAQ1400 Frequency
-            97, # Phidget DAQ1400 Digital
-            98, # Phidget DAQ1400 Voltage
-            106, # Phidget HUB IO 0
-            107, # Phidget HUB IO Digital 0
-            123, # Phidget VCP1000
-            124, # Phidget VCP1001
-            125, # Phidget VCP1002
-            137, # Phidget DAQ1500
-            146, # Phidget DAQ1000 01
-            152, # Phidget DAQ1200 01
-            154, # Phidget DAQ1300 01
-            156, # Phidget DAQ1301 01
-            168, # Phidget TMP1202
-            191, # +Phidget TMP1000
-            192, # +Phidget HUM1000 Hum/Temp
-            193, # +Phidget PRE1000
-        ]
-
-        # ADD DEVICE:
-        # ids of (main) devices (without a + in front of their name string)
-        # that do NOT communicate via any serial port thus do not need any serial port configuration
-        self.nonSerialDevices : Final[list[int]] = self.phidgetDevices + [
-            18, # NONE (manual)
-            27, # Program
-            45, # Yocto Thermocouple
-            46, # Yocto PT100
-            79, # S7
-            83, # Aillio Bullet R1 BT/DT
-            99, # Aillio Bullet R1 IBTS/BT
-            100, # Yocto IR
-            108, # Yocto 4-20mA Rx
-            111, # WebSocket
-            120, # Yocto-0-10V-Rx
-            121, # Yocto-milliVolt-Rx
-            122, # Yocto-Serial
-            129, # Yocto Power
-            130, # Yocto Energy
-            131, # Yocto Voltage
-            132, # Yocto Current
-            133, # Yocto Sensor
-            134, # Santoker BT/ET
-            138, # Kaleido BT/ET
-            142, # IKAWA,
-            164, # Mugma BT/ET
-            171, # Santoker R BT/ET
-            174, # ColorTrack BT
-            175, # Thermoworks BlueDOT
-            176, # Aillio Bullet R2
-            194, # +Yocto Meteo Hum/Temp
-            195  # +Yocto Meteo Pressure
-        ]
-
-
-        # ADD DEVICE:
-        # ids of special devices certain input filters should not be applied
-        self.specialDevices : Final[list[int]] = [
-            18, # NONE (Manual)
-            25, # Virtual
-            50, # Dummy
-            90, # Slider01
-            91  # Slider23
-        ]
-
-        # ADD DEVICE:
-        # ids of devices with binary results (0 and 1) certain input filters should not be applied
-        self.binaryDevices : Final[list[int]] = [
-            69, # Phidget IO Digital 01
-            70, # Phidget IO Digital 23
-            71, # Phidget IO Digital 45
-            72, # Phidget IO Digital 67
-            73, # Phidget 1011 IO Digital 01
-            74, # Phidget HUB IO Digital 01
-            75, # Phidget HUB IO Digital 23
-            76  # Phidget HUB IO Digital 45
-        ]
 
         #extra devices
         self.extradevices:list[int] = []                            # list with indexes for extra devices
@@ -1337,6 +932,10 @@ class tgraphcanvas(QObject):
 
         self.zoom_follow:bool = False # if True, Artisan "follows" BT in the center by panning during recording. Activated via a click on the HOME icon
         self.zoom_follow_onET:bool = False # if True, the Zoom Follow follows ET (or ET RoR if fmt_data_RoR is set) instead of BT (or BT RoR if fmt_data_RoR is set)
+        # panning factor relative to the distance (xmax - xmin) applied after centering
+        #   0: no panning, 1: pan canvas one full screen to the left/bottom, -1: pan canvas one full screen to the right/top
+        self.zoom_follow_pan_x:float = 0
+        self.zoom_follow_pan_y:float = 0
 
         self.alignEvent = 0 # 0:CHARGE, 1:DRY, 2:FCs, 3:FCe, 4:SCs, 5:SCe, 6:DROP, 7:ALL
         self.alignnames = [
@@ -1717,6 +1316,20 @@ class tgraphcanvas(QObject):
         self.glow:int = 0
         self.graphstyle:int = 0
         self.graphfont:int = 0
+        # 0: Qt system default (system)
+        # 1: Humor (included)
+        # 2: Comic (system)
+        # 3: WenQuanYi Zen Hei (included)
+        # 4: Source Han Sans CN (included)
+        # 5: Source Han Sans TW (included)
+        # 6: Source Han Sans HK (included)
+        # 7: Source Han Sans KR (included)
+        # 8: Source Han Sans JP (included)
+        # 9: Dijkstra (included)
+        # 10: xkcd Script (included)
+        # 11: Comic Neue (included)
+        # 12: Nunito  (included)
+        # 13: Noto Sans Mono  (included)
 
         #variables to configure the 8 default buttons
         # button = 0:CHARGE, 1:DRY_END, 2:FC_START, 3:FC_END, 4:SC_START, 5:SC_END, 6:DROP, 7:COOL_END;
@@ -1855,7 +1468,7 @@ class tgraphcanvas(QObject):
         self.EvalueColor:list[str] = self.EvalueColor_default.copy()
         self.EvalueTextColor:list[str] = self.EvalueTextColor_default.copy()
         self.EvalueMarker:list[str] = ['o','s','h','D']
-        self.EvalueMarkerSize:list[float] = [4,4,4,4]
+        self.EvalueMarkerSize:list[float] = [3,3,3,3]
         self.Evaluelinethickness:list[float] = [1,1,1,1]
         self.Evaluealpha:list[float] = [.8,.8,.8,.8]
         #the event value position bars are calculated at redraw()
@@ -1875,21 +1488,21 @@ class tgraphcanvas(QObject):
         self.linestyle_default: Final[str] = '-'
         self.drawstyle_default: Final[str] = 'default'
         self.linewidth_default: Final[float] = 1.5
-        self.back_linewidth_default: Final[float] = 2
-        self.delta_linewidth_default: Final[float] = 1
-        self.back_delta_linewidth_default: Final[float] = 1.5
+        self.back_linewidth_default: Final[float] = 1.8
+        self.delta_linewidth_default: Final[float] = 0.8
+        self.back_delta_linewidth_default: Final[float] = 1.3
         self.extra_linewidth_default: Final[float] = 1
         self.marker_default: Final[str] = 'None'
         self.markersize_default: Final[float] = 6
 
         self.BTlinestyle:str = self.linestyle_default
         self.BTdrawstyle:str = self.drawstyle_default
-        self.BTlinewidth:float = self.linewidth_default
+        self.BTlinewidth:float = 2 # self.linewidth_default
         self.BTmarker:str = self.marker_default
         self.BTmarkersize:float = self.markersize_default
         self.ETlinestyle:str = self.linestyle_default
         self.ETdrawstyle:str = self.drawstyle_default
-        self.ETlinewidth:float = self.linewidth_default
+        self.ETlinewidth:float = 1.5 # self.linewidth_default
         self.ETmarker:str = self.marker_default
         self.ETmarkersize:float = self.markersize_default
         self.BTdeltalinestyle:str = self.linestyle_default
@@ -2396,7 +2009,7 @@ class tgraphcanvas(QObject):
         # flag to toggle between Temp and RoR scale of xy-display
         self.fmt_data_RoR:bool = False
         self.fmt_data_ON:bool = True #; if False, the xy-display is deactivated
-        # toggle between using the 0: y-cursor pos, 1: BT@x, 2: ET@x, 3: BTB@x, 4: ETB@x (thus BT, ET or the corresponding background curve data at cursor position x)
+        # toggle between using the 0: y-cursor pos, 1: BT@x, 2: ET@x, 3: BTB@x, 4: ETB@x (thus BT, ET or the corresponding background curve data at cursor position
         # to display the y of the cursor coordinates
         self.fmt_data_curve = 0
         self.running_LCDs = 0 # if not 0 and not sampling visible LCDs show the readings at the cursor position of 1: foreground profile, 2: background profile
@@ -2626,6 +2239,8 @@ class tgraphcanvas(QObject):
         self.showBackgroundEventsSignal.connect(self.showBackgroundEvents)
         self.redrawSignal.connect(self.redraw, type=Qt.ConnectionType.QueuedConnection) # type: ignore[call-arg]
         self.redrawKeepViewSignal.connect(self.redraw_keep_view, type=Qt.ConnectionType.QueuedConnection) # type: ignore[call-arg]
+        self.canvasZoomSignal.connect(self.canvas_zoom, type=Qt.ConnectionType.QueuedConnection) # type: ignore[call-arg]
+        self.canvasPanSignal.connect(self.canvas_pan, type=Qt.ConnectionType.QueuedConnection) # type: ignore[call-arg]
 
     #NOTE: empty Figure is initially drawn at the end of self.awsettingsload()
     #################################    FUNCTIONS    ###################################
@@ -2645,10 +2260,140 @@ class tgraphcanvas(QObject):
              (device_id == 83 and 2 < self.aw.s7.type[8+channel_offset] < 11) or # S7 910
              (device_id == 151 and 2 < self.aw.s7.type[8+channel_offset] < 11) or # S7 1112
               # any other binary device
-             device_id in self.binaryDevices or
+             is_binary_device(device_id) or
               # special device
-             device_id in self.specialDevices
+             is_special_device(device_id)
              )
+
+    @pyqtSlot(float, float)
+    def canvas_zoom(self, factor_x:float, factor_y:float) -> None:
+        try:
+            if self.fig.canvas.toolbar is not None and self.ax is not None:
+                if self.fig.canvas.toolbar._nav_stack() is None:  # type:ignore[attr-defined] # pylint: disable=protected-access
+                    self.fig.canvas.toolbar.push_current()   # Set the home button to this view.
+                xmin, xmax = self.ax.get_xlim()
+                ymin, ymax = self.ax.get_ylim()
+                if self.twoAxisMode() and self.delta_ax is not None:
+                    zmin, zmax = self.delta_ax.get_ylim()
+                else:
+                    zmin = ymin
+                    zmax = ymax
+                # update
+                if factor_x != 0:
+                    new_x_range = (xmax - xmin)/(2*factor_x)
+                    mid_x = (xmax - xmin)/2 + xmin
+                    xmin = mid_x - new_x_range
+                    xmax = mid_x + new_x_range
+                    # update state
+                    self.ax.set_xlim(xmin, xmax)
+                if factor_y != 0:
+                    new_y_range = (ymax - ymin)/(2*factor_y)
+                    mid_y = (ymax - ymin)/2 + ymin
+                    ymin = mid_y -  new_y_range
+                    ymax = mid_y + new_y_range
+                    # update state
+                    self.ax.set_ylim(ymin, ymax)
+                    # delta axis
+                    if self.twoAxisMode() and self.delta_ax is not None:
+                        new_z_range = (zmax - zmin)/(2*factor_y)
+                        mid_z = (zmax - zmin)/2 + zmin
+                        zmin = mid_z - new_z_range
+                        zmax = mid_z + new_z_range
+                        self.delta_ax.set_ylim(zmin, zmax)
+#                        self.delta_ax.set_xlim(xmin, xmax)
+
+                # remember current state in history
+                self.fig.canvas.toolbar.push_current()
+                self.fig.canvas.draw_idle()
+        except Exception as e:  # pylint: disable=broad-except
+            _log.exception(e)
+
+    # the center argument is interpreted as
+    # -2: don't center, just pan (for use by pan Artisan Command)
+    # -1: center to current time only during recording and otherwise like 0, center to current axis limits
+    #  0: center to current axis limits
+    #  during recording the following are actually follow-time only and keep y/z-achses to defaults:
+    #  1: current time and BT
+    #  2: current time and ET
+    #  3: current time and BT RoR (delta BT)
+    #  4: current time and ET RoR (delta ET)
+    # mode 1-4 are ignored if not recording and default to 0
+    @pyqtSlot(float, float, int)
+    def canvas_pan(self, factor_x:float, factor_y:float, center:int) -> None:
+        try:
+            if self.fig.canvas.toolbar is not None and self.ax is not None:
+                if self.fig.canvas.toolbar._nav_stack() is None:  # type:ignore[attr-defined] # pylint: disable=protected-access
+                    self.fig.canvas.toolbar.push_current()   # Set the home button to this view.
+                xmin, xmax = self.ax.get_xlim()
+                ymin, ymax = self.ax.get_ylim()
+                if self.twoAxisMode() and self.delta_ax is not None:
+                    zmin, zmax = self.delta_ax.get_ylim()
+                else:
+                    zmin = ymin
+                    zmax = ymax
+                # center
+                if center != -2:
+                    if center in {-1, 0} or not self.flagstart:
+                        chargetime = (self.timex[self.timeindex[0]] if self.timeindex[0] > -1 and self.timeindex[0] < len(self.timex) else 0)
+                        xmin = self.startofx
+                        xmax = self.endofx + chargetime
+                        if center != -1:
+                            ymin = self.ylimit_min
+                            ymax = self.ylimit
+                    elif (center == -1 or center>0) and len(self.timex)>0 and len(self.temp1)>0 and len(self.temp2)> 0:
+                        # only during recording we center relative to current time and optional to temp/RoR
+                        tx = self.timex[-1]
+                        xoffset = (xmax - xmin) / 2.
+                        xmin = tx - xoffset
+                        xmax = tx + xoffset
+                        if center in {1, 2}:
+                            # center on ET or BT
+                            yoffset = (ymax - ymin) / 2.
+                            yvalue = (self.temp1[-1] if center == 2 else self.temp2[-1])
+                            ymin = yvalue - yoffset
+                            ymax = yvalue + yoffset
+                            if self.twoAxisMode() and self.delta_ax is not None:
+                                zoffset = (zmax - zmin) / 2.
+                                zvalued = float(self.delta_ax.transData.inverted().transform((0,self.ax.transData.transform((0,yvalue))[1]))[1])
+                                zmin = zvalued - zoffset
+                                zmax = zvalued + zoffset
+                        elif center in {3, 4} and self.twoAxisMode() and self.delta_ax is not None:
+                            # center on ET RoR or BT RoR
+                            ror:float|None = None
+                            if center == 4 and len(self.delta1)>0:
+                                ror = self.delta1[-1]
+                            elif center == 3 and len(self.delta2)>0:
+                                ror = self.delta2[-1]
+                            if ror is not None:
+                                zoffset = (zmax - zmin) / 2.
+                                zmin = ror - zoffset
+                                zmax = ror + zoffset
+                                yoffset = (ymax - ymin) / 2.
+                                zvalue = float(self.ax.transData.inverted().transform((0,self.delta_ax.transData.transform((0,ror))[1]))[1])
+                                ymin = zvalue - yoffset
+                                ymax = zvalue + yoffset
+                # shift from center
+                shift_x = (xmax - xmin)*factor_x
+                xmin += shift_x
+                xmax += shift_x
+                shift_y = (ymax - ymin)*factor_y
+                ymin += shift_y
+                ymax += shift_y
+                # update state
+                self.ax.set_xlim(xmin, xmax)
+                self.ax.set_ylim(ymin, ymax)
+                # delta axis
+                if self.twoAxisMode() and self.delta_ax is not None:
+                    shift_z = (zmax - zmin)*factor_y
+                    zmin += shift_z
+                    zmax += shift_z
+                    self.delta_ax.set_ylim(zmin, zmax)
+#                    self.delta_ax.set_xlim(xmin, xmax)
+                # remember current state in history
+                self.fig.canvas.toolbar.push_current()
+                self.fig.canvas.draw_idle()
+        except Exception as e:   # pylint: disable=broad-except
+            _log.exception(e)
 
     # returns None if there is no weight at the given container_idx registered
     def get_container_weight(self, container_idx:int) -> float|None:
@@ -2656,16 +2401,7 @@ class tgraphcanvas(QObject):
             return self.container_weights[container_idx]
         return None
 
-    # toggles the y cursor coordinate see self.fmt_data_curve
-    def nextFmtDataCurve(self) -> None:
-        self.fmt_data_curve = (self.fmt_data_curve+1) % 5
-        if self.backgroundprofile is None and self.fmt_data_curve in {3, 4}:
-            self.fmt_data_curve = 0
-        if len(self.timex)<3 and self.fmt_data_curve in {1, 2}:
-            if self.backgroundprofile is None:
-                self.fmt_data_curve = 0
-            else:
-                self.fmt_data_curve = 3
+    def xy_cursor_setting(self) -> str:
         s = 'cursor position'
         if self.fmt_data_curve == 1:
             s = self.aw.BTname
@@ -2675,8 +2411,20 @@ class tgraphcanvas(QObject):
             s = f"{QApplication.translate('Label','Background')} {self.aw.BTname}"
         elif self.fmt_data_curve == 4:
             s = f"{QApplication.translate('Label','Background')} {self.aw.ETname}"
+        return QApplication.translate('Message', 'set y-coordinate to {}').format(s)
+
+    # toggles the xy cursor coordinate see self.fmt_data_curve
+    def nextFmtDataCurve(self) -> None:
+        self.fmt_data_curve = (self.fmt_data_curve+1) % 5
+        if self.backgroundprofile is None and self.fmt_data_curve in {3, 4}:
+            self.fmt_data_curve = 0
+        if len(self.timex)<3 and self.fmt_data_curve in {1, 2}:
+            if self.backgroundprofile is None:
+                self.fmt_data_curve = 0
+            else:
+                self.fmt_data_curve = 3
         self.aw.ntb.update_message()
-        self.aw.sendmessage(QApplication.translate('Message', 'set y-coordinate to {}').format(s))
+        self.aw.sendmessage(self.xy_cursor_setting())
 
     @pyqtSlot(str, bool)
     def showCurve(self, name: str, state: bool) -> None:
@@ -4484,10 +4232,9 @@ class tgraphcanvas(QObject):
             _log.exception(e)
 
 
-    # ADD DEVICE:
-
     # returns True if the extra device n, channel c, is of type MODBUS or S7, has no factor defined, nor any math formula, and is of type int
     # channel c is either 0 or 1
+    # ADD DEVICE:
     @functools.cache # noqa: B019 # pylint: disable=W1518 # Not relevant here, as qmc is only created once: [B019] Use of `functools.lru_cache` or `functools.cache` on methods can lead to memory leaks
     def intChannel(self, n:int, c:int) -> bool:
         if len(self.extradevices) > n:
@@ -4497,7 +4244,7 @@ class tgraphcanvas(QObject):
             if c == 1:
                 no_math_formula_defined = bool(self.extramathexpression2[n] == '')
             # MODBUS channels
-            for idx, dev_type in enumerate([29,33,55,109,150]): # MODBUS, MODBUS_34, MODBUS_56, MODBUS_78, MODBUS_910
+            for idx, dev_type in enumerate([29,33,55,109,150,207]): # MODBUS, MODBUS_34, MODBUS_56, MODBUS_78, MODBUS_910, MODBUS_1112
                 if self.extradevices[n] == dev_type:
                     return ((self.aw.modbus.inputFloatsAsInt[idx*2 + c] or self.aw.modbus.inputBCDsAsInt[idx*2 + c] or not self.aw.modbus.inputFloats[idx*2 + c]) and
                         self.aw.modbus.inputDivs[idx*2 + c] == 0 and
@@ -5341,14 +5088,14 @@ class tgraphcanvas(QObject):
                                     alarm_temp = sample_temp2[-1]
                                     if alarm_idx is not None:
                                         alarm_temp -= sample_temp2[alarm_idx] # subtract the reading at alarm_idx for IF ALARMs
-                                elif self.alarmsource[i] > 1 and ((self.alarmsource[i] - 2) < (2*len(self.extradevices))):
-                                    if (self.alarmsource[i])%2==0:
+                                elif self.alarmsource[i] > 1 and ((self.alarmsource[i] - 2)//2 < (len(self.extradevices))):
+                                    if (self.alarmsource[i])%2==0 and len(sample_extratemp1[(self.alarmsource[i] - 2)//2])>0:
                                         alarm_temp = sample_extratemp1[(self.alarmsource[i] - 2)//2][-1]
-                                        if alarm_idx is not None:
+                                        if alarm_idx is not None and alarm_idx < len(sample_extratemp1[(self.alarmsource[i] - 2)//2]):
                                             alarm_temp -= sample_extratemp1[(self.alarmsource[i] - 2)//2][alarm_idx] # subtract the reading at alarm_idx for IF ALARMs
-                                    else:
+                                    elif len(sample_extratemp2[(self.alarmsource[i] - 2)//2])>0:
                                         alarm_temp = sample_extratemp2[(self.alarmsource[i] - 2)//2][-1]
-                                        if alarm_idx is not None:
+                                        if alarm_idx is not None and alarm_idx < len(sample_extratemp2[(self.alarmsource[i] - 2)//2]):
                                             alarm_temp -= sample_extratemp2[(self.alarmsource[i] - 2)//2][alarm_idx] # subtract the reading at alarm_idx for IF ALARMs
 
                                 alarm_limit = self.alarmtemperature[i]
@@ -5523,7 +5270,7 @@ class tgraphcanvas(QObject):
                 if i < self.aw.nLCDS:
                     try:
                         extra1_value = resLCD
-                        if idx is not None and XTs1[i] and idx < len(XTs1[i]):
+                        if idx is not None and i < len(XTs1) and idx < len(XTs1[i]):
                             fmt = lcdformat
                             v = float(XTs1[i][idx])
                             if v != -1:
@@ -5545,7 +5292,7 @@ class tgraphcanvas(QObject):
                         self.aw.extraLCD1[i].display(extra1_value)
                     try:
                         extra2_value = resLCD
-                        if idx is not None and XTs2[i] and idx < len(XTs2[i]):
+                        if idx is not None and i < len(XTs2) and idx < len(XTs2[i]):
                             fmt = lcdformat
                             v = float(XTs2[i][idx])
                             if v != -1:
@@ -5648,10 +5395,16 @@ class tgraphcanvas(QObject):
                                     # get current limits
                                     xlim = self.ax.get_xlim()
                                     xlim_offset = (xlim[1] - xlim[0]) / 2.
-                                    xlim_new = (tx - xlim_offset, tx + xlim_offset)
+                                    xlim_shift = (xlim[1] - xlim[0])*self.zoom_follow_pan_x
+                                    xlim_new = (tx - xlim_offset + xlim_shift, tx + xlim_offset + xlim_shift)
                                     ylim = self.ax.get_ylim()
-                                    ylim_offset = (ylim[1] - ylim[0]) / 2.
-                                    ylim_new = (temp - ylim_offset, temp + ylim_offset)
+                                    if self.fmt_data_curve == 0:
+                                        ylim_offset = (ylim[1] - ylim[0]) / 2.
+                                        ylim_shift = (ylim[1] - ylim[0])*self.zoom_follow_pan_y
+                                        ylim_new = (temp - ylim_offset + ylim_shift, temp + ylim_offset + ylim_shift)
+                                    else:
+                                        # in clamp mode (any) we don't follow the y-axis, but only the x-axis
+                                        ylim_new = ylim
                                     if ylim != ylim_new or xlim != xlim_new:
                                         # set new limits to center current temp on canvas
                                         self.ax.set_xlim(xlim_new)
@@ -5660,8 +5413,9 @@ class tgraphcanvas(QObject):
                                             # keep the RoR axis constant
                                             zlim = self.delta_ax.get_ylim()
                                             zlim_offset = (zlim[1] - zlim[0]) / 2.
+                                            zlim_shift = (zlim[1] - zlim[0])*self.zoom_follow_pan_y
                                             tempd = float(self.delta_ax.transData.inverted().transform((0,self.ax.transData.transform((0,temp))[1]))[1])
-                                            zlim_new = (tempd - zlim_offset, tempd + zlim_offset)
+                                            zlim_new = (tempd - zlim_offset + zlim_shift, tempd + zlim_offset + zlim_shift)
                                             self.delta_ax.set_ylim(zlim_new)
                                         self.ax_background = None
                             else:
@@ -5678,11 +5432,17 @@ class tgraphcanvas(QObject):
                                         # get current limits
                                         xlim = self.ax.get_xlim()
                                         xlim_offset = (xlim[1] - xlim[0]) / 2.
-                                        xlim_new = (tx - xlim_offset, tx + xlim_offset)
+                                        xlim_shift = (xlim[1] - xlim[0])*self.zoom_follow_pan_x
+                                        xlim_new = (tx - xlim_offset + xlim_shift, tx + xlim_offset + xlim_shift)
                                         ylim = self.ax.get_ylim()
-                                        ylim_offset = (ylim[1] - ylim[0]) / 2.
-                                        rord = float(self.ax.transData.inverted().transform((0,self.delta_ax.transData.transform((0,ror))[1]))[1])
-                                        ylim_new = (rord - ylim_offset, rord + ylim_offset)
+                                        if self.fmt_data_curve == 0:
+                                            ylim_offset = (ylim[1] - ylim[0]) / 2.
+                                            ylim_shift = (ylim[1] - ylim[0])*self.zoom_follow_pan_y
+                                            rord = float(self.ax.transData.inverted().transform((0,self.delta_ax.transData.transform((0,ror))[1]))[1])
+                                            ylim_new = (rord - ylim_offset + ylim_shift, rord + ylim_offset + ylim_shift)
+                                        else:
+                                            # in clamp mode (any) we don't follow the y-axis, but only the x-axis
+                                            ylim_new = ylim
                                         if ylim != ylim_new or xlim != xlim_new:
                                             # set new limits to center current temp on canvas
                                             self.ax.set_xlim(xlim_new)
@@ -8105,14 +7865,26 @@ class tgraphcanvas(QObject):
                 self.aw.buttonCOOL.setFlat(False)
                 self.aw.buttonONOFF.setText(QApplication.translate('Button', 'ON'))
                 if self.aw.simulator:
-                    self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles_simulator['OFF'])
+                    self.aw.buttonONOFF.setStyleSheet(artisan_simulator_push_button_style_dict['OFF'].format(
+                        min_width=self.aw.main_button_min_width,
+                        font_size=self.aw.button_font_size,
+                        border_radius=self.aw.button_border_radius))
                 else:
-                    self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles['OFF'])
+                    self.aw.buttonONOFF.setStyleSheet(artisan_push_button_style_dict['OFF'].format(
+                        min_width=self.aw.main_button_min_width,
+                        font_size=self.aw.button_font_size,
+                        border_radius=self.aw.button_border_radius))
                 self.aw.buttonSTARTSTOP.setText(QApplication.translate('Button', 'START'))
                 if self.aw.simulator:
-                    self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles_simulator['STOP'])
+                    self.aw.buttonSTARTSTOP.setStyleSheet(artisan_simulator_push_button_style_dict['STOP'].format(
+                        min_width=self.aw.main_button_min_width,
+                        font_size=self.aw.button_font_size,
+                        border_radius=self.aw.button_border_radius))
                 else:
-                    self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles['STOP'])
+                    self.aw.buttonSTARTSTOP.setStyleSheet(artisan_push_button_style_dict['STOP'].format(
+                        min_width=self.aw.main_button_min_width,
+                        font_size=self.aw.button_font_size,
+                        border_radius=self.aw.button_border_radius))
 
             # quantification is blocked if lock_quantification_sampling_ticks is not 0
             # (eg. after a change of the event value by button or slider actions)
@@ -8954,8 +8726,8 @@ class tgraphcanvas(QObject):
         self.background_title_width = 0
         backgroundtitle = backgroundtitle.strip()
         if backgroundtitle != '':
-            backgroundtitle = self.__dijkstra_to_ascii(backgroundtitle)
-            backgroundtitle = f'\n{abbrevString(backgroundtitle, 32)}'
+#            backgroundtitle = self.__dijkstra_to_ascii(backgroundtitle)
+            backgroundtitle = f'\n{self.__dijkstra_to_ascii(abbrevString(backgroundtitle, 32))}'
 
         self.l_subtitle = self.fig.suptitle(backgroundtitle,
                 horizontalalignment='right',verticalalignment='top',
@@ -9297,17 +9069,24 @@ class tgraphcanvas(QObject):
         if self.flagstart or self.xgrid == 0:
             return ''
         if self.roastersize_setup == 0 and self.roastertype_setup == '':
+
             if self.aw.qmc.xgrid < 3600:
+                res = 'mins'
+                if self.aw.locale_str != 'en':
+                    try:
+                        from babel.units import get_unit_name
+                        res = get_unit_name('duration-minute', length='short', locale=self.aw.locale_str) or 'mins'
+                    except Exception as e:  # pylint: disable=broad-except # UnknownLocaleError
+                        _log.exception(e)
+                return res
+            res = 'h'
+            if self.aw.locale_str != 'en':
                 try:
-                    return get_unit_name('duration-minute', length='short', locale=self.aw.locale_str) or 'min'
+                    from babel.units import get_unit_name
+                    return get_unit_name('duration-hour', length='short', locale=self.aw.locale_str) or 'h'
                 except Exception as e:  # pylint: disable=broad-except # UnknownLocaleError
                     _log.exception(e)
-                    return get_unit_name('duration-minute', length='short', locale='en') or 'min'
-            try:
-                return get_unit_name('duration-hour', length='short', locale=self.aw.locale_str) or 'h'
-            except Exception as e:  # pylint: disable=broad-except # UnknownLocaleError
-                _log.exception(e)
-                return get_unit_name('duration-hour', length='short', locale='en') or 'h'
+            return res
         if right_to_left(self.locale_str):
             return f"{(render_weight(self.roastersize_setup, 1, weight_units.index(self.weight[2]), right_to_left_lang=True) if self.roastersize_setup>=0 else '')}  {self.__dijkstra_to_ascii(self.roastertype_setup)}"
         return f"{self.__dijkstra_to_ascii(self.roastertype_setup)} {(render_weight(self.roastersize_setup, 1, weight_units.index(self.weight[2])) if self.roastersize_setup>0 else '')}"
@@ -9345,9 +9124,9 @@ class tgraphcanvas(QObject):
 
                     decay_smoothing_p = (not self.optimalSmoothing) or self.flagon
 
-                    scale = 1 if self.graphstyle == 1 else 0
-                    length = 700 # 100 (128 the default)
-                    randomness = 12 # 2 (16 default)
+                    scale = 1.5 if self.graphstyle == 1 else 0
+                    length = 800 # 100 (128 the default)
+                    randomness = 16 # 2 (16 default)
                     rcParams['path.sketch'] = (scale, length, randomness)
 
                     # if no axis are set, we need to forceRenewAxis in any case
@@ -9524,7 +9303,11 @@ class tgraphcanvas(QObject):
                         self.ax.spines['top'].set_sketch_params(scale, length, randomness)
                     # hide all spines from the delta_ax
                     if self.delta_ax is not None:
-                        self.delta_ax.set_frame_on(False) # hide all splines (as the four lines above)
+                        self.delta_ax.spines.top.set_visible(False)
+                        self.delta_ax.spines.bottom.set_visible(False)
+                        self.delta_ax.spines.left.set_visible(False)
+                        self.delta_ax.spines.right.set_visible(False)
+#                        self.delta_ax.set_frame_on(False) # hide all splines (as the four lines above) # this removes canvas background color on MPL 3.11.x, lines above don't have this issue
 
                     if self.ygrid > 0:
                         major_locator = ticker.MultipleLocator(self.ygrid)
@@ -12328,7 +12111,7 @@ class tgraphcanvas(QObject):
                 bbox_data = self.ax.transData.inverted().transform(bb)  # zuban:ignore[arg-type] # bounding box in data space
                 bbox = Bbox(bbox_data)
                 t.remove()
-                return bbox.bounds  # x0, y0, width, height.  Relative to the start of the curve and self.ylimit_min
+                return bbox.bounds # type:ignore[no-any-return] # x0, y0, width, height.  Relative to the start of the curve and self.ylimit_min
             return 0,0,0,0
 
     # Find the bounds for an event annotation text box
@@ -12641,7 +12424,6 @@ class tgraphcanvas(QObject):
                 self.EvalueColor = self.EvalueColor_default.copy()
                 self.EvalueTextColor = self.EvalueTextColor_default.copy()
                 self.aw.sendmessage(QApplication.translate('Message','Colors set to defaults'))
-#                self.aw.closeEventSettings()
 
         elif color == 2:
             self.aw.sendmessage(QApplication.translate('Message','Colors set to grey'))
@@ -12663,7 +12445,6 @@ class tgraphcanvas(QObject):
             self.backgroundxtcolor      = self.aw.convertToGreyscale(self.backgroundxtcolor)
             self.backgroundytcolor      = self.aw.convertToGreyscale(self.backgroundytcolor)
             self.aw.setLCDsBW()
-#            self.aw.closeEventSettings()
 
         elif color == 3:
             from artisanlib.colors import graphColorDlg
@@ -12707,23 +12488,15 @@ class tgraphcanvas(QObject):
                 self.backgrounddeltabtcolor = str(dialog.bgdeltabtButton.text())
                 self.backgroundxtcolor = str(dialog.bgextraButton.text())
                 self.backgroundytcolor = str(dialog.bgextra2Button.text())
-#                self.aw.closeEventSettings()
-
-#            #deleteLater() will not work here as the dialog is still bound via the parent
-#            #dialog.deleteLater() # now we explicitly allow the dialog an its widgets to be GCed
-#            # the following will immediately release the memory despite this parent link
-#            QApplication.processEvents() # we ensure events concerning this dialog are processed before deletion
-#            try: # sip not supported on older PyQt versions (RPi!)
-#                sip.delete(dialog)
-#                #print(sip.isdeleted(dialog))
-#            except Exception:  # pylint: disable=broad-except
-#                pass
+                # release the dialog
+                dialog.destroy()
+                del dialog
 
         #update screen with new colors
         self.aw.updateCanvasColors()
         self.aw.applyStandardButtonVisibility()
         self.aw.update_extraeventbuttons_visibility()
-        self.fig.canvas.draw_idle() #.redraw()
+        self.fig.canvas.draw_idle()
 
     def clearFlavorChart(self) -> None:
         self.flavorchart_plotf = None
@@ -13017,13 +12790,14 @@ class tgraphcanvas(QObject):
     # indicating which curves should not be temperature converted
     # True indicates a non-temperature device (data should not be converted)
     # False indicates a temperature device (data should be converted if temperature unit changes)
+    # ADD DEVICE:
     def generateNoneTempHints(self) -> None:
         self.extraNoneTempHint1 = []
         self.extraNoneTempHint2 = []
         for d in self.extradevices:
-            if d in self.nonTempDevices:
-                self.extraNoneTempHint1.append(self.nonTempDevices[d][0])
-                self.extraNoneTempHint2.append(self.nonTempDevices[d][1])
+            if is_non_temp_device(d):
+                self.extraNoneTempHint1.append(is_non_temp_device_chan(d,0))
+                self.extraNoneTempHint2.append(is_non_temp_device_chan(d,1))
             elif d == 29: # MODBUS
                 self.extraNoneTempHint1.append(self.aw.modbus.inputModes[0] == '')
                 self.extraNoneTempHint2.append(self.aw.modbus.inputModes[1] == '')
@@ -13036,6 +12810,12 @@ class tgraphcanvas(QObject):
             elif d == 109: # +MODBUS 78
                 self.extraNoneTempHint1.append(self.aw.modbus.inputModes[6] == '')
                 self.extraNoneTempHint2.append(self.aw.modbus.inputModes[7] == '')
+            elif d == 150: # +MODBUS 910
+                self.extraNoneTempHint1.append(self.aw.modbus.inputModes[8] == '')
+                self.extraNoneTempHint2.append(self.aw.modbus.inputModes[9] == '')
+            elif d == 207: # +MODBUS 1112
+                self.extraNoneTempHint1.append(self.aw.modbus.inputModes[10] == '')
+                self.extraNoneTempHint2.append(self.aw.modbus.inputModes[11] == '')
             elif d == 79: # S7
                 self.extraNoneTempHint1.append(not bool(self.aw.s7.mode[0]))
                 self.extraNoneTempHint2.append(not bool(self.aw.s7.mode[1]))
@@ -13066,9 +12846,6 @@ class tgraphcanvas(QObject):
             elif d == 119: # +WebSocket 910
                 self.extraNoneTempHint1.append(not bool(self.aw.ws.channel_modes[8]))
                 self.extraNoneTempHint2.append(not bool(self.aw.ws.channel_modes[9]))
-            elif d == 150: # +MODBUS 910
-                self.extraNoneTempHint1.append(self.aw.modbus.inputModes[8] == '')
-                self.extraNoneTempHint2.append(self.aw.modbus.inputModes[9] == '')
             elif d == 151: # +S7 1112
                 self.extraNoneTempHint1.append(not bool(self.aw.s7.mode[10]))
                 self.extraNoneTempHint2.append(not bool(self.aw.s7.mode[11]))
@@ -13142,9 +12919,6 @@ class tgraphcanvas(QObject):
     # the PhidgetManager which makes Phidgets accessible is only started if PhdigetsConfigured returns True
     def PhidgetsConfigured(self) -> bool:
 
-        # searching sets is faster than lists
-        phidget_device_ids = set(self.phidgetDevices)
-
         # collecting all device ids in use (from main or extra)
         device_ids_in_use = self.extradevices[:]
         device_ids_in_use.append(self.device)
@@ -13166,7 +12940,7 @@ class tgraphcanvas(QObject):
         slider_phidget_action_ids = { 9, 10, 11, 17 }
 
         return (
-            any(i in phidget_device_ids for i in device_ids_in_use) or                    # phidget main/extra device
+            any(is_phidget_device(i) for i in device_ids_in_use) or                       # phidget main/extra device
             any(i in {1, 3} for i in ambient_device_ids) or                               # phidget ambient device
             any(i in main_button_phidget_action_ids for i in self.buttonactions) or       # phidget actions in event button commands (CHARGE, .., COOL)
             any(i in main_button_phidget_action_ids for i in self.extrabuttonactions) or  # phidget actions in main event button commandss (ON, OFF, SAMPLE)
@@ -13200,7 +12974,7 @@ class tgraphcanvas(QObject):
                     _log.info('phidgetServer added')
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
-                    if self.device in self.phidgetDevices:
+                    if is_phidget_device(self.device):
                         self.adderror(QApplication.translate('Error Message',"Exception: phidgetServer couldn't be added. Verify that the Phidget driver is correctly installed!"))
             if self.phidgetManager is None:
                 try:
@@ -13208,7 +12982,7 @@ class tgraphcanvas(QObject):
                     _log.info('phidgetManager started')
                 except Exception as e: # pylint: disable=broad-except
                     _log.exception(e)
-                    if self.device in self.phidgetDevices:
+                    if is_phidget_device(self.device):
                         self.adderror(QApplication.translate('Error Message',"Exception: PhidgetManager couldn't be started. Verify that the Phidget driver is correctly installed!"))
 
     def stopPhidgetManager(self) -> None:
@@ -13450,9 +13224,15 @@ class tgraphcanvas(QObject):
                 _log.exception(e)
 
             if self.aw.simulator:
-                self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles_simulator['ON'])
+                self.aw.buttonONOFF.setStyleSheet(artisan_simulator_push_button_style_dict['ON'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
             else:
-                self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles['ON'])
+                self.aw.buttonONOFF.setStyleSheet(artisan_push_button_style_dict['ON'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
 
             self.aw.buttonONOFF.setText(QApplication.translate('Button', 'OFF')) # text means click to turn OFF (it is ON)
             self.aw.buttonONOFF.setToolTip(QApplication.translate('Tooltip', 'Stop monitoring'))
@@ -13609,7 +13389,10 @@ class tgraphcanvas(QObject):
                 self.palette['canvas'] = self.palette['canvas_alt']
                 self.aw.updateCanvasColors(checkColors=False)
             #enable RESET button:
-            self.aw.buttonRESET.setStyleSheet(self.aw.pushbuttonstyles['RESET'])
+            self.aw.buttonRESET.setStyleSheet(artisan_push_button_style_dict['RESET'].format(
+                min_width=self.aw.main_button_min_width,
+                font_size=self.aw.button_font_size,
+                border_radius=self.aw.button_border_radius))
             self.aw.buttonRESET.setEnabled(True)
             self.aw.buttonRESET.setVisible(True)
 
@@ -13624,9 +13407,15 @@ class tgraphcanvas(QObject):
                 _log.exception(e)
 
             if self.aw.simulator:
-                self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles_simulator['OFF'])
+                self.aw.buttonONOFF.setStyleSheet(artisan_simulator_push_button_style_dict['OFF'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
             else:
-                self.aw.buttonONOFF.setStyleSheet(self.aw.pushbuttonstyles['OFF'])
+                self.aw.buttonONOFF.setStyleSheet(artisan_push_button_style_dict['OFF'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
             self.aw.buttonONOFF.setToolTip(QApplication.translate('Tooltip', 'Start monitoring'))
             self.aw.sendmessage(QApplication.translate('Message','Scope stopped'))
             self.aw.buttonONOFF.setText(QApplication.translate('Button', 'ON')) # text means click to turn OFF (it is ON)
@@ -14338,14 +14127,23 @@ class tgraphcanvas(QObject):
             self.flagstart = False
             self.aw.updateSantokerWarmupControls()
             if self.aw.simulator:
-                self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles_simulator['STOP'])
+                self.aw.buttonSTARTSTOP.setStyleSheet(artisan_simulator_push_button_style_dict['STOP'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
             else:
-                self.aw.buttonSTARTSTOP.setStyleSheet(self.aw.pushbuttonstyles['STOP'])
+                self.aw.buttonSTARTSTOP.setStyleSheet(artisan_push_button_style_dict['STOP'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
             if enableButton:
                 self.aw.buttonSTARTSTOP.setEnabled(True)
                 self.aw.buttonSTARTSTOP.setGraphicsEffect(self.aw.makeShadow())
             #enable RESET button:
-            self.aw.buttonRESET.setStyleSheet(self.aw.pushbuttonstyles['RESET'])
+            self.aw.buttonRESET.setStyleSheet(artisan_push_button_style_dict['RESET'].format(
+                min_width=self.aw.main_button_min_width,
+                font_size=self.aw.button_font_size,
+                border_radius=self.aw.button_border_radius))
             self.aw.buttonRESET.setEnabled(True)
             self.updateLCDtime()
             #prevents accidentally deleting a modified profile:
@@ -15311,8 +15109,21 @@ class tgraphcanvas(QObject):
                 self.aw.roasthubs_org_id,
                 self.aw.roasthubs_machine_id,
                 self.aw.roasthubs_token,
-                on_upload_succeeded,
-                on_upload_failure)
+                # filter conf
+                interpolate_drops = self.interpolateDropsflag,
+                curvefilter = self.curvefilter,
+                medfilt_factor = self.median_filter_factor,
+                limit_ror = self.RoRlimitFlag,
+                ror_limit_min = self.RoRlimitm,
+                ror_limit_max = self.RoRlimit,
+                delta_span_ET = self.deltaETspan,
+                delta_span_BT = self.deltaBTspan,
+                medfilt_factor_RoR = self.median_filter_factor_RoR,
+                delta_ET_filter = self.deltaETfilter,
+                delta_BT_filter = self.deltaBTfilter,
+                # handlers
+                on_success=on_upload_succeeded,
+                on_failure=on_upload_failure)
 
 
 

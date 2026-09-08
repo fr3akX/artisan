@@ -1,8 +1,8 @@
 #
 # ABOUT
-# Artisan Profile Transposer
+# artisan scope profile transposer
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -319,11 +319,12 @@ class profileTransformatorDlg(ArtisanDialog):
             for w in self.phases_target_widgets_time:
                 ri:int|None = None
                 if w is not None:
-                    try:
-                        txt = w.text()
-                        ri = stringtoseconds(txt)
-                    except Exception as e: # pylint: disable=broad-except
-                        _log.error(e) # widget should not allow for malformed time string input on which stringtoseconds raises an exception
+                    txt = w.text()
+                    if txt != '':
+                        try:
+                            ri = stringtoseconds(txt)
+                        except Exception as e: # pylint: disable=broad-except
+                            _log.error(e) # widget should not allow for malformed time string input on which stringtoseconds raises an exception
                 res_times.append(ri)
         if self.phases_target_widgets_percent is not None:
             for w in self.phases_target_widgets_percent:

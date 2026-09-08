@@ -21,7 +21,7 @@
 from typing import Literal
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QApplication, QFrame, QPushButton, QSpinBox, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QBoxLayout, QFrame, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 
 class SantokerWarmupControls(QFrame):
@@ -54,10 +54,23 @@ class SantokerWarmupControls(QFrame):
 
     def setCompactHeight(self, height: int) -> None:
         layout = self.layout()
-        if layout is None:
+        if not isinstance(layout, QBoxLayout):
             return
-        fixed_height = max(2, height)
-        spacing = min(layout.spacing(), fixed_height - 2)
+        self.button.ensurePolished()
+        self.target.ensurePolished()
+        button_minimum = self.button.minimumSizeHint().height()
+        target_minimum = self.target.minimumSizeHint().height()
+        fixed_height = max(height, button_minimum, target_minimum)
+        spacing = 2
+        if fixed_height < button_minimum + target_minimum + spacing:
+            # Short upstream toolbars cannot fit two readable rows.
+            layout.setDirection(QBoxLayout.Direction.LeftToRight)
+            layout.setSpacing(spacing)
+            self.button.setFixedHeight(fixed_height)
+            self.target.setFixedHeight(fixed_height)
+            self.setFixedHeight(fixed_height)
+            return
+        layout.setDirection(QBoxLayout.Direction.TopToBottom)
         child_height = fixed_height - spacing
         button_height = (child_height + 1) // 2
         target_height = child_height - button_height
