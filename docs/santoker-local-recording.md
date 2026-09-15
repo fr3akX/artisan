@@ -3,6 +3,8 @@
 This foundation does not itself connect to BLE, roast controls, Qt, or HTTP.
 An optional [transport-only Santoker BLE adapter](santoker-ble-transport-tracing.md)
 now accepts its immutable handles; no application ON/OFF or HTTP wiring is enabled.
+A separate [private HTTP primitive](santoker-trace-http.md) now supports explicit
+caller-owned held-stream transfer; there is still no UI or upload scheduler.
 The unchanged
 [wire contract](diagnostic-traces-v1.md) remains authoritative. No automatic
 upload, publication, retention eviction, credential persistence, or live device
@@ -114,7 +116,7 @@ fixed evidence names. A second conflicting damaged candidate fails closed rather
 than growing an unbounded evidence-name series or overwriting evidence. Root
 entries not owned by the selected session are never deleted.
 
-## Explicit upload-job metadata, without HTTP
+## Explicit upload-job metadata
 
 Worker-side selected-ID sequence:
 
@@ -131,8 +133,12 @@ Worker-side selected-ID sequence:
    **not ticket equality**: every attempt transition rejects stale callbacks.
 4. The future upload worker must pin its immutable credential/client separately,
    verify identity with that same client, then call `begin_upload(ticket,
-   authenticated_destination)`. Send contract identity preconditions and exact
-   ticket bytes. Neither this ledger nor its ticket contains credentials.
+   authenticated_destination)`. `open_upload(ticket)` holds the validated private
+   descriptor without holding the store mutex during network IO. Follow the exact
+   [HTTP invocation order](santoker-trace-http.md); exit its context only after the
+   actual call settles, before failure/receipt transitions or store close. Send
+   contract identity preconditions and exact ticket bytes. Neither this ledger
+   nor its ticket contains credentials.
 5. `upload_failed(ticket)` retains bytes and pinned authorization. A further
    `prepare` is an explicit Retry action. Startup converts abandoned preparing/
    uploading jobs to authorized but **never starts a request**.

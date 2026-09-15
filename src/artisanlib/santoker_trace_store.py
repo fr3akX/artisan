@@ -27,6 +27,7 @@ No credentials, HTTP, automatic upload, eviction, or arbitrary caller paths.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import io
@@ -138,6 +139,7 @@ class TraceStore:
             raise ValueError('insufficient disk budget')
         self._mutex = threading.RLock()
         self._active: dict[str, _Journal] = {}
+        self._held_uploads: set[str] = set()
         self._lock_fd: int | None = None
         self._used = 0
         self.failure: str | None = None
@@ -170,6 +172,8 @@ class TraceStore:
 
     def close(self) -> None:
         with self._mutex:
+            if self._held_uploads:
+                raise StoreError('session_busy')
             for journal in self._active.values():
                 journal.stream.close()
             self._active.clear()
@@ -661,11 +665,49 @@ class TraceStore:
             metadata['state'] = 'uploading'
             self._save(ticket.session_id, metadata)
 
+    @contextmanager
+    def open_upload(self, ticket: UploadTicket) -> Iterator[BinaryIO]:
+        """Hold the validated descriptor until the caller's actual HTTP call settles.
+
+        No mutex is held across the yield. Completion/failure and store close must
+        follow context exit; while held, no new attempt or deletion is permitted.
+        """
+        with self._mutex:
+            self._ensure_open()
+            metadata = self._load(ticket.session_id)
+            if metadata['state'] != 'uploading' or self._ticket(metadata) != ticket:
+                raise StoreError('stale_job')
+            if ticket.session_id in self._held_uploads:
+                raise StoreError('session_busy')
+            source = self._open(ticket.artifact)
+            try:
+                if os.fstat(source.fileno()).st_size != ticket.byte_size:
+                    raise StoreError('artifact_mismatch')
+                result = validate_trace(source, expected_session_id=ticket.session_id,
+                                        expected_sha256=ticket.sha256, limits=self.limits)
+                if result.byte_size != ticket.byte_size:
+                    raise StoreError('artifact_mismatch')
+                source.seek(0)
+            except BaseException:
+                source.close()
+                raise
+            self._held_uploads.add(ticket.session_id)
+        try:
+            yield source
+        finally:
+            try:
+                source.close()
+            finally:
+                with self._mutex:
+                    self._held_uploads.remove(ticket.session_id)
+
     def upload_failed(self, ticket: UploadTicket) -> None:
         """Retain pinned identity and exact bytes; another explicit Retry is required."""
         with self._mutex:
             self._ensure_open()
             metadata = self._load(ticket.session_id)
+            if ticket.session_id in self._held_uploads:
+                raise StoreError('session_busy')
             if metadata['state'] not in {'preparing', 'uploading'} or self._ticket(metadata) != ticket:
                 raise StoreError('stale_job')
             metadata['state'] = 'authorized'
@@ -696,6 +738,8 @@ class TraceStore:
         with self._mutex:
             self._ensure_open()
             metadata = self._load(ticket.session_id)
+            if ticket.session_id in self._held_uploads:
+                raise StoreError('session_busy')
             if (metadata['state'] != 'uploading' or self._ticket(metadata) != ticket
                     or canonical_origin(request_origin) != ticket.destination.origin):
                 raise StoreError('stale_job')

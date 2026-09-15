@@ -77,6 +77,8 @@ from artisanlib.roastserver.contract import (
     validate_archive_filters,
 )
 from artisanlib.roastserver.origin import canonical_origin
+from artisanlib.santoker_trace_contract import DEFAULT_LIMITS, Record, validate_trace
+from artisanlib.santoker_trace_store import UploadTicket, canonical_id
 
 if TYPE_CHECKING:
     from artisanlib.roastserver.inventory_contract import (
@@ -89,6 +91,8 @@ CONNECT_TIMEOUT_SECONDS: Final[float] = 4.0
 READ_TIMEOUT_SECONDS: Final[float] = 10.0
 # This hard whole-operation budget remains below the worker's 15-second shutdown wait.
 OPERATION_DEADLINE_SECONDS: Final[float] = 12.0
+TRACE_OPERATION_DEADLINE_SECONDS: Final[float] = 120.0
+_MAX_TRACE_RECEIPT_BYTES: Final[int] = 8192
 MAX_RETRY_AFTER_SECONDS: Final[int] = 3600
 
 _RESPONSE_CHUNK_BYTES: Final[int] = 64 * 1024
@@ -150,8 +154,8 @@ class _ResponseBodyError(ValueError):
 class _DeadlineGuard:
     """Secret-free watchdog state for one absolute monotonic deadline."""
 
-    def __init__(self) -> None:
-        self.deadline = time.monotonic() + OPERATION_DEADLINE_SECONDS
+    def __init__(self, seconds: float = OPERATION_DEADLINE_SECONDS) -> None:
+        self.deadline = time.monotonic() + seconds
         self._done = threading.Event()
         self._expired = threading.Event()
         self._response_lock = threading.Lock()
@@ -258,6 +262,47 @@ class _DeadlineUploadBody(BytesIO):
         return super().tell()
 
 
+class _TraceUploadBody:
+    """Non-owning, exact-length stream; never materializes the artifact in RAM."""
+
+    def __init__(self, source: BinaryIO, size: int, check: Callable[[], None]) -> None:
+        self._source = source
+        self._size = size
+        self._position = 0
+        self._check = check
+
+    @override
+    def __repr__(self) -> str:
+        return '<DiagnosticTraceUploadBody content=<redacted>>'
+
+    def __len__(self) -> int:
+        return self._size
+
+    def tell(self) -> int:
+        return self._position
+
+    def rewind(self) -> None:
+        self._check()
+        self._source.seek(0)
+        self._position = 0
+        self._check()
+
+    def read(self, size: int = -1) -> bytes:
+        self._check()
+        if size == 0:
+            return b''
+        remaining = self._size - self._position
+        amount = min(_RESPONSE_CHUNK_BYTES, remaining or 1)
+        if size > 0:
+            amount = min(amount, size)
+        data: object = self._source.read(amount)
+        self._check()
+        if not isinstance(data, bytes) or len(data) > amount or (not data and remaining) or (data and not remaining):
+            raise _fixed_api_failure(FailureKind.LOCAL_PROFILE, status_code=None)
+        self._position += len(data)
+        return data
+
+
 @dataclass(frozen=True, slots=True)
 class DownloadReceipt:
     roast_uuid: UUID
@@ -341,6 +386,67 @@ class RoastServerClient:
             return self._parse_json_response(response, parse_identity, deadline)
         finally:
             _close_response(response)
+
+    def put_diagnostic_trace(
+        self,
+        ticket: UploadTicket,
+        source: BinaryIO,
+        *,
+        before_disclosure: Callable[[], None] | None = None,
+    ) -> Record:
+        """One manual attempt on a dedicated client and caller-held store stream.
+
+        The caller owns begin_upload/open_upload, keeps the stream alive until
+        this synchronous call settles, then explicitly accepts the receipt or
+        records failure. A timeout is not proof of remote absence. The optional
+        callback raises to veto disclosure after validation and fresh identity;
+        a future coordinator must atomically fence its generation at this seam.
+        """
+        def operation(deadline: _DeadlineGuard) -> Record:
+            _validate_trace_ticket(ticket)
+            if ticket.destination.origin != self._origin:
+                raise _fixed_api_failure(FailureKind.CREDENTIAL_REJECTED, status_code=None)
+            identity = self._test_connection(deadline)
+            if (str(identity.organization.id) != ticket.destination.organization_id
+                    or str(identity.user.id) != ticket.destination.uploader_user_id):
+                raise _fixed_api_failure(FailureKind.CREDENTIAL_REJECTED, status_code=None)
+
+            def check() -> None:
+                deadline.check()
+                self._require_open()
+
+            body = _TraceUploadBody(source, ticket.byte_size, check)
+            try:
+                body.rewind()
+                result = validate_trace(cast(BinaryIO, body), expected_session_id=ticket.session_id,
+                                        expected_sha256=ticket.sha256)
+                if result.byte_size != ticket.byte_size:
+                    raise ValueError('artifact mismatch')
+                body.rewind()
+            except (OSError, ValueError):
+                raise _fixed_api_failure(FailureKind.LOCAL_PROFILE, status_code=None) from None
+            check()
+            if before_disclosure is not None:
+                before_disclosure()
+            check()
+            response = self._request(
+                'PUT', f'/api/v1/diagnostic-traces/{ticket.session_id}',
+                deadline=deadline, data=cast(BinaryIO, body),
+                body_content_type='application/gzip', body_content_length=ticket.byte_size,
+                trace_ticket=ticket, stream=True,
+            )
+            try:
+                self._require_status(response, frozenset({200, 201}))
+                if body.tell() != ticket.byte_size:
+                    raise _fixed_api_failure(FailureKind.INVALID_RESPONSE, status_code=response.status_code)
+                return self._parse_json_response(
+                    response, lambda value: _parse_trace_receipt(value, ticket), deadline,
+                    maximum=_MAX_TRACE_RECEIPT_BYTES,
+                )
+            finally:
+                _close_response(response)
+
+        return self._run_operation(operation, seconds=TRACE_OPERATION_DEADLINE_SECONDS)
 
     def post_aroast(self, roast_uuid: UUID, aroast_json: bytes) -> None:
         def operation(deadline: _DeadlineGuard) -> None:
@@ -673,6 +779,7 @@ class RoastServerClient:
         body_content_type: str | None = None,
         body_content_length: int | None = None,
         additional_headers: Mapping[str, str] | None = None,
+        trace_ticket: UploadTicket | None = None,
         stream: bool = False,
     ) -> requests.Response:
         deadline.check()
@@ -701,6 +808,19 @@ class RoastServerClient:
             ):
                 raise ValueError('invalid additional request header')
             headers['Idempotency-Key'] = idempotency_key
+        if trace_ticket is not None:
+            _validate_trace_ticket(trace_ticket)
+            if (method != 'PUT' or path != f'/api/v1/diagnostic-traces/{trace_ticket.session_id}'
+                    or trace_ticket.destination.origin != self._origin
+                    or body_content_type != 'application/gzip'
+                    or body_content_length != trace_ticket.byte_size
+                    or additional_headers is not None or json_bytes is not None):
+                raise ValueError('invalid diagnostic trace request')
+            headers.update({
+                'X-Trace-SHA256': trace_ticket.sha256,
+                'X-Trace-Organization-ID': trace_ticket.destination.organization_id,
+                'X-Trace-Uploader-ID': trace_ticket.destination.uploader_user_id,
+            })
         request_data: Mapping[str, str | bytes] | BinaryIO | bytes | None = data
         if json_bytes is not None:
             if data is not None or body_content_type is not None:
@@ -756,8 +876,10 @@ class RoastServerClient:
     def _run_operation(
         self,
         operation: Callable[[_DeadlineGuard], _ResultT],
+        *,
+        seconds: float | None = None,
     ) -> _ResultT:
-        deadline = self._start_operation()
+        deadline = self._start_operation(seconds)
         result: _ResultT | None = None
         operation_error: Exception | None = None
         try:
@@ -774,7 +896,7 @@ class RoastServerClient:
             raise operation_error
         return cast(_ResultT, result)
 
-    def _start_operation(self) -> _DeadlineGuard:
+    def _start_operation(self, seconds: float | None = None) -> _DeadlineGuard:
         with self._state_lock:
             if self._closed:
                 raise _fixed_api_failure(
@@ -788,7 +910,7 @@ class RoastServerClient:
                     status_code=None,
                     code='request_error',
                 )
-            deadline = _DeadlineGuard()
+            deadline = _DeadlineGuard(OPERATION_DEADLINE_SECONDS if seconds is None else seconds)
             self._active_deadline = deadline
         deadline.start(self)
         return deadline
@@ -971,6 +1093,8 @@ class RoastServerClient:
         response: requests.Response,
         parser: Callable[[object], _ResultT],
         deadline: _DeadlineGuard,
+        *,
+        maximum: int = MAX_JSON_BYTES,
     ) -> _ResultT:
         if response.headers.get('Content-Type') != _JSON_CONTENT_TYPE:
             raise _fixed_api_failure(
@@ -979,7 +1103,7 @@ class RoastServerClient:
             )
         body: bytes | None = None
         try:
-            body = _bounded_body(response, MAX_JSON_BYTES, deadline)
+            body = _bounded_body(response, maximum, deadline)
         except _ResponseBodyError:
             pass
         if body is None:
@@ -1052,6 +1176,38 @@ class RoastServerClient:
                 FailureKind.CHECKSUM_MISMATCH,
                 status_code=response.status_code,
             )
+
+
+def _validate_trace_ticket(ticket: UploadTicket) -> None:
+    for value in (ticket.session_id, ticket.authorization_id, ticket.attempt_id,
+                  ticket.destination.organization_id, ticket.destination.uploader_user_id):
+        canonical_id(value)
+    if (_SHA256_RE.fullmatch(ticket.sha256) is None
+            or type(ticket.byte_size) is not int
+            or not 1 <= ticket.byte_size <= DEFAULT_LIMITS.compressed_bytes):
+        raise ValueError('invalid diagnostic trace ticket')
+
+
+def _parse_trace_receipt(value: object, ticket: UploadTicket) -> Record:
+    fields = {'id', 'session_id', 'organization_id', 'uploader_user_id',
+              'sha256', 'byte_size', 'stored_at', 'storage_status'}
+    if not isinstance(value, dict) or value.keys() != fields:
+        raise ValueError('invalid diagnostic trace receipt')
+    receipt = cast(dict[str, object], value)
+    for key in ('id', 'session_id', 'organization_id', 'uploader_user_id'):
+        canonical_id(receipt[key])
+    stored_at = receipt['stored_at']
+    if (not isinstance(stored_at, str) or re.fullmatch(
+            r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z', stored_at) is None):
+        raise ValueError('invalid diagnostic trace receipt')
+    datetime.strptime(stored_at, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=UTC)
+    if (receipt['storage_status'] != 'stored' or receipt['session_id'] != ticket.session_id
+            or receipt['organization_id'] != ticket.destination.organization_id
+            or receipt['uploader_user_id'] != ticket.destination.uploader_user_id
+            or receipt['sha256'] != ticket.sha256 or type(receipt['byte_size']) is not int
+            or receipt['byte_size'] != ticket.byte_size):
+        raise ValueError('invalid diagnostic trace receipt')
+    return cast(Record, value)
 
 
 type ClientFactory = Callable[[str, str], RoastServerClient]
@@ -1321,7 +1477,7 @@ def _bounded_body(
     stream_failure: ApiFailure | None = None
     body_error = False
     try:
-        iterator = iter(response.iter_content(chunk_size=_RESPONSE_CHUNK_BYTES))
+        iterator = iter(response.iter_content(chunk_size=min(_RESPONSE_CHUNK_BYTES, maximum + 1)))
         while True:
             deadline.check()
             try:
