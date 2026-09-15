@@ -991,3 +991,39 @@ def test_raw_command_chunk_boundaries_and_scalar_events(tmp_path: Path) -> None:
         assert trace[-1]['completion'] == 'complete'
     finally:
         recorder.shutdown(wait=True)
+
+
+def test_mark_incomplete_accounts_parser_loss_without_raw_admission_gap(tmp_path: Path) -> None:
+    root = tmp_path / 'traces'
+    recorder = TraceRecorder(root, limits=LIMITS, store_factory=lambda: make_store(root))
+    handle = recorder.start(CONFIG)
+    try:
+        handle.mark_incomplete('queue_overflow')
+        handle.mark_incomplete('queue_overflow')
+        assert handle.status().reasons == ('queue_overflow',)
+        assert handle.status().attempted_events == 0
+        assert handle.status().dropped_events == 0
+        with pytest.raises(ValueError, match='invalid incomplete reason'):
+            handle.mark_incomplete('arbitrary text')
+        handle.request_close()
+        handle.cleanup_finished()
+        wait_sealed(handle)
+        before = handle.status()
+        handle.mark_incomplete('capture_error')
+        assert handle.status() == before
+        summary = records(root, handle.session_id)[-1]
+        assert summary['reasons'] == ['queue_overflow']
+        assert summary['completion'] == 'incomplete'
+        assert summary['dropped_events'] == 0
+    finally:
+        assert recorder.shutdown(wait=True)
+
+
+def test_mark_incomplete_does_not_mutate_failed_handle(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path / 'traces')
+    assert recorder.shutdown(wait=True)
+    handle = recorder.start(CONFIG)
+    before = handle.status()
+    assert before.state == 'failed'
+    handle.mark_incomplete('capture_error')
+    assert handle.status() == before

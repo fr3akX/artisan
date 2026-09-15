@@ -35,6 +35,8 @@ from typing import Final, TYPE_CHECKING, override
 from artisanlib.santoker_diagnostics import DiagnosticField, SantokerDiagnosticsSession
 
 if TYPE_CHECKING:
+    from artisanlib.santoker_trace import SessionHandle
+    from artisanlib.santoker_ble_trace import SantokerBLETrace
     from artisanlib.atypes import SerialSettings # pylint: disable=unused-import
     from bleak.backends.characteristic import BleakGATTCharacteristic  # pylint: disable=unused-import
 
@@ -54,8 +56,13 @@ class SantokerCube_BLE(ClientBLE):
     def __init__(self,
                     read_msg:Callable[[asyncio.StreamReader|IteratorReader], Awaitable[None]],
                     connected_handler:Callable[[], None]|None = None,
-                    disconnected_handler:Callable[[], None]|None = None):
+                    disconnected_handler:Callable[[], None]|None = None,
+                    trace_handle:'SessionHandle|None' = None) -> None:
         super().__init__()
+        self._trace_transport:SantokerBLETrace|None = None
+        if trace_handle is not None:
+            from artisanlib.santoker_ble_trace import SantokerBLETrace as TraceTransport
+            self._trace_transport = TraceTransport(self, trace_handle, read_msg)
 
         # Protocol parser variables
         self._read_queue : asyncio.Queue[bytes]|None = None
@@ -68,6 +75,27 @@ class SantokerCube_BLE(ClientBLE):
         self.add_device_description(self.SANTOKER_CUBE_SERVICE_UUID, self.SANTOKER_CUBE_NAME)
         self.add_notify(self.SANTOKER_CUBE_NOTIFY_UUID, self.notify_callback)
         self.add_write(self.SANTOKER_CUBE_SERVICE_UUID, self.SANTOKER_CUBE_WRTIE_UUID)
+
+    @override
+    def start(self, case_sensitive:bool=True, scan_timeout:float=6, connect_timeout:float=6, address:str|None = None) -> None:
+        if self._trace_transport is None:
+            super().start(case_sensitive, scan_timeout, connect_timeout, address)
+        else:
+            self._trace_transport.start(case_sensitive, scan_timeout, connect_timeout, address)
+
+    @override
+    def stop(self) -> None:
+        if self._trace_transport is None:
+            super().stop()
+        else:
+            self._trace_transport.stop()
+
+    @override
+    def send(self, message:bytes, response:bool = False, write_characteristic:str|None = None, chunk:int = 20) -> None:
+        if self._trace_transport is None:
+            super().send(message, response, write_characteristic, chunk)
+        else:
+            self._trace_transport.write(message, response, write_characteristic, chunk)
 
     def notify_callback(self, _sender:'BleakGATTCharacteristic', data:bytearray) -> None:
         if hasattr(self, '_async_loop_thread') and self._async_loop_thread is not None and self._read_queue is not None:
@@ -172,7 +200,8 @@ class Santoker(AsyncComm):
                 warmup_target: float = DEFAULT_WARMUP_TEMP_C,
                 ready_handler:Callable[[bool], None]|None = None,
                 diagnostics: SantokerDiagnosticsSession | None = None,
-                frame_handler:Callable[[], None]|None = None) -> None:
+                frame_handler:Callable[[], None]|None = None,
+                trace_handle:'SessionHandle|None' = None) -> None:
 
         self._diagnostics: SantokerDiagnosticsSession | None = diagnostics
         self._frame_handler:Callable[[], None]|None = frame_handler
@@ -242,8 +271,12 @@ class Santoker(AsyncComm):
         self._SCs:bool = False
         self._DROP:bool = False
 
-        self._ble_client:SantokerCube_BLE|None = \
-                (SantokerCube_BLE(self.read_msg, _connected, _disconnected) if self._connect_using_ble else None)
+        self._ble_client:SantokerCube_BLE|None = None
+        if self._connect_using_ble:
+            # Preserve the no-sink constructor/call shape for existing integrations.
+            self._ble_client = (SantokerCube_BLE(self.read_msg, _connected, _disconnected)
+                if trace_handle is None else
+                SantokerCube_BLE(self.read_msg, _connected, _disconnected, trace_handle=trace_handle))
 
 
     # external API to access machine state
@@ -740,13 +773,25 @@ class Santoker(AsyncComm):
         else:
             super().start(connect_timeout)
 
+    def request_trace_close(self, cleanup_timeout:float = 5.0) -> None:
+        """Record OFF before safety writes; stop() later starts transport cleanup."""
+        if self._ble_client is not None and self._ble_client._trace_transport is not None:
+            self._ble_client._trace_transport.request_close(cleanup_timeout)
+
+    @property
+    def trace_cleanup_complete(self) -> bool:
+        """Poll actual traced cleanup; never use a legacy stop callback as proof."""
+        return (self._ble_client is not None and self._ble_client._trace_transport is not None
+                and self._ble_client._trace_transport.cleanup_complete)
+
     @override
     def stop(self) -> None:
         self.resetProtocolState()
         if self._connect_using_ble and hasattr(self, '_ble_client') and self._ble_client is not None:
             self._ble_client.stop()
             #del self._ble_client # on this level the released object should be automatically collected by the GC
-            self._ble_client = None
+            if self._ble_client._trace_transport is None:
+                self._ble_client = None
         else:
             super().stop()
 

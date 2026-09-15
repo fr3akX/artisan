@@ -40,7 +40,7 @@ import time
 from typing import cast
 from uuid import uuid4
 
-from artisanlib.santoker_trace_contract import DEFAULT_LIMITS, FIELDS, Record, TraceLimits
+from artisanlib.santoker_trace_contract import DEFAULT_LIMITS, FIELDS, REASONS, Record, TraceLimits
 from artisanlib.santoker_trace_store import TraceStore, summary_record, utc_now
 
 
@@ -135,6 +135,14 @@ class SessionHandle:
     def request_close(self, *, cleanup_timeout: float = 5.0) -> None:
         """OFF intent only; keep accepting cleanup traffic until barrier/deadline."""
         self._recorder._request_close(self._session, cleanup_timeout)
+
+    def mark_incomplete(self, reason: str) -> None:
+        """Record known capture loss without inventing rejected raw admissions."""
+        if reason not in REASONS:
+            raise ValueError('invalid incomplete reason')
+        with self._recorder._condition:
+            if not self._session.stopped:
+                self._session.reasons.add(reason)
 
     def cleanup_finished(self) -> None:
         """Caller asserts the actual transport cleanup barrier has completed."""

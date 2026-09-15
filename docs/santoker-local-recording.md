@@ -1,6 +1,9 @@
 # Santoker local recorder/store foundation
 
-This slice is **not connected to BLE, roast controls, Qt, or HTTP**. The unchanged
+This foundation does not itself connect to BLE, roast controls, Qt, or HTTP.
+An optional [transport-only Santoker BLE adapter](santoker-ble-transport-tracing.md)
+now accepts its immutable handles; no application ON/OFF or HTTP wiring is enabled.
+The unchanged
 [wire contract](diagnostic-traces-v1.md) remains authoritative. No automatic
 upload, publication, retention eviction, credential persistence, or live device
 access is implemented.
@@ -28,6 +31,10 @@ access is implemented.
   No per-session timer thread is used. Post-seal callbacks return false without
   consuming sequence numbers. The caller remains responsible for actually
   cleaning up its transport; recorder sealing never cancels or proves cleanup.
+- `handle.mark_incomplete(reason)` records an allowlisted known loss reason under
+  the admission lock, without inventing rejected raw-admission counts. It does no
+  IO and cannot mutate a sealed/failed session. Parser overflow uses this when raw
+  RX was recorded but could not safely reach the parser.
 - `handle.status()` and `recorder.failure` are in-memory polling interfaces.
   Failures are sticky, fixed categories, not exception/configuration dumps.
   `stored_events` means journal writes accepted, not individually fsynced events.

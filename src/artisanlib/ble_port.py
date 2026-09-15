@@ -134,7 +134,8 @@ class BLE:
                 case_sensitive:bool,
                 disconnected_callback:Callable[[BleakClient], None]|None,
                 scan_timeout:float, connect_timeout:float,
-                address:str|None = None # if given, connect only to the device with this ble address
+                address:str|None = None, # if given, connect only to the device with this ble address
+                *, client_observer:Callable[[BleakClient], None]|None = None
                 ) -> tuple[BleakClient|None, str|None, str|None]:
         async with self._scan_and_connect_lock:
             # the lock ensures that only one scan/connect operation is running at any time
@@ -150,6 +151,13 @@ class BLE:
                         disconnected_callback=disconnected_callback,
                         service=([service_uuid] if service_uuid is not None else None),
                         timeout=connect_timeout)
+            if client_observer is not None:
+                # Traced owners retain a constructed client even if connect
+                # subsequently fails. No-sink call shape/behavior is unchanged.
+                try:
+                    client_observer(client)
+                except Exception:  # pylint: disable=broad-except
+                    _log.error('BLE client observer failed')
             try:
                 async with asyncio.timeout(connect_timeout):
                     await client.connect()
@@ -201,21 +209,20 @@ class BLE:
             disconnected_callback:Callable[[BleakClient], None]|None = None,
             scan_timeout:float=6,
             connect_timeout:float=6,
-            address:str|None = None # if given, connect only to the device with this ble address
+            address:str|None = None, # if given, connect only to the device with this ble address
+            *, client_observer:Callable[[BleakClient], None]|None = None
             ) -> tuple[BleakClient|None, str|None, str|None]:
         if hasattr(self, '_asyncLoopThread') and self._asyncLoopThread is None:
             self._asyncLoopThread = AsyncLoopThread()
         assert self._asyncLoopThread is not None
-        fut = asyncio.run_coroutine_threadsafe(
-                self._scan_and_connect(
-                    device_descriptions,
-                    blacklist,
-                    case_sensitive,
-                    disconnected_callback,
-                    scan_timeout,
-                    connect_timeout,
-                    address),
-                self._asyncLoopThread.loop)
+        # Keep the exact legacy positional shape when no observer is supplied.
+        coroutine = (self._scan_and_connect(
+            device_descriptions, blacklist, case_sensitive, disconnected_callback,
+            scan_timeout, connect_timeout, address) if client_observer is None else
+            self._scan_and_connect(
+                device_descriptions, blacklist, case_sensitive, disconnected_callback,
+                scan_timeout, connect_timeout, address, client_observer=client_observer))
+        fut = asyncio.run_coroutine_threadsafe(coroutine, self._asyncLoopThread.loop)
         try:
             return fut.result()
         except BleakBluetoothNotAvailableError:
