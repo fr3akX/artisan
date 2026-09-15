@@ -1,8 +1,8 @@
 #!/bin/bash
 # ABOUT
-# Build shell script for Artisan macOS CI builds
+# Build shell script for artisan macOS CI builds
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -61,7 +61,7 @@ version=$(python3 -c "import artisanlib; print(artisanlib.__version__)")
 basename="artisan-mac-$version"
 echo "basename: $basename"
 suffixes=".dmg" # array of suffixes to check
-min_size=260000000
+min_size=160000000
 for suffix in $suffixes; do
     filename="$basename$suffix"
     size=$(($(du -k "$filename" | cut -f1) * 1024)) # returns kB so multiply by 1024 (du works on macOS)

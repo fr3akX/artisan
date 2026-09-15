@@ -12,6 +12,7 @@ from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QHBoxLayout,
     QLineEdit,
     QPushButton,
@@ -71,13 +72,14 @@ def test_compact_controls_match_top_button_layout_height(
 
     controls_layout = controls.layout()
     assert controls.height() == top_button.height() == height
-    assert controls_layout is not None
-    assert (
-        controls.button.height()
-        + controls_layout.spacing()
-        + controls.target.height()
-        == height
-    )
+    assert isinstance(controls_layout, QBoxLayout)
+    if controls_layout.direction() == QBoxLayout.Direction.LeftToRight:
+        assert controls.button.height() == controls.target.height() == height
+    else:
+        assert controls.button.height() + controls_layout.spacing() + controls.target.height() == height
+    line_edit = controls.target.lineEdit()
+    assert line_edit is not None
+    assert line_edit.height() >= line_edit.fontMetrics().height()
     assert parent.sizeHint().height() == height
 
 
@@ -215,3 +217,23 @@ def test_set_state_blocks_button_signal(qapplication: QApplication) -> None:  # 
 
     assert controls.button.isChecked()
     changed.assert_not_called()
+
+
+@pytest.mark.parametrize('heights', [(30, 70), (70, 30)])
+def test_compact_layout_adapts_without_clipping(
+    qapplication: QApplication, heights: tuple[int, int],
+) -> None:
+    controls = SantokerWarmupControls()
+    controls.configureTarget('F', 374)
+    for height in heights:
+        controls.setCompactHeight(height)
+        controls.show()
+        qapplication.processEvents()
+        layout = controls.layout()
+        assert isinstance(layout, QBoxLayout)
+        expected = QBoxLayout.Direction.LeftToRight if height == 30 else QBoxLayout.Direction.TopToBottom
+        assert layout.direction() == expected
+        line_edit = controls.target.lineEdit()
+        assert line_edit is not None
+        assert line_edit.height() >= line_edit.fontMetrics().height()
+        assert controls.target.value() == 374

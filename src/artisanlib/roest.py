@@ -1,8 +1,8 @@
 #
 # ABOUT
-# ROEST CSV Roast Profile importer for Artisan
+# ROEST CSV roast profile importer for artisan scope
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -34,7 +34,7 @@ from typing import TypedDict, Final, NotRequired, TYPE_CHECKING
 if TYPE_CHECKING:
     from artisanlib.main import ApplicationWindow # noqa: F401 # pylint: disable=unused-import
 
-from PyQt6.QtWidgets import (QApplication, QGroupBox, QHBoxLayout,
+from PyQt6.QtWidgets import (QApplication, QGroupBox, QHBoxLayout, QLayout,
     QVBoxLayout, QLabel, QLineEdit, QToolButton, QDialogButtonBox, QComboBox)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QKeySequence, QAction, QIcon
@@ -42,6 +42,7 @@ from PyQt6.QtGui import QKeySequence, QAction, QIcon
 from artisanlib.util import encodeLocalStrict, getResourcePath
 from artisanlib.atypes import ProfileData
 from artisanlib.dialogs import ArtisanDialog
+from artisanlib.widgets import StyledQLineEdit
 
 _log: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -467,15 +468,14 @@ class ROESTdialog(ArtisanDialog):
             cancelAction.setShortcut(QKeySequence.StandardKey.Cancel)
             self.cancel_button.addActions([cancelAction])
 
-
         self.labelTitle:QLabel = QLabel('ROEST')
 
-        self.textClientId:QLineEdit = QLineEdit(self)
+        self.textClientId = StyledQLineEdit(self)
         self.textClientId.setMinimumWidth(300)
         self.textClientId.setPlaceholderText('Client Id')
         self.textClientId.setText(self.client_id)
 
-        self.textClientSecret:QLineEdit = QLineEdit(self)
+        self.textClientSecret = StyledQLineEdit(self)
         self.textClientSecret.setPlaceholderText('Secret')
         self.textClientSecret.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
         self.textClientSecret.setText(self.client_secret)
@@ -543,7 +543,10 @@ class ROESTdialog(ArtisanDialog):
         layout.addLayout(buttonLayout)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(5)
-        self.setLayout(layout)
+
+        # not resizable
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        self.setSizeGripEnabled(False)
 
     @pyqtSlot(str)
     def textChanged(self, _:str) -> None:
@@ -582,10 +585,13 @@ def selectROESTmachine(aw:'ApplicationWindow') -> RoestMachine|None:
     global clientId, clientSecret # pylint:disable=global-statement
     rd = ROESTdialog(aw, clientId, clientSecret)
     rd.setWindowFlags(Qt.WindowType.Sheet)
-    rd.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    rd.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
     if rd.exec():
         # login dialog not canceled
         clientId = rd.client_id
         clientSecret = rd.client_secret
-        return rd.selected_machine
+        selected_machine = rd.selected_machine
+        rd.destroy()
+        del rd
+        return selected_machine
     return None

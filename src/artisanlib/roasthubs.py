@@ -2,7 +2,7 @@
 # ABOUT
 # Profile upload to RoastHubs platform
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from proto import artisan_roast_pb2 # pylint: disable=unused-import
 
 from PyQt6.QtWidgets import (QApplication, QGroupBox, QHBoxLayout,
-    QVBoxLayout, QLabel, QLineEdit, QDialogButtonBox)
+    QVBoxLayout, QLabel, QLineEdit, QDialogButtonBox, QLayout)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QKeySequence, QAction
 
@@ -49,7 +49,7 @@ from PyQt6.QtGui import QKeySequence, QAction
 from artisanlib import __version__
 from artisanlib.util import roast_message
 from artisanlib.dialogs import ArtisanDialog
-
+from artisanlib.widgets import StyledQLineEdit
 
 _log: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ async def send_roast(roast:'artisan_roast_pb2.Roast', token:str,
         async with aiohttp.ClientSession() as session:
             headers = {
                 'Content-Type': 'application/protobuf',
-                'User-Agent': f'Artisan/{__version__}',
+                'User-Agent': f'artisan/{__version__}',
                 'Accept-Encoding': 'deflate, compress, gzip',
                 'Authorization': f'Bearer {token}',
                 'Idempotency-Key': uuid.uuid4().hex
@@ -105,11 +105,47 @@ async def send_roast(roast:'artisan_roast_pb2.Roast', token:str,
         _log.error('exception in roasthubs:send_roast: %s', e)
 
 
-def send_profile(profile:'ProfileData', org_id:str, machine_id:str, token:str,
-        on_success:Callable[[], None] | None, on_failure:Callable[[], None] | None) -> None:
+def send_profile(
+        profile:'ProfileData',
+        org_id:str,
+        machine_id:str,
+        token:str,
+        # filter conf
+        interpolate_drops:bool = True,
+        curvefilter:int = 3,
+        medfilt_factor:int = 3,
+        limit_ror:bool = True,
+        ror_limit_min:int = 0,
+        ror_limit_max:int = 170,
+        delta_span_ET:int = 20,
+        delta_span_BT:int = 20,
+        medfilt_factor_RoR:int = 3,
+        delta_ET_filter:int = 7,
+        delta_BT_filter:int = 7,
+        # handlers
+        on_success:Callable[[], None] | None = None,
+        on_failure:Callable[[], None] | None = None) -> None:
     if org_id != '' and machine_id != '' and token != '':
         # only if org_id and machin_id are not empty the connector is active
-        roast:artisan_roast_pb2.Roast|None = roast_message(profile, org_id=org_id, machine_id=machine_id) # pylint: disable=no-member
+        roast:artisan_roast_pb2.Roast|None = roast_message( # pylint: disable=no-member
+                profile,
+                org_id=org_id,
+                machine_id=machine_id,
+                # filter conf
+                interpolate_drops=interpolate_drops,
+                smooth_curves=True,
+                curvefilter=curvefilter,
+                medfilt_factor=medfilt_factor,
+                decay_smoothing_p=False, # optimal smoothing # qmc.optimalSmoothing
+                limit_ror=limit_ror,
+                ror_limit_min=ror_limit_min,
+                ror_limit_max=ror_limit_max,
+                delta_span_ET=delta_span_ET,
+                delta_span_BT=delta_span_BT,
+                medfilt_factor_RoR=medfilt_factor_RoR,
+                delta_ET_filter=delta_ET_filter,
+                delta_BT_filter=delta_BT_filter
+            ) # pylint: disable=no-member
         if roast is not None:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 executor.submit(asyncio.run, send_roast(roast, token, on_success, on_failure))
@@ -178,20 +214,19 @@ class RoastHubsdialog(ArtisanDialog):
             cancelAction.setShortcut(QKeySequence.StandardKey.Cancel)
             self.cancel_button.addActions([cancelAction])
 
-
         self.labelTitle:QLabel = QLabel('RoastHubs')
 
-        self.textOrgId:QLineEdit = QLineEdit(self)
+        self.textOrgId = StyledQLineEdit(self)
         self.textOrgId.setMinimumWidth(300)
         self.textOrgId.setPlaceholderText(QApplication.translate('Label','Organization ID'))
         self.textOrgId.setText(self.org_id)
 
-        self.textMachineId:QLineEdit = QLineEdit(self)
+        self.textMachineId = StyledQLineEdit(self)
         self.textMachineId.setMinimumWidth(300)
         self.textMachineId.setPlaceholderText(QApplication.translate('Label','Machine ID'))
         self.textMachineId.setText(self.machine_id)
 
-        self.textSecret:QLineEdit = QLineEdit(self)
+        self.textSecret = StyledQLineEdit(self)
         self.textSecret.setPlaceholderText(QApplication.translate('Label','Token'))
         self.textSecret.setEchoMode(QLineEdit.EchoMode.Password)
         self.textSecret.setText(self.token)
@@ -229,7 +264,10 @@ class RoastHubsdialog(ArtisanDialog):
         layout.addLayout(buttonLayout)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(5)
-        self.setLayout(layout)
+
+        # not resizable
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        self.setSizeGripEnabled(False)
 
 
     @pyqtSlot(str)
@@ -259,12 +297,14 @@ def setRoastHubsCredentials(aw:'ApplicationWindow', org_id:str, machine_id:str, 
 def configureConnection(aw:'ApplicationWindow') -> bool:
     rd = RoastHubsdialog(aw)
     rd.setWindowFlags(Qt.WindowType.Sheet)
-    rd.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    rd.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
     if rd.exec():
         # login dialog not canceled
         try:
             setRoastHubsCredentials(aw, rd.org_id, rd.machine_id, rd.token)
         except Exception as e:  # pylint: disable=broad-except
             _log.exception(e)
+        rd.destroy()
+        del rd
         return True
     return False

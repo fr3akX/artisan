@@ -1,8 +1,8 @@
 #
 # ABOUT
-# Artisan PID Controllers (Fuji, DTA, Arduino TC4)
+# artisan scope PID control (Fuji, DTA, Arduino TC4, artisan)
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -44,6 +44,7 @@ from typing import Final, TYPE_CHECKING
 if TYPE_CHECKING:
     from artisanlib.main import ApplicationWindow # pylint: disable=unused-import
 
+from artisanlib.button_style import artisan_push_button_style_dict
 from artisanlib.util import fromCtoFstrict, fromFtoCstrict, hex2int, str2cmd, stringfromseconds, cmd2str, float2float
 
 from PyQt6.QtCore import pyqtSlot
@@ -52,6 +53,10 @@ from PyQt6.QtWidgets import QApplication
 _log: Final[logging.Logger] = logging.getLogger(__name__)
 
 class FujiPID:
+
+    __slots__ = [ 'aw', 'followBackground', 'lookahead', 'rampsoak', 'sv', 'PXGthermotypes', 'PXFthermotypes', 'PXGconversiontoindex',
+         'PXFthermotypes', 'PXFconversiontoindex', 'PXRthermotypes', 'PXRconversiontoindex', 'PXG4', 'PXR', 'PXF' ]
+
     def __init__(self, aw:'ApplicationWindow') -> None:
         self.aw = aw
 
@@ -296,20 +301,20 @@ class FujiPID:
             ikey = 'i' + str(k)
             dkey = 'd' + str(k)
             if self.aw.ser.useModbusPort:
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXG4[pkey][1],6)
+                reg = self.aw.modbus.address2register(self.PXG4[pkey][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,int(float(newPvalue)*10.))
                 libtime.sleep(0.035)
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXG4[ikey][1],6)
+                reg = self.aw.modbus.address2register(self.PXG4[ikey][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,int(float(newIvalue)*10.))
                 libtime.sleep(0.035)
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXG4[dkey][1],6)
+                reg = self.aw.modbus.address2register(self.PXG4[dkey][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,int(float(newDvalue)*10.))
                 libtime.sleep(0.035)
                 p = i = d = b'        '
             else:
-                commandp = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXG4[pkey][1]),int(float(newPvalue)*10.))
-                commandi = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXG4[ikey][1]),int(float(newIvalue)*10.))
-                commandd = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXG4[dkey][1]),int(float(newDvalue)*10.))
+                commandp = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXG4[pkey][1]),int(float(newPvalue)*10.))
+                commandi = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXG4[ikey][1]),int(float(newIvalue)*10.))
+                commandd = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXG4[dkey][1]),int(float(newDvalue)*10.))
                 p = self.aw.ser.sendFUJIcommand(commandp,8)
                 libtime.sleep(0.035)
                 i = self.aw.ser.sendFUJIcommand(commandi,8)
@@ -318,9 +323,9 @@ class FujiPID:
                 libtime.sleep(0.035)
             #verify it went ok
             if len(p) == 8 and len(i)==8 and len(d) == 8:
-                self.aw.fujipid.PXG4[pkey][0] = float(newPvalue)
-                self.aw.fujipid.PXG4[ikey][0] = float(newIvalue)
-                self.aw.fujipid.PXG4[dkey][0] = float(newDvalue)
+                self.PXG4[pkey][0] = float(newPvalue)
+                self.PXG4[ikey][0] = float(newIvalue)
+                self.PXG4[dkey][0] = float(newDvalue)
                 message = QApplication.translate('StatusBar','pid #{0} successfully set to ({1},{2},{3})'
                                                        ).format(str(k),str(newPvalue),str(newIvalue),str(newDvalue))
                 self.aw.sendmessage(message)
@@ -341,20 +346,20 @@ class FujiPID:
             ikey = 'i' + str(k)
             dkey = 'd' + str(k)
             if self.aw.ser.useModbusPort:
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXF[pkey][1],6)
+                reg = self.aw.modbus.address2register(self.PXF[pkey][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,int(float(newPvalue)*10.))
                 libtime.sleep(0.035)
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXF[ikey][1],6)
+                reg = self.aw.modbus.address2register(self.PXF[ikey][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,int(float(newIvalue)*10.))
                 libtime.sleep(0.035)
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXF[dkey][1],6)
+                reg = self.aw.modbus.address2register(self.PXF[dkey][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,int(float(newDvalue)*10.))
                 libtime.sleep(0.035)
                 p = i = d = b'        '
             else:
-                commandp = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXF[pkey][1]),int(float(newPvalue)*10.))
-                commandi = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXF[ikey][1]),int(float(newIvalue)*10.))
-                commandd = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXF[dkey][1]),int(float(newDvalue)*10.))
+                commandp = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXF[pkey][1]),int(float(newPvalue)*10.))
+                commandi = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXF[ikey][1]),int(float(newIvalue)*10.))
+                commandd = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXF[dkey][1]),int(float(newDvalue)*10.))
                 p = self.aw.ser.sendFUJIcommand(commandp,8)
                 libtime.sleep(0.035)
                 i = self.aw.ser.sendFUJIcommand(commandi,8)
@@ -363,9 +368,9 @@ class FujiPID:
                 libtime.sleep(0.035)
             #verify it went ok
             if len(p) == 8 and len(i)==8 and len(d) == 8:
-                self.aw.fujipid.PXF[pkey][0] = float(newPvalue)
-                self.aw.fujipid.PXF[ikey][0] = float(newIvalue)
-                self.aw.fujipid.PXF[dkey][0] = float(newDvalue)
+                self.PXF[pkey][0] = float(newPvalue)
+                self.PXF[ikey][0] = float(newIvalue)
+                self.PXF[dkey][0] = float(newDvalue)
                 message = QApplication.translate('StatusBar','pid #{0} successfully set to ({1},{2},{3})'
                                                        ).format(str(k),str(newPvalue),str(newIvalue),str(newDvalue))
                 self.aw.sendmessage(message)
@@ -382,11 +387,11 @@ class FujiPID:
     def getCurrentRampSoakMode(self) -> float|int|None:
         register: int
         if self.aw.ser.controlETpid[0] == 0: # PXG
-            register = int(self.aw.fujipid.PXG4['rampsoakmode'][1])
+            register = int(self.PXG4['rampsoakmode'][1])
         elif self.aw.ser.controlETpid[0] == 1: # PXR
-            register = int(self.aw.fujipid.PXR['rampsoakmode'][1])
+            register = int(self.PXR['rampsoakmode'][1])
         elif self.aw.ser.controlETpid[0] == 4: # PXF
-            register = int(self.aw.fujipid.PXF['rampsoakmode'][1])
+            register = int(self.PXF['rampsoakmode'][1])
         else:
             return None
         currentmode: float|int|None
@@ -394,40 +399,40 @@ class FujiPID:
             reg = self.aw.modbus.address2register(register,3)
             currentmode = self.aw.modbus.readSingleRegister(self.aw.ser.controlETpid[1],reg,3)
         else:
-            msg = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],3,register,1)
-            currentmode = self.aw.fujipid.readoneword(msg)
+            msg = self.message2send(self.aw.ser.controlETpid[1],3,register,1)
+            currentmode = self.readoneword(msg)
         if currentmode is not None:
             if self.aw.ser.controlETpid[0] == 0: # PXG
-                self.aw.fujipid.PXG4['rampsoakmode'][0] = currentmode
+                self.PXG4['rampsoakmode'][0] = currentmode
             elif self.aw.ser.controlETpid[0] == 1: # PXR
-                self.aw.fujipid.PXR['rampsoakmode'][0] = currentmode
+                self.PXR['rampsoakmode'][0] = currentmode
             elif self.aw.ser.controlETpid[0] == 4: # PXF
-                self.aw.fujipid.PXF['rampsoakmode'][0] = currentmode
+                self.PXF['rampsoakmode'][0] = currentmode
         return currentmode
 
     def getCurrentPIDnumberPXG(self) -> int:
         N:int = -1
         if self.aw.ser.useModbusPort:
-            reg = self.aw.modbus.address2register(self.aw.fujipid.PXG4['selectedpid'][1],3)
+            reg = self.aw.modbus.address2register(self.PXG4['selectedpid'][1],3)
             Nr = self.aw.modbus.readSingleRegister(self.aw.ser.controlETpid[1],reg,3)
             if Nr is None:
                 N = -1
         else:
-            command = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],3,int(self.aw.fujipid.PXG4['selectedpid'][1]),1)
-            N = self.aw.fujipid.readoneword(command)
+            command = self.message2send(self.aw.ser.controlETpid[1],3,int(self.PXG4['selectedpid'][1]),1)
+            N = self.readoneword(command)
         libtime.sleep(0.035)
         return N
 
     def getCurrentPIDnumberPXF(self) -> int:
         N:int = -1
         if self.aw.ser.useModbusPort:
-            reg = self.aw.modbus.address2register(self.aw.fujipid.PXF['selectedpid'][1],3)
+            reg = self.aw.modbus.address2register(self.PXF['selectedpid'][1],3)
             Nr = self.aw.modbus.readSingleRegister(self.aw.ser.controlETpid[1],reg,3)
             if Nr is None:
                 N = -1
         else:
-            command = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],3,int(self.aw.fujipid.PXF['selectedpid'][1]),1)
-            N = self.aw.fujipid.readoneword(command)
+            command = self.message2send(self.aw.ser.controlETpid[1],3,int(self.PXF['selectedpid'][1]),1)
+            N = self.readoneword(command)
         libtime.sleep(0.035)
         return N
 
@@ -436,40 +441,40 @@ class FujiPID:
         if var == 'p':
             p = int(v*10)
             if self.aw.ser.useModbusPort:
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXR['p'][1],6)
+                reg = self.aw.modbus.address2register(self.PXR['p'][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,p)
                 r = b'        '
             else:
-                command = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXR['p'][1]),p)
+                command = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXR['p'][1]),p)
                 r = self.aw.ser.sendFUJIcommand(command,8)
         elif var == 'i':
             i = int(v*10)
             if self.aw.ser.useModbusPort:
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXR['i'][1],6)
+                reg = self.aw.modbus.address2register(self.PXR['i'][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,i)
                 r = b'        '
             else:
-                command = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXR['i'][1]),i)
+                command = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXR['i'][1]),i)
                 r = self.aw.ser.sendFUJIcommand(command,8)
         elif var == 'd':
             d = int(v*10)
             if self.aw.ser.useModbusPort:
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXR['d'][1],6)
+                reg = self.aw.modbus.address2register(self.PXR['d'][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,d)
                 r = b'        '
             else:
-                command = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXR['d'][1]),d)
+                command = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXR['d'][1]),d)
                 r = self.aw.ser.sendFUJIcommand(command,8)
 
         if len(r) == 8:
             message = QApplication.translate('StatusBar','{0} successfully sent to pid').format(var)
             self.aw.sendmessage(message)
             if var == 'p':
-                self.aw.fujipid.PXR['p'][0] = int(v)
+                self.PXR['p'][0] = int(v)
             elif var == 'i':
-                self.aw.fujipid.PXR['i'][0] = int(v)
+                self.PXR['i'][0] = int(v)
             elif var == 'd':
-                self.aw.fujipid.PXR['d'][0] = int(v)
+                self.PXR['d'][0] = int(v)
         else:
             message = QApplication.translate('StatusBar','setpid(): There was a problem setting {0}').format(var)
             self.aw.sendmessage(message)
@@ -630,7 +635,7 @@ class FujiPID:
             self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,mode)
             r = b''
         else:
-            command = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,register,mode)
+            command = self.message2send(self.aw.ser.controlETpid[1],6,register,mode)
             r = self.aw.ser.sendFUJIcommand(command,8)
         if self.aw.ser.useModbusPort or len(r) == 8:
             if self.aw.ser.controlETpid[0] == 0: #Fuji PXG
@@ -659,10 +664,10 @@ class FujiPID:
                 reg = self.aw.modbus.address2register(register,6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,flag)
                 if flag == 1:
-                    self.aw.fujipid.rampsoak = True
+                    self.rampsoak = True
                     self.aw.sendmessage(QApplication.translate('Message','RS ON'))
                 elif flag == 0:
-                    self.aw.fujipid.rampsoak = False
+                    self.rampsoak = False
                     self.aw.sendmessage(QApplication.translate('Message','RS OFF'))
                 else:
                     self.aw.sendmessage(QApplication.translate('Message','RS on HOLD'))
@@ -673,10 +678,10 @@ class FujiPID:
             #if OK
             if r == command:
                 if flag == 1:
-                    self.aw.fujipid.rampsoak = True
+                    self.rampsoak = True
                     self.aw.sendmessage(QApplication.translate('Message','RS ON'))
                 elif flag == 0:
-                    self.aw.fujipid.rampsoak = False
+                    self.rampsoak = False
                     self.aw.sendmessage(QApplication.translate('Message','RS OFF'))
                 else:
                     self.aw.sendmessage(QApplication.translate('Message','RS on HOLD'))
@@ -693,11 +698,11 @@ class FujiPID:
         #Fuji PXG
         register:int
         if self.aw.ser.controlETpid[0] == 0:
-            register = int(self.aw.fujipid.PXG4['runstandby'][1])
+            register = int(self.PXG4['runstandby'][1])
         elif self.aw.ser.controlETpid[0] == 1:
-            register = int(self.aw.fujipid.PXR['runstandby'][1])
+            register = int(self.PXR['runstandby'][1])
         elif self.aw.ser.controlETpid[0] == 4:
-            register = int(self.aw.fujipid.PXF['runstandby'][1])
+            register = int(self.PXF['runstandby'][1])
         else:
             return False
         r = None
@@ -706,16 +711,16 @@ class FujiPID:
             reg = self.aw.modbus.address2register(register,6)
             self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,flag)
         else:
-            command = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],6,register,flag)
+            command = self.message2send(self.aw.ser.controlETpid[1],6,register,flag)
             #TX and RX
             r = self.aw.ser.sendFUJIcommand(command,8)
         if self.aw.ser.useModbusPort or (command is not None and r == command):
             if self.aw.ser.controlETpid[0] == 0:
-                self.aw.fujipid.PXG4['runstandby'][0] = flag
+                self.PXG4['runstandby'][0] = flag
             elif self.aw.ser.controlETpid[0] == 1:
-                self.aw.fujipid.PXR['runstandby'][0] = flag
+                self.PXR['runstandby'][0] = flag
             elif self.aw.ser.controlETpid[0] == 4:
-                self.aw.fujipid.PXF['runstandby'][0] = flag
+                self.PXF['runstandby'][0] = flag
             return True
         mssg = QApplication.translate('Error Message','Exception:') + ' setONOFFstandby()'
         self.aw.qmc.adderror(mssg)
@@ -723,11 +728,11 @@ class FujiPID:
 
     def getONOFFstandby(self) -> int|None:
         if self.aw.ser.controlETpid[0] == 0:
-            return int(self.aw.fujipid.PXG4['runstandby'][0])
+            return int(self.PXG4['runstandby'][0])
         if self.aw.ser.controlETpid[0] == 1:
-            return int(self.aw.fujipid.PXR['runstandby'][0])
+            return int(self.PXR['runstandby'][0])
         if self.aw.ser.controlETpid[0] == 4:
-            return int(self.aw.fujipid.PXF['runstandby'][0])
+            return int(self.PXF['runstandby'][0])
         return None
 
     #sets a new sv value (if silent=False, no output nor event recording is done, if move is True the SV slider is moved)
@@ -790,17 +795,17 @@ class FujiPID:
         elif self.aw.ser.controlETpid[0] == 1:
             r = None
             if self.aw.ser.useModbusPort:
-                reg = self.aw.modbus.address2register(self.aw.fujipid.PXR['sv0'][1],6)
+                reg = self.aw.modbus.address2register(self.PXR['sv0'][1],6)
                 self.aw.modbus.writeSingleRegister(self.aw.ser.controlETpid[1],reg,int(value*10))
             else:
-                command = self.message2send(self.aw.ser.controlETpid[1],6,int(self.aw.fujipid.PXR['sv0'][1]),int(value*10))
+                command = self.message2send(self.aw.ser.controlETpid[1],6,int(self.PXR['sv0'][1]),int(value*10))
                 r = self.aw.ser.sendFUJIcommand(command,8)
             #check response
             if self.aw.ser.useModbusPort or (r is not None and r == command):
                 if not silent:
                     # [Not sure the following will translate or even format properly... Need testing!]
                     message = QApplication.translate('Message','PXR sv set to {0}').format(f'{float(value):.1f}')
-                    self.aw.fujipid.PXR['sv0'][0] = value
+                    self.PXR['sv0'][0] = value
                     self.aw.sendmessage(message)
                     #record command as an Event
                     strcommand = f'SETSV::{float(value):.1f}'
@@ -833,8 +838,8 @@ class FujiPID:
                     reg = self.aw.modbus.address2register(reg_dict['selectsv'][1],3)
                     N = self.aw.modbus.readSingleRegister(self.aw.ser.controlETpid[1],reg,3)
                 else:
-                    command = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],3,int(reg_dict['selectsv'][1]),1)
-                    N = self.aw.fujipid.readoneword(command)
+                    command = self.message2send(self.aw.ser.controlETpid[1],3,int(reg_dict['selectsv'][1]),1)
+                    N = self.readoneword(command)
                 if N is not None and N > 0:
                     reg_dict['selectsv'][0] = N
                 #-- experimental end
@@ -977,8 +982,8 @@ class FujiPID:
             reg = self.aw.modbus.address2register(register,3)
             sv = self.aw.modbus.readSingleRegister(self.aw.ser.controlETpid[1],reg,3)
         else:
-            svcommand = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],3,register,1)
-            sv = self.aw.fujipid.readoneword(svcommand)
+            svcommand = self.message2send(self.aw.ser.controlETpid[1],3,register,1)
+            sv = self.readoneword(svcommand)
         if sv is None or sv == -1:
             return -1
         reg_dict[svkey][0] = sv/10.              #divide by 10 because the decimal point is not sent by the PID
@@ -989,8 +994,8 @@ class FujiPID:
             reg = self.aw.modbus.address2register(register,3)
             ramp = self.aw.modbus.readSingleRegister(self.aw.ser.controlETpid[1],reg,3)
         else:
-            rampcommand = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],3,register,1)
-            ramp = self.aw.fujipid.readoneword(rampcommand)
+            rampcommand = self.message2send(self.aw.ser.controlETpid[1],3,register,1)
+            ramp = self.readoneword(rampcommand)
 
         if ramp is None or ramp == -1:
             return -1
@@ -1002,8 +1007,8 @@ class FujiPID:
             reg = self.aw.modbus.address2register(register,3)
             soak = self.aw.modbus.readSingleRegister(self.aw.ser.controlETpid[1],reg,3)
         else:
-            soakcommand = self.aw.fujipid.message2send(self.aw.ser.controlETpid[1],3,register,1)
-            soak = self.aw.fujipid.readoneword(soakcommand)
+            soakcommand = self.message2send(self.aw.ser.controlETpid[1],3,register,1)
+            soak = self.readoneword(soakcommand)
         if soak is None or soak == -1:
             return -1
         reg_dict[soakkey][0] = soak
@@ -1210,7 +1215,7 @@ class PIDcontrol:
         self.negativeTargetMin:int = 0
         self.negativeTargetMax:int = 100
         # derivative filter
-        self.derivative_filter:int = 0 # 0: off, 1: on
+        self.derivative_filter:int = 0 # 0: off, >0: on
         # duty filter
         self.duty_filter:int = 0 # 0: off, 1: on
         # sv smoothing
@@ -1496,12 +1501,20 @@ class PIDcontrol:
         if (self.externalPIDControl() == 1 and self.aw.modbus.PID_ON_action and self.aw.modbus.PID_ON_action != ''):
             self.aw.eventaction(4,self.aw.modbus.PID_ON_action)
             self.pidActive = True
-            self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PIDactive'])
+            self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PIDactive'].format(
+                min_width=self.aw.main_button_min_width,
+                font_size=self.aw.button_font_size,
+                border_radius=self.aw.button_border_radius))
+
         # S7 hardware PID
         elif (self.externalPIDControl() == 2 and self.aw.s7.PID_ON_action and self.aw.s7.PID_ON_action != ''):
             self.aw.eventaction(15,self.aw.s7.PID_ON_action)
             self.pidActive = True
-            self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PIDactive'])
+            self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PIDactive'].format(
+                min_width=self.aw.main_button_min_width,
+                font_size=self.aw.button_font_size,
+                border_radius=self.aw.button_border_radius))
+
         elif self.aw.qmc.device == 19 and self.aw.qmc.PIDbuttonflag: # ArduinoTC4 firmware PID
             if send_command and self.aw.ser.ArduinoIsInitialized:
                 self.confPID(self.pidKp,self.pidKi,self.pidKd,self.pidSource,self.pidCycle) # first configure PID according to the actual settings
@@ -1514,7 +1527,10 @@ class PIDcontrol:
                         self.aw.ser.SP.write(str2cmd('PID;LIMIT;' + str(duty_min) + ';' + str(duty_max) + '\n'))
                         self.aw.ser.SP.write(str2cmd('PID;ON\n'))
                         self.pidActive = True
-                        self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PIDactive'])
+                        self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PIDactive'].format(
+                            min_width=self.aw.main_button_min_width,
+                            font_size=self.aw.button_font_size,
+                            border_radius=self.aw.button_border_radius))
                         self.aw.sendmessage(QApplication.translate('Message','PID turned on'))
                 finally:
                     if self.aw.ser.COMsemaphore.available() < 1:
@@ -1525,14 +1541,20 @@ class PIDcontrol:
                 self.aw.kaleido.pidON()
             self.pidActive = True
             self.aw.qmc.pid.on()
-            self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PIDactive'])
+            self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PIDactive'].format(
+                min_width=self.aw.main_button_min_width,
+                font_size=self.aw.button_font_size,
+                border_radius=self.aw.button_border_radius))
         elif self.aw.qmc.Controlbuttonflag:
             # software PID
             if not self.pidActive: # only if not yet active!
                 self.confSoftwarePID()
                 self.pidActive = True
                 self.aw.qmc.pid.on()
-                self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PIDactive'])
+                self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PIDactive'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
                 self.aw.qmc.pid.setTarget(self.svValue,init=False)
         if self.sv is None and self.svMode == 0: # only in manual SV mode we initialize the SV on PID ON
             self.setSV(self.svValue)
@@ -1548,13 +1570,19 @@ class PIDcontrol:
         if (self.externalPIDControl() == 1 and self.aw.modbus.PID_OFF_action and self.aw.modbus.PID_OFF_action != ''):
             self.aw.eventaction(4,self.aw.modbus.PID_OFF_action)
             if not self.aw.HottopControlActive:
-                self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PID'])
+                self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PID'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
             self.pidActive = False
         # S7 hardware PID
         elif (self.externalPIDControl() == 2 and self.aw.s7.PID_OFF_action and self.aw.s7.PID_OFF_action != ''):
             self.aw.eventaction(15,self.aw.s7.PID_OFF_action)
             if not self.aw.HottopControlActive:
-                self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PID'])
+                self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PID'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
             self.pidActive = False
         # TC4 hardware PID
         elif self.aw.qmc.device == 19 and self.aw.qmc.PIDbuttonflag and self.aw.qmc.Controlbuttonflag: # ArduinoTC4 firmware PID
@@ -1571,7 +1599,10 @@ class PIDcontrol:
                     if self.aw.ser.COMsemaphore.available() < 1:
                         self.aw.ser.COMsemaphore.release(1)
                 if not self.aw.HottopControlActive:
-                    self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PID'])
+                    self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PID'].format(
+                        min_width=self.aw.main_button_min_width,
+                        font_size=self.aw.button_font_size,
+                        border_radius=self.aw.button_border_radius))
                 self.pidActive = False
         elif self.aw.qmc.Controlbuttonflag and self.externalPIDControl() == 4 and self.aw.kaleido is not None:
             # Kaleido PID
@@ -1579,14 +1610,20 @@ class PIDcontrol:
                 self.aw.kaleido.pidOFF()
             self.pidActive = False
             self.aw.qmc.pid.off()
-            self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PID'])
+            self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PID'].format(
+                min_width=self.aw.main_button_min_width,
+                font_size=self.aw.button_font_size,
+                border_radius=self.aw.button_border_radius))
         elif self.aw.qmc.Controlbuttonflag:
             # software PID
             self.aw.qmc.pid.setControl(lambda _: None)
             self.pidActive = False
             self.aw.qmc.pid.off()
             if not self.aw.HottopControlActive:
-                self.aw.buttonCONTROL.setStyleSheet(self.aw.pushbuttonstyles['PID'])
+                self.aw.buttonCONTROL.setStyleSheet(artisan_push_button_style_dict['PID'].format(
+                    min_width=self.aw.main_button_min_width,
+                    font_size=self.aw.button_font_size,
+                    border_radius=self.aw.button_border_radius))
 
     @pyqtSlot(int)
     def sliderMinValueChanged(self, i:int) -> None:
@@ -1842,20 +1879,10 @@ class PIDcontrol:
 
     def showSVButtons(self) -> None:
         if self.aw.qmc.flagon and self.aw.qmc.Controlbuttonflag:
-            self.aw.buttonSVp5.setVisible(True)
-            self.aw.buttonSVp10.setVisible(True)
-            self.aw.buttonSVp20.setVisible(True)
-            self.aw.buttonSVm20.setVisible(True)
-            self.aw.buttonSVm10.setVisible(True)
-            self.aw.buttonSVm5.setVisible(True)
+            self.aw.pidbuttonFrame.setVisible(True)
 
     def hideSVButtons(self) -> None:
-        self.aw.buttonSVp5.setVisible(False)
-        self.aw.buttonSVp10.setVisible(False)
-        self.aw.buttonSVp20.setVisible(False)
-        self.aw.buttonSVm20.setVisible(False)
-        self.aw.buttonSVm10.setVisible(False)
-        self.aw.buttonSVm5.setVisible(False)
+        self.aw.pidbuttonFrame.setVisible(False)
 
     def activateONOFFeasySV(self, flag:bool) -> None:
         if flag:
@@ -1937,6 +1964,9 @@ class PIDcontrol:
 # documentation
 # http://www.deltaww.hu/homersekletszabalyozok/DTA_series_temperature_controller_instruction_sheet_English.pdf
 class DtaPID:
+
+    __slots__ = [ 'aw', 'dtamem' ]
+
     def __init__(self, aw:'ApplicationWindow') -> None:
         self.aw = aw
 
@@ -1969,7 +1999,7 @@ class DtaPID:
             deviceID = self.aw.ser.controlETpid[1]
             if self.aw.ser.controlETpid[0] != 2: # control pid is not a DTA PID
                 deviceID = self.aw.ser.readBTpid[1]
-            command = self.aw.dtapid.message2send(deviceID,6,str(DTAaddress),newsv)
+            command = self.message2send(deviceID,6,str(DTAaddress),newsv)
             self.aw.ser.sendDTAcommand(command)
         except Exception:  # pylint: disable=broad-except
             pass

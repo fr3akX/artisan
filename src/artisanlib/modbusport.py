@@ -1,8 +1,8 @@
 #
 # ABOUT
-# MODBUS support for Artisan
+# MODBUS support for artisan scope
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -134,7 +134,7 @@ class modbusport:
         self.PID_ON_action:str = ''
         self.PID_OFF_action:str = ''
 
-        self.channels:Final[int] = 10
+        self.channels:Final[int] = 12
         self.inputDeviceIds:list[int] = [0] * self.channels
         self.inputRegisters:list[int] = [0]*self.channels
         # decoding (default: 16bit uInt)

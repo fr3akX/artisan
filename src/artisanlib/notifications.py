@@ -1,8 +1,8 @@
 #
 # ABOUT
-# Artisan Notification System
+# artisan scope notification aystem
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -191,21 +191,23 @@ class NotificationManager(QObject):
     # returns the plus icon as QIcon
     @staticmethod
     def notificationPlusIcon() -> QIcon:
-        basedir = os.path.join(getResourcePath(),'Icons')
-        if sys.platform.startswith('darwin'):
-            p = os.path.join(basedir, 'plus-notification.png')
-        else:
-            p = os.path.join(basedir, 'plus-notification.svg')
-        return QIcon(p)
+        return NotificationManager.notificationArtisanIcon()
+#        basedir = os.path.join(getResourcePath(),'Icons')
+#        if sys.platform.startswith('darwin'):
+#            p = os.path.join(basedir, 'plus-notification.png')
+#        else:
+#            p = os.path.join(basedir, 'plus-notification.svg')
+#        return QIcon(p)
 
     # returns the Artisan icon as QIcon
     @staticmethod
     def notificationArtisanIcon() -> QIcon:
         basedir = os.path.join(getResourcePath(),'Icons')
-        if sys.platform.startswith('darwin'):
-            p = os.path.join(basedir, 'artisan-notification.png')
-        else:
-            p = os.path.join(basedir, 'artisan-notification.svg')
+#        if sys.platform.startswith('darwin'):
+#            p = os.path.join(basedir, 'artisan-notification.png')
+#        else:
+#            p = os.path.join(basedir, 'artisan-notification.svg')
+        p = os.path.join(basedir, 'artisan-notification.svg')
         return QIcon(p)
 
     @pyqtSlot()

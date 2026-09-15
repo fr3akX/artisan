@@ -1,8 +1,8 @@
 #
 # ABOUT
-# This program realizes a PID controller as part of the open-source roast logging software Artisan.
+# This program realizes a PID controller as part of the open-source roast logging software artisan scope
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -38,8 +38,6 @@ from typing import Final, TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy.typing as npt # pylint: disable=unused-import
 
-
-from scipy.signal import iirfilter  # type # ignore[import-untyped]
 
 from artisanlib.filters import LiveSosFilter
 from artisanlib.suppress_errors import suppress_stdout_stderr
@@ -204,10 +202,10 @@ class PID:
         self.active: bool = False  # if active, the control function is called with the PID results
         # PID output smoothing
         self.output_filter_level: int = 0  # off if 0
-        self.output_filter: LiveSosFilter = self.outputFilter(self.sampling_rate)
+        self.output_filter: LiveSosFilter|None = None
         # PID derivative smoothing
         self.derivative_filter_level: int = 0  # 0: off, >0: on
-        self.derivative_filter: LiveSosFilter = self.derivativeFilter(self.sampling_rate)
+        self.derivative_filter: LiveSosFilter|None = None
         #
         self.force_duty: int = (
             3  # at least every n update cycles a new duty value is send, even if its duplicating a previous duty (within the duty step)
@@ -240,6 +238,8 @@ class PID:
 
     def _smooth_output(self, output: float) -> float:
         if self.output_filter_level > 0:
+            if self.output_filter is None:
+                self.output_filter = self.outputFilter(self.sampling_rate)
             return self.output_filter(output)
         return output
 
@@ -275,6 +275,8 @@ class PID:
 
         # apply derative filter before estimating limits in DoM mode
         if self.derivative_filter_level > 0:
+            if self.derivative_filter is None:
+                self.derivative_filter = self.derivativeFilter(self.sampling_rate)
             derror = self.derivative_filter(derror)
 
         # Apply derivative limiting to prevent excessive derivative action
@@ -664,6 +666,7 @@ class PID:
         """infinite impulse response filter"""
         # Note: IIR filter can be computed faster but can suffer from artefacts and FIR filters should be preferred. However, IIR filter specification
         # can be easier adjusted to varying samplings rates
+        from scipy.signal import iirfilter  # type # ignore[import-untyped]
         return LiveSosFilter(
             iirfilter(
                 1,         # order (higher-order, sharper cut-off, but incr. delay)

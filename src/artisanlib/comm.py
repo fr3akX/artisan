@@ -1,8 +1,8 @@
 #
 # ABOUT
-# Artisan Device Communication
+# artisan scope device communication
 #
-# COPYRIGHT (C) 2010-2026 The Artisan team represented by
+# COPYRIGHT (C) 2010-2026 The artisan team represented by
 #   Marko Luther <marko.luther@gmx.net> (maintainer) and all contributors
 #
 # LICENSE
@@ -201,11 +201,14 @@ class nonedevDlg(QDialog):
         self.btEdit.setValidator(QIntValidator(0, 1000, self.btEdit))
         self.btEdit.setFocus()
         self.ETbox = QCheckBox(QApplication.translate('CheckBox','ET'))
+        self.ETbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         if self.aw.qmc.manuallogETflag:
             self.ETbox.setChecked(True)
+            self.etEdit.selectAll()
         else:
             self.ETbox.setChecked(False)
             self.etEdit.setVisible(False)
+            self.btEdit.selectAll()
         self.ETbox.stateChanged.connect(self.changemanuallogETflag)
         self.okButton = QPushButton(QApplication.translate('Button','OK'))
         self.cancelButton = QPushButton(QApplication.translate('Button','Cancel'))
@@ -591,7 +594,8 @@ class serialport:
                                    self.MQTT_56,                     #203
                                    self.MQTT_78,                     #204
                                    self.MQTT_910,                    #205
-                                   self.MQTT_1112                    #206
+                                   self.MQTT_1112,                   #206
+                                   self.MODBUS_1112,                 #207
                                    ]
         #string with the name of the program for device #27
         self.externalprogram:str = 'test.py'
@@ -707,8 +711,8 @@ class serialport:
             self.aw.qmc.updateLargePIDLCDs(sv='', duty='')
             return self.aw.qmc.timeclock.elapsedMilli(),-1,-1
         lcdformat = ('%.1f' if self.aw.qmc.LCDdecimalplaces else '%.0f')
-        if (self.aw.qmc.device == 19 and not self.aw.pidcontrol.externalPIDControl()) or \
-                (self.aw.qmc.device in {29, 79} and not self.aw.pidcontrol.externalPIDControl()):
+        if not self.aw.pidcontrol.externalPIDControl() and \
+            (self.aw.qmc.device == 19 or self.aw.qmc.device in {29, 79}):
                 # TC4 (19) or MODBUS/S7 (29/79) with Artisan Software PID
             duty = self.aw.qmc.pid.getDuty()
             duty = (-1.0 if duty is None else min(100.0, max(-100.0, duty)))
@@ -1663,6 +1667,9 @@ class serialport:
 
     def MODBUS_910(self) -> tuple[float,float,float]:
         return self.aw.extraMODBUStx,self.aw.extraMODBUStemps[9],self.aw.extraMODBUStemps[8]
+
+    def MODBUS_1112(self) -> tuple[float,float,float]:
+        return self.aw.extraMODBUStx,self.aw.extraMODBUStemps[11],self.aw.extraMODBUStemps[10]
 
     def HH802U(self) -> tuple[float,float,float]:
         tx = self.aw.qmc.timeclock.elapsedMilli()
