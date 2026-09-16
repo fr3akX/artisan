@@ -1,8 +1,8 @@
 # Santoker private trace HTTP primitive
 
-This slice adds synchronous, worker-only transfer primitives. It does **not** wire
-capture, Qt prompts, settings, credentials, scheduling, account generations, or
-application shutdown. The [wire contract](diagnostic-traces-v1.md) is unchanged.
+This module provides synchronous, worker-only transfer primitives. The separate
+[desktop runtime](santoker-trace-runtime.md) now owns capture, Qt prompts, verified
+identity generations, explicit scheduling and application shutdown. The [wire contract](diagnostic-traces-v1.md) is unchanged.
 Use a **separate** `RoastServerClient(origin, captured_credential)` instance, never
 the roast/inventory worker's client. No autonomous retry or server DELETE occurs.
 

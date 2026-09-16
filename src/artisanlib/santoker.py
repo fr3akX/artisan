@@ -30,7 +30,8 @@ import logging
 
 from pymodbus.framer.rtu import FramerRTU
 from collections.abc import Callable, Awaitable
-from typing import Final, TYPE_CHECKING, override
+from typing import Final, TYPE_CHECKING, cast, override
+from uuid import uuid4
 
 from artisanlib.santoker_diagnostics import DiagnosticField, SantokerDiagnosticsSession
 
@@ -183,7 +184,7 @@ class Santoker(AsyncComm):
         '_drum_fresh', '_machine_on', '_machine_on_fresh', '_heating_on', '_heating_on_fresh',
         '_CHARGE', '_DRY', '_FCs',
         '_SCs', '_DROP', '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
-        '_desired_warmup', '_connect_using_ble', '_ble_client', '_diagnostics', '_frame_handler'
+        '_trace_handle', '_desired_warmup', '_connect_using_ble', '_ble_client', '_diagnostics', '_frame_handler'
     ]
 
     def __init__(self, host:str = '127.0.0.1', port:int = 8080, serial:'SerialSettings|None' = None,
@@ -203,6 +204,7 @@ class Santoker(AsyncComm):
                 frame_handler:Callable[[], None]|None = None,
                 trace_handle:'SessionHandle|None' = None) -> None:
 
+        self._trace_handle = trace_handle if connect_using_ble else None
         self._diagnostics: SantokerDiagnosticsSession | None = diagnostics
         self._frame_handler:Callable[[], None]|None = frame_handler
         self._desired_warmup:bool | None = None
@@ -396,6 +398,9 @@ class Santoker(AsyncComm):
     def _setHeaderReady(self, ready: bool) -> None:
         if ready != self._header_ready:
             self._header_ready = ready
+            if self._trace_handle is not None:
+                self._trace_handle.emit('status', {'severity': 'info',
+                    'code': 'protocol_ready' if ready else 'protocol_not_ready'})
             self._record_protocol(ready, self.HEADER if ready else None)
             if self._ready_handler is not None:
                 try:
@@ -670,6 +675,12 @@ class Santoker(AsyncComm):
     @override
     async def read_msg(self, stream: asyncio.StreamReader|IteratorReader) -> None:
         candidate:bytearray = bytearray()
+        # The reader owns immutable connection identity; never consult current BLE.
+        trace_parser = cast(Callable[[str], None] | None, getattr(stream, 'trace_parser', None))
+
+        def parsed(result:str) -> None:
+            if trace_parser is not None:
+                trace_parser(result)
 
         async def read_candidate(size: int) -> bytes:
             try:
@@ -680,6 +691,7 @@ class Santoker(AsyncComm):
                     candidate.extend(partial)
                 if candidate:
                     self._record_rx(bytes(candidate), 'truncated frame', accepted=False)
+                    parsed('truncated')
                 raise
             candidate.extend(part)
             return part
@@ -696,6 +708,7 @@ class Santoker(AsyncComm):
             candidate_header = self.HEADER_WIFI
         else:
             self._record_rx(bytes(candidate), 'invalid second header', accepted=False)
+            parsed('invalid_header')
             return
 
         # read the data target (BT, ET,..)
@@ -704,6 +717,7 @@ class Santoker(AsyncComm):
         code2 = await read_candidate(2)
         if code2 != self.CODE_HEADER:
             self._record_rx(bytes(candidate), 'invalid code header', accepted=False)
+            parsed('invalid_header')
             return
 
         # Santoker telemetry payloads use one to three bytes, while commands sent
@@ -712,6 +726,7 @@ class Santoker(AsyncComm):
         data_size = int.from_bytes(data_len, 'big')
         if not 1 <= data_size <= 3:
             self._record_rx(bytes(candidate), 'invalid data length', accepted=False)
+            parsed('invalid_length')
             return
 
         data = await read_candidate(data_size)
@@ -721,6 +736,7 @@ class Santoker(AsyncComm):
         calculated_crc = FramerRTU.compute_CRC(self.CODE_HEADER + data_len + data).to_bytes(2, 'big')
         if self._verify_crc and crc[1] != calculated_crc[1]: # we only check the second CRC bit!
             self._record_rx(bytes(candidate), 'CRC mismatch', accepted=False)
+            parsed('crc_mismatch')
             if self._logging:
                 _log.debug('CRC error')
             return
@@ -729,8 +745,10 @@ class Santoker(AsyncComm):
         tail = await read_candidate(4)
         if tail != self.TAIL:
             self._record_rx(bytes(candidate), 'invalid tail', accepted=False)
+            parsed('invalid_tail')
             return
 
+        parsed('accepted')
         # full message decoded
         self.HEADER = candidate_header
         self._setHeaderReady(True)
@@ -753,6 +771,18 @@ class Santoker(AsyncComm):
         return self.HEADER + target + data + crc + self.TAIL
 
     def send_msg(self, target:bytes, value: int) -> None:
+        if self._trace_handle is not None:
+            action = {self.POWER: 'power', self.AIR: 'fan', self.DRUM: 'drum',
+                self.MACHINE_ON: 'machine_on', self.HEATING_ON: 'heating_on',
+                self.WARMUP: 'warmup', self.WARMUP_TEMP: 'warmup_target'}.get(target)
+            if action is not None:
+                intent:float|int = value
+                if target == self.WARMUP_TEMP:
+                    intent = value / 10.0
+                    if self._trace_handle.temperature_unit == 'F':
+                        intent = intent * 9 / 5 + 32
+                self._trace_handle.emit('control', {'operation_id': str(uuid4()),
+                    'action': action, 'value': intent})
         packet:bytes = self.create_msg(target, value)
         self._record_tx(packet, target, value)
         if self._connect_using_ble and hasattr(self, '_ble_client') and self._ble_client is not None:
@@ -777,6 +807,10 @@ class Santoker(AsyncComm):
         """Record OFF before safety writes; stop() later starts transport cleanup."""
         if self._ble_client is not None and self._ble_client._trace_transport is not None:
             self._ble_client._trace_transport.request_close(cleanup_timeout)
+
+    @property
+    def trace_enabled(self) -> bool:
+        return self._trace_handle is not None
 
     @property
     def trace_cleanup_complete(self) -> bool:

@@ -127,6 +127,10 @@ class SessionHandle:
     _recorder: TraceRecorder = field(repr=False, compare=False)
     _session: _Session = field(repr=False, compare=False)
 
+    @property
+    def temperature_unit(self) -> str:
+        return cast(str, self._session.manifest['temperature_unit'])
+
     def emit(self, kind: str, fields: Mapping[str, Scalar], *,
              payload: bytes | bytearray | memoryview | None = None) -> bool:
         """True means bounded queue admission, NOT durable storage/transport success."""

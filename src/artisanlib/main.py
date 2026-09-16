@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     from artisanlib.hottop import Hottop # pylint: disable=unused-import
     from artisanlib.weblcds import WebLCDs, WebGreen, WebRoasted # pylint: disable=unused-import
     from artisanlib.santoker import Santoker # pylint: disable=unused-import
+    from artisanlib.santoker_trace import SessionHandle
     from artisanlib.santoker_r import SantokerR # pylint: disable=unused-import
     from artisanlib.lebrew import Lebrew_RoastSeeNEXT # pylint: disable=unused-import
     from artisanlib.bluedot import BlueDOT # pylint: disable=unused-import
@@ -227,6 +228,8 @@ from artisanlib.qtsingleapplication import QtSingleApplication
 from artisanlib.santoker_controls import CONTROL_TARGETS, SantokerControlController
 from artisanlib.santoker_diagnostics import SantokerDiagnosticsSession, TransportKind
 from artisanlib.santoker_diagnostics_ui import SantokerDiagnosticsDialog
+from artisanlib.santoker_trace_runtime import TraceRuntime
+from artisanlib.santoker_trace_ui import TracePresentation
 from artisanlib.santoker_warmup import (
     ReconcileOutcome,
     SantokerWarmupController,
@@ -1439,7 +1442,7 @@ class ApplicationWindow(QMainWindow):
         'userprofilepath', 'printer', 'main_widget', 'defaultdpi', 'dpi', 'qmc', 'HottopControlActive', 'AsyncSamplingTimer', 'wheeldialog',
         'simulator', 'simulatorpath', 'comparator', 'eventsbuttonflag', 'minieventsflags', 'seriallogflag',
         'seriallog', 'ser', 'modbus', 'extraMODBUStemps', 'extraMODBUStx', 's7', 'extraS7tx', 'ws', 'extraser', 'extracomport', 'extrabaudrate',
-        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerWarmup', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerDiagnosticsSession', 'santokerDiagnosticsDialog', 'santokerMonitoringGeneration', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
+        'extrabytesize', 'extraparity', 'extrastopbits', 'extratimeout', 'hottop', 'santokerHost', 'santokerPort', 'santokerSerial', 'santokerBLE', 'santokerWarmup', 'santokerEventFlags', 'santoker', 'santokerWarmupController', 'santokerDiagnosticsSession', 'santokerDiagnosticsDialog', 'santokerTraceRuntime', 'santokerTracePresentation', 'santokerTraceUploadAction', 'traceShutdownPending', 'santokerMonitoringGeneration', 'santokerR', 'lebrew_roastseeNEXT', 'thermoworksBlueDOT', 'fujipid', 'dtapid', 'pidcontrol', 'soundflag', 'recentRoasts', 'maxRecentRoasts',
         'mugmaHost','mugmaPort', 'mugma', 'mugma_default_host', 'shelly_3EMPro_host', 'shelly_PlusPlug_host',
         'kaleido_default_host', 'kaleidoHost', 'kaleidoPort', 'kaleidoSerial', 'kaleidoPID', 'kaleido', 'kaleidoEventFlags', 'colorTrack_mean_window_size', 'colorTrack_median_window_size', 'ikawa',
         'lcdpaletteB', 'lcdpaletteF', 'extraeventsbuttonsflags', 'extraeventslabels', 'extraeventbuttoncolor', 'extraeventsactionstrings',
@@ -1816,6 +1819,9 @@ class ApplicationWindow(QMainWindow):
         self.santokerControlRecoveryReported:bool = False
         self.santokerDiagnosticsSession:SantokerDiagnosticsSession|None = None
         self.santokerDiagnosticsDialog:SantokerDiagnosticsDialog|None = None
+        self.santokerTraceRuntime:TraceRuntime|None = None
+        self.santokerTracePresentation:TracePresentation|None = None
+        self.traceShutdownPending:bool = False
         self.santokerMonitoringGeneration:int = 0
 
         # Santoker R
@@ -2756,6 +2762,8 @@ class ApplicationWindow(QMainWindow):
         self.KshortCAction.triggered.connect(self.viewKshortcuts)
 
         self.santokerDiagnosticsAction = self.createSantokerDiagnosticsAction()
+        self.santokerTraceUploadAction = QAction(QApplication.translate('Menu', 'Upload diagnostic log…'), self)
+        self.santokerTraceUploadAction.triggered.connect(self.uploadSantokerTrace)
 
         self.checkUpdateAction = QAction(QApplication.translate('Menu', 'Check for Updates'), self)
         self.checkUpdateAction.setMenuRole(QAction.MenuRole.NoRole)
@@ -4187,6 +4195,9 @@ class ApplicationWindow(QMainWindow):
         help_menu.addSeparator()
         debug_menu = QMenu(QApplication.translate('Menu', 'Debug'), help_menu)
         debug_menu.addAction(self.santokerDiagnosticsAction)
+        trace_upload_action = getattr(self, 'santokerTraceUploadAction', None)
+        if trace_upload_action is not None:
+            debug_menu.addAction(trace_upload_action)
         help_menu.addMenu(debug_menu)
         if ui_mode is UI_MODE.EXPERT:
             help_menu.addSeparator()
@@ -4584,9 +4595,15 @@ class ApplicationWindow(QMainWindow):
         from artisanlib.roastserver.controller import RoastServerController
         from artisanlib.roastserver.settings import SettingsStore, SystemCredentialStore
 
+        credentials = SystemCredentialStore(cast(Any, keyring))
+        if not self.app.artisanviewerMode and self.santokerTraceRuntime is None:
+            self.santokerTraceRuntime = TraceRuntime(data_directory / 'santoker-traces', credentials)
+            self.santokerTracePresentation = TracePresentation(
+                self, self.santokerTraceRuntime, self.sendmessage)
+
         controller = RoastServerController(
             settings=SettingsStore(QSettings()),
-            credentials=SystemCredentialStore(cast(Any, keyring)),
+            credentials=credentials,
             data_root=data_directory / 'roastserver',
             client_factory=RoastServerClient,
             profile_validator=self.validateRoastServerProfile,
@@ -4594,6 +4611,9 @@ class ApplicationWindow(QMainWindow):
         )
         self.roastserver_controller = controller
         controller.settingsChanged.connect(self.setRoastServerSettings)
+        if self.santokerTraceRuntime is not None:
+            controller.settingsChanged.connect(self.santokerTraceRuntime.settings_changed)
+            controller.identityChanged.connect(self.santokerTraceRuntime.identity_changed)
         controller.profileReady.connect(self.openRoastServerProfile)
         controller.inventoryRecoveryRequired.connect(self.scheduleInventoryRecovery)
         controller.inventoryConflict.connect(self.showInventoryConflict)
@@ -19632,16 +19652,62 @@ class ApplicationWindow(QMainWindow):
             ApplicationWindow.refreshSantokerWarmupControls(self)
 
     def markSantokerCharge(self) -> None:
+        ApplicationWindow.markSantokerTrace(self, 'charge')
         control_controller = getattr(self, 'santokerControlController', None)
         if control_controller is not None:
             control_controller.mark_charge(getattr(self, 'santoker', None))
         self.santokerControlRecoveryReported = False
 
     def markSantokerDrop(self) -> None:
+        qmc = getattr(self, 'qmc', None)
+        if qmc is not None and qmc.timeindex[6] > 0:
+            ApplicationWindow.markSantokerTrace(self, 'drop')
         control_controller = getattr(self, 'santokerControlController', None)
         if control_controller is not None:
             control_controller.mark_drop()
         self.santokerControlRecoveryReported = False
+
+    @pyqtSlot()
+    def uploadSantokerTrace(self) -> None:
+        presentation = self.santokerTracePresentation
+        if presentation is not None:
+            presentation.previous_sessions(manual=True)
+        else:
+            from artisanlib.santoker_trace_ui import trace_message
+            self.sendmessage(trace_message('capture'))
+
+    def beginSantokerTrace(self) -> 'SessionHandle|None':
+        from PyQt6.QtCore import QOperatingSystemVersion, QSysInfo
+        from artisanlib.santoker_trace import CaptureConfig
+        from artisanlib.santoker_trace_ui import trace_message
+        runtime:TraceRuntime|None = getattr(self, 'santokerTraceRuntime', None)
+        if self.qmc.device != 134 or not self.santokerBLE or self.simulator is not None:
+            return None
+        if runtime is None:
+            self.sendmessage(trace_message('capture'))
+            return None
+        try:
+            version = QOperatingSystemVersion.current()
+            numeric_version = '.'.join(str(v) for v in (
+                version.majorVersion(), version.minorVersion(), version.microVersion()) if v >= 0)
+            architecture = QSysInfo.buildCpuArchitecture()
+            config = CaptureConfig(str(__version__),
+                {'darwin': 'macos', 'win32': 'windows'}.get(sys.platform, 'linux'),
+                numeric_version or 'unknown',
+                architecture if architecture in {'x86', 'x86_64', 'arm', 'arm64'} else 'other',
+                self.qmc.delay, self.qmc.mode)
+            handle = runtime.begin(config)
+            if handle is not None and self.qmc.flagstart:
+                runtime.milestone('roast_start') # direct START: session exists before BLE callbacks
+            return handle
+        except (ValueError, TypeError):
+            runtime.notice('capture')
+            return None
+
+    def markSantokerTrace(self, name:str) -> None:
+        runtime:TraceRuntime|None = getattr(self, 'santokerTraceRuntime', None)
+        if runtime is not None:
+            runtime.milestone(name)
 
     def startSantokerDiagnosticsSession(self) -> SantokerDiagnosticsSession:
         self.santokerMonitoringGeneration = getattr(self, 'santokerMonitoringGeneration', 0) + 1
@@ -19675,6 +19741,11 @@ class ApplicationWindow(QMainWindow):
 
     def stopSantokerMonitoring(self) -> None:
         self.santokerMonitoringGeneration = getattr(self, 'santokerMonitoringGeneration', 0) + 1
+        runtime:TraceRuntime|None = getattr(self, 'santokerTraceRuntime', None)
+        if runtime is not None:
+            runtime.milestone('roast_end')
+        if self.santoker is not None and getattr(self.santoker, 'trace_enabled', False):
+            self.santoker.request_trace_close() # BEFORE warm-up safety OFF traffic
         self.santokerWarmupController.stop_monitoring(self.santoker)
         control_controller = getattr(self, 'santokerControlController', None)
         if control_controller is not None:
@@ -19682,7 +19753,11 @@ class ApplicationWindow(QMainWindow):
         self.santokerControlRecoveryReported = False
         if self.santoker is not None:
             self.santoker.stop()
+            if runtime is not None:
+                runtime.retire(self.santoker if getattr(self.santoker, 'trace_enabled', False) else None)
             self.santoker = None
+        elif runtime is not None:
+            runtime.retire(None)
         if self.santokerDiagnosticsSession is not None:
             self.santokerDiagnosticsSession.stop()
 
@@ -23555,11 +23630,17 @@ class ApplicationWindow(QMainWindow):
 
     # returns True if confirmed, False if canceled by the user
     def closeApp(self) -> bool:
+        if getattr(self, 'traceShutdownPending', False):
+            return False
         self.quitAction.setEnabled(False)
         try:
             unsaved_changes = self.qmc.safesaveflag
             if self.qmc.checkSaved(): # if not canceled
                 _log.info('MODE: QUIT')
+                if self.santokerTracePresentation is not None:
+                    self.traceShutdownPending = True
+                    assert self.santokerTraceRuntime is not None
+                    self.santokerTraceRuntime.shutdown()
                 flagKeepON = self.qmc.flagKeepON
                 self.qmc.flagKeepON = False # temporarily turn keepOn off
 
@@ -23581,16 +23662,8 @@ class ApplicationWindow(QMainWindow):
                         self.sendmessage(shutdown_timeout_message)
 
                 self.stopActivities() # also disconnect from connected scales and stops BLE scanning
-                # if BLE was used we need to terminate its singular thread/asyncloop running the bleak scan and connect:
-                # BLE is not stopped in self.stopActivities() as that one is also called on settings load and we need to keep
-                # the same BLE thread/loop running over the whole runtime of the app to avoid ble._scan_and_connect_lock and ble._terminate_scan_event
-                # are running in the wrong thread
-                try:
-                    if 'artisanlib.ble_port' in sys.modules:
-                        from artisanlib import ble_port
-                        ble_port.ble.close()
-                except Exception: # pylint: disable=broad-except
-                    pass
+                # Trace owners retain the global BLE loop until actual SDK cleanup.
+                # Final store joining runs on the trace worker, never on this thread.
 
                 if unsaved_changes:
                     self.qmc.safesaveflag = False
@@ -23609,14 +23682,37 @@ class ApplicationWindow(QMainWindow):
                 if QApplication.queryKeyboardModifiers() != (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier):
                     self.closeEventSettings() # it takes quite some time to write the >1000 setting items
 #                gc.collect() # this takes quite some time
-                QApplication.exit()
+                presentation = getattr(self, 'santokerTracePresentation', None)
+                if presentation is not None:
+                    self.traceShutdownPending = True
+                    presentation.shutdown(self.finishTraceShutdown)
+                    return False # closeEvent must keep the window/event loop alive
+                self.finishTraceShutdown(True)
                 return True
             self.quitAction.setEnabled(True)
             return False
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
-            self.quitAction.setEnabled(True)
+            if getattr(self, 'traceShutdownPending', False) and self.santokerTracePresentation is not None:
+                self.santokerTracePresentation.shutdown(self.finishTraceShutdown)
+            else:
+                self.quitAction.setEnabled(True)
             return False
+
+    @staticmethod
+    def finishTraceShutdown(ble_cleanup_complete:bool) -> None:
+        if ble_cleanup_complete and 'artisanlib.santoker_ble_trace' in sys.modules:
+            from artisanlib.santoker_ble_trace import SantokerBLETrace
+            ble_cleanup_complete = SantokerBLETrace.owners_cleanup_complete()
+        if ble_cleanup_complete:
+            try:
+                if 'artisanlib.ble_port' in sys.modules:
+                    from artisanlib import ble_port
+                    ble_port.ble.close()
+            except Exception: # pylint: disable=broad-except
+                pass
+        # At the deadline this is a process-crash boundary, not successful cleanup.
+        QApplication.exit()
 
     def closeserialports(self) -> None:
         # close main instrument port

@@ -63,6 +63,10 @@ class _Connection:
 
 
 class _Reader(IteratorReader):
+    def __init__(self, chunks: AsyncIterator[bytes], trace_parser: Callable[[str], None]) -> None:
+        super().__init__(chunks)
+        self.trace_parser = trace_parser
+
     # IteratorReader.readuntil accumulates arbitrary noise. Santoker only needs
     # the single header byte, so discard preceding noise without accumulating it.
     @override
@@ -72,8 +76,12 @@ class _Reader(IteratorReader):
         while True:
             index = self._backlog.find(separator)
             if index >= 0:
+                if index:
+                    self.trace_parser('noise')
                 self._backlog = self._backlog[index + 1:]
                 return separator
+            if self._backlog:
+                self.trace_parser('noise')
             self._backlog = await anext(self._chunks)
 
 
@@ -99,8 +107,14 @@ class SantokerBLETrace:
         self._connection: _Connection | None = None
         self._writes = 0
         self._started = False
+        self._close_requested = False
         self._future: Future[None] | None = None
         self._lifecycle_task: asyncio.Task[None] | None = None
+
+    @classmethod
+    def owners_cleanup_complete(cls) -> bool:
+        with cls._owners_lock:
+            return not cls._owners
 
     @property
     def cleanup_complete(self) -> bool:
@@ -109,6 +123,10 @@ class SantokerBLETrace:
 
     def request_close(self, cleanup_timeout: float = 5.0) -> None:
         """Call BEFORE safety OFF writes; writes remain allowed until stop()."""
+        with self._lock:
+            if self._close_requested:
+                return
+            self._close_requested = True
         self.handle.emit('status', {'severity': 'info', 'code': 'off_requested'})
         self.handle.request_close(cleanup_timeout=cleanup_timeout)
 
@@ -247,7 +265,10 @@ class SantokerBLETrace:
                     raise asyncio.CancelledError
                 yield data
 
-        stream = _Reader(chunks())
+        def parsed(result: str) -> None:
+            self.handle.emit('parser', {'connection_id': connection.connection_id, 'result': result})
+
+        stream = _Reader(chunks(), parsed)
         while not self._stopped.is_set() and not connection.disconnected.is_set():
             await self._read_msg(stream)
 

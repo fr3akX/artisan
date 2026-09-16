@@ -4427,6 +4427,14 @@ def roastserver_action_window(profile_path: Path) -> ApplicationWindow:
     return window
 
 
+def roastserver_shutdown_window() -> ApplicationWindow:
+    window = ApplicationWindow.__new__(ApplicationWindow)
+    window.traceShutdownPending = False
+    window.santokerTraceRuntime = None
+    window.santokerTracePresentation = None
+    return window
+
+
 class TestRoastServerMainIntegration:
     def test_roastserver_successful_save_uses_descriptor_timestamp_and_immediate_detach(
         self, tmp_path: Path
@@ -5089,6 +5097,9 @@ class TestRoastServerMainIntegration:
         window = ApplicationWindow.__new__(ApplicationWindow)
         window.roastserver_controller = None
         window.roastserver_settings = None
+        window.app = Mock(artisanviewerMode=False)
+        window.santokerTraceRuntime = None
+        window.santokerTracePresentation = None
         controller = Mock()
         with patch.dict(sys.modules, {'keyring': Mock()}), patch(
             'artisanlib.roastserver.settings.SettingsStore'
@@ -5101,7 +5112,9 @@ class TestRoastServerMainIntegration:
             'artisanlib.roastserver.api.RoastServerClient'
         ) as client_class, patch(
             'artisanlib.roastserver.presentation.UploadStatusWidget'
-        ), patch.object(ApplicationWindow, 'statusBar', return_value=Mock()):
+        ), patch.object(main_module, 'TraceRuntime') as trace_runtime, patch.object(
+            main_module, 'TracePresentation'
+        ) as trace_presentation, patch.object(ApplicationWindow, 'statusBar', return_value=Mock()):
             window.startRoastServer(tmp_path)
 
         controller_class.assert_called_once_with(
@@ -5112,6 +5125,10 @@ class TestRoastServerMainIntegration:
             profile_validator=window.validateRoastServerProfile,
             parent=window,
         )
+        trace_runtime.assert_called_once_with(tmp_path / 'santoker-traces', credential_store.return_value)
+        trace_presentation.assert_called_once_with(window, trace_runtime.return_value, window.sendmessage)
+        controller.identityChanged.connect.assert_called_once_with(trace_runtime.return_value.identity_changed)
+        assert call(trace_runtime.return_value.settings_changed) in controller.settingsChanged.connect.call_args_list
         controller.profileReady.connect.assert_called_once_with(
             window.openRoastServerProfile)
         controller.start.assert_called_once_with()
@@ -5216,7 +5233,7 @@ class TestRoastServerMainIntegration:
         )
         controller = coordinator_controller(coordinator, context_b)
         controller.shutdown = Mock(return_value=True)
-        window = ApplicationWindow.__new__(ApplicationWindow)
+        window = roastserver_shutdown_window()
         window.quitAction = Mock()
         window.qmc = Mock(
             safesaveflag=False,
@@ -5250,7 +5267,7 @@ class TestRoastServerMainIntegration:
     def test_roastserver_shutdown_is_bounded_and_precedes_device_teardown(
         self, stopped: bool
     ) -> None:
-        window = ApplicationWindow.__new__(ApplicationWindow)
+        window = roastserver_shutdown_window()
         window.quitAction = Mock()
         window.qmc = Mock()
         window.qmc.safesaveflag = False
@@ -5290,7 +5307,7 @@ class TestRoastServerMainIntegration:
         assert '.terminate(' not in inspect.getsource(ApplicationWindow.closeApp)
 
     def test_inventory_shutdown_cancel_does_not_release_or_interrupt_worker(self) -> None:
-        window = ApplicationWindow.__new__(ApplicationWindow)
+        window = roastserver_shutdown_window()
         window.quitAction = Mock()
         window.qmc = Mock(
             safesaveflag=True,
@@ -5307,7 +5324,7 @@ class TestRoastServerMainIntegration:
     def test_inventory_shutdown_discard_reset_does_not_release_after_worker_stop(
         self,
     ) -> None:
-        window = ApplicationWindow.__new__(ApplicationWindow)
+        window = roastserver_shutdown_window()
         window.quitAction = Mock()
         window.qmc = Mock(
             safesaveflag=True,
@@ -5343,7 +5360,7 @@ class TestRoastServerMainIntegration:
         assert window.qmc.roastUUID is None
 
     def test_inventory_shutdown_release_failure_warns_and_continues(self) -> None:
-        window = ApplicationWindow.__new__(ApplicationWindow)
+        window = roastserver_shutdown_window()
         window.quitAction = Mock()
         window.qmc = Mock(
             safesaveflag=False,

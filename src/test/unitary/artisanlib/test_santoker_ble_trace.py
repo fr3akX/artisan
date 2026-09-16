@@ -734,3 +734,48 @@ def test_proxy_cancel_before_lifecycle_launch_keeps_loop_until_actual_completion
     wait_for(lambda: traced._thread is None)
     assert not rig.scan_entered.is_set()
     assert rig.events(handle)[-1]['completion'] == 'complete'
+
+
+def test_parser_enums_are_bound_to_original_reader_connection(rig: Rig) -> None:
+    first = FakeClient()
+    santoker, handle = rig.start(first)
+    wait_for(lambda: first.notify is not None)
+    first.notify(None, bytearray(b'noise' + incoming(2, b'\xee\xb5')))
+    wait_for(santoker.isHeaderReady)
+    second = FakeClient()
+    rig.clients.append(second)
+    first.is_connected = False
+    first.disconnected(first)
+    wait_for(lambda: second.notify is not None)
+    second.notify(None, bytearray(incoming(4, b'\xee\xb5')))
+    time.sleep(0.03)
+    santoker.stop()
+    events = rig.events(handle)
+    rx = [e for e in events if e['kind'] == 'rx']
+    parsers = [e for e in events if e['kind'] == 'parser']
+    assert [(e['connection_id'], e['result']) for e in parsers][:2] == [
+        (rx[0]['connection_id'], 'noise'), (rx[0]['connection_id'], 'accepted')]
+    assert any(e['connection_id'] == rx[1]['connection_id'] and e['result'] == 'invalid_length' for e in parsers)
+    assert rx[0]['connection_id'] != rx[1]['connection_id']
+    assert not any(e['kind'] == 'device_ack' for e in events)
+
+
+def test_control_intent_uses_manifest_fahrenheit_not_write_success(rig: Rig) -> None:
+    handle = rig.recorder.start(CaptureConfig('4.0.0', 'linux', '6.1', 'x86_64', temperature_unit='F'))
+    client = FakeClient()
+    client.write_error = RuntimeError('failed actual write')
+    rig.clients.append(client)
+    santoker = Santoker(connect_using_ble=True, trace_handle=handle)
+    rig.sessions.append((santoker, handle))
+    santoker.start()
+    wait_for(lambda: client.notify is not None)
+    with pytest.raises(RuntimeError, match='failed actual write'):
+        santoker.send_msg(santoker.WARMUP_TEMP, 2000)
+    santoker.request_trace_close()
+    santoker.request_trace_close()
+    santoker.stop()
+    events = rig.events(handle)
+    assert [(e['action'], e['value']) for e in events if e['kind'] == 'control'] == [('warmup_target', 392.0)]
+    assert [e['outcome'] for e in events if e['kind'] == 'tx_result'] == ['error']
+    assert len([e for e in events if e['kind'] == 'status' and e['code'] == 'off_requested']) == 1
+    assert not any(e['kind'] == 'device_ack' for e in events)

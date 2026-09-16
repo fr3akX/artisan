@@ -1,14 +1,12 @@
 # Santoker local recorder/store foundation
 
-This foundation does not itself connect to BLE, roast controls, Qt, or HTTP.
-An optional [transport-only Santoker BLE adapter](santoker-ble-transport-tracing.md)
-now accepts its immutable handles; no application ON/OFF or HTTP wiring is enabled.
-A separate [private HTTP primitive](santoker-trace-http.md) now supports explicit
-caller-owned held-stream transfer; there is still no UI or upload scheduler.
-The unchanged
-[wire contract](diagnostic-traces-v1.md) remains authoritative. No automatic
-upload, publication, retention eviction, credential persistence, or live device
-access is implemented.
+The recorder/store foundation is now wired by the separate
+[desktop runtime](santoker-trace-runtime.md) for real Santoker BLE ON/OFF capture,
+nonmodal consent and explicit private upload. The synchronous interfaces below
+remain unchanged. The [wire contract](diagnostic-traces-v1.md) is authoritative;
+no automatic upload, publication, retention eviction, or credential persistence
+is introduced. See also the [transport adapter](santoker-ble-transport-tracing.md)
+and [held-stream HTTP primitive](santoker-trace-http.md).
 
 ## Integration interfaces
 
