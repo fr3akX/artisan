@@ -293,6 +293,8 @@ class TraceRuntime:
             self._revision += 1
 
     def _run(self) -> None:
+        # pylint: disable=broad-exception-caught
+        # Credential/HTTP/filesystem worker boundary; never surface raw exceptions.
         self._ready.wait()
         store = self._store
         while True:

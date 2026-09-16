@@ -18745,7 +18745,6 @@ class ApplicationWindow(QMainWindow):
     @staticmethod
     def roastServerProfileHash(profile:dict[str,Any]) -> None:
         import hashlib
-        import json
         profile['hash'] = hashlib.sha256(json.dumps(
             rec_int_to_float(profile),
             sort_keys=True,

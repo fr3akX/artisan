@@ -85,7 +85,8 @@ class _Reader(IteratorReader):
             self._backlog = await anext(self._chunks)
 
 
-class SantokerBLETrace:
+class SantokerBLETrace:  # pylint: disable=protected-access
+    # Deliberate internal ClientBLE lifecycle adapter, not a separate public client.
     MAX_OWNERS = 16
     MAX_WRITES = 16
     MAX_WRITE_BYTES = 65536
@@ -273,6 +274,7 @@ class SantokerBLETrace:
             await self._read_msg(stream)
 
     async def _disconnect(self, connection: _Connection) -> bool:
+        # pylint: disable=broad-exception-caught
         client = connection.client
         if client is None:
             return True
@@ -297,6 +299,7 @@ class SantokerBLETrace:
 
     async def _run(self, case_sensitive: bool, scan_timeout: float,
                    connect_timeout: float, address: str | None) -> None:
+        # pylint: disable=broad-exception-caught
         clean = True
         connection: _Connection | None = None
         reader: asyncio.Task[None] | None = None

@@ -121,7 +121,8 @@ class _Event:
 
 
 @dataclass(frozen=True, slots=True)
-class SessionHandle:
+class SessionHandle:  # pylint: disable=protected-access
+    # This capability is the recorder's own bounded admission facade.
     """Immutable identity; old transport closures retain THIS sink, never current ON."""
     session_id: str
     _recorder: TraceRecorder = field(repr=False, compare=False)
@@ -307,6 +308,8 @@ class TraceRecorder:
             session.stopped = True
 
     def _run(self) -> None:
+        # pylint: disable=broad-exception-caught
+        # Worker/store boundary: failures become fixed status, never roast errors.
         store: TraceStore | None = None
         try:
             store = self._factory()  # startup/recovery never on producer/UI
@@ -390,6 +393,7 @@ class TraceRecorder:
                         self._failure = 'io_error'
 
     def _abandon(self, store: TraceStore, session: _Session) -> None:
+        # pylint: disable=broad-exception-caught
         try:
             store.abandon(session.session_id, session.failure or 'io_error')
         except Exception:
@@ -398,6 +402,7 @@ class TraceRecorder:
                 self._failure = 'io_error'
 
     def _write_event(self, store: TraceStore, event: _Event) -> None:
+        # pylint: disable=broad-exception-caught
         session = event.session
         if session.state == 'failed' or 'event_limit' in session.reasons or 'storage_limit' in session.reasons:
             with self._condition:

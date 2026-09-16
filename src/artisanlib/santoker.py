@@ -805,6 +805,7 @@ class Santoker(AsyncComm):
 
     def request_trace_close(self, cleanup_timeout:float = 5.0) -> None:
         """Record OFF before safety writes; stop() later starts transport cleanup."""
+        # pylint: disable=protected-access
         if self._ble_client is not None and self._ble_client._trace_transport is not None:
             self._ble_client._trace_transport.request_close(cleanup_timeout)
 
@@ -815,11 +816,13 @@ class Santoker(AsyncComm):
     @property
     def trace_cleanup_complete(self) -> bool:
         """Poll actual traced cleanup; never use a legacy stop callback as proof."""
+        # pylint: disable=protected-access
         return (self._ble_client is not None and self._ble_client._trace_transport is not None
                 and self._ble_client._trace_transport.cleanup_complete)
 
     @override
     def stop(self) -> None:
+        # pylint: disable=protected-access
         self.resetProtocolState()
         if self._connect_using_ble and hasattr(self, '_ble_client') and self._ble_client is not None:
             self._ble_client.stop()
