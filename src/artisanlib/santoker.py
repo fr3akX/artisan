@@ -30,11 +30,14 @@ import logging
 
 from pymodbus.framer.rtu import FramerRTU
 from collections.abc import Callable, Awaitable
-from typing import Final, TYPE_CHECKING, override
+from typing import Final, TYPE_CHECKING, cast, override
+from uuid import uuid4
 
 from artisanlib.santoker_diagnostics import DiagnosticField, SantokerDiagnosticsSession
 
 if TYPE_CHECKING:
+    from artisanlib.santoker_trace import SessionHandle
+    from artisanlib.santoker_ble_trace import SantokerBLETrace
     from artisanlib.atypes import SerialSettings # pylint: disable=unused-import
     from bleak.backends.characteristic import BleakGATTCharacteristic  # pylint: disable=unused-import
 
@@ -54,8 +57,13 @@ class SantokerCube_BLE(ClientBLE):
     def __init__(self,
                     read_msg:Callable[[asyncio.StreamReader|IteratorReader], Awaitable[None]],
                     connected_handler:Callable[[], None]|None = None,
-                    disconnected_handler:Callable[[], None]|None = None):
+                    disconnected_handler:Callable[[], None]|None = None,
+                    trace_handle:'SessionHandle|None' = None) -> None:
         super().__init__()
+        self._trace_transport:SantokerBLETrace|None = None
+        if trace_handle is not None:
+            from artisanlib.santoker_ble_trace import SantokerBLETrace as TraceTransport
+            self._trace_transport = TraceTransport(self, trace_handle, read_msg)
 
         # Protocol parser variables
         self._read_queue : asyncio.Queue[bytes]|None = None
@@ -68,6 +76,27 @@ class SantokerCube_BLE(ClientBLE):
         self.add_device_description(self.SANTOKER_CUBE_SERVICE_UUID, self.SANTOKER_CUBE_NAME)
         self.add_notify(self.SANTOKER_CUBE_NOTIFY_UUID, self.notify_callback)
         self.add_write(self.SANTOKER_CUBE_SERVICE_UUID, self.SANTOKER_CUBE_WRTIE_UUID)
+
+    @override
+    def start(self, case_sensitive:bool=True, scan_timeout:float=6, connect_timeout:float=6, address:str|None = None) -> None:
+        if self._trace_transport is None:
+            super().start(case_sensitive, scan_timeout, connect_timeout, address)
+        else:
+            self._trace_transport.start(case_sensitive, scan_timeout, connect_timeout, address)
+
+    @override
+    def stop(self) -> None:
+        if self._trace_transport is None:
+            super().stop()
+        else:
+            self._trace_transport.stop()
+
+    @override
+    def send(self, message:bytes, response:bool = False, write_characteristic:str|None = None, chunk:int = 20) -> None:
+        if self._trace_transport is None:
+            super().send(message, response, write_characteristic, chunk)
+        else:
+            self._trace_transport.write(message, response, write_characteristic, chunk)
 
     def notify_callback(self, _sender:'BleakGATTCharacteristic', data:bytearray) -> None:
         if hasattr(self, '_async_loop_thread') and self._async_loop_thread is not None and self._read_queue is not None:
@@ -155,7 +184,7 @@ class Santoker(AsyncComm):
         '_drum_fresh', '_machine_on', '_machine_on_fresh', '_heating_on', '_heating_on_fresh',
         '_CHARGE', '_DRY', '_FCs',
         '_SCs', '_DROP', '_header_ready', '_warmup', '_warmup_target', '_reported_warmup_target',
-        '_desired_warmup', '_connect_using_ble', '_ble_client', '_diagnostics', '_frame_handler'
+        '_trace_handle', '_desired_warmup', '_connect_using_ble', '_ble_client', '_diagnostics', '_frame_handler'
     ]
 
     def __init__(self, host:str = '127.0.0.1', port:int = 8080, serial:'SerialSettings|None' = None,
@@ -172,8 +201,10 @@ class Santoker(AsyncComm):
                 warmup_target: float = DEFAULT_WARMUP_TEMP_C,
                 ready_handler:Callable[[bool], None]|None = None,
                 diagnostics: SantokerDiagnosticsSession | None = None,
-                frame_handler:Callable[[], None]|None = None) -> None:
+                frame_handler:Callable[[], None]|None = None,
+                trace_handle:'SessionHandle|None' = None) -> None:
 
+        self._trace_handle = trace_handle if connect_using_ble else None
         self._diagnostics: SantokerDiagnosticsSession | None = diagnostics
         self._frame_handler:Callable[[], None]|None = frame_handler
         self._desired_warmup:bool | None = None
@@ -242,8 +273,12 @@ class Santoker(AsyncComm):
         self._SCs:bool = False
         self._DROP:bool = False
 
-        self._ble_client:SantokerCube_BLE|None = \
-                (SantokerCube_BLE(self.read_msg, _connected, _disconnected) if self._connect_using_ble else None)
+        self._ble_client:SantokerCube_BLE|None = None
+        if self._connect_using_ble:
+            # Preserve the no-sink constructor/call shape for existing integrations.
+            self._ble_client = (SantokerCube_BLE(self.read_msg, _connected, _disconnected)
+                if trace_handle is None else
+                SantokerCube_BLE(self.read_msg, _connected, _disconnected, trace_handle=trace_handle))
 
 
     # external API to access machine state
@@ -363,6 +398,9 @@ class Santoker(AsyncComm):
     def _setHeaderReady(self, ready: bool) -> None:
         if ready != self._header_ready:
             self._header_ready = ready
+            if self._trace_handle is not None:
+                self._trace_handle.emit('status', {'severity': 'info',
+                    'code': 'protocol_ready' if ready else 'protocol_not_ready'})
             self._record_protocol(ready, self.HEADER if ready else None)
             if self._ready_handler is not None:
                 try:
@@ -637,6 +675,12 @@ class Santoker(AsyncComm):
     @override
     async def read_msg(self, stream: asyncio.StreamReader|IteratorReader) -> None:
         candidate:bytearray = bytearray()
+        # The reader owns immutable connection identity; never consult current BLE.
+        trace_parser = cast(Callable[[str], None] | None, getattr(stream, 'trace_parser', None))
+
+        def parsed(result:str) -> None:
+            if trace_parser is not None:
+                trace_parser(result)
 
         async def read_candidate(size: int) -> bytes:
             try:
@@ -647,6 +691,7 @@ class Santoker(AsyncComm):
                     candidate.extend(partial)
                 if candidate:
                     self._record_rx(bytes(candidate), 'truncated frame', accepted=False)
+                    parsed('truncated')
                 raise
             candidate.extend(part)
             return part
@@ -663,6 +708,7 @@ class Santoker(AsyncComm):
             candidate_header = self.HEADER_WIFI
         else:
             self._record_rx(bytes(candidate), 'invalid second header', accepted=False)
+            parsed('invalid_header')
             return
 
         # read the data target (BT, ET,..)
@@ -671,6 +717,7 @@ class Santoker(AsyncComm):
         code2 = await read_candidate(2)
         if code2 != self.CODE_HEADER:
             self._record_rx(bytes(candidate), 'invalid code header', accepted=False)
+            parsed('invalid_header')
             return
 
         # Santoker telemetry payloads use one to three bytes, while commands sent
@@ -679,6 +726,7 @@ class Santoker(AsyncComm):
         data_size = int.from_bytes(data_len, 'big')
         if not 1 <= data_size <= 3:
             self._record_rx(bytes(candidate), 'invalid data length', accepted=False)
+            parsed('invalid_length')
             return
 
         data = await read_candidate(data_size)
@@ -688,6 +736,7 @@ class Santoker(AsyncComm):
         calculated_crc = FramerRTU.compute_CRC(self.CODE_HEADER + data_len + data).to_bytes(2, 'big')
         if self._verify_crc and crc[1] != calculated_crc[1]: # we only check the second CRC bit!
             self._record_rx(bytes(candidate), 'CRC mismatch', accepted=False)
+            parsed('crc_mismatch')
             if self._logging:
                 _log.debug('CRC error')
             return
@@ -696,8 +745,10 @@ class Santoker(AsyncComm):
         tail = await read_candidate(4)
         if tail != self.TAIL:
             self._record_rx(bytes(candidate), 'invalid tail', accepted=False)
+            parsed('invalid_tail')
             return
 
+        parsed('accepted')
         # full message decoded
         self.HEADER = candidate_header
         self._setHeaderReady(True)
@@ -720,6 +771,18 @@ class Santoker(AsyncComm):
         return self.HEADER + target + data + crc + self.TAIL
 
     def send_msg(self, target:bytes, value: int) -> None:
+        if self._trace_handle is not None:
+            action = {self.POWER: 'power', self.AIR: 'fan', self.DRUM: 'drum',
+                self.MACHINE_ON: 'machine_on', self.HEATING_ON: 'heating_on',
+                self.WARMUP: 'warmup', self.WARMUP_TEMP: 'warmup_target'}.get(target)
+            if action is not None:
+                intent:float|int = value
+                if target == self.WARMUP_TEMP:
+                    intent = value / 10.0
+                    if self._trace_handle.temperature_unit == 'F':
+                        intent = intent * 9 / 5 + 32
+                self._trace_handle.emit('control', {'operation_id': str(uuid4()),
+                    'action': action, 'value': intent})
         packet:bytes = self.create_msg(target, value)
         self._record_tx(packet, target, value)
         if self._connect_using_ble and hasattr(self, '_ble_client') and self._ble_client is not None:
@@ -740,13 +803,32 @@ class Santoker(AsyncComm):
         else:
             super().start(connect_timeout)
 
+    def request_trace_close(self, cleanup_timeout:float = 5.0) -> None:
+        """Record OFF before safety writes; stop() later starts transport cleanup."""
+        # pylint: disable=protected-access
+        if self._ble_client is not None and self._ble_client._trace_transport is not None:
+            self._ble_client._trace_transport.request_close(cleanup_timeout)
+
+    @property
+    def trace_enabled(self) -> bool:
+        return self._trace_handle is not None
+
+    @property
+    def trace_cleanup_complete(self) -> bool:
+        """Poll actual traced cleanup; never use a legacy stop callback as proof."""
+        # pylint: disable=protected-access
+        return (self._ble_client is not None and self._ble_client._trace_transport is not None
+                and self._ble_client._trace_transport.cleanup_complete)
+
     @override
     def stop(self) -> None:
+        # pylint: disable=protected-access
         self.resetProtocolState()
         if self._connect_using_ble and hasattr(self, '_ble_client') and self._ble_client is not None:
             self._ble_client.stop()
             #del self._ble_client # on this level the released object should be automatically collected by the GC
-            self._ble_client = None
+            if self._ble_client._trace_transport is None:
+                self._ble_client = None
         else:
             super().stop()
 

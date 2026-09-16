@@ -12,11 +12,12 @@ import sys
 import threading
 import time
 from collections.abc import Buffer, Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta, timezone
 from email.utils import format_datetime
-from typing import cast, override
-from uuid import UUID
+from pathlib import Path
+from typing import BinaryIO, cast, override
+from uuid import UUID, uuid4
 
 import pytest
 import requests
@@ -37,6 +38,10 @@ from artisanlib.roastserver.contract import (
     RoastDetail,
     parse_roast_detail,
 )
+
+from artisanlib.santoker_trace import CaptureConfig
+from artisanlib.santoker_trace_contract import Json, Record
+from artisanlib.santoker_trace_store import Destination, StoreError, TraceStore, UploadTicket, summary_record
 
 ROAST_UUID = UUID('11111111-1111-4111-8111-111111111111')
 OTHER_ROAST_UUID = UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
@@ -2161,3 +2166,512 @@ def test_importing_api_has_no_settings_or_qt_transitive_import() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+# Diagnostic trace PUT and caller-owned immutable artifact streams.
+TRACE_DESTINATION = Destination('https://example.test',
+                          '22222222-2222-4222-8222-222222222222',
+                          '11111111-1111-4111-8111-111111111111')
+
+
+@pytest.fixture
+def prepared_trace(tmp_path: Path) -> Iterator[tuple[TraceStore, UploadTicket]]:
+    store = TraceStore(tmp_path / 'traces')
+    session = str(uuid4())
+    store.begin(CaptureConfig('4.0.0', 'linux', '6.1', 'x86_64').manifest(session, 0))
+    store.seal(session, summary_record(session, 1, 1, 0, 0, 0, set()))
+    store.authorize(session, TRACE_DESTINATION)
+    ticket = store.prepare(session)
+    try:
+        yield store, ticket
+    finally:
+        store.close()
+
+
+def trace_receipt(ticket: UploadTicket) -> Record:
+    return {'id': '33333333-3333-4333-8333-333333333333', 'session_id': ticket.session_id,
+            'organization_id': ticket.destination.organization_id,
+            'uploader_user_id': ticket.destination.uploader_user_id,
+            'sha256': ticket.sha256, 'byte_size': ticket.byte_size,
+            'stored_at': '2026-08-01T12:00:00.123456Z', 'storage_status': 'stored'}
+
+
+class TraceAdapter(RecordingAdapter):
+    def __init__(self, outcomes: tuple[requests.Response | requests.RequestException, ...]) -> None:
+        super().__init__('test-only-not-a-real-credential', outcomes)
+        self.bodies: list[bytes] = []
+        self.read_sizes: list[int] = []
+
+    @override
+    def send(self, request: requests.PreparedRequest, stream: bool = False,
+             timeout: object = None, verify: object = True, cert: object = None,
+             proxies: Mapping[str, str] | None = None) -> requests.Response:
+        if request.method == 'PUT':
+            body = cast(BinaryIO, request.body)
+            chunks: list[bytes] = []
+            while chunk := body.read(1024 * 1024):
+                self.read_sizes.append(len(chunk))
+                chunks.append(chunk)
+            self.bodies.append(b''.join(chunks))
+        return super().send(request, stream, timeout, verify, cert, proxies)
+
+
+def trace_client_for(*outcomes: requests.Response | requests.RequestException) -> tuple[RoastServerClient, TraceAdapter]:
+    client = RoastServerClient(TRACE_DESTINATION.origin, 'test-only-not-a-real-credential')
+    adapter = TraceAdapter(outcomes)
+    _install_test_adapter(client, adapter)
+    return client, adapter
+
+
+def test_held_upload_receipt_before_unlink_and_identical_explicit_retry(
+    prepared_trace: tuple[TraceStore, UploadTicket],
+) -> None:
+    store, first = prepared_trace
+    original = first.artifact.read_bytes()
+    client, adapter = trace_client_for(json_response(200, valid_identity_payload()),
+                                 json_response(200, valid_identity_payload()), raw_response(503, b''),
+                                 json_response(200, valid_identity_payload()), json_response(200, trace_receipt(first)))
+    with client:
+        identity = client.test_connection()
+        store.begin_upload(first, Destination(TRACE_DESTINATION.origin, str(identity.organization.id), str(identity.user.id)))
+        with store.open_upload(first) as source:
+            with pytest.raises(ApiFailure):
+                client.put_diagnostic_trace(first, source)
+            assert not bool(source.closed)
+            assert first.artifact.exists()
+        assert source.closed
+        store.upload_failed(first)
+        second = store.prepare(first.session_id)
+        assert second.attempt_id != first.attempt_id
+        assert second.sha256 == first.sha256
+        store.begin_upload(second, TRACE_DESTINATION)
+        with store.open_upload(second) as source:
+            result = client.put_diagnostic_trace(second, source)
+            assert not bool(source.closed)
+        store.accept_receipt(second, result, request_origin=TRACE_DESTINATION.origin)
+    assert adapter.bodies == [original, original]
+    assert not first.artifact.exists()
+    metadata = store.read_session(first.session_id)
+    assert metadata['state'] == 'removed'
+    assert metadata['receipt'] == result
+    put = adapter.calls[-1]
+    assert put.method == 'PUT'
+    assert put.url == f'{TRACE_DESTINATION.origin}/api/v1/diagnostic-traces/{first.session_id}'
+    assert put.headers['Content-Type'] == 'application/gzip'
+    assert put.headers['Content-Length'] == str(first.byte_size)
+    assert put.headers['X-Trace-SHA256'] == first.sha256
+    assert put.headers['X-Trace-Organization-ID'] == TRACE_DESTINATION.organization_id
+    assert put.headers['X-Trace-Uploader-ID'] == TRACE_DESTINATION.uploader_user_id
+    assert 'Transfer-Encoding' not in put.headers
+    assert all(call.timeout == (4.0, 10.0) and call.verify is True and not call.proxies for call in adapter.calls)
+    assert all(not any(key.startswith('X-Trace-') for key in call.headers)
+               for call in adapter.calls if call.method == 'GET')
+
+
+@pytest.mark.parametrize('mismatch', ['origin', 'organization', 'user'])
+def test_identity_mismatch_never_reads_or_sends_artifact(
+    prepared_trace: tuple[TraceStore, UploadTicket], mismatch: str,
+) -> None:
+    _, ticket = prepared_trace
+    identity = valid_identity_payload()
+    if mismatch == 'origin':
+        ticket = replace(ticket, destination=replace(TRACE_DESTINATION, origin='https://other.test'))
+    else:
+        cast(dict[str, str], identity[mismatch])['id'] = str(uuid4())
+    client, adapter = trace_client_for(json_response(200, identity))
+    source = io.BytesIO(b'must not read')
+    with client, pytest.raises(ApiFailure) as raised:
+        client.put_diagnostic_trace(ticket, source)
+    assert raised.value.failure.kind is FailureKind.CREDENTIAL_REJECTED
+    assert source.tell() == 0
+    assert not bool(source.closed)
+    assert len(adapter.calls) == (0 if mismatch == 'origin' else 1)
+    assert not adapter.bodies
+
+
+@pytest.mark.parametrize(('key', 'value'), [
+    ('id', '00000000-0000-0000-0000-000000000000'), ('id', 'A' * 32),
+    ('id', 1), ('session_id', str(uuid4())), ('organization_id', str(uuid4())),
+    ('uploader_user_id', str(uuid4())), ('sha256', 'A' * 64), ('byte_size', True),
+    ('byte_size', 1), ('byte_size', 1.0), ('byte_size', '368'), ('stored_at', '2026-02-30T12:00:00.000000Z'),
+    ('stored_at', '2026-08-01T12:00:00Z'), ('storage_status', 'pending'),
+    ('extra', 'forbidden'),
+])
+def test_malformed_receipt_retains_data(prepared_trace: tuple[TraceStore, UploadTicket], key: str, value: Json) -> None:
+    store, ticket = prepared_trace
+    malformed = trace_receipt(ticket)
+    malformed[key] = value
+    client, _ = trace_client_for(json_response(200, valid_identity_payload()), json_response(201, malformed))
+    store.begin_upload(ticket, TRACE_DESTINATION)
+    with client, store.open_upload(ticket) as source, pytest.raises(ApiFailure) as raised:
+        client.put_diagnostic_trace(ticket, source)
+    assert raised.value.failure.kind is FailureKind.INVALID_RESPONSE
+    store.upload_failed(ticket)
+    assert ticket.artifact.exists()
+    assert store.read_session(ticket.session_id)['receipt'] is None
+
+
+@pytest.mark.parametrize('malformation', ['duplicate', 'oversized', 'missing', 'constant', 'content-type', 'encoding'])
+def test_receipt_decoding_is_strict_and_bounded(
+    prepared_trace: tuple[TraceStore, UploadTicket], malformation: str,
+) -> None:
+    _, ticket = prepared_trace
+    body = json.dumps(trace_receipt(ticket)).encode()
+    headers = {'Content-Type': 'application/json'}
+    if malformation == 'duplicate':
+        body = body[:-1] + b', "storage_status": "stored"}'
+    elif malformation == 'oversized':
+        body = b' ' * 8193 + body
+    elif malformation == 'missing':
+        body = b'{}'
+    elif malformation == 'constant':
+        body = body.replace(str(ticket.byte_size).encode(), b'NaN')
+    elif malformation == 'content-type':
+        headers['Content-Type'] = 'text/html'
+    else:
+        headers['Content-Encoding'] = 'gzip'
+    response = raw_response(200, body, headers)
+    client, _ = trace_client_for(json_response(200, valid_identity_payload()), response)
+    with client, ticket.artifact.open('rb') as source, pytest.raises(ApiFailure):
+        client.put_diagnostic_trace(ticket, source)
+    assert ticket.artifact.exists()
+    assert response.closed_by_client
+    if response.requested_chunk_size is not None:
+        assert response.requested_chunk_size <= 8193
+
+
+@pytest.mark.parametrize('status', [200, 201, 202, 204, 301, 302, 307, 308, 401, 403, 409, 410, 413, 422, 429, 500, 503])
+def test_only_stored_success_statuses_no_redirect_or_retry(
+    prepared_trace: tuple[TraceStore, UploadTicket], status: int,
+) -> None:
+    _, ticket = prepared_trace
+    response = json_response(status, trace_receipt(ticket), {'Location': 'https://other.test/private'})
+    client, adapter = trace_client_for(json_response(200, valid_identity_payload()), response)
+    with client, ticket.artifact.open('rb') as source:
+        if status in {200, 201}:
+            assert client.put_diagnostic_trace(ticket, source) == trace_receipt(ticket)
+        else:
+            with pytest.raises(ApiFailure):
+                client.put_diagnostic_trace(ticket, source)
+        assert not bool(source.closed)
+    assert len(adapter.calls) == 2
+    assert ticket.artifact.exists()
+    assert response.closed_by_client
+
+
+@pytest.mark.parametrize('failure', [requests.Timeout('secret'), requests.ConnectionError('secret'), requests.exceptions.SSLError('secret')])
+def test_transport_failure_has_no_retry_or_deletion(
+    prepared_trace: tuple[TraceStore, UploadTicket], failure: requests.RequestException,
+) -> None:
+    _, ticket = prepared_trace
+    client, adapter = trace_client_for(json_response(200, valid_identity_payload()), failure)
+    with client, ticket.artifact.open('rb') as source, pytest.raises(ApiFailure) as raised:
+        client.put_diagnostic_trace(ticket, source)
+    assert 'secret' not in str(raised.value)
+    assert len(adapter.calls) == 2
+    assert ticket.artifact.exists()
+
+
+@pytest.mark.parametrize('corruption', ['hash', 'size', 'gzip', 'closed', 'truncated', 'trailing'])
+def test_invalid_held_bytes_fail_before_put(prepared_trace: tuple[TraceStore, UploadTicket], corruption: str) -> None:
+    _, ticket = prepared_trace
+    data = ticket.artifact.read_bytes()
+    if corruption == 'hash':
+        ticket = replace(ticket, sha256='0' * 64)
+    elif corruption == 'size':
+        ticket = replace(ticket, byte_size=ticket.byte_size + 1)
+    elif corruption == 'gzip':
+        data = b'x' * len(data)
+        ticket = replace(ticket, sha256=hashlib.sha256(data).hexdigest())
+    elif corruption == 'truncated':
+        data = data[:-1]
+    elif corruption == 'trailing':
+        data += b'x'
+    source = io.BytesIO(data)
+    if corruption == 'closed':
+        source.close()
+    client, adapter = trace_client_for(json_response(200, valid_identity_payload()))
+    with client, pytest.raises(ApiFailure):
+        client.put_diagnostic_trace(ticket, source)
+    assert len(adapter.calls) == 1
+    assert not adapter.bodies
+
+
+def test_pre_disclosure_generation_veto_and_client_close(prepared_trace: tuple[TraceStore, UploadTicket]) -> None:
+    _, ticket = prepared_trace
+    client, adapter = trace_client_for(json_response(200, valid_identity_payload()))
+    with client, ticket.artifact.open('rb') as source, pytest.raises(ApiFailure):
+        client.put_diagnostic_trace(ticket, source, before_disclosure=client.close)
+    assert len(adapter.calls) == 1
+    client, adapter = trace_client_for(json_response(200, valid_identity_payload()))
+
+    def veto() -> None:
+        raise RuntimeError('generation changed')
+
+    with client, ticket.artifact.open('rb') as source, pytest.raises(RuntimeError, match='generation changed'):
+        client.put_diagnostic_trace(ticket, source, before_disclosure=veto)
+    assert len(adapter.calls) == 1
+
+
+def test_trace_deadline_includes_fresh_identity_and_does_not_change_generic_budget(
+    prepared_trace: tuple[TraceStore, UploadTicket], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, ticket = prepared_trace
+    assert roastserver_api.TRACE_OPERATION_DEADLINE_SECONDS == 120
+    assert roastserver_api.OPERATION_DEADLINE_SECONDS == 12
+    monkeypatch.setattr(roastserver_api, 'TRACE_OPERATION_DEADLINE_SECONDS', 0.05)
+    response = SlowDripResponse(json.dumps(valid_identity_payload()).encode(), 0.02)
+    client, adapter = trace_client_for(response)
+    with client, ticket.artifact.open('rb') as source, pytest.raises(ApiFailure) as raised:
+        client.put_diagnostic_trace(ticket, source)
+    assert raised.value.failure.code == 'timeout'
+    assert len(adapter.calls) == 1
+    assert response.closed_by_client
+    client, _ = trace_client_for(json_response(200, valid_identity_payload()), json_response(200, trace_receipt(ticket)))
+    monkeypatch.setattr(roastserver_api, 'OPERATION_DEADLINE_SECONDS', 0.01)
+    monkeypatch.setattr(roastserver_api, 'TRACE_OPERATION_DEADLINE_SECONDS', 1.0)
+    with client, ticket.artifact.open('rb') as source:
+        assert client.put_diagnostic_trace(ticket, source, before_disclosure=lambda: time.sleep(0.03)) == trace_receipt(ticket)
+
+
+def test_store_held_descriptor_is_busy_but_mutex_is_free(prepared_trace: tuple[TraceStore, UploadTicket]) -> None:
+    store, ticket = prepared_trace
+    store.begin_upload(ticket, TRACE_DESTINATION)
+    with store.open_upload(ticket) as source:
+        for action in (store.close, lambda: store.upload_failed(ticket),
+                       lambda: store.delete_local(ticket.session_id),
+                       lambda: store.accept_receipt(ticket, trace_receipt(ticket), request_origin=TRACE_DESTINATION.origin)):
+            with pytest.raises(StoreError, match='session_busy'):
+                action()
+        with pytest.raises(StoreError, match='session_busy'), store.open_upload(ticket):
+            pass
+        completed = threading.Event()
+
+        def other_store_work() -> None:
+            store.read_session(ticket.session_id)
+            completed.set()
+
+        thread = threading.Thread(target=other_store_work)
+        thread.start()
+        try:
+            assert completed.wait(1)
+        finally:
+            thread.join(1)
+        assert hashlib.sha256(source.read()).hexdigest() == ticket.sha256
+    assert source.closed
+    store.upload_failed(ticket)
+
+
+def test_store_rejects_unbegun_stale_and_closed_tickets(prepared_trace: tuple[TraceStore, UploadTicket]) -> None:
+    store, ticket = prepared_trace
+    with pytest.raises(StoreError, match='stale_job'), store.open_upload(ticket):
+        pass
+    store.begin_upload(ticket, TRACE_DESTINATION)
+    store.upload_failed(ticket)
+    new = store.prepare(ticket.session_id)
+    store.begin_upload(new, TRACE_DESTINATION)
+    with pytest.raises(StoreError, match='stale_job'), store.open_upload(ticket):
+        pass
+    store.close()
+    with pytest.raises(StoreError, match='store_closed'), store.open_upload(new):
+        pass
+
+
+@pytest.mark.parametrize('substitution', ['symlink', 'hardlink', 'bytes', 'same-size', 'path'])
+def test_store_rejects_substitution_before_disclosure(
+    prepared_trace: tuple[TraceStore, UploadTicket], substitution: str, tmp_path: Path,
+) -> None:
+    store, ticket = prepared_trace
+    store.begin_upload(ticket, TRACE_DESTINATION)
+    outside = tmp_path / 'outside'
+    outside.write_bytes(b'not the immutable artifact')
+    if substitution == 'path':
+        ticket = replace(ticket, artifact=outside)
+    elif substitution == 'symlink':
+        ticket.artifact.unlink()
+        ticket.artifact.symlink_to(outside)
+    elif substitution == 'hardlink':
+        outside.unlink()
+        outside.hardlink_to(ticket.artifact)
+    elif substitution == 'same-size':
+        ticket.artifact.write_bytes(b'x' * ticket.byte_size)
+    else:
+        ticket.artifact.write_bytes(b'changed')
+    with pytest.raises((OSError, RuntimeError, ValueError)), store.open_upload(ticket):
+        pass
+
+
+def test_stream_never_reopens_path_after_validation(
+    prepared_trace: tuple[TraceStore, UploadTicket], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ticket = prepared_trace
+    store.begin_upload(ticket, TRACE_DESTINATION)
+    original = ticket.artifact.read_bytes()
+    with store.open_upload(ticket) as source:
+        def forbidden_open(_path: Path) -> BinaryIO:
+            raise AssertionError('reopened artifact')
+        monkeypatch.setattr(store, '_open', forbidden_open)
+        client, adapter = trace_client_for(json_response(200, valid_identity_payload()), json_response(201, trace_receipt(ticket)))
+        with client:
+            assert client.put_diagnostic_trace(ticket, source) == trace_receipt(ticket)
+        assert adapter.bodies == [original]
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('sha256', 'A' * 64), ('sha256', '0' * 64 + '\n'),
+    ('session_id', 'A' * 32), ('session_id', '00000000-0000-0000-0000-000000000000'),
+    ('byte_size', True), ('byte_size', 0), ('byte_size', 65 * 1024 * 1024 + 1),
+])
+def test_trace_ticket_headers_are_canonical_before_any_request(
+    prepared_trace: tuple[TraceStore, UploadTicket], field: str, value: object,
+) -> None:
+    _, ticket = prepared_trace
+    # Runtime boundary deliberately receives malformed typed input.
+    malformed = replace(ticket, **{field: value})  # type: ignore[arg-type]
+    client, adapter = trace_client_for()
+    with client, pytest.raises(ValueError):
+        client.put_diagnostic_trace(malformed, io.BytesIO())
+    assert not adapter.calls
+
+
+def test_trace_headers_cannot_escape_diagnostic_put(prepared_trace: tuple[TraceStore, UploadTicket]) -> None:
+    _, ticket = prepared_trace
+    client, adapter = trace_client_for()
+    with client:
+        for method, path, content_type in (
+            ('POST', '/api/v1/diagnostic-traces/' + ticket.session_id, 'application/gzip'),
+            ('PUT', '/api/v1/aroast', 'application/gzip'),
+            ('PUT', '/api/v1/diagnostic-traces/' + ticket.session_id, 'text/plain'),
+        ):
+            def rejected_request(deadline: roastserver_api._DeadlineGuard, method: str = method,
+                                 path: str = path, content_type: str = content_type) -> requests.Response:
+                return client._request(
+                    method, path, deadline=deadline, data=io.BytesIO(),
+                    trace_ticket=ticket, body_content_type=content_type,
+                    body_content_length=ticket.byte_size,
+                )
+
+            with pytest.raises(ValueError):
+                client._run_operation(rejected_request)
+        with pytest.raises(ValueError):
+            client._run_operation(lambda deadline: client._request(
+                'GET', '/api/v1/auth/me', deadline=deadline,
+                additional_headers={'X-Trace-SHA256': ticket.sha256},
+            ))
+    assert not adapter.calls
+
+
+def test_large_trace_transport_reads_are_bounded_and_exact(tmp_path: Path) -> None:
+    store = TraceStore(tmp_path / 'large')
+    session = str(uuid4())
+    try:
+        store.begin(CaptureConfig('4.0.0', 'linux', '6.1', 'x86_64').manifest(session, 0))
+        for seq in range(1, 5):
+            data = secrets.token_bytes(32768)
+            event: Record = {'kind': 'rx', 'session_id': session, 'seq': seq,
+                             'mono_ns': seq, 'dropped_before': 0,
+                             'connection_id': str(uuid4()), 'direction': 'rx',
+                             'characteristic': '6e400003-b5a3-f393-e0a9-e50e24dcca9e',
+                             'payload': {'encoding': 'base64', 'byte_length': len(data),
+                                         'data': base64.b64encode(data).decode('ascii')}}
+            assert store.append(session, event) is None
+        store.seal(session, summary_record(session, 5, 5, 4, 0, 0, set()))
+        store.authorize(session, TRACE_DESTINATION)
+        ticket = store.prepare(session)
+        assert ticket.byte_size > 65536
+        store.begin_upload(ticket, TRACE_DESTINATION)
+        client, adapter = trace_client_for(json_response(200, valid_identity_payload()), json_response(201, trace_receipt(ticket)))
+        with client, store.open_upload(ticket) as source:
+            assert client.put_diagnostic_trace(ticket, source) == trace_receipt(ticket)
+        assert max(adapter.read_sizes) == 65536
+        assert sum(adapter.read_sizes) == ticket.byte_size
+        assert hashlib.sha256(adapter.bodies[0]).hexdigest() == ticket.sha256
+    finally:
+        store.close()
+
+
+def test_trace_success_without_consuming_exact_body_is_rejected(prepared_trace: tuple[TraceStore, UploadTicket]) -> None:
+    _, ticket = prepared_trace
+    client = RoastServerClient(TRACE_DESTINATION.origin, 'test-only')
+    adapter = RecordingAdapter('test-only', (json_response(200, valid_identity_payload()),
+                                            json_response(201, trace_receipt(ticket))))
+    _install_test_adapter(client, adapter)
+    with client, ticket.artifact.open('rb') as source, pytest.raises(ApiFailure):
+        client.put_diagnostic_trace(ticket, source)
+    assert ticket.artifact.exists()
+
+
+def test_held_stream_survives_cancellation_until_actual_request_settles(
+    prepared_trace: tuple[TraceStore, UploadTicket], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ticket = prepared_trace
+    store.begin_upload(ticket, TRACE_DESTINATION)
+    started, release = threading.Event(), threading.Event()
+    failure: list[Exception] = []
+    disclosed: list[bytes] = []
+
+    class BlockedTraceAdapter(TraceAdapter):
+        @override
+        def send(self, request: requests.PreparedRequest, stream: bool = False,
+                 timeout: object = None, verify: object = True, cert: object = None,
+                 proxies: Mapping[str, str] | None = None) -> requests.Response:
+            if request.method == 'PUT':
+                disclosed.append(cast(BinaryIO, request.body).read(7))
+                started.set()
+                assert release.wait(2)
+            return super().send(request, stream, timeout, verify, cert, proxies)
+
+    client = RoastServerClient(TRACE_DESTINATION.origin, 'test-only-not-a-real-credential')
+    adapter = BlockedTraceAdapter((json_response(200, valid_identity_payload()), json_response(201, trace_receipt(ticket))))
+    _install_test_adapter(client, adapter)
+    monkeypatch.setattr(roastserver_api, 'TRACE_OPERATION_DEADLINE_SECONDS', 0.05)
+    with store.open_upload(ticket) as source:
+        def upload() -> None:
+            try:
+                client.put_diagnostic_trace(ticket, source)
+            except Exception as error:  # thread returns failures to the test owner
+                failure.append(error)
+
+        thread = threading.Thread(target=upload)
+        thread.start()
+        try:
+            assert started.wait(1)
+            # A deadline closes the client but cannot pretend a blocked adapter has settled.
+            time.sleep(0.1)
+            assert thread.is_alive()
+            assert not bool(source.closed)
+            with pytest.raises(StoreError, match='session_busy'):
+                store.upload_failed(ticket)
+            release.set()
+            thread.join(1)
+            assert not thread.is_alive()
+            assert not bool(source.closed)
+        finally:
+            release.set()
+            thread.join(2)
+            client.close()
+    assert source.closed
+    assert len(failure) == 1 and isinstance(failure[0], ApiFailure)
+    assert failure[0].failure.code == 'timeout'
+    store.upload_failed(ticket)
+    assert ticket.artifact.exists()
+    assert disclosed == [ticket.artifact.read_bytes()[:7]]
+    assert not adapter.bodies  # Deadline/cancellation guard rejects further body reads.
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='POSIX rename of a held descriptor')
+def test_trace_upload_uses_held_inode_not_substituted_path(prepared_trace: tuple[TraceStore, UploadTicket]) -> None:
+    store, ticket = prepared_trace
+    store.begin_upload(ticket, TRACE_DESTINATION)
+    original = ticket.artifact.read_bytes()
+    with store.open_upload(ticket) as source:
+        ticket.artifact.rename(ticket.artifact.with_suffix('.held-test'))
+        ticket.artifact.write_bytes(b'x' * ticket.byte_size)
+        client, adapter = trace_client_for(json_response(200, valid_identity_payload()),
+                                           json_response(201, trace_receipt(ticket)))
+        with client:
+            assert client.put_diagnostic_trace(ticket, source) == trace_receipt(ticket)
+        assert adapter.bodies == [original]
+    # Hostile same-user substitution is outside the filesystem trust boundary;
+    # do not authorize deletion of the replacement in this synthetic test.
+    assert ticket.artifact.read_bytes() != original
