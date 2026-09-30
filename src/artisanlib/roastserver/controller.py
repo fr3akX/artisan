@@ -326,8 +326,9 @@ class RoastServerController(QObject):
         self._shutdown_complete = False
 
         root = _absolute_path(data_root)
+        self._cache_root = root / 'cache'
         outbox = outbox_factory(root / 'outbox', self._clock)
-        cache = cache_factory(root / 'cache')
+        cache = cache_factory(self._cache_root)
         inventory_root = root / 'inventory'
         self._inventory_store = inventory_store_factory(inventory_root)
         worker_inventory_store = inventory_store_factory(inventory_root)
@@ -1150,6 +1151,17 @@ class RoastServerController(QObject):
     def current_protection_token(self) -> ProtectionToken | None:
         self._require_command_state()
         return self._protection_registry.current()
+
+    def set_background_path(self, path: Path | None) -> None:
+        self._require_ui_thread()
+        canonical_path = None if path is None else _absolute_path(path)
+        # Local background files do not belong to the server cache. In
+        # particular, a missing local file must not prevent cache cleanup.
+        self._protection_registry.set_background_path(
+            canonical_path
+            if canonical_path is not None and canonical_path.is_relative_to(self._cache_root)
+            else None
+        )
 
     def owns_protection_token(self, expected: ProtectionToken) -> bool:
         self._require_command_state()

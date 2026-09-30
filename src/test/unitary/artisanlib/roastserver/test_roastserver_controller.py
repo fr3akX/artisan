@@ -4048,3 +4048,23 @@ def test_real_expired_token_stops_and_replacement_works_without_removal(
         assert credentials.delete_calls == []
     finally:
         assert controller.shutdown(2000)
+
+
+def test_background_protection_releases_cache_when_loading_local_profile(
+    controller_harness: ControllerHarness,
+) -> None:
+    controller = controller_harness.controller
+    cached_path = controller_harness.tmp_path / 'data' / 'cache' / 'background.alog'
+    local_path = controller_harness.tmp_path / 'local.alog'
+    registry = controller._protection_registry
+    namespace = namespace_for(ORIGIN, ORGANIZATION_ID)
+    token = controller.current_protection_token()
+    controller.set_background_path(cached_path)
+    assert cached_path in registry.paths(namespace)
+    assert controller.current_protection_token() is token
+    controller.set_background_path(local_path)
+    assert cached_path not in registry.paths(namespace)
+    assert local_path not in registry.paths(namespace)
+    controller.set_background_path(cached_path)
+    controller.set_background_path(None)
+    assert cached_path not in registry.paths(namespace)

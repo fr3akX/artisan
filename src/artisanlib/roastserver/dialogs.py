@@ -46,6 +46,7 @@ from PyQt6.QtCore import (
     QRect,
     Qt,
     QTimer,
+    pyqtSignal,
     pyqtSlot,
 )
 from PyQt6.QtGui import QCloseEvent, QColor, QShowEvent
@@ -1389,6 +1390,8 @@ class RoastServerConfigDialog(QDialog):
 
 
 class RoastServerBrowserDialog(QDialog):
+    profileSelected = pyqtSignal(str, object)
+
     search_label: QLabel
     search_edit: QLineEdit
     state_combo: QComboBox
@@ -1855,7 +1858,7 @@ class RoastServerBrowserDialog(QDialog):
         self._finish_open()
 
     @pyqtSlot(str, object)
-    def _on_profile_ready(self, _path: str, value: object) -> None:
+    def _on_profile_ready(self, path: str, value: object) -> None:
         expected = self._open_expected
         if self._open_request is None or expected is None:
             return
@@ -1890,6 +1893,7 @@ class RoastServerBrowserDialog(QDialog):
                 )
             )
         self._finish_open()
+        self.profileSelected.emit(path, value)
 
     @pyqtSlot(str, object)
     def _on_cached_fallback(self, request_id: str, value: object) -> None:

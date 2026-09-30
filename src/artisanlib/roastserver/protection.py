@@ -57,6 +57,7 @@ class ProtectionRegistry:
         self._lock = threading.RLock()
         self._serial = 0
         self._current: ProtectionToken | None = None
+        self._background_path: Path | None = None
 
     @override
     def __repr__(self) -> str:
@@ -70,15 +71,20 @@ class ProtectionRegistry:
         with self.read_guard(namespace) as paths:
             return paths
 
+    def set_background_path(self, path: Path | None) -> None:
+        canonical_path = None if path is None else _absolute_path(path)
+        with self._lock:
+            self._background_path = canonical_path
+
     @contextmanager
     def read_guard(self, namespace: Namespace) -> Iterator[frozenset[Path]]:
         """Hold ownership stable while a cache operation uses its paths."""
         with self._lock:
             current = self._current
-            if current is None or current.namespace != namespace:
-                yield frozenset()
-            else:
-                yield frozenset({current.path})
+            paths: set[Path] = set() if self._background_path is None else {self._background_path}
+            if current is not None and current.namespace == namespace:
+                paths.add(current.path)
+            yield frozenset(paths)
 
     @contextmanager
     def transaction_guard(

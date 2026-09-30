@@ -4246,6 +4246,7 @@ class ApplicationWindow(QMainWindow):
             from artisanlib.roastserver.dialogs import RoastServerBrowserDialog
             self.roastserver_browser_dialog = RoastServerBrowserDialog(
                 controller, self.roastserver_settings, self)
+            self.roastserver_browser_dialog.profileSelected.connect(self.openRoastServerProfile)
         self.roastserver_browser_dialog.show()
         self.roastserver_browser_dialog.raise_()
         self.roastserver_browser_dialog.activateWindow()
@@ -4614,7 +4615,6 @@ class ApplicationWindow(QMainWindow):
         if self.santokerTraceRuntime is not None:
             controller.settingsChanged.connect(self.santokerTraceRuntime.settings_changed)
             controller.identityChanged.connect(self.santokerTraceRuntime.identity_changed)
-        controller.profileReady.connect(self.openRoastServerProfile)
         controller.inventoryRecoveryRequired.connect(self.scheduleInventoryRecovery)
         controller.inventoryConflict.connect(self.showInventoryConflict)
         from artisanlib.roastserver.presentation import UploadStatusWidget
@@ -14516,6 +14516,7 @@ class ApplicationWindow(QMainWindow):
                 f'background-{name}',
                 functools.partial(restore_field, self.qmc, name, value),
             )
+        guarded('background-protection', self.updateRoastServerBackgroundProtection)
         for name, value in state['axis'].items():
             guarded(
                 f'axis-{name}',
@@ -15418,7 +15419,7 @@ class ApplicationWindow(QMainWindow):
 
     # Loads background profile
     # NOTE: this does NOT set the self.qmc.background flag to make the loaded background visible.
-    def loadbackground(self, filename:str, quiet:bool = True) -> None: # pyright: ignore[reportGeneralTypeIssues] # code to complex to analyze
+    def loadbackground(self, filename:str, quiet:bool = True) -> bool: # pyright: ignore[reportGeneralTypeIssues] # code to complex to analyze
         if self.loadableProfile(filename):
             try:
                 profile = deserialize(filename)
@@ -15665,11 +15666,13 @@ class ApplicationWindow(QMainWindow):
                 self.sendmessage(message)
                 self.qmc.backgroundpath = str(filename)
                 self.qmc.backgroundUUID = profile.get('roastUUID', None)
+                self.updateRoastServerBackgroundProtection()
                 _log.info('background profile loaded: %s', filename)
+                return True
             except OSError as e:
                 _, _, exc_tb = sys.exc_info()
                 self.qmc.adderror((QApplication.translate('Error Message', 'IO Error:') + ' loadbackground() {0}').format(str(e)),getattr(exc_tb, 'tb_lineno', '?'))
-                return
+                return False
 
             except (ValidationError) as e:
                 # pydantic validation against ProfileData TypedDict failed
@@ -15689,15 +15692,16 @@ class ApplicationWindow(QMainWindow):
             except ValueError as e:
                 _, _, exc_tb = sys.exc_info()
                 self.qmc.adderror((QApplication.translate('Error Message', 'Value Error:') + ' loadbackground() {0}').format(str(e)),getattr(exc_tb, 'tb_lineno', '?'))
-                return
+                return False
 
             except Exception as e: # pylint: disable=broad-except
                 _log.exception(e)
                 _, _, exc_tb = sys.exc_info()
                 self.qmc.adderror((QApplication.translate('Error Message', 'Exception:') + ' loadbackground() {0}').format(str(e)),getattr(exc_tb, 'tb_lineno', '?'))
-                return
+                return False
         else:
             self.sendmessage(QApplication.translate('Message', 'Invalid artisan format'))
+        return False
 
 
     def addSerialPort(self) -> None:
@@ -27728,12 +27732,19 @@ class ApplicationWindow(QMainWindow):
         dialog = backgroundDlg(self,self,self.backgroundDlg_activeTab)
         dialog.show()
 
+    def updateRoastServerBackgroundProtection(self) -> None:
+        controller = self.roastserver_controller
+        if controller is not None:
+            path = self.qmc.backgroundpath
+            controller.set_background_path(Path(path) if path else None)
+
     def deleteBackground(self) -> None:
         self.qmc.background = False
         self.qmc.backgroundprofile = None
         self.qmc.backgroundprofile_moved_x = 0
         self.qmc.backgroundprofile_moved_y = 0
         self.qmc.backgroundpath = ''
+        self.updateRoastServerBackgroundProtection()
         self.qmc.backgroundUUID = None
         self.qmc.titleB = ''
         self.qmc.roastbatchnrB = 0

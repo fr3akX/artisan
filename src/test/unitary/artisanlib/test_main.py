@@ -193,6 +193,7 @@ if not QApplication.instance():
 from artisanlib import main as main_module
 from artisanlib import util as util_module
 from artisanlib.atypes import ProfileData, RecentRoast
+from artisanlib.background import backgroundDlg
 from artisanlib.canvas import tgraphcanvas
 from artisanlib.main import ApplicationWindow, UI_MODE
 from artisanlib.roastserver import dialogs as roastserver_dialogs
@@ -4436,6 +4437,77 @@ def roastserver_shutdown_window() -> ApplicationWindow:
 
 
 class TestRoastServerMainIntegration:
+    def test_roastserver_browser_routes_selected_profile_to_foreground(self) -> None:
+        window = ApplicationWindow.__new__(ApplicationWindow)
+        window.roastserver_controller = Mock()
+        window.roastserver_settings = None
+        window.roastserver_browser_dialog = None
+        with patch.object(roastserver_dialogs, 'RoastServerBrowserDialog') as browser_class:
+            window.showServerRoasts()
+            window.showServerRoasts()
+        browser_class.assert_called_once()
+        browser_class.return_value.profileSelected.connect.assert_called_once_with(
+            window.openRoastServerProfile)
+
+    @pytest.mark.parametrize('outcome', ['success', 'failed', 'cancelled', 'unexpected'])
+    def test_background_server_picker_keeps_foreground_and_cleans_up(
+        self, outcome: str, tmp_path: Path,
+    ) -> None:
+        dialog = Mock()
+        controller = MagicMock()
+        dialog.aw.roastserver_controller = controller
+        dialog.aw.curFile = 'current.alog'
+        dialog.aw.roastserver_open_source = SERVER_SOURCE
+        dialog.loadFile.return_value = outcome != 'failed'
+        controller.is_expected_open_source.return_value = outcome != 'unexpected'
+        browser = Mock()
+        filename = str(tmp_path / 'server.alog')
+
+        def choose_profile() -> None:
+            if outcome != 'cancelled':
+                callback = browser.profileSelected.connect.call_args.args[0]
+                callback(filename, SERVER_SOURCE)
+
+        browser.exec.side_effect = choose_profile
+        with patch.object(roastserver_dialogs, 'RoastServerBrowserDialog', return_value=browser):
+            backgroundDlg.loadServer(cast(Any, dialog))
+
+        dialog.aw.roastserver_browser_dialog.close.assert_called_once()
+        assert dialog.aw.curFile == 'current.alog'
+        assert dialog.aw.roastserver_open_source is SERVER_SOURCE
+        dialog.aw.loadFile.assert_not_called()
+        if outcome in {'success', 'failed'}:
+            dialog.loadFile.assert_called_once_with(filename)
+        else:
+            dialog.loadFile.assert_not_called()
+        assert browser.accept.call_count == (1 if outcome == 'success' else 0)
+        browser.close.assert_called_once()
+        browser.deleteLater.assert_called_once()
+
+    @pytest.mark.parametrize('loaded', [True, False])
+    def test_background_load_updates_controls_only_on_success(self, loaded: bool) -> None:
+        dialog = Mock(filename='previous.alog')
+        dialog.aw.loadbackground.return_value = loaded
+        dialog.aw.qmc.extraname1B = ['ET']
+        dialog.aw.qmc.extraname2B = ['BT']
+        dialog.aw.qmc.extratimexB = [[0, 1]]
+        dialog.aw.qmc.xtcurveidx = 1
+        dialog.aw.qmc.ytcurveidx = 2
+
+        assert backgroundDlg.loadFile(cast(Any, dialog), 'server.alog') is loaded
+        dialog.aw.loadbackground.assert_called_once_with('server.alog', quiet=False)
+        assert dialog.filename == ('server.alog' if loaded else 'previous.alog')
+        if loaded:
+            dialog.pathedit.setText.assert_called_once_with('server.alog')
+            dialog.xtcurveComboBox.addItems.assert_called_once_with(['', 'B3: ET', 'B4: BT'])
+            dialog.backgroundCheck.setChecked.assert_called_once_with(True)
+            dialog.aw.qmc.timealign.assert_called_once_with(redraw=False)
+            dialog.readChecks.assert_called_once()
+        else:
+            dialog.pathedit.setText.assert_not_called()
+            dialog.aw.qmc.timealign.assert_not_called()
+            dialog.readChecks.assert_not_called()
+
     def test_roastserver_successful_save_uses_descriptor_timestamp_and_immediate_detach(
         self, tmp_path: Path
     ) -> None:
@@ -5129,8 +5201,7 @@ class TestRoastServerMainIntegration:
         trace_presentation.assert_called_once_with(window, trace_runtime.return_value, window.sendmessage)
         controller.identityChanged.connect.assert_called_once_with(trace_runtime.return_value.identity_changed)
         assert call(trace_runtime.return_value.settings_changed) in controller.settingsChanged.connect.call_args_list
-        controller.profileReady.connect.assert_called_once_with(
-            window.openRoastServerProfile)
+        controller.profileReady.connect.assert_not_called()
         controller.start.assert_called_once_with()
         assert window.roastserver_controller is controller
 

@@ -27,6 +27,7 @@
 
 import platform
 import logging
+from pathlib import Path
 
 from artisanlib.main import UI_MODE
 from artisanlib.util import deltaLabelUTF8, deltaLabelPrefix, stringfromseconds
@@ -94,6 +95,10 @@ class backgroundDlg(ArtisanResizeablDialog):
         self.keyboardControlflag.setChecked(self.aw.qmc.backgroundKeyboardControlFlag)
         loadButton = QPushButton(QApplication.translate('Button','Load'))
         loadButton.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.loadServerButton = QPushButton(QApplication.translate('RoastServer', 'Load from Server…'))
+        self.loadServerButton.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.loadServerButton.setEnabled(self.aw.roastserver_controller is not None)
+        self.loadServerButton.clicked.connect(self.loadServer)
         delButton = QPushButton(QApplication.translate('Button','Delete'))
         delButton.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
@@ -542,6 +547,7 @@ class backgroundDlg(ArtisanResizeablDialog):
             self.TabWidget.addTab(C3Widget,QApplication.translate('Tab','Data'))
         buttonLayout = QHBoxLayout()
         buttonLayout.addWidget(loadButton)
+        buttonLayout.addWidget(self.loadServerButton)
         buttonLayout.addWidget(delButton)
         buttonLayout.addStretch()
         buttonLayout.addWidget(self.dialogbuttons)
@@ -883,12 +889,44 @@ class backgroundDlg(ArtisanResizeablDialog):
 
     @pyqtSlot(bool)
     def load(self, _:bool = False) -> None:
-        self.filename = self.aw.ArtisanOpenFileDialog(msg=QApplication.translate('Message','Load Background'),ext='*.alog')
-        if len(self.filename) == 0:
+        filename = self.aw.ArtisanOpenFileDialog(msg=QApplication.translate('Message','Load Background'),ext='*.alog')
+        if filename:
+            self.loadFile(filename)
+
+    @pyqtSlot(bool)
+    def loadServer(self, _:bool = False) -> None:
+        from artisanlib.roastserver.contract import ServerProfileSource
+        from artisanlib.roastserver.dialogs import RoastServerBrowserDialog
+
+        controller = self.aw.roastserver_controller
+        if controller is None:
             return
+        # Only one browser may own a controller download at a time.
+        if self.aw.roastserver_browser_dialog is not None:
+            self.aw.roastserver_browser_dialog.close()
+        browser = RoastServerBrowserDialog(controller, self.aw.roastserver_settings, self)
+        browser.setWindowTitle(QApplication.translate('RoastServer', 'Load Background from Server'))
+
+        def load_selected(filename:str, source:object) -> None:
+            if not isinstance(source, ServerProfileSource):
+                return
+            with controller.protection_guard(controller.current_protection_token()):
+                if controller.is_expected_open_source(Path(filename), source) and self.loadFile(filename):
+                    browser.accept()
+
+        browser.profileSelected.connect(load_selected)
+        try:
+            browser.exec()
+        finally:
+            browser.close()
+            browser.deleteLater()
+
+    def loadFile(self, filename:str) -> bool:
         self.aw.sendmessage(QApplication.translate('Message','Reading background profile...'))
         self.aw.qmc.resetlinecountcaches()
-        self.aw.loadbackground(self.filename, quiet=False)
+        if not self.aw.loadbackground(filename, quiet=False):
+            return False
+        self.filename = filename
 
         # reset XT curve popup
         curvenames = [''] # first entry is the empty one (no extra curve displayed)
@@ -914,6 +952,7 @@ class backgroundDlg(ArtisanResizeablDialog):
         self.backgroundCheck.setChecked(True)
         self.aw.qmc.timealign(redraw=False)
         self.readChecks()
+        return True
 
     def createEventTable(self) -> None:
         ndata = len(self.aw.qmc.backgroundEvents)
