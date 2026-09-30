@@ -1524,6 +1524,33 @@ def test_browser_retained_offline_page_merges_verified_cache_and_keeps_server_de
     assert not browser.open_button.isEnabled()
 
 
+@pytest.mark.parametrize('online', [True, False])
+def test_browser_routes_only_its_pending_selection(
+    browser: RoastServerBrowserDialog,
+    browser_controller: FakeBrowserController,
+    online: bool,
+) -> None:
+    selected = QSignalSpy(browser.profileSelected)
+    page = online_browser_page(BROWSER_SUMMARY_ONE) if online else cached_browser_page(BROWSER_CACHED)
+    emit_current_page(browser_controller, page)
+    browser.select_roast(BROWSER_ROAST_ONE)
+    source = replace(BROWSER_SOURCE, stale=not online)
+    path = str(BROWSER_CACHED.path)
+    browser_controller.profileReady.emit(path, source)
+    assert len(selected) == 0
+    browser.open_button.click()
+    browser_controller.profileReady.emit(path, replace(source, roast_uuid=BROWSER_ROAST_TWO))
+    assert len(selected) == 0
+    browser_controller.profileReady.emit(path, source)
+    assert list(selected) == [[path, source]]
+    browser_controller.profileReady.emit(path, source)
+    assert len(selected) == 1
+    browser.open_button.click()
+    browser.close()
+    browser_controller.profileReady.emit(path, source)
+    assert len(selected) == 1
+
+
 def test_browser_offline_open_revalidates_cached_and_tracks_only_matching_profile(
     browser: RoastServerBrowserDialog,
     browser_controller: FakeBrowserController,

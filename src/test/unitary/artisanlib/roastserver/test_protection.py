@@ -156,3 +156,20 @@ def test_registry_reentrant_cas_never_releases_or_restores_wrong_token(
     assert not registry.release(first)
     assert not registry.restore(first, expected=None)
     assert registry.current() is second
+
+
+def test_background_protection_is_independent_of_foreground_ownership(tmp_path: Path) -> None:
+    registry = ProtectionRegistry()
+    foreground = tmp_path / 'foreground.alog'
+    background = tmp_path / 'background.alog'
+    token = registry.protect(NAMESPACE, foreground)
+    registry.set_background_path(background)
+    assert registry.current() is token
+    assert registry.paths(NAMESPACE) == frozenset({foreground, background})
+    assert registry.release(token)
+    assert registry.paths(NAMESPACE) == frozenset({background})
+    replacement = tmp_path / 'replacement.alog'
+    registry.set_background_path(replacement)
+    assert registry.paths(NAMESPACE) == frozenset({replacement})
+    registry.set_background_path(None)
+    assert registry.paths(NAMESPACE) == frozenset()

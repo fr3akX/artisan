@@ -2986,6 +2986,9 @@ def test_publication_prune_always_unions_synchronous_registry_snapshot(
     open_path = worker_harness.tmp_path / 'registry-open.alog'
     open_path.write_bytes(b'open')
     worker_harness.worker._protection_registry.protect(NAMESPACE, open_path)
+    background_path = worker_harness.tmp_path / 'registry-background.alog'
+    background_path.write_bytes(b'background')
+    worker_harness.worker._protection_registry.set_background_path(background_path)
     _online_id, request = worker_harness.open_online()
     publish_id = worker_harness.command_vault.put(request)
 
@@ -2993,7 +2996,7 @@ def test_publication_prune_always_unions_synchronous_registry_snapshot(
     worker_harness.wait_until(lambda: bool(worker_harness.cache.prune_calls))
 
     _namespace, protected, _thread_id = worker_harness.cache.prune_calls[-1]
-    assert protected == frozenset({open_path})
+    assert protected == frozenset({open_path, background_path})
 
 
 def test_worker_holds_registry_guard_through_prune_against_token_transition(
