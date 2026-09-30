@@ -13016,6 +13016,8 @@ class tgraphcanvas(QObject):
 
     @pyqtSlot()
     def OnMonitor(self) -> None:
+        if (self.device == 134 and self.aw.santokerBLE and self.flagon) or getattr(self.aw, 'traceShutdownPending', False):
+            return
         try:
             self.generateNoneTempHints()
             self.block_update = True # block the updating of the bitblit canvas (unblocked at the end of this function to avoid multiple redraws)
@@ -13095,9 +13097,11 @@ class tgraphcanvas(QObject):
                             callback,
                         )
 
+                    trace_handle = self.aw.beginSantokerTrace()
                     self.aw.santoker = Santoker(self.aw.santokerHost, self.aw.santokerPort,
                         santoker_serial, self.aw.santokerBLE,
                         diagnostics=santoker_diagnostics_session,
+                        trace_handle=trace_handle,
                         frame_handler=lambda: self.aw.santokerFrameGenerationSignal.emit(santoker_generation),
                         connected_handler=lambda: queue_santoker_callback(lambda: self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} connected').format('Santoker'),True,None)),
                         disconnected_handler=lambda: queue_santoker_callback(lambda: self.aw.sendmessageSignal.emit(QApplication.translate('Message', '{} disconnected').format('Santoker'),True,None)),
@@ -13114,6 +13118,8 @@ class tgraphcanvas(QObject):
                         ready_handler=lambda ready: self.aw.santokerWarmupReadyGenerationSignal.emit(santoker_generation, ready))
                     self.aw.santoker.setLogging(self.device_logging)
                     self.aw.santoker.start()
+                    if trace_handle is not None and self.aw.santokerTracePresentation is not None:
+                        self.aw.santokerTracePresentation.previous_sessions(current_session=trace_handle.session_id)
                 elif self.device == 171:
                     # connect Santoker R
                     from artisanlib.santoker_r import SantokerR
@@ -13999,6 +14005,8 @@ class tgraphcanvas(QObject):
             self.plus_lockSchedule_sent_date is not None and self.plus_lockSchedule_sent_date == str(datetime.datetime.now().astimezone().date()))
 
     def OnRecorder(self) -> None:
+        if getattr(self.aw, 'traceShutdownPending', False):
+            return
         try:
             # if on turn mouse crosslines off
             if self.crossmarker:
@@ -14035,6 +14043,7 @@ class tgraphcanvas(QObject):
                 self.OnMonitor()
             else:
                 self.timealign(redraw=True) # need to redraw here which is otherwise done in OnOnitor to align behavior of OFF->START with OFF->ON->START
+            self.aw.markSantokerTrace('roast_start')
             try:
                 self.aw.eventactionx(self.xextrabuttonactions[1],self.xextrabuttonactionstrings[1])
             except Exception as e: # pylint: disable=broad-except
@@ -14125,6 +14134,7 @@ class tgraphcanvas(QObject):
             self.aw.enableSaveActions()
             self.aw.resetCurveVisibilities()
             self.flagstart = False
+            self.aw.markSantokerTrace('roast_end')
             self.aw.updateSantokerWarmupControls()
             if self.aw.simulator:
                 self.aw.buttonSTARTSTOP.setStyleSheet(artisan_simulator_push_button_style_dict['STOP'].format(
@@ -14560,6 +14570,8 @@ class tgraphcanvas(QObject):
                                 self.timeindex[1] = max(0,len(self.timex)-1)
                             else:
                                 return
+                        if self.timeindex[1] > 0:
+                            self.aw.markSantokerTrace('dry_end')
                         if self.phasesbuttonflag and is_proper_temp(self.temp2[self.timeindex[1]]):
                             self.phases[1] = int(round(self.temp2[self.timeindex[1]]))
                         if self.BTcurve or self.ETcurve:
@@ -14678,6 +14690,8 @@ class tgraphcanvas(QObject):
                                 self.timeindex[2] = max(0,len(self.timex)-1)
                             else:
                                 return
+                        if self.timeindex[2] > 0:
+                            self.aw.markSantokerTrace('fc_start')
                         if self.phasesbuttonflag and is_proper_temp(self.temp2[self.timeindex[2]]):
                             self.phases[2] = int(round(self.temp2[self.timeindex[2]]))
                         if self.BTcurve or self.ETcurve:
@@ -14790,6 +14804,8 @@ class tgraphcanvas(QObject):
                                 self.timeindex[3] = max(0,len(self.timex)-1)
                             else:
                                 return
+                        if self.timeindex[3] > 0:
+                            self.aw.markSantokerTrace('fc_end')
                         if self.BTcurve or self.ETcurve:
                             temp_FCs = ((self.temp2[self.timeindex[2]] if self.BTcurve else self.temp1[self.timeindex[2]]) if self.timeindex[2] else -1)
                             temp = (self.temp2[self.timeindex[3]] if self.BTcurve else self.temp1[self.timeindex[3]])
@@ -14903,6 +14919,8 @@ class tgraphcanvas(QObject):
                                 self.timeindex[4] = max(0,len(self.timex)-1)
                             else:
                                 return
+                        if self.timeindex[4] > 0:
+                            self.aw.markSantokerTrace('sc_start')
                         if self.BTcurve or self.ETcurve:
                             temp_FCe = ((self.temp2[self.timeindex[3]] if self.BTcurve else self.temp1[self.timeindex[3]]) if self.timeindex[3] else -1)
                             temp = (self.temp2[self.timeindex[4]] if self.BTcurve else self.temp1[self.timeindex[4]])
@@ -15021,6 +15039,8 @@ class tgraphcanvas(QObject):
                                 self.timeindex[5] = max(0,len(self.timex)-1)
                             else:
                                 return
+                        if self.timeindex[5] > 0:
+                            self.aw.markSantokerTrace('sc_end')
                         if self.BTcurve or self.ETcurve:
                             temp_SCs = ((self.temp2[self.timeindex[4]] if self.BTcurve else self.temp1[self.timeindex[4]]) if self.timeindex[4] else -1)
                             temp = (self.temp2[self.timeindex[5]] if self.BTcurve else self.temp1[self.timeindex[5]])
@@ -15379,6 +15399,8 @@ class tgraphcanvas(QObject):
                                 self.timeindex[7] = max(0,len(self.timex)-1)
                             else:
                                 return
+                        if self.timeindex[7] > 0:
+                            self.aw.markSantokerTrace('cool_end')
                         if self.BTcurve or self.ETcurve:
                             temp_DROP = ((self.temp2[self.timeindex[6]] if self.BTcurve else self.temp1[self.timeindex[6]]) if self.timeindex[6] else -1)
                             temp = (self.temp2[self.timeindex[7]] if self.BTcurve else self.temp1[self.timeindex[7]])
